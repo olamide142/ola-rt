@@ -1,0 +1,294 @@
+use std::sync::Arc;
+
+use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
+use ola_core::GenerationConfig;
+use ola_model::{
+    CausalModel, ExecutionStage, GeneratedToken, GenerationSession, ModelExecutionError,
+    SessionMetrics,
+};
+
+use super::{LlamaConfig, LlamaForCausalLM};
+
+/// Shared Burn weights exposed through OlaRT's architecture-neutral model API.
+pub(crate) struct BurnLlamaModel<B: Backend> {
+    module: Arc<LlamaForCausalLM<B>>,
+    config: Arc<LlamaConfig>,
+    device: B::Device,
+}
+
+impl<B: Backend> BurnLlamaModel<B> {
+    pub(crate) fn new(module: LlamaForCausalLM<B>, config: LlamaConfig, device: B::Device) -> Self {
+        Self {
+            module: Arc::new(module),
+            config: Arc::new(config),
+            device,
+        }
+    }
+}
+
+impl<B> CausalModel for BurnLlamaModel<B>
+where
+    B: Backend + 'static,
+    B::Device: Send + Sync,
+{
+    fn create_session(
+        &self,
+        generation: GenerationConfig,
+    ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
+        if generation.max_new_tokens == 0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "max_new_tokens must be greater than zero",
+            ));
+        }
+        if !generation.top_p.is_finite() || generation.top_p <= 0.0 || generation.top_p > 1.0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "top_p must be finite and in the interval (0, 1]",
+            ));
+        }
+        if generation.temperature != 0.0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "the initial Llama executor supports greedy decoding only; set temperature to 0",
+            ));
+        }
+        Ok(Box::new(LlamaSession {
+            module: self.module.clone(),
+            config: self.config.clone(),
+            device: self.device.clone(),
+            generation,
+            tokens: Vec::new(),
+            last_generated: None,
+            metrics: SessionMetrics::default(),
+            terminal: false,
+        }))
+    }
+}
+
+/// Request-local state for correctness-first, full-sequence Llama decoding.
+struct LlamaSession<B: Backend> {
+    module: Arc<LlamaForCausalLM<B>>,
+    config: Arc<LlamaConfig>,
+    device: B::Device,
+    generation: GenerationConfig,
+    tokens: Vec<u32>,
+    last_generated: Option<u32>,
+    metrics: SessionMetrics,
+    terminal: bool,
+}
+
+impl<B> LlamaSession<B>
+where
+    B: Backend + 'static,
+    B::Device: Send + Sync,
+{
+    fn generate(&mut self, stage: ExecutionStage) -> Result<GeneratedToken, ModelExecutionError> {
+        if self.tokens.len() > self.config.max_position_embeddings {
+            return Err(ModelExecutionError::new(
+                stage,
+                format!(
+                    "sequence length {} exceeds model context length {}",
+                    self.tokens.len(),
+                    self.config.max_position_embeddings
+                ),
+            ));
+        }
+        let token_values = self.tokens.iter().map(|&id| i64::from(id)).collect();
+        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [1, self.tokens.len()]),
+            &self.device,
+        );
+        let logits = self.module.forward(input_ids);
+        let vocabulary = self.config.vocab_size;
+        let last = logits
+            .slice([
+                0..1,
+                self.tokens.len() - 1..self.tokens.len(),
+                0..vocabulary,
+            ])
+            .argmax(2)
+            .into_data()
+            .to_vec::<i64>()
+            .map_err(|error| {
+                ModelExecutionError::new(stage, format!("failed to read selected token: {error}"))
+            })?;
+        let id = u32::try_from(last[0]).map_err(|_| {
+            ModelExecutionError::new(stage, "backend returned a token ID outside the u32 range")
+        })?;
+        let is_end_of_sequence = self.config.eos_token_id.contains(&id);
+        self.last_generated = Some(id);
+        self.metrics.generated_tokens += 1;
+        self.terminal =
+            is_end_of_sequence || self.metrics.generated_tokens >= self.generation.max_new_tokens;
+        Ok(GeneratedToken {
+            id,
+            is_end_of_sequence,
+        })
+    }
+
+    fn validate_token(&self, token: u32, stage: ExecutionStage) -> Result<(), ModelExecutionError> {
+        if token as usize >= self.config.vocab_size {
+            return Err(ModelExecutionError::new(
+                stage,
+                format!(
+                    "token ID {token} is outside vocabulary size {}",
+                    self.config.vocab_size
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<B> GenerationSession for LlamaSession<B>
+where
+    B: Backend + 'static,
+    B::Device: Send + Sync,
+{
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<GeneratedToken, ModelExecutionError> {
+        if !self.tokens.is_empty() || self.last_generated.is_some() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prefill may be called exactly once per session",
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prompt must contain at least one token",
+            ));
+        }
+        for &token in prompt_tokens {
+            self.validate_token(token, ExecutionStage::Prefill)?;
+        }
+        self.tokens.extend_from_slice(prompt_tokens);
+        self.metrics.prompt_tokens = prompt_tokens.len();
+        self.generate(ExecutionStage::Prefill)
+    }
+
+    fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
+        let expected = self.last_generated.ok_or_else(|| {
+            ModelExecutionError::new(
+                ExecutionStage::Decode,
+                "decode requires one successful prefill call",
+            )
+        })?;
+        if self.terminal {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Decode,
+                "generation already reached EOS or max_new_tokens",
+            ));
+        }
+        if input_token != expected {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Decode,
+                format!(
+                    "decode input token {input_token} does not match the previous model output {expected}"
+                ),
+            ));
+        }
+        self.validate_token(input_token, ExecutionStage::Decode)?;
+        self.tokens.push(input_token);
+        self.generate(ExecutionStage::Decode)
+    }
+
+    fn metrics(&self) -> SessionMetrics {
+        self.metrics
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::NdArray;
+
+    use super::*;
+
+    type TestBackend = NdArray<f32>;
+
+    fn tiny_model() -> BurnLlamaModel<TestBackend> {
+        let config = LlamaConfig {
+            model_type: "llama".into(),
+            vocab_size: 16,
+            hidden_size: 8,
+            intermediate_size: 12,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            max_position_embeddings: 16,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            head_dim: None,
+            hidden_act: "silu".into(),
+            attention_bias: false,
+            mlp_bias: false,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            bos_token_id: Some(1),
+            eos_token_id: Vec::new(),
+        };
+        let device = Default::default();
+        TestBackend::seed(&device, 11);
+        let module = LlamaForCausalLM::init(&config, &device);
+        BurnLlamaModel::new(module, config, device)
+    }
+
+    fn greedy(max_new_tokens: usize) -> GenerationConfig {
+        GenerationConfig {
+            max_new_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: Some(0),
+        }
+    }
+
+    #[test]
+    fn full_sequence_session_reports_zero_cache_bytes() {
+        let model = tiny_model();
+        let mut session = model.create_session(greedy(2)).unwrap();
+
+        let first = session.prefill(&[1, 4]).unwrap();
+        let _second = session.decode(first.id).unwrap();
+
+        assert_eq!(
+            session.metrics(),
+            SessionMetrics {
+                prompt_tokens: 2,
+                generated_tokens: 2,
+                kv_cache_bytes: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_sampling_until_a_sampler_is_implemented() {
+        let model = tiny_model();
+        let error = model
+            .create_session(GenerationConfig::default())
+            .err()
+            .unwrap();
+
+        assert_eq!(error.stage(), ExecutionStage::SessionCreation);
+        assert!(error.message().contains("greedy"));
+    }
+
+    #[test]
+    fn enforces_the_generation_limit_inside_the_session() {
+        let model = tiny_model();
+        let mut session = model.create_session(greedy(1)).unwrap();
+        let first = session.prefill(&[1]).unwrap();
+
+        let error = session.decode(first.id).unwrap_err();
+
+        assert!(error.message().contains("max_new_tokens"));
+    }
+
+    #[test]
+    fn rejects_a_zero_generation_limit_at_session_creation() {
+        let model = tiny_model();
+        let error = model.create_session(greedy(0)).err().unwrap();
+
+        assert_eq!(error.stage(), ExecutionStage::SessionCreation);
+        assert!(error.message().contains("greater than zero"));
+    }
+}
