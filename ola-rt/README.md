@@ -24,6 +24,7 @@ workload against which those abstractions can be tested.
 | `ola-burn` | Adapting Burn concepts to OlaRT interfaces | Scheduling or serving |
 | `ola-serve` | Transport-neutral service boundary | HTTP-framework details, execution policy |
 | `ola-bench` | Deterministic workload construction, replay, summaries | Runtime production logic |
+| `ola-ui` | Ratatui workbench and integration contracts | Model kernels, scheduling policy |
 
 Dependencies point inward. `ola-core` knows nothing about the other crates.
 `ola-model` describes available artifacts and selects an architecture factory.
@@ -127,19 +128,24 @@ Implemented:
 - queued/running/terminal lifecycle state;
 - FIFO scheduling through a replaceable trait;
 - explicit queue, active-set, memory, and timing state;
+- deterministic fixed-size KV block allocation and fragmentation metrics;
 - a transport-neutral generation service;
+- a Ratatui workbench with background local Llama generation, KV benchmarks,
+  and FIFO runtime experiments;
 - deterministic fixed-workload generation and replay;
 - basic latency summaries;
 - a Burn device adapter;
 - strict parsing of compatible Hugging Face Llama configurations;
 - Hugging Face tokenizer and single-file SafeTensors loading;
 - a correctness-first Burn Llama decoder with grouped-query attention;
-- isolated greedy generation sessions using full-sequence recomputation.
+- request-local contiguous KV caches with measured byte usage;
+- isolated greedy generation sessions using cached single-token decode;
+- a pinned external checkpoint and independent scalar conformance oracle.
 
 Deliberately deferred:
 
 - tensors in the public runtime API;
-- KV-cache storage;
+- physical paged KV tensors, eviction, preemption, and prefix reuse;
 - batching and execution plans;
 - probabilistic sampling;
 - sharded and remotely materialized checkpoints;
@@ -161,8 +167,9 @@ cargo run -p ola-burn --example run_llama -- \
 ```
 
 See `crates/ola-burn/README.md` for supported artifact features, baseline
-execution semantics, and the reason this first decoder intentionally has no KV
-cache.
+execution semantics, and the limits of its first contiguous KV cache. Its
+`CONFORMANCE.md` pins the external checkpoint and independent scalar logit
+oracle used as the numerical baseline for future optimized paths.
 
 ## Research extension rule
 

@@ -27,6 +27,34 @@ pub struct LlamaFactory<B: Backend> {
     backend: PhantomData<fn() -> B>,
 }
 
+/// Native Burn Llama module paired with the configuration that shaped it.
+///
+/// Most callers should use [`LlamaFactory::load_local`] and the neutral
+/// [`CausalLanguageModel`] interface. This representation exists for research
+/// probes that need logits or hidden tensor outputs without widening the core
+/// runtime API to include backend-specific tensors.
+pub struct LoadedLlama<B: Backend> {
+    config: LlamaConfig,
+    module: LlamaForCausalLM<B>,
+}
+
+impl<B: Backend> LoadedLlama<B> {
+    /// Returns the validated Hugging Face configuration.
+    pub const fn config(&self) -> &LlamaConfig {
+        &self.config
+    }
+
+    /// Returns the native Burn module for explicit research measurements.
+    pub const fn module(&self) -> &LlamaForCausalLM<B> {
+        &self.module
+    }
+
+    /// Consumes the wrapper into configuration and module parts.
+    pub fn into_parts(self) -> (LlamaConfig, LlamaForCausalLM<B>) {
+        (self.config, self.module)
+    }
+}
+
 impl<B: Backend> LlamaFactory<B> {
     /// Creates a factory registered as the canonical `llama` architecture.
     pub fn new(device: B::Device) -> Self {
@@ -62,11 +90,31 @@ impl<B: Backend> LlamaFactory<B> {
         if !directory.is_dir() {
             return Err(LlamaLoadError::NotDirectory(directory.to_path_buf()));
         }
-        let config = LlamaConfig::from_file(directory.join("config.json"))?;
         let tokenizer = HuggingFaceTokenizer::from_file(directory.join("tokenizer.json"))
             .map_err(|error| LlamaLoadError::Tokenizer(error.to_string()))?;
-        let weights = find_single_safetensors_file(directory)?;
+        let (config, module) = self.load_native(directory)?.into_parts();
 
+        Ok(CausalLanguageModel::new(
+            tokenizer,
+            BurnLlamaModel::new(module, config, self.device.clone()),
+        ))
+    }
+
+    /// Loads configuration and weights while leaving tokenization to the caller.
+    ///
+    /// This is the narrow escape hatch used by logit-conformance tests. It
+    /// preserves the native Burn type without making backend tensors part of
+    /// `ola-model` or `ola-runtime`.
+    pub fn load_native(&self, directory: impl AsRef<Path>) -> Result<LoadedLlama<B>, LlamaLoadError>
+    where
+        B: 'static,
+    {
+        let directory = directory.as_ref();
+        if !directory.is_dir() {
+            return Err(LlamaLoadError::NotDirectory(directory.to_path_buf()));
+        }
+        let config = LlamaConfig::from_file(directory.join("config.json"))?;
+        let weights = find_single_safetensors_file(directory)?;
         let mut module = LlamaForCausalLM::<B>::init(&config, &self.device);
         // Burn stores RMSNorm scale as `gamma`, while Hugging Face Llama uses
         // `weight`. The general PyTorch adapter cannot infer these nested
@@ -79,11 +127,7 @@ impl<B: Backend> LlamaFactory<B> {
         module
             .load_from(&mut store)
             .map_err(|error| LlamaLoadError::Weights(error.to_string()))?;
-
-        Ok(CausalLanguageModel::new(
-            tokenizer,
-            BurnLlamaModel::new(module, config, self.device.clone()),
-        ))
+        Ok(LoadedLlama { config, module })
     }
 }
 
@@ -206,7 +250,10 @@ impl From<LlamaConfigError> for LlamaLoadError {
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
+    use burn::{
+        backend::NdArray,
+        tensor::{Int, Tensor, TensorData},
+    };
 
     use super::*;
 
@@ -215,5 +262,61 @@ mod tests {
         let factory = LlamaFactory::<NdArray>::new(Default::default());
 
         assert_eq!(factory.architecture().as_str(), "llama");
+    }
+
+    /// Compares Burn with the independent scalar oracle documented in
+    /// `CONFORMANCE.md`. The external fixture is intentionally not downloaded
+    /// by `cargo test`; run this explicitly after materializing the pinned
+    /// artifact and setting `OLA_LLAMA_CONFORMANCE_DIR`.
+    #[test]
+    #[ignore = "requires the pinned external Hugging Face conformance fixture"]
+    fn matches_pinned_reference_logits() {
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
+        let weights = directory.join("model.safetensors");
+        assert_eq!(
+            std::fs::metadata(&weights).unwrap().len(),
+            4_131_280,
+            "fixture size differs; verify the pinned SHA-256 before using expected logits"
+        );
+
+        let factory = LlamaFactory::<NdArray<f32>>::new(Default::default());
+        let loaded = factory.load_native(&directory).unwrap();
+        let device = Default::default();
+        let input: Tensor<NdArray<f32>, 2, Int> =
+            Tensor::from_data(TensorData::new(vec![1_i64, 15_043, 1_789], [1, 3]), &device);
+        let logits = loaded.module().forward(input);
+        let actual = logits
+            .clone()
+            .slice([0..1, 0..3, 0..16])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        #[rustfmt::skip]
+        let expected: [f64; 48] = [
+            -0.042735109, -0.065533388, -0.100713878, -0.057570876,
+             0.006277183,  0.019492461,  0.150525994,  0.102675800,
+             0.045494971,  0.034240757,  0.127989488,  0.082428453,
+            -0.012951005,  0.130573982,  0.073102357,  0.090223021,
+             0.036621468,  0.086013101, -0.097030822, -0.045341135,
+             0.131229144, -0.044916200, -0.051172383,  0.134220192,
+            -0.121404217, -0.000155305, -0.081268123, -0.134603569,
+             0.031301317, -0.104547035, -0.039362161, -0.027215165,
+             0.055092733,  0.069419146, -0.048099038, -0.013597904,
+            -0.029187137, -0.014970722, -0.002289230,  0.139541307,
+            -0.141860866,  0.060625086, -0.199687625, -0.120067634,
+             0.080293021, -0.112008740, -0.142695550, -0.041046643,
+        ];
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let difference = (f64::from(*actual) - expected).abs();
+            assert!(
+                difference <= 2e-5,
+                "logit {index}: actual {actual}, expected {expected}"
+            );
+        }
+
+        let selected = logits.argmax(2).into_data().to_vec::<i64>().unwrap();
+        assert_eq!(selected, vec![5_971, 1_789, 19_053]);
     }
 }

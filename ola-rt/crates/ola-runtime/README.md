@@ -21,6 +21,28 @@ requirements measurable.
 Lifecycle timestamps are supplied by callers. That allows the same runtime to
 operate with real monotonic time, simulation time, or recorded trace time.
 
+## KV-cache block allocation
+
+`KvBlockManager` is the first backend-neutral cache-memory mechanism. It divides
+a byte capacity into fixed-size physical blocks and maintains a logical block
+table for every live cache sequence. Its operations are deliberately small:
+
+- `allocate` creates an empty logical sequence;
+- `append` reserves enough blocks for additional token positions atomically;
+- `free` returns every sequence block to the pool;
+- `block_table` exposes the logical-to-physical mapping to a storage backend;
+- `metrics` reports occupancy, unusable capacity, and internal fragmentation.
+
+Allocation chooses the lowest available block ID so identical traces produce
+identical mappings. `bytes_per_token` represents keys and values across all
+layers covered by the pool; it is supplied by the model/backend boundary rather
+than inferred by the runtime.
+
+The manager owns metadata only. It does not allocate Burn tensors, move device
+memory, evict sequences, or yet update `RuntimeState::memory` automatically.
+Keeping those concerns separate lets CPU, CUDA, and simulated storage use the
+same allocation and scheduling experiments.
+
 ## Minimal lifecycle
 
 ```rust

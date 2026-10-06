@@ -46,21 +46,26 @@ The decoder implements token embeddings, pre-normalized decoder blocks,
 grouped-query causal self-attention, Llama's split-half rotary embeddings,
 SwiGLU MLPs, final RMSNorm, and the language-model head.
 
-The baseline is intentionally inefficient and easy to inspect:
+The baseline is intentionally simple and easy to inspect:
 
 - batch size is one at the `GenerationSession` boundary;
 - only greedy decoding (`temperature = 0`) is accepted;
-- every decode call recomputes the complete token sequence;
-- there is no KV cache, reported explicitly as `kv_cache_bytes = 0`;
+- prefill stores one compact key/value tensor per decoder layer;
+- decode processes only the newest token and appends its keys and values;
+- request metrics report the cache's actual element storage in bytes;
+- cache growth currently concatenates contiguous tensors, so it still copies
+  existing cache contents and has no capacity reservation or paging;
 - the session enforces call order, vocabulary bounds, context length, EOS, and
   `max_new_tokens`;
 - Hub references are descriptive only and must first be materialized locally.
 
-This gives later KV-cache, batching, sampling, quantization, and accelerator
-work a small reference implementation to compare against. In particular,
-Llama-specific RoPE is implemented explicitly because Burn's general rotary
-module pairs adjacent dimensions, while Hugging Face Llama pairs the two halves
-of each attention head.
+The unchanged full-sequence path is the cache's numerical oracle. Unit tests
+compare cached decode logits with complete recomputation at every generated
+position. This gives later paged allocation, batching, sampling, quantization,
+and accelerator work a small reference implementation to compare against. In
+particular, Llama-specific RoPE is implemented explicitly because Burn's
+general rotary module pairs adjacent dimensions, while Hugging Face Llama pairs
+the two halves of each attention head.
 
 ## Running a local artifact
 
@@ -86,5 +91,9 @@ Changes to this implementation should retain a correctness comparison against a
 known reference implementation for fixed inputs and checkpoint revision. New
 performance paths must record backend, device, dtype, context length, generated
 length, warm-up, repetitions, and whether compilation/autotuning is included.
-Throughput results from this full-sequence baseline must not be presented as
-KV-cached decoding results.
+Throughput results must state whether they use full-sequence or cached decoding;
+the current contiguous cache must not be presented as paged allocation.
+
+The pinned fixture, independent scalar oracle, numerical tolerance, and manual
+test command are specified in [`CONFORMANCE.md`](CONFORMANCE.md). That protocol
+is the reference baseline for future KV-cache work.
