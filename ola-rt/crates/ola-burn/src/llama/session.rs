@@ -7,7 +7,7 @@ use ola_model::{
     SessionMetrics,
 };
 
-use super::{LlamaConfig, LlamaForCausalLM};
+use super::{LlamaConfig, LlamaForCausalLM, model::LlamaKvCache};
 
 /// Shared Burn weights exposed through OlaRT's architecture-neutral model API.
 pub(crate) struct BurnLlamaModel<B: Backend> {
@@ -59,6 +59,7 @@ where
             device: self.device.clone(),
             generation,
             tokens: Vec::new(),
+            cache: None,
             last_generated: None,
             metrics: SessionMetrics::default(),
             terminal: false,
@@ -73,6 +74,7 @@ struct LlamaSession<B: Backend> {
     device: B::Device,
     generation: GenerationConfig,
     tokens: Vec<u32>,
+    cache: Option<LlamaKvCache<B>>,
     last_generated: Option<u32>,
     metrics: SessionMetrics,
     terminal: bool,
@@ -83,30 +85,15 @@ where
     B: Backend + 'static,
     B::Device: Send + Sync,
 {
-    fn generate(&mut self, stage: ExecutionStage) -> Result<GeneratedToken, ModelExecutionError> {
-        if self.tokens.len() > self.config.max_position_embeddings {
-            return Err(ModelExecutionError::new(
-                stage,
-                format!(
-                    "sequence length {} exceeds model context length {}",
-                    self.tokens.len(),
-                    self.config.max_position_embeddings
-                ),
-            ));
-        }
-        let token_values = self.tokens.iter().map(|&id| i64::from(id)).collect();
-        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
-            TensorData::new(token_values, [1, self.tokens.len()]),
-            &self.device,
-        );
-        let logits = self.module.forward(input_ids);
+    fn select_token(
+        &mut self,
+        logits: Tensor<B, 3>,
+        stage: ExecutionStage,
+    ) -> Result<GeneratedToken, ModelExecutionError> {
+        let sequence_length = logits.dims()[1];
         let vocabulary = self.config.vocab_size;
         let last = logits
-            .slice([
-                0..1,
-                self.tokens.len() - 1..self.tokens.len(),
-                0..vocabulary,
-            ])
+            .slice([0..1, sequence_length - 1..sequence_length, 0..vocabulary])
             .argmax(2)
             .into_data()
             .to_vec::<i64>()
@@ -139,6 +126,23 @@ where
         }
         Ok(())
     }
+
+    fn validate_context_length(
+        &self,
+        sequence_length: usize,
+        stage: ExecutionStage,
+    ) -> Result<(), ModelExecutionError> {
+        if sequence_length > self.config.max_position_embeddings {
+            return Err(ModelExecutionError::new(
+                stage,
+                format!(
+                    "sequence length {sequence_length} exceeds model context length {}",
+                    self.config.max_position_embeddings
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<B> GenerationSession for LlamaSession<B>
@@ -162,9 +166,18 @@ where
         for &token in prompt_tokens {
             self.validate_token(token, ExecutionStage::Prefill)?;
         }
+        self.validate_context_length(prompt_tokens.len(), ExecutionStage::Prefill)?;
         self.tokens.extend_from_slice(prompt_tokens);
+        let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
+        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [1, prompt_tokens.len()]),
+            &self.device,
+        );
+        let (logits, cache) = self.module.prefill(input_ids);
+        self.metrics.kv_cache_bytes = cache.bytes();
+        self.cache = Some(cache);
         self.metrics.prompt_tokens = prompt_tokens.len();
-        self.generate(ExecutionStage::Prefill)
+        self.select_token(logits, ExecutionStage::Prefill)
     }
 
     fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
@@ -189,8 +202,21 @@ where
             ));
         }
         self.validate_token(input_token, ExecutionStage::Decode)?;
+        self.validate_context_length(self.tokens.len() + 1, ExecutionStage::Decode)?;
         self.tokens.push(input_token);
-        self.generate(ExecutionStage::Decode)
+        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(vec![i64::from(input_token)], [1, 1]),
+            &self.device,
+        );
+        let cache = self.cache.as_mut().ok_or_else(|| {
+            ModelExecutionError::new(
+                ExecutionStage::Decode,
+                "decode requires an initialized KV cache",
+            )
+        })?;
+        let logits = self.module.decode(input_ids, cache);
+        self.metrics.kv_cache_bytes = cache.bytes();
+        self.select_token(logits, ExecutionStage::Decode)
     }
 
     fn metrics(&self) -> SessionMetrics {
@@ -243,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn full_sequence_session_reports_zero_cache_bytes() {
+    fn session_reports_contiguous_cache_bytes() {
         let model = tiny_model();
         let mut session = model.create_session(greedy(2)).unwrap();
 
@@ -255,7 +281,9 @@ mod tests {
             SessionMetrics {
                 prompt_tokens: 2,
                 generated_tokens: 2,
-                kv_cache_bytes: 0,
+                // 1 layer * K/V * 1 KV head * 3 cached tokens * 4 head
+                // elements * 4 bytes per F32 element.
+                kv_cache_bytes: 96,
             }
         );
     }
