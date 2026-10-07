@@ -903,21 +903,18 @@ The end goal is to study **adaptive AI execution**:
 
 # Status
 
-**Current phase:** Foundations — September 2026.
+The authoritative implementation snapshot is the timestamped
+[`progress_report.md`](progress_report.md).
 
-Immediate objectives:
+**Current phase:** foundations transitioning into the first inference-engine
+vertical slice — October 2026.
 
-- [ ] define core public API
-- [ ] set up workspace
-- [ ] create Burn compute adapter
-- [ ] implement request/session abstraction
-- [ ] reproduce a tiny transformer
-- [ ] understand Burn backend and CubeCL execution
-- [ ] build first CPU/GPU benchmarks
-- [ ] implement basic runtime state
-- [ ] create FIFO scheduler
-- [ ] establish experiment format
-- [ ] establish research log
+Current engineering focus:
+
+- connect runtime KV block tables to physical paged tensor storage;
+- add an executor that connects scheduled requests to model sessions;
+- propagate live cache occupancy into runtime memory state;
+- establish a numerically validated GPU execution path.
 
 ---
 

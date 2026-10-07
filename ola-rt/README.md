@@ -4,6 +4,9 @@ This directory contains the executable portion of OlaRT. The repository root
 contains the broader research notes and paper planning; this workspace contains
 the interfaces and implementations on which experiments will depend.
 
+The timestamped, repository-wide implementation snapshot is maintained in
+[`../progress_report.md`](../progress_report.md).
+
 OlaRT asks one systems question:
 
 > Given the current workload, model, hardware, memory, cache state, and service
