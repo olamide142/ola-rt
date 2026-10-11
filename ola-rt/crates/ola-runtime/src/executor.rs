@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    error::Error,
+    fmt,
+};
 
 use ola_core::{Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp};
 use ola_model::{
@@ -20,6 +24,15 @@ pub struct ExecutionResult {
     pub metrics: SessionMetrics,
 }
 
+/// Model work represented by a token event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionPhase {
+    /// Prompt processing and first-token selection.
+    Prefill,
+    /// One cached autoregressive token step.
+    Decode,
+}
+
 /// One observable outcome from a synchronous executor step.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutorEvent {
@@ -35,6 +48,8 @@ pub enum ExecutorEvent {
         generated_tokens: usize,
         /// Physical KV bytes currently attributed to the request.
         kv_cache_bytes: u64,
+        /// Model phase that produced this token.
+        phase: ExecutionPhase,
         /// Whether the request completed with this token.
         finished: bool,
     },
@@ -47,6 +62,28 @@ pub enum ExecutorEvent {
     },
 }
 
+/// Observable result of one iteration-level scheduling boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutorIteration {
+    /// Caller-supplied monotonic iteration timestamp.
+    pub at: Timestamp,
+    /// Per-request outcomes in deterministic execution order.
+    pub events: Vec<ExecutorEvent>,
+    /// Live generation sessions after the iteration.
+    pub active_requests: usize,
+    /// Requests still waiting for admission after the iteration.
+    pub queued_requests: usize,
+    /// Physical KV bytes attributed to all live sessions.
+    pub kv_cache_bytes: u64,
+}
+
+impl ExecutorIteration {
+    /// Returns true when the iteration observed no queued or active work.
+    pub fn is_idle(&self) -> bool {
+        self.events == [ExecutorEvent::Idle]
+    }
+}
+
 /// Failure to configure or control the executor itself.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExecutorError {
@@ -56,6 +93,8 @@ pub enum ExecutorError {
     ModelNotRegistered(ModelId),
     /// An executable was attached more than once under one model ID.
     DuplicateExecutableModel(ModelId),
+    /// A multi-request executor requires at least one active slot.
+    InvalidActiveRequestLimit(usize),
 }
 
 impl fmt::Display for ExecutorError {
@@ -72,6 +111,12 @@ impl fmt::Display for ExecutorError {
                 write!(
                     formatter,
                     "model `{model}` already has an executable attached"
+                )
+            }
+            Self::InvalidActiveRequestLimit(limit) => {
+                write!(
+                    formatter,
+                    "active request limit must be positive, got {limit}"
                 )
             }
         }
@@ -103,16 +148,20 @@ struct ActiveGeneration {
     last_step_at: Timestamp,
 }
 
-/// Deterministic single-request synchronous model executor.
+/// Deterministic synchronous model executor.
 ///
 /// Each [`step`](Self::step) performs at most one model operation: a queued
-/// request's prefill or an active request's single-token decode. This makes the
-/// execution boundary observable and testable before asynchronous execution
-/// and continuous batching are introduced.
+/// request's prefill or an active request's single-token decode.
+/// [`step_iteration`](Self::step_iteration) advances every session that was
+/// active at the iteration boundary once, then fills newly available slots.
+/// The sessions still execute individually; this control-plane baseline is the
+/// correctness oracle for later tensor batching.
 pub struct Executor<S = FifoScheduler> {
     runtime: Runtime<S>,
     models: BTreeMap<ModelId, CausalLanguageModel>,
-    active: Option<ActiveGeneration>,
+    active: BTreeMap<RequestId, ActiveGeneration>,
+    ready: VecDeque<RequestId>,
+    max_active_requests: usize,
     results: BTreeMap<RequestId, ExecutionResult>,
 }
 
@@ -128,9 +177,24 @@ impl<S: Scheduler> Executor<S> {
         Self {
             runtime,
             models: BTreeMap::new(),
-            active: None,
+            active: BTreeMap::new(),
+            ready: VecDeque::new(),
+            max_active_requests: 1,
             results: BTreeMap::new(),
         }
+    }
+
+    /// Wraps a runtime with a bounded number of concurrently live sessions.
+    pub fn with_max_active_requests(
+        runtime: Runtime<S>,
+        max_active_requests: usize,
+    ) -> Result<Self, ExecutorError> {
+        if max_active_requests == 0 {
+            return Err(ExecutorError::InvalidActiveRequestLimit(0));
+        }
+        let mut executor = Self::new(runtime);
+        executor.max_active_requests = max_active_requests;
+        Ok(executor)
     }
 
     /// Registers runtime metadata and its corresponding executable atomically.
@@ -180,12 +244,8 @@ impl<S: Scheduler> Executor<S> {
         cancelled_at: Timestamp,
     ) -> Result<(), ExecutorError> {
         self.runtime.cancel(request_id, cancelled_at)?;
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.request_id == request_id)
-        {
-            self.active = None;
+        if self.active.remove(&request_id).is_some() {
+            self.ready.retain(|ready| *ready != request_id);
             self.refresh_kv_memory();
         }
         Ok(())
@@ -193,22 +253,45 @@ impl<S: Scheduler> Executor<S> {
 
     /// Performs one prefill or decode operation at the supplied timestamp.
     pub fn step(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
-        match self.active.take() {
-            Some(active) if at < active.last_step_at => {
-                let request = active.request_id;
-                let previous = active.last_step_at;
-                self.active = Some(active);
-                Err(RuntimeError::TimestampRegression {
-                    request,
-                    event: "executor step",
-                    previous,
-                    observed: at,
-                }
-                .into())
-            }
-            Some(active) => self.decode(active, at),
-            None => self.start_next(at),
+        let can_admit =
+            self.active.len() < self.max_active_requests && self.runtime.state().queued_len() > 0;
+        if can_admit || self.ready.is_empty() {
+            self.start_next(at)
+        } else {
+            self.decode_next(at)
         }
+    }
+
+    /// Advances one deterministic generation iteration.
+    ///
+    /// Every request active at entry receives one decode step. Slots freed by
+    /// completion or failure are then filled from the configured scheduler;
+    /// newly admitted requests receive prefill but are not decoded again in the
+    /// same iteration.
+    pub fn step_iteration(&mut self, at: Timestamp) -> Result<ExecutorIteration, ExecutorError> {
+        self.validate_iteration_time(at)?;
+        let decode_count = self.ready.len();
+        let mut events = Vec::with_capacity(self.max_active_requests);
+        for _ in 0..decode_count {
+            events.push(self.decode_next(at)?);
+        }
+
+        let available_slots = self.max_active_requests.saturating_sub(self.active.len());
+        let admission_count = available_slots.min(self.runtime.state().queued_len());
+        for _ in 0..admission_count {
+            events.push(self.start_next(at)?);
+        }
+        if events.is_empty() {
+            events.push(ExecutorEvent::Idle);
+        }
+
+        Ok(ExecutorIteration {
+            at,
+            events,
+            active_requests: self.active.len(),
+            queued_requests: self.runtime.state().queued_len(),
+            kv_cache_bytes: self.runtime.state().memory.kv_cache_bytes,
+        })
     }
 
     /// Returns runtime lifecycle and memory state.
@@ -222,8 +305,18 @@ impl<S: Scheduler> Executor<S> {
     }
 
     /// Returns whether one request currently owns a generation session.
-    pub const fn has_active_request(&self) -> bool {
-        self.active.is_some()
+    pub fn has_active_request(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    /// Returns the number of request-local generation sessions currently live.
+    pub fn active_request_count(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Returns the configured upper bound on concurrently live sessions.
+    pub const fn max_active_requests(&self) -> usize {
+        self.max_active_requests
     }
 
     /// Borrows the underlying runtime for read-only inspection.
@@ -272,14 +365,29 @@ impl<S: Scheduler> Executor<S> {
             max_new_tokens: request.spec.generation.max_new_tokens,
             last_step_at: at,
         };
-        self.observe_token(active, at)
+        self.observe_token(active, ExecutionPhase::Prefill, at)
     }
 
-    fn decode(
-        &mut self,
-        mut active: ActiveGeneration,
-        at: Timestamp,
-    ) -> Result<ExecutorEvent, ExecutorError> {
+    fn decode_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
+        let Some(request_id) = self.ready.pop_front() else {
+            return Ok(ExecutorEvent::Idle);
+        };
+        let mut active = self
+            .active
+            .remove(&request_id)
+            .expect("ready requests always retain an active generation session");
+        if at < active.last_step_at {
+            let previous = active.last_step_at;
+            self.active.insert(request_id, active);
+            self.ready.push_front(request_id);
+            return Err(RuntimeError::TimestampRegression {
+                request: request_id,
+                event: "executor step",
+                previous,
+                observed: at,
+            }
+            .into());
+        }
         let token = match active.session.decode(active.last_token.id) {
             Ok(token) => token,
             Err(error) => {
@@ -289,12 +397,13 @@ impl<S: Scheduler> Executor<S> {
         active.generated.push(token.id);
         active.last_token = token;
         active.last_step_at = at;
-        self.observe_token(active, at)
+        self.observe_token(active, ExecutionPhase::Decode, at)
     }
 
     fn observe_token(
         &mut self,
         active: ActiveGeneration,
+        phase: ExecutionPhase,
         at: Timestamp,
     ) -> Result<ExecutorEvent, ExecutorError> {
         let metrics = active.session.metrics();
@@ -305,6 +414,7 @@ impl<S: Scheduler> Executor<S> {
             token: active.last_token,
             generated_tokens: active.generated.len(),
             kv_cache_bytes: metrics.kv_cache_bytes,
+            phase,
             finished,
         };
 
@@ -326,7 +436,9 @@ impl<S: Scheduler> Executor<S> {
             drop(active.session);
             self.refresh_kv_memory();
         } else {
-            self.active = Some(active);
+            let request_id = active.request_id;
+            self.active.insert(request_id, active);
+            self.ready.push_back(request_id);
             self.refresh_kv_memory();
         }
         Ok(event)
@@ -349,8 +461,22 @@ impl<S: Scheduler> Executor<S> {
     fn refresh_kv_memory(&mut self) {
         self.runtime.state_mut().memory.kv_cache_bytes = self
             .active
-            .as_ref()
-            .map_or(0, |active| active.session.metrics().kv_cache_bytes);
+            .values()
+            .map(|active| active.session.metrics().kv_cache_bytes)
+            .sum();
+    }
+
+    fn validate_iteration_time(&self, at: Timestamp) -> Result<(), ExecutorError> {
+        if let Some(active) = self.active.values().find(|active| at < active.last_step_at) {
+            return Err(RuntimeError::TimestampRegression {
+                request: active.request_id,
+                event: "executor step",
+                previous: active.last_step_at,
+                observed: at,
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -613,6 +739,127 @@ mod tests {
         assert!(matches!(
             executor.step(Timestamp::from_micros(30)).unwrap(),
             ExecutorEvent::Token { finished: true, .. }
+        ));
+    }
+
+    #[test]
+    fn iteration_advances_live_sessions_and_refills_freed_slots() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor.submit(request("1", 2), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 3), Timestamp::ZERO).unwrap();
+        let third = executor.submit(request("20", 1), Timestamp::ZERO).unwrap();
+
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        assert!(matches!(
+            admitted.events.as_slice(),
+            [
+                ExecutorEvent::Token {
+                    request_id: first_id,
+                    phase: ExecutionPhase::Prefill,
+                    ..
+                },
+                ExecutorEvent::Token {
+                    request_id: second_id,
+                    phase: ExecutionPhase::Prefill,
+                    ..
+                }
+            ] if *first_id == first && *second_id == second
+        ));
+        assert_eq!(admitted.active_requests, 2);
+        assert_eq!(admitted.queued_requests, 1);
+        assert_eq!(admitted.kv_cache_bytes, 16);
+
+        let refilled = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        assert!(matches!(
+            refilled.events.as_slice(),
+            [
+                ExecutorEvent::Token {
+                    request_id: first_id,
+                    phase: ExecutionPhase::Decode,
+                    finished: true,
+                    ..
+                },
+                ExecutorEvent::Token {
+                    request_id: second_id,
+                    phase: ExecutionPhase::Decode,
+                    finished: false,
+                    ..
+                },
+                ExecutorEvent::Token {
+                    request_id: third_id,
+                    phase: ExecutionPhase::Prefill,
+                    finished: true,
+                    ..
+                }
+            ] if *first_id == first && *second_id == second && *third_id == third
+        ));
+        assert_eq!(refilled.active_requests, 1);
+        assert_eq!(refilled.queued_requests, 0);
+        assert_eq!(refilled.kv_cache_bytes, 16);
+        assert_eq!(
+            executor.state().active_ids().collect::<Vec<_>>(),
+            vec![second]
+        );
+
+        let completed = executor.step_iteration(Timestamp::from_micros(30)).unwrap();
+        assert!(matches!(
+            completed.events.as_slice(),
+            [ExecutorEvent::Token {
+                request_id,
+                phase: ExecutionPhase::Decode,
+                finished: true,
+                ..
+            }] if *request_id == second
+        ));
+        assert_eq!(completed.active_requests, 0);
+        assert_eq!(completed.kv_cache_bytes, 0);
+        assert_eq!(executor.result(first).unwrap().token_ids, vec![2, 3]);
+        assert_eq!(executor.result(second).unwrap().token_ids, vec![11, 12, 13]);
+        assert_eq!(executor.result(third).unwrap().token_ids, vec![21]);
+    }
+
+    #[test]
+    fn cancellation_releases_only_the_selected_live_session() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 3), Timestamp::ZERO).unwrap();
+        executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        executor.cancel(first, Timestamp::from_micros(11)).unwrap();
+
+        assert_eq!(executor.active_request_count(), 1);
+        assert_eq!(executor.state().memory.kv_cache_bytes, 8);
+        assert_eq!(
+            executor.state().request(first).unwrap().status,
+            RequestStatus::Cancelled
+        );
+        assert_eq!(
+            executor.state().active_ids().collect::<Vec<_>>(),
+            vec![second]
+        );
+        assert!(matches!(
+            executor
+                .step_iteration(Timestamp::from_micros(20))
+                .unwrap()
+                .events
+                .as_slice(),
+            [ExecutorEvent::Token { request_id, .. }] if *request_id == second
+        ));
+    }
+
+    #[test]
+    fn rejects_a_zero_active_request_limit() {
+        let result = Executor::with_max_active_requests(Runtime::default(), 0);
+
+        assert!(matches!(
+            result,
+            Err(ExecutorError::InvalidActiveRequestLimit(0))
         ));
     }
 }

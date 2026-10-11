@@ -14,9 +14,10 @@ request. This is a deliberate research boundary: schedulers can be compared or
 replaced without allowing experimental code to mutate runtime bookkeeping.
 
 The current scheduler is FIFO. The trait is already sufficient for priority,
-deadline, estimated-size, and memory-aware baselines. Batching and richer
-execution policy will be introduced after the baseline executor makes their
-decision requirements measurable.
+deadline, estimated-size, and memory-aware baselines. The executor now exposes
+an iteration-level boundary over several live sessions; richer admission and
+batch-composition policy can build on that boundary without owning lifecycle
+state.
 
 Lifecycle timestamps are supplied by callers. That allows the same runtime to
 operate with real monotonic time, simulation time, or recorded trace time.
@@ -43,27 +44,37 @@ memory, evict sequences, or yet update `RuntimeState::memory` automatically.
 Keeping those concerns separate lets CPU, CUDA, and simulated storage use the
 same allocation and scheduling experiments.
 
-## Synchronous executor
+## Synchronous multi-request executor
 
 `Executor` connects lifecycle scheduling to executable `ola-model` artifacts.
-It intentionally performs at most one model operation per `step`: either a
-queued request's prefill or one active request's decode. Each step emits a typed
-token, failure, or idle event, making execution traces deterministic without
-hiding model work inside an asynchronous loop.
+`step` intentionally performs at most one model operation: either a queued
+request's prefill or one active request's decode. `step_iteration` is the first
+continuous-batching control-plane boundary: it advances every request that was
+active at iteration entry once, then fills slots released by completions or
+failures. Each token event identifies whether prefill or decode produced it.
+
+The iteration path still invokes request sessions individually. That is
+intentional: its deterministic lifecycle, output, cancellation, and accounting
+semantics are the correctness oracle for a later backend operation that packs
+compatible requests into one tensor batch.
 
 The baseline executor:
 
 - attaches executable models to registered runtime metadata;
 - accepts one text or token input per request;
-- owns one active `GenerationSession` at a time;
+- owns a configurable, positive number of active `GenerationSession` values;
+- advances live requests in stable round-robin order;
+- admits queued work through the configured scheduler when slots are free;
 - records first-token and completion lifecycle transitions;
-- propagates active session KV bytes into `RuntimeState::memory`;
+- aggregates all live session KV bytes into `RuntimeState::memory`;
 - drops session/cache state on completion, failure, and cancellation;
+- cancels one live request without disturbing the remaining sessions;
 - retains final token IDs, decoded text, and session metrics;
-- rejects regressive step timestamps without losing active state.
+- rejects regressive iteration timestamps before advancing any live session.
 
-The executor is synchronous by design. Continuous batching, multiple active
-sessions, result eviction, and streaming transports remain later layers.
+The executor is synchronous by design. Tensor-level batching, memory-aware
+admission, preemption, result eviction, and streaming transports remain later
+layers.
 
 ## Minimal lifecycle
 

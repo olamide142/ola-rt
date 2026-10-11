@@ -9,7 +9,9 @@ mod scheduler;
 mod state;
 
 pub use error::RuntimeError;
-pub use executor::{ExecutionResult, Executor, ExecutorError, ExecutorEvent};
+pub use executor::{
+    ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
+};
 pub use kv_cache::{
     KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId,
 };

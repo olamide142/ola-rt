@@ -132,7 +132,8 @@ Implemented:
 - FIFO scheduling through a replaceable trait;
 - explicit queue, active-set, memory, and timing state;
 - deterministic fixed-size KV block allocation and fragmentation metrics;
-- a synchronous scheduler-to-model executor with live KV-memory accounting;
+- a synchronous multi-request executor with iteration-level stepping and
+  aggregate live KV-memory accounting;
 - a transport-neutral generation service;
 - a Ratatui workbench with background local Llama generation, KV benchmarks,
   and FIFO runtime experiments;
@@ -153,7 +154,7 @@ Deliberately deferred:
 
 - tensors in the public runtime API;
 - fused accelerator attention, eviction, preemption, and prefix reuse;
-- continuous batching and multi-request execution plans;
+- tensor-level continuous batching and memory-aware admission;
 - probabilistic sampling;
 - sharded and remotely materialized checkpoints;
 - RoPE-scaled and tied-embedding Llama variants;

@@ -1,12 +1,11 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-11 19:46 BST (Europe/London)
+**Last updated:** 2026-10-11 20:01 BST (Europe/London)
 
-**Source revision:** GPU execution milestone in this revision; parent `29a0043`
-on `master`
+**Source revision:** working tree based on GPU milestone `27841d9` on `master`
 
-**Repository state at update:** paged KV cache, synchronous executor,
-page-native decode attention, and opt-in GPU execution implemented together
+**Repository state at update:** GPU milestone merged and pushed; multi-request
+iteration execution implemented locally and awaiting its full verification pass
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -39,9 +38,12 @@ development GTX 1650. CPU and WGPU select identical fixture tokens, and sampled
 logits agree within the accelerator tolerance. Native CUDA support compiles,
 but local execution is blocked by the missing CUDA toolkit/NVRTC installation.
 
-The next major systems milestone is multi-request execution with
-iteration-level scheduling, followed by continuous batching and memory-aware
-admission.
+The multi-request control-plane milestone is now underway. A configurable
+executor can keep several sessions live, advance each existing session once at
+an iteration boundary, refill released slots, isolate cancellation and results,
+and aggregate their KV usage. It deliberately executes each model operation
+individually so the next tensor-batching implementation has a deterministic
+correctness oracle.
 
 ## Current delivery status
 
@@ -51,7 +53,7 @@ admission.
 | Core request model | Working | IDs, timestamps, multimodal inputs, generation controls, validation |
 | Model selection | Working | Catalog, model definitions, architecture registry, factories |
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
-| Runtime executor | Baseline working | Executable models, prefill/decode stepping, events, results, failure/cancellation cleanup |
+| Runtime executor | Multi-request baseline working | Configurable live sessions, single-operation steps, iteration steps, stable interleaving, results, failure/cancellation cleanup |
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
 | Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank latency summaries |
@@ -67,7 +69,7 @@ admission.
 | GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
-| Continuous batching | Not implemented | Sessions execute independently, one request at a time |
+| Continuous batching | Control-plane foundation | Iterations advance multiple isolated sessions and continuously refill slots; tensor operations are not yet batched |
 | Production server | Not implemented | No async executor, streaming HTTP, or OpenAI-compatible API yet |
 
 ## Implemented system
@@ -104,14 +106,17 @@ admission.
   - freeing and reuse;
   - occupancy and internal-fragmentation metrics;
   - explicit capacity and configuration errors.
-- Synchronous single-request executor with:
+- Synchronous multi-request executor with:
   - runtime metadata plus attached executable models;
-  - scheduler-driven session creation;
+  - configurable concurrent session limits;
+  - scheduler-driven admission into available slots;
   - one prefill or decode operation per observable step;
+  - iteration steps that advance each existing session once before refilling;
+  - stable round-robin request ordering and explicit prefill/decode events;
   - token, completion, and failure events;
   - retained token/text results and terminal metrics;
   - automatic lifecycle transitions;
-  - live KV-byte propagation and cleanup on completion, failure, or cancellation;
+  - aggregate live KV-byte propagation and per-request cleanup;
   - monotonic step-time validation.
 
 ### `ola-burn`
@@ -182,7 +187,7 @@ admission.
 
 At the working tree recorded above:
 
-- `cargo test --workspace`: **47 passed**, **2 ignored external-fixture tests**.
+- `cargo test --workspace`: **50 passed**, **2 ignored external-fixture tests**.
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
 - Pinned Llama scalar-oracle conformance test: **passed manually**.
@@ -199,7 +204,8 @@ At the working tree recorded above:
 - Paged cache tests cover cross-page reconstruction, non-contiguous mappings,
   atomic capacity failure, release, and physical-block reuse.
 - Executor tests cover prefill/decode progression, retained output, live memory
-  accounting, execution failure, cancellation, and regressive timestamps.
+  accounting, execution failure, cancellation, regressive timestamps,
+  multi-session iteration order, slot refill, and isolated cancellation.
 - KV allocator tests cover deterministic mapping, atomic out-of-capacity
   failure, freeing/reuse, invalid configuration, and fragmentation metrics.
 - Ratatui screens render through `TestBackend`, including the small-terminal
@@ -253,8 +259,10 @@ cargo run -p ola-ui --features wgpu -- \
 - There is no cache eviction, preemption, swapping, prefix reuse, or
   quantization.
 - Generation is batch size one and greedy only.
-- The synchronous executor runs one active request at a time; it does not yet
-  continuously batch or interleave multiple sessions.
+- The synchronous executor interleaves multiple sessions but invokes their
+  model operations individually; it does not yet form tensor batches.
+- Admission is bounded by request count, not predicted KV demand, token budget,
+  or device capacity.
 - Executor results are retained in memory and there is no result eviction or
   persistence policy yet.
 - Checkpoint loading accepts one SafeTensors file only.
@@ -265,10 +273,9 @@ cargo run -p ola-ui --features wgpu -- \
 
 ## Recommended next milestones
 
-1. **Multi-request execution**
-   - allow several live generation sessions to advance at token boundaries;
-   - define explicit iteration plans before adding tensor batching;
-   - introduce memory-aware admission and scheduling baselines;
+1. **Admission and iteration policy**
+   - introduce memory-aware admission and token-budget baselines;
+   - separate batch-composition decisions from their execution mechanism;
    - measure TTFT, inter-token latency, throughput, and fragmentation.
 
 2. **Continuous tensor batching**
@@ -301,7 +308,11 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
-- **2026-10-11 19:46 BST — GPU milestone in this revision:** Added opt-in WGPU
+- **2026-10-11 20:01 BST — working tree on `27841d9`:** Began the
+  multi-request phase with configurable live sessions, deterministic
+  iteration-level execution, slot refill, aggregate KV accounting, and
+  isolated cancellation/results.
+- **2026-10-11 19:46 BST — GPU milestone `27841d9`:** Added opt-in WGPU
   and CUDA backends to the example and terminal workbench, validated WGPU
   fixture generation and CPU-logit agreement on the GTX 1650, and documented
   the native CUDA toolkit requirement.
