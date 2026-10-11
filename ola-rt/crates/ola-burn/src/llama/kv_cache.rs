@@ -1,0 +1,408 @@
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use burn::tensor::{Tensor, backend::Backend};
+use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
+
+use super::LlamaConfig;
+
+/// Capacity and page geometry for the Llama KV-cache pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LlamaKvCacheConfig {
+    capacity_tokens: usize,
+    tokens_per_block: usize,
+}
+
+impl LlamaKvCacheConfig {
+    /// Creates a cache configuration.
+    ///
+    /// Capacity is shared by every live session created from one loaded model.
+    /// Invalid or overflowing values are reported when the model is loaded.
+    pub const fn new(capacity_tokens: usize, tokens_per_block: usize) -> Self {
+        Self {
+            capacity_tokens,
+            tokens_per_block,
+        }
+    }
+
+    /// Uses one model context of capacity and 16 token positions per block.
+    pub const fn for_model(config: &LlamaConfig) -> Self {
+        Self::new(config.max_position_embeddings, 16)
+    }
+
+    /// Returns the requested minimum token capacity shared by all sessions.
+    ///
+    /// The physical pool rounds this up to a whole number of blocks.
+    pub const fn capacity_tokens(self) -> usize {
+        self.capacity_tokens
+    }
+
+    /// Returns the number of token positions in each physical block.
+    pub const fn tokens_per_block(self) -> usize {
+        self.tokens_per_block
+    }
+}
+
+pub(crate) struct LlamaKvCache<B: Backend> {
+    pool: Arc<Mutex<LlamaKvPool<B>>>,
+    sequence: KvSequenceId,
+    tokens: usize,
+}
+
+impl<B: Backend> LlamaKvCache<B> {
+    pub(crate) fn allocate(pool: Arc<Mutex<LlamaKvPool<B>>>) -> Result<Self, KvBlockError> {
+        let sequence = lock_pool(&pool).manager.allocate()?;
+        Ok(Self {
+            pool,
+            sequence,
+            tokens: 0,
+        })
+    }
+
+    pub(crate) const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    pub(crate) fn reserve(&mut self, additional_tokens: usize) -> Result<(), KvBlockError> {
+        let new_token_count = self
+            .tokens
+            .checked_add(additional_tokens)
+            .ok_or(KvBlockError::TokenCountOverflow(self.sequence))?;
+        lock_pool(&self.pool)
+            .manager
+            .append(self.sequence, additional_tokens)?;
+        self.tokens = new_token_count;
+        Ok(())
+    }
+
+    pub(crate) fn write_layer(
+        &self,
+        layer: usize,
+        token_offset: usize,
+        key: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+    ) {
+        lock_pool(&self.pool).write_layer(self.sequence, layer, token_offset, key, value);
+    }
+
+    pub(crate) fn read_layer_pages(&self, layer: usize) -> Vec<(Tensor<B, 4>, Tensor<B, 4>)> {
+        lock_pool(&self.pool).read_layer_pages(self.sequence, layer)
+    }
+
+    /// Returns physical page bytes attributed to this sequence.
+    pub(crate) fn bytes(&self) -> u64 {
+        let pool = lock_pool(&self.pool);
+        let blocks = pool
+            .manager
+            .block_table(self.sequence)
+            .expect("a live cache owns a block table")
+            .len() as u64;
+        blocks * pool.manager.metrics().block_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_ids(&self) -> Vec<usize> {
+        lock_pool(&self.pool)
+            .manager
+            .block_table(self.sequence)
+            .expect("a live cache owns a block table")
+            .iter()
+            .map(|block| block.get())
+            .collect()
+    }
+}
+
+impl<B: Backend> Drop for LlamaKvCache<B> {
+    fn drop(&mut self) {
+        let result = lock_pool(&self.pool).manager.free(self.sequence);
+        debug_assert!(result.is_ok(), "a live cache sequence must be releasable");
+    }
+}
+
+pub(crate) struct LlamaKvPool<B: Backend> {
+    manager: KvBlockManager,
+    layers: Vec<LlamaLayerPages<B>>,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    device: B::Device,
+}
+
+struct LlamaLayerPages<B: Backend> {
+    keys: Vec<Option<Tensor<B, 4>>>,
+    values: Vec<Option<Tensor<B, 4>>>,
+}
+
+impl<B: Backend> LlamaKvPool<B> {
+    pub(crate) fn new(
+        model: &LlamaConfig,
+        config: LlamaKvCacheConfig,
+        device: B::Device,
+    ) -> Result<Self, KvBlockError> {
+        if config.capacity_tokens == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "capacity_tokens must be greater than zero",
+            ));
+        }
+        if config.tokens_per_block == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "tokens_per_block must be greater than zero",
+            ));
+        }
+
+        let element_bytes = std::mem::size_of::<B::FloatElem>() as u64;
+        let bytes_per_token = checked_product(&[
+            model.num_hidden_layers as u64,
+            2,
+            model.num_key_value_heads as u64,
+            model.attention_head_dim() as u64,
+            element_bytes,
+        ])?;
+        let total_blocks = config.capacity_tokens.div_ceil(config.tokens_per_block);
+        let capacity_bytes = checked_product(&[
+            total_blocks as u64,
+            config.tokens_per_block as u64,
+            bytes_per_token,
+        ])?;
+        let manager =
+            KvBlockManager::new(capacity_bytes, config.tokens_per_block, bytes_per_token)?;
+        let physical_blocks = manager.metrics().total_blocks;
+        let layers = (0..model.num_hidden_layers)
+            .map(|_| LlamaLayerPages {
+                keys: (0..physical_blocks).map(|_| None).collect(),
+                values: (0..physical_blocks).map(|_| None).collect(),
+            })
+            .collect();
+        Ok(Self {
+            manager,
+            layers,
+            num_key_value_heads: model.num_key_value_heads,
+            head_dim: model.attention_head_dim(),
+            device,
+        })
+    }
+
+    fn write_layer(
+        &mut self,
+        sequence: KvSequenceId,
+        layer: usize,
+        token_offset: usize,
+        key: Tensor<B, 4>,
+        value: Tensor<B, 4>,
+    ) {
+        let [batch, heads, token_count, head_dim] = key.dims();
+        debug_assert_eq!(value.dims(), key.dims());
+        debug_assert_eq!(batch, 1);
+        debug_assert_eq!(heads, self.num_key_value_heads);
+        debug_assert_eq!(head_dim, self.head_dim);
+        debug_assert!(token_offset + token_count <= self.manager.cached_tokens(sequence).unwrap());
+
+        let tokens_per_block = self.manager.tokens_per_block();
+        let block_table = self
+            .manager
+            .block_table(sequence)
+            .expect("a reserved cache owns a block table")
+            .to_vec();
+        let layer = self
+            .layers
+            .get_mut(layer)
+            .expect("model and cache layer counts must agree");
+        let mut source_offset = 0;
+        while source_offset < token_count {
+            let logical_position = token_offset + source_offset;
+            let logical_block = logical_position / tokens_per_block;
+            let block_offset = logical_position % tokens_per_block;
+            let physical_block = block_table[logical_block].get();
+            let count = (tokens_per_block - block_offset).min(token_count - source_offset);
+            let key_values = key.clone().slice([
+                0..1,
+                0..heads,
+                source_offset..source_offset + count,
+                0..head_dim,
+            ]);
+            let value_values = value.clone().slice([
+                0..1,
+                0..heads,
+                source_offset..source_offset + count,
+                0..head_dim,
+            ]);
+            let page_shape = [1, heads, tokens_per_block, head_dim];
+            let key_page = layer.keys[physical_block]
+                .take()
+                .unwrap_or_else(|| Tensor::zeros(page_shape, &self.device));
+            let value_page = layer.values[physical_block]
+                .take()
+                .unwrap_or_else(|| Tensor::zeros(page_shape, &self.device));
+            layer.keys[physical_block] = Some(key_page.slice_assign(
+                [
+                    0..1,
+                    0..heads,
+                    block_offset..block_offset + count,
+                    0..head_dim,
+                ],
+                key_values,
+            ));
+            layer.values[physical_block] = Some(value_page.slice_assign(
+                [
+                    0..1,
+                    0..heads,
+                    block_offset..block_offset + count,
+                    0..head_dim,
+                ],
+                value_values,
+            ));
+            source_offset += count;
+        }
+    }
+
+    fn read_layer_pages(
+        &self,
+        sequence: KvSequenceId,
+        layer: usize,
+    ) -> Vec<(Tensor<B, 4>, Tensor<B, 4>)> {
+        let token_count = self
+            .manager
+            .cached_tokens(sequence)
+            .expect("a live cache owns token accounting");
+        debug_assert!(token_count > 0);
+        let tokens_per_block = self.manager.tokens_per_block();
+        let layer = self
+            .layers
+            .get(layer)
+            .expect("model and cache layer counts must agree");
+        let mut pages = Vec::new();
+        for (logical_block, block) in self
+            .manager
+            .block_table(sequence)
+            .expect("a live cache owns a block table")
+            .iter()
+            .enumerate()
+        {
+            let remaining = token_count - logical_block * tokens_per_block;
+            let used = remaining.min(tokens_per_block);
+            let physical = block.get();
+            let key = layer.keys[physical]
+                .as_ref()
+                .expect("every reserved layer page must be populated")
+                .clone()
+                .slice([0..1, 0..self.num_key_value_heads, 0..used, 0..self.head_dim]);
+            let value = layer.values[physical]
+                .as_ref()
+                .expect("every reserved layer page must be populated")
+                .clone()
+                .slice([0..1, 0..self.num_key_value_heads, 0..used, 0..self.head_dim]);
+            pages.push((key, value));
+        }
+        pages
+    }
+}
+
+fn checked_product(values: &[u64]) -> Result<u64, KvBlockError> {
+    values.iter().try_fold(1_u64, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or(KvBlockError::ConfigurationOverflow)
+    })
+}
+
+fn lock_pool<B: Backend>(pool: &Mutex<LlamaKvPool<B>>) -> MutexGuard<'_, LlamaKvPool<B>> {
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::{backend::NdArray, tensor::TensorData};
+
+    use super::*;
+
+    type TestBackend = NdArray<f32>;
+
+    fn tiny_config() -> LlamaConfig {
+        LlamaConfig {
+            model_type: "llama".into(),
+            vocab_size: 8,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            head_dim: None,
+            hidden_act: "silu".into(),
+            attention_bias: false,
+            mlp_bias: false,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            bos_token_id: Some(1),
+            eos_token_id: vec![2],
+        }
+    }
+
+    #[test]
+    fn writes_and_reads_across_non_contiguous_physical_pages() {
+        let pool = LlamaKvPool::<TestBackend>::new(
+            &tiny_config(),
+            LlamaKvCacheConfig::new(6, 2),
+            Default::default(),
+        )
+        .unwrap();
+        let device = pool.device;
+        let pool = Arc::new(Mutex::new(pool));
+        let mut first = LlamaKvCache::allocate(pool.clone()).unwrap();
+        let mut second = LlamaKvCache::allocate(pool).unwrap();
+
+        first.reserve(3).unwrap();
+        second.reserve(2).unwrap();
+        assert_eq!(first.block_ids(), vec![0, 1]);
+        assert_eq!(second.block_ids(), vec![2]);
+
+        let keys = Tensor::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], [1, 1, 3, 2]),
+            &device,
+        );
+        let values = Tensor::from_data(
+            TensorData::new(vec![11.0_f32, 12.0, 13.0, 14.0, 15.0, 16.0], [1, 1, 3, 2]),
+            &device,
+        );
+        first.write_layer(0, 0, keys, values);
+        let pages = first.read_layer_pages(0);
+        let (keys, values): (Vec<_>, Vec<_>) = pages.into_iter().unzip();
+        let keys = Tensor::cat(keys, 2);
+        let values = Tensor::cat(values, 2);
+
+        assert_eq!(
+            keys.into_data().to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        assert_eq!(
+            values.into_data().to_vec::<f32>().unwrap(),
+            vec![11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn released_pages_are_reused_and_capacity_failure_is_atomic() {
+        let pool = LlamaKvPool::<TestBackend>::new(
+            &tiny_config(),
+            LlamaKvCacheConfig::new(4, 2),
+            Default::default(),
+        )
+        .unwrap();
+        let pool = Arc::new(Mutex::new(pool));
+        let mut first = LlamaKvCache::allocate(pool.clone()).unwrap();
+        let mut waiting = LlamaKvCache::allocate(pool.clone()).unwrap();
+        first.reserve(4).unwrap();
+
+        assert!(matches!(
+            waiting.reserve(1),
+            Err(KvBlockError::InsufficientCapacity { .. })
+        ));
+        assert_eq!(waiting.tokens(), 0);
+        assert!(waiting.block_ids().is_empty());
+
+        drop(first);
+        waiting.reserve(1).unwrap();
+        assert_eq!(waiting.block_ids(), vec![0]);
+    }
+}

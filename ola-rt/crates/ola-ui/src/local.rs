@@ -5,12 +5,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
 use burn::backend::NdArray;
+#[cfg(feature = "wgpu")]
+use burn::backend::Wgpu;
 use ola_bench::FixedWorkload;
 use ola_burn::llama::LlamaFactory;
-use ola_core::{GenerationConfig, ModelDescriptor, Timestamp};
+use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
-use ola_runtime::{KvBlockManager, KvBlockMetrics, Runtime};
+use ola_runtime::{Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, Runtime};
 
 use crate::{
     ChatMessage, ChatRole, ConnectionState, RunState, RuntimeSummary, UiBackend, UiBackendError,
@@ -18,11 +22,37 @@ use crate::{
 };
 
 type CpuBackend = NdArray<f32>;
+#[cfg(feature = "cuda")]
+type CudaBackend = Cuda<f32, i32>;
+#[cfg(feature = "wgpu")]
+type WgpuBackend = Wgpu<f32, i32>;
 
 const LLAMA_BENCHMARK: &str = "llama-generation";
 const KV_BENCHMARK: &str = "kv-block-pressure";
 const FIFO_EXPERIMENT: &str = "fifo-workload";
 const MAX_ACTIVITY: usize = 100;
+
+/// Compute backend selected for local model execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LocalDevice {
+    /// Portable CPU execution through Burn NdArray.
+    #[default]
+    Cpu,
+    /// GPU execution through Burn WGPU and the platform graphics API.
+    Wgpu,
+    /// Native CubeCL CUDA execution; requires a local CUDA toolkit.
+    Cuda,
+}
+
+impl LocalDevice {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "local / Burn NdArray<f32> / CPU",
+            Self::Wgpu => "local / Burn WGPU<f32> / GPU",
+            Self::Cuda => "local / Burn CUDA<f32> / GPU",
+        }
+    }
+}
 
 /// In-process adapter connecting the terminal shell to OlaRT foundation code.
 ///
@@ -37,14 +67,19 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     /// Starts a local adapter, optionally loading one Hugging Face Llama
-    /// artifact directory in the background.
+    /// artifact directory on the CPU in the background.
     pub fn new(model_directory: Option<PathBuf>) -> Self {
+        Self::with_device(model_directory, LocalDevice::Cpu)
+    }
+
+    /// Starts a local adapter on an explicitly selected compute backend.
+    pub fn with_device(model_directory: Option<PathBuf>, device: LocalDevice) -> Self {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let loading_model = model_directory.is_some();
         thread::Builder::new()
             .name("ola-ui-worker".into())
-            .spawn(move || worker_loop(model_directory, command_receiver, event_sender))
+            .spawn(move || worker_loop(model_directory, device, command_receiver, event_sender))
             .expect("failed to spawn the OlaRT UI worker");
 
         let snapshot = WorkspaceSnapshot {
@@ -54,7 +89,7 @@ impl LocalBackend {
                 } else {
                     ConnectionState::Connected
                 },
-                backend: "local / Burn NdArray<f32>".into(),
+                backend: device.label().into(),
                 ..RuntimeSummary::default()
             },
             benchmarks: vec![
@@ -86,7 +121,7 @@ impl LocalBackend {
                 "local runtime connected; no Llama artifact selected".into()
             }],
             notice: Some(if loading_model {
-                "Loading the selected Llama artifact on the CPU backend".into()
+                format!("Loading the selected Llama artifact on {}", device.label())
             } else {
                 "Pass --model <directory> or set OLA_MODEL_DIR to enable chat".into()
             }),
@@ -302,12 +337,14 @@ enum WorkerEvent {
 
 fn worker_loop(
     model_directory: Option<PathBuf>,
+    device: LocalDevice,
     commands: Receiver<WorkerCommand>,
     events: Sender<WorkerEvent>,
 ) {
     let model =
-        model_directory.as_ref().and_then(|directory| {
-            match LlamaFactory::<CpuBackend>::new(Default::default()).load_local(directory) {
+        model_directory
+            .as_ref()
+            .and_then(|directory| match load_model(directory, device) {
                 Ok(model) => {
                     let name = directory
                         .file_name()
@@ -317,12 +354,11 @@ fn worker_loop(
                     let _ = events.send(WorkerEvent::ModelReady { name });
                     Some(model)
                 }
-                Err(error) => {
-                    let _ = events.send(WorkerEvent::ModelFailed(error.to_string()));
+                Err(message) => {
+                    let _ = events.send(WorkerEvent::ModelFailed(message));
                     None
                 }
-            }
-        });
+            });
 
     while let Ok(command) = commands.recv() {
         let event = match command {
@@ -346,6 +382,33 @@ fn worker_loop(
     }
 }
 
+fn load_model(
+    directory: &std::path::Path,
+    device: LocalDevice,
+) -> Result<CausalLanguageModel, String> {
+    match device {
+        LocalDevice::Cpu => LlamaFactory::<CpuBackend>::new(Default::default())
+            .load_local(directory)
+            .map_err(|error| error.to_string()),
+        #[cfg(feature = "wgpu")]
+        LocalDevice::Wgpu => LlamaFactory::<WgpuBackend>::new(Default::default())
+            .load_local(directory)
+            .map_err(|error| error.to_string()),
+        #[cfg(not(feature = "wgpu"))]
+        LocalDevice::Wgpu => {
+            Err("WGPU support is not compiled; rerun ola-ui with --features wgpu".into())
+        }
+        #[cfg(feature = "cuda")]
+        LocalDevice::Cuda => LlamaFactory::<CudaBackend>::new(Default::default())
+            .load_local(directory)
+            .map_err(|error| error.to_string()),
+        #[cfg(not(feature = "cuda"))]
+        LocalDevice::Cuda => {
+            Err("CUDA support is not compiled; rerun ola-ui with --features cuda".into())
+        }
+    }
+}
+
 struct GenerationResult {
     text: String,
     metrics: SessionMetrics,
@@ -357,41 +420,44 @@ fn generate(
     prompt: &str,
     max_new_tokens: usize,
 ) -> Result<GenerationResult, String> {
-    let prompt_tokens = model
-        .tokenizer()
-        .encode(prompt, true)
+    const MODEL_ID: &str = "local-llama";
+
+    let mut executor = Executor::default();
+    executor
+        .register_model(ModelDescriptor::language(MODEL_ID, "llama"), model.clone())
         .map_err(|error| error.to_string())?;
-    let mut session = model
-        .create_session(GenerationConfig {
-            max_new_tokens,
-            temperature: 0.0,
-            top_p: 1.0,
-            seed: Some(0),
-        })
+    let mut request = RequestSpec::text(MODEL_ID, prompt);
+    request.generation = GenerationConfig {
+        max_new_tokens,
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: Some(0),
+    };
+    let request_id = executor
+        .submit(request, Timestamp::ZERO)
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
-    let first = session
-        .prefill(&prompt_tokens)
-        .map_err(|error| error.to_string())?;
-    let mut generated = vec![first.id];
-    let mut previous = first;
-    for _ in 1..max_new_tokens {
-        if previous.is_end_of_sequence {
-            break;
+    let mut step = 1_u64;
+    loop {
+        match executor
+            .step(Timestamp::from_micros(step))
+            .map_err(|error| error.to_string())?
+        {
+            ExecutorEvent::Token { finished: true, .. } => break,
+            ExecutorEvent::Token { .. } => step += 1,
+            ExecutorEvent::Failed { message, .. } => return Err(message),
+            ExecutorEvent::Idle => {
+                return Err("executor became idle before generation completed".into());
+            }
         }
-        previous = session
-            .decode(previous.id)
-            .map_err(|error| error.to_string())?;
-        generated.push(previous.id);
     }
     let elapsed = started.elapsed();
-    let text = model
-        .tokenizer()
-        .decode(&generated, true)
-        .map_err(|error| error.to_string())?;
+    let result = executor
+        .result(request_id)
+        .expect("a finished token event retains an execution result");
     Ok(GenerationResult {
-        text,
-        metrics: session.metrics(),
+        text: result.text.clone(),
+        metrics: result.metrics,
         elapsed,
     })
 }
@@ -637,11 +703,45 @@ mod tests {
         assert_eq!(snapshot.runtime.connection, ConnectionState::Connected);
     }
 
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR and a working WGPU adapter"]
+    fn local_wgpu_backend_loads_and_generates_through_the_executor() {
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in ola-burn/CONFORMANCE.md");
+        let mut backend = LocalBackend::with_device(Some(directory), LocalDevice::Wgpu);
+
+        let loaded = wait_until_for(&mut backend, Duration::from_secs(60), |snapshot| {
+            snapshot.selected_model.is_some()
+        });
+        assert!(loaded.runtime.backend.contains("WGPU"));
+
+        backend.submit_prompt("Hello").unwrap();
+        let snapshot = wait_until_for(&mut backend, Duration::from_secs(60), |snapshot| {
+            snapshot.chat.len() == 2
+        });
+
+        assert_eq!(snapshot.chat[0].role, ChatRole::User);
+        assert_eq!(snapshot.chat[1].role, ChatRole::Assistant);
+        assert!(!snapshot.chat[1].content.is_empty());
+        assert_eq!(snapshot.runtime.kv_cache_bytes, 0);
+        assert_eq!(snapshot.runtime.connection, ConnectionState::Connected);
+    }
+
     fn wait_until(
         backend: &mut LocalBackend,
         condition: impl Fn(&WorkspaceSnapshot) -> bool,
     ) -> WorkspaceSnapshot {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        wait_until_for(backend, Duration::from_secs(10), condition)
+    }
+
+    fn wait_until_for(
+        backend: &mut LocalBackend,
+        timeout: Duration,
+        condition: impl Fn(&WorkspaceSnapshot) -> bool,
+    ) -> WorkspaceSnapshot {
+        let deadline = Instant::now() + timeout;
         loop {
             let snapshot = backend.snapshot().unwrap();
             if condition(&snapshot) {

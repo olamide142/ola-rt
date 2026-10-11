@@ -50,22 +50,42 @@ The baseline is intentionally simple and easy to inspect:
 
 - batch size is one at the `GenerationSession` boundary;
 - only greedy decoding (`temperature = 0`) is accepted;
-- prefill stores one compact key/value tensor per decoder layer;
-- decode processes only the newest token and appends its keys and values;
-- request metrics report the cache's actual element storage in bytes;
-- cache growth currently concatenates contiguous tensors, so it still copies
-  existing cache contents and has no capacity reservation or paging;
+- prefill writes compact keys and values into fixed-size per-layer pages;
+- runtime block tables map each sequence's logical blocks to physical pages;
+- decode processes only the newest token and writes into its assigned page;
+- request metrics report physical page bytes attributed to the sequence,
+  including internal fragmentation;
+- capacity reservation is atomic, and released physical block IDs are reused;
+- decode attention traverses pages directly and combines their scores and
+  values with a numerically stable online softmax;
 - the session enforces call order, vocabulary bounds, context length, EOS, and
   `max_new_tokens`;
 - Hub references are descriptive only and must first be materialized locally.
 
 The unchanged full-sequence path is the cache's numerical oracle. Unit tests
-compare cached decode logits with complete recomputation at every generated
-position. This gives later paged allocation, batching, sampling, quantization,
-and accelerator work a small reference implementation to compare against. In
-particular, Llama-specific RoPE is implemented explicitly because Burn's
-general rotary module pairs adjacent dimensions, while Hugging Face Llama pairs
-the two halves of each attention head.
+compare page-native decode logits with complete recomputation at every
+generated position and across several page sizes. This gives later batching,
+sampling, quantization, fusion, and accelerator work a small reference
+implementation to compare against. In particular, Llama-specific RoPE is
+implemented explicitly because Burn's general rotary module pairs adjacent
+dimensions, while Hugging Face Llama pairs the two halves of each attention
+head.
+
+The default page pool has capacity for one full model context and uses 16-token
+blocks. Experiments can override both values before loading an artifact:
+
+```rust,no_run
+use burn::backend::NdArray;
+use ola_burn::llama::{LlamaFactory, LlamaKvCacheConfig};
+
+let factory = LlamaFactory::<NdArray<f32>>::new(Default::default())
+    .with_kv_cache(LlamaKvCacheConfig::new(8_192, 32));
+# let _ = factory;
+```
+
+Capacity is shared by the live sessions for one loaded model. Physical tensors
+are materialized lazily and retained at the pool's high-water mark so released
+block IDs can be reused without changing their physical identity.
 
 ## Running a local artifact
 
@@ -78,12 +98,35 @@ cargo run -p ola-burn --example run_llama -- \
   8
 ```
 
-The example uses Burn's CPU `NdArray<f32>` backend, selects the `llama` factory
-through `ArchitectureRegistry`, tokenizes the prompt, performs greedy prefill
-and decode, and prints token IDs, session metrics, and decoded text. A random
-test checkpoint validates mechanics but produces meaningless text; a trained
+The default is Burn's CPU `NdArray<f32>` backend. WGPU is an opt-in path that
+uses the platform graphics API and is the simplest GPU route on a machine
+without a CUDA toolkit:
+
+```text
+cargo run -p ola-burn --features wgpu --example run_llama -- \
+  --backend wgpu /path/to/hugging-face-llama "Hello" 8
+```
+
+Native CUDA is also feature-gated and requires both a compatible NVIDIA driver
+and a local CUDA toolkit/NVRTC installation:
+
+```text
+cargo run -p ola-burn --features cuda --example run_llama -- \
+  --backend cuda /path/to/hugging-face-llama "Hello" 8
+```
+
+The example selects the `llama` factory through `ArchitectureRegistry`,
+tokenizes the prompt, performs greedy prefill and decode, and prints token IDs,
+session metrics, the concrete backend type, and decoded text. A random test
+checkpoint validates mechanics but produces meaningless text; a trained
 checkpoint such as TinyLlama is required for meaningful output and needs enough
 memory for its full-precision representation.
+
+The WGPU path has been checked on the development GTX 1650 with the pinned
+fixture: its selected tokens match CPU exactly, and sampled logits remain
+within the documented accelerator tolerance. This is correctness evidence, not
+a throughput claim; first-run compilation and shader warm-up must be separated
+from steady-state measurements.
 
 ## Evidence expectations
 
@@ -91,8 +134,9 @@ Changes to this implementation should retain a correctness comparison against a
 known reference implementation for fixed inputs and checkpoint revision. New
 performance paths must record backend, device, dtype, context length, generated
 length, warm-up, repetitions, and whether compilation/autotuning is included.
-Throughput results must state whether they use full-sequence or cached decoding;
-the current contiguous cache must not be presented as paged allocation.
+Throughput results must state whether they use full-sequence or page-native
+cached decoding. The current attention path uses portable Burn operations; it
+must not be presented as a fused accelerator kernel.
 
 The pinned fixture, independent scalar oracle, numerical tolerance, and manual
 test command are specified in [`CONFORMANCE.md`](CONFORMANCE.md). That protocol

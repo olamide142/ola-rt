@@ -132,29 +132,33 @@ Implemented:
 - FIFO scheduling through a replaceable trait;
 - explicit queue, active-set, memory, and timing state;
 - deterministic fixed-size KV block allocation and fragmentation metrics;
+- a synchronous scheduler-to-model executor with live KV-memory accounting;
 - a transport-neutral generation service;
 - a Ratatui workbench with background local Llama generation, KV benchmarks,
   and FIFO runtime experiments;
 - deterministic fixed-workload generation and replay;
 - basic latency summaries;
 - a Burn device adapter;
+- opt-in WGPU and native CUDA Burn backends, with WGPU inference numerically
+  validated on the development GPU;
 - strict parsing of compatible Hugging Face Llama configurations;
 - Hugging Face tokenizer and single-file SafeTensors loading;
 - a correctness-first Burn Llama decoder with grouped-query attention;
-- request-local contiguous KV caches with measured byte usage;
+- configurable physical KV page storage backed by runtime block tables;
 - isolated greedy generation sessions using cached single-token decode;
+- executor-driven local UI generation with retained token and text results;
 - a pinned external checkpoint and independent scalar conformance oracle.
 
 Deliberately deferred:
 
 - tensors in the public runtime API;
-- physical paged KV tensors, eviction, preemption, and prefix reuse;
-- batching and execution plans;
+- fused accelerator attention, eviction, preemption, and prefix reuse;
+- continuous batching and multi-request execution plans;
 - probabilistic sampling;
 - sharded and remotely materialized checkpoints;
 - RoPE-scaled and tied-embedding Llama variants;
 - asynchronous serving and HTTP;
-- GPU telemetry;
+- GPU telemetry and accelerator-specific fused kernels;
 - persistence and distributed execution.
 
 ## Small Llama probe
@@ -167,10 +171,14 @@ cargo run -p ola-burn --example run_llama -- \
   /path/to/model \
   "Hello" \
   8
+
+# Opt-in WGPU execution
+cargo run -p ola-burn --features wgpu --example run_llama -- \
+  --backend wgpu /path/to/model "Hello" 8
 ```
 
 See `crates/ola-burn/README.md` for supported artifact features, baseline
-execution semantics, and the limits of its first contiguous KV cache. Its
+execution semantics, and the limits of its first paged KV cache. Its
 `CONFORMANCE.md` pins the external checkpoint and independent scalar logit
 oracle used as the numerical baseline for future optimized paths.
 

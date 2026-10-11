@@ -1,28 +1,40 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{ElementConversion, Int, Tensor, TensorData, backend::Backend};
 use ola_core::GenerationConfig;
 use ola_model::{
     CausalModel, ExecutionStage, GeneratedToken, GenerationSession, ModelExecutionError,
     SessionMetrics,
 };
+use ola_runtime::KvBlockError;
 
-use super::{LlamaConfig, LlamaForCausalLM, model::LlamaKvCache};
+use super::{
+    LlamaConfig, LlamaForCausalLM, LlamaKvCacheConfig,
+    kv_cache::{LlamaKvCache, LlamaKvPool},
+};
 
 /// Shared Burn weights exposed through OlaRT's architecture-neutral model API.
 pub(crate) struct BurnLlamaModel<B: Backend> {
     module: Arc<LlamaForCausalLM<B>>,
     config: Arc<LlamaConfig>,
     device: B::Device,
+    cache_pool: Arc<Mutex<LlamaKvPool<B>>>,
 }
 
 impl<B: Backend> BurnLlamaModel<B> {
-    pub(crate) fn new(module: LlamaForCausalLM<B>, config: LlamaConfig, device: B::Device) -> Self {
-        Self {
+    pub(crate) fn with_kv_cache(
+        module: LlamaForCausalLM<B>,
+        config: LlamaConfig,
+        device: B::Device,
+        cache_config: LlamaKvCacheConfig,
+    ) -> Result<Self, KvBlockError> {
+        let cache_pool = LlamaKvPool::new(&config, cache_config, device.clone())?;
+        Ok(Self {
             module: Arc::new(module),
             config: Arc::new(config),
             device,
-        }
+            cache_pool: Arc::new(Mutex::new(cache_pool)),
+        })
     }
 }
 
@@ -53,13 +65,15 @@ where
                 "the initial Llama executor supports greedy decoding only; set temperature to 0",
             ));
         }
+        let cache = LlamaKvCache::allocate(self.cache_pool.clone())
+            .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
         Ok(Box::new(LlamaSession {
             module: self.module.clone(),
             config: self.config.clone(),
             device: self.device.clone(),
             generation,
             tokens: Vec::new(),
-            cache: None,
+            cache: Some(cache),
             last_generated: None,
             metrics: SessionMetrics::default(),
             terminal: false,
@@ -67,7 +81,7 @@ where
     }
 }
 
-/// Request-local state for correctness-first, full-sequence Llama decoding.
+/// Request-local state for correctness-first cached Llama decoding.
 struct LlamaSession<B: Backend> {
     module: Arc<LlamaForCausalLM<B>>,
     config: Arc<LlamaConfig>,
@@ -96,11 +110,12 @@ where
             .slice([0..1, sequence_length - 1..sequence_length, 0..vocabulary])
             .argmax(2)
             .into_data()
-            .to_vec::<i64>()
+            .to_vec::<B::IntElem>()
             .map_err(|error| {
                 ModelExecutionError::new(stage, format!("failed to read selected token: {error}"))
             })?;
-        let id = u32::try_from(last[0]).map_err(|_| {
+        let selected = last[0].elem::<i64>();
+        let id = u32::try_from(selected).map_err(|_| {
             ModelExecutionError::new(stage, "backend returned a token ID outside the u32 range")
         })?;
         let is_end_of_sequence = self.config.eos_token_id.contains(&id);
@@ -167,15 +182,21 @@ where
             self.validate_token(token, ExecutionStage::Prefill)?;
         }
         self.validate_context_length(prompt_tokens.len(), ExecutionStage::Prefill)?;
-        self.tokens.extend_from_slice(prompt_tokens);
         let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
         let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
             TensorData::new(token_values, [1, prompt_tokens.len()]),
             &self.device,
         );
-        let (logits, cache) = self.module.prefill(input_ids);
+        let cache = self
+            .cache
+            .as_mut()
+            .expect("sessions allocate a cache at creation");
+        let logits = self
+            .module
+            .prefill(input_ids, cache)
+            .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
-        self.cache = Some(cache);
+        self.tokens.extend_from_slice(prompt_tokens);
         self.metrics.prompt_tokens = prompt_tokens.len();
         self.select_token(logits, ExecutionStage::Prefill)
     }
@@ -203,7 +224,6 @@ where
         }
         self.validate_token(input_token, ExecutionStage::Decode)?;
         self.validate_context_length(self.tokens.len() + 1, ExecutionStage::Decode)?;
-        self.tokens.push(input_token);
         let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
             TensorData::new(vec![i64::from(input_token)], [1, 1]),
             &self.device,
@@ -214,14 +234,22 @@ where
                 "decode requires an initialized KV cache",
             )
         })?;
-        let logits = self.module.decode(input_ids, cache);
+        let logits = self
+            .module
+            .decode(input_ids, cache)
+            .map_err(|error| cache_error(ExecutionStage::Decode, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
+        self.tokens.push(input_token);
         self.select_token(logits, ExecutionStage::Decode)
     }
 
     fn metrics(&self) -> SessionMetrics {
         self.metrics
     }
+}
+
+fn cache_error(stage: ExecutionStage, error: KvBlockError) -> ModelExecutionError {
+    ModelExecutionError::new(stage, format!("KV cache: {error}"))
 }
 
 #[cfg(test)]
@@ -256,7 +284,8 @@ mod tests {
         let device = Default::default();
         TestBackend::seed(&device, 11);
         let module = LlamaForCausalLM::init(&config, &device);
-        BurnLlamaModel::new(module, config, device)
+        BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(16, 16))
+            .unwrap()
     }
 
     fn greedy(max_new_tokens: usize) -> GenerationConfig {
@@ -269,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn session_reports_contiguous_cache_bytes() {
+    fn session_reports_paged_cache_bytes() {
         let model = tiny_model();
         let mut session = model.create_session(greedy(2)).unwrap();
 
@@ -281,9 +310,9 @@ mod tests {
             SessionMetrics {
                 prompt_tokens: 2,
                 generated_tokens: 2,
-                // 1 layer * K/V * 1 KV head * 3 cached tokens * 4 head
-                // elements * 4 bytes per F32 element.
-                kv_cache_bytes: 96,
+                // One 16-token physical block. Logical payload is 96 bytes;
+                // the remaining page slots are internal fragmentation.
+                kv_cache_bytes: 512,
             }
         );
     }

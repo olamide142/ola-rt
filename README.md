@@ -911,10 +911,9 @@ vertical slice — October 2026.
 
 Current engineering focus:
 
-- connect runtime KV block tables to physical paged tensor storage;
-- add an executor that connects scheduled requests to model sessions;
-- propagate live cache occupancy into runtime memory state;
-- establish a numerically validated GPU execution path.
+- extend the synchronous executor into continuous multi-request batching;
+- add memory-aware admission and iteration-level scheduling baselines;
+- optimize page-native attention with accelerator-specific fusion.
 
 ---
 

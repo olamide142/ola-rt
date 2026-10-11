@@ -6,19 +6,34 @@
 
 use std::{env, error::Error, io};
 
-use burn::backend::NdArray;
+#[cfg(feature = "cuda")]
+use burn::backend::Cuda;
+#[cfg(feature = "wgpu")]
+use burn::backend::Wgpu;
+use burn::{backend::NdArray, tensor::backend::Backend};
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor};
 use ola_model::{ArchitectureRegistry, CausalLanguageModel, ModelDefinition};
 
-type CpuBackend = NdArray<f32>;
-
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
-    let artifact_directory = arguments.next().ok_or_else(|| {
+    let mut backend = "cpu".to_owned();
+    let first = arguments.next();
+    let artifact_directory = if first.as_deref() == Some("--backend") {
+        backend = arguments.next().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--backend requires cpu or cuda",
+            )
+        })?;
+        arguments.next()
+    } else {
+        first
+    };
+    let artifact_directory = artifact_directory.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: cargo run -p ola-burn --example run_llama -- <artifact-directory> [prompt] [max-new-tokens]",
+            "usage: cargo run -p ola-burn --example run_llama [--features wgpu|cuda] -- [--backend cpu|wgpu|cuda] <artifact-directory> [prompt] [max-new-tokens]",
         )
     })?;
     let prompt = arguments.next().unwrap_or_else(|| "Hello".into());
@@ -28,12 +43,63 @@ fn main() -> Result<(), Box<dyn Error>> {
         .transpose()?
         .unwrap_or(8);
 
+    match backend.as_str() {
+        "cpu" => run::<NdArray<f32>>(
+            Default::default(),
+            artifact_directory,
+            prompt,
+            max_new_tokens,
+        ),
+        #[cfg(feature = "cuda")]
+        "cuda" => run::<Cuda<f32, i32>>(
+            Default::default(),
+            artifact_directory,
+            prompt,
+            max_new_tokens,
+        ),
+        #[cfg(feature = "wgpu")]
+        "wgpu" => run::<Wgpu<f32, i32>>(
+            Default::default(),
+            artifact_directory,
+            prompt,
+            max_new_tokens,
+        ),
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CUDA support is not compiled; rerun with --features cuda",
+        )
+        .into()),
+        #[cfg(not(feature = "wgpu"))]
+        "wgpu" => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "WGPU support is not compiled; rerun with --features wgpu",
+        )
+        .into()),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown backend `{other}`; expected cpu, wgpu, or cuda"),
+        )
+        .into()),
+    }
+}
+
+fn run<B>(
+    device: B::Device,
+    artifact_directory: String,
+    prompt: String,
+    max_new_tokens: usize,
+) -> Result<(), Box<dyn Error>>
+where
+    B: Backend + 'static,
+    B::Device: Send + Sync,
+{
     let definition = ModelDefinition::local(
         ModelDescriptor::language("selected-llama", "llama"),
         artifact_directory,
     );
     let mut architectures = ArchitectureRegistry::<CausalLanguageModel>::default();
-    architectures.register(LlamaFactory::<CpuBackend>::new(Default::default()))?;
+    architectures.register(LlamaFactory::<B>::new(device))?;
     let loaded = architectures.load(&definition)?;
 
     let prompt_tokens = loaded.inner().tokenizer().encode(&prompt, true)?;
@@ -58,6 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("prompt_tokens={prompt_tokens:?}");
     println!("generated_tokens={generated:?}");
     println!("metrics={:?}", session.metrics());
+    println!("backend={}", std::any::type_name::<B>());
     println!("text={text:?}");
     Ok(())
 }

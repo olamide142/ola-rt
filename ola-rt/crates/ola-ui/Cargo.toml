@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+cuda = ["burn/cuda", "ola-burn/cuda"]
+wgpu = ["burn/wgpu", "ola-burn/wgpu"]
+
 [dependencies]
 burn.workspace = true
 crossterm.workspace = true

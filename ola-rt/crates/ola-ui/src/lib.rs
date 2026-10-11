@@ -16,7 +16,7 @@ use ratatui::DefaultTerminal;
 
 pub use app::{App, InputMode, Screen, UiCommand};
 pub use backend::{DisconnectedBackend, UiBackend, UiBackendError};
-pub use local::LocalBackend;
+pub use local::{LocalBackend, LocalDevice};
 pub use model::{
     ChatMessage, ChatRole, ConnectionState, RunState, RuntimeSummary, WorkItem, WorkspaceSnapshot,
 };

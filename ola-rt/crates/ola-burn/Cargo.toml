@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
+
 [dependencies]
 burn.workspace = true
 burn-store.workspace = true
 ola-core.workspace = true
 ola-model.workspace = true
+ola-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokenizers.workspace = true

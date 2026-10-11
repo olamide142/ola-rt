@@ -13,7 +13,8 @@ use ola_model::{
 };
 
 use super::{
-    HuggingFaceTokenizer, LlamaConfig, LlamaConfigError, LlamaForCausalLM, session::BurnLlamaModel,
+    HuggingFaceTokenizer, LlamaConfig, LlamaConfigError, LlamaForCausalLM, LlamaKvCacheConfig,
+    session::BurnLlamaModel,
 };
 
 /// Constructs Llama models on one selected Burn backend and device.
@@ -24,6 +25,7 @@ use super::{
 pub struct LlamaFactory<B: Backend> {
     architecture: ArchitectureId,
     device: B::Device,
+    kv_cache: Option<LlamaKvCacheConfig>,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -61,6 +63,7 @@ impl<B: Backend> LlamaFactory<B> {
         Self {
             architecture: "llama".into(),
             device,
+            kv_cache: None,
             backend: PhantomData,
         }
     }
@@ -73,8 +76,18 @@ impl<B: Backend> LlamaFactory<B> {
         Self {
             architecture: architecture.into(),
             device,
+            kv_cache: None,
             backend: PhantomData,
         }
+    }
+
+    /// Overrides the shared KV-cache capacity and page geometry.
+    ///
+    /// By default, the factory reserves logical capacity for one complete
+    /// model context with 16 token positions per physical block.
+    pub fn with_kv_cache(mut self, config: LlamaKvCacheConfig) -> Self {
+        self.kv_cache = Some(config);
+        self
     }
 
     /// Loads a local Hugging Face artifact directory with detailed errors.
@@ -94,10 +107,13 @@ impl<B: Backend> LlamaFactory<B> {
             .map_err(|error| LlamaLoadError::Tokenizer(error.to_string()))?;
         let (config, module) = self.load_native(directory)?.into_parts();
 
-        Ok(CausalLanguageModel::new(
-            tokenizer,
-            BurnLlamaModel::new(module, config, self.device.clone()),
-        ))
+        let cache_config = self
+            .kv_cache
+            .unwrap_or_else(|| LlamaKvCacheConfig::for_model(&config));
+        let model =
+            BurnLlamaModel::with_kv_cache(module, config, self.device.clone(), cache_config)
+                .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
+        Ok(CausalLanguageModel::new(tokenizer, model))
     }
 
     /// Loads configuration and weights while leaving tokenization to the caller.
@@ -201,6 +217,8 @@ pub enum LlamaLoadError {
     ShardedWeights(Vec<PathBuf>),
     /// SafeTensors could not be mapped completely onto the Burn module.
     Weights(String),
+    /// KV-cache pool geometry could not be represented safely.
+    KvCache(String),
 }
 
 impl fmt::Display for LlamaLoadError {
@@ -229,6 +247,7 @@ impl fmt::Display for LlamaLoadError {
                 paths.len()
             ),
             Self::Weights(message) => write!(formatter, "failed to load model weights: {message}"),
+            Self::KvCache(message) => write!(formatter, "failed to configure KV cache: {message}"),
         }
     }
 }
@@ -250,6 +269,8 @@ impl From<LlamaConfigError> for LlamaLoadError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "wgpu")]
+    use burn::backend::{Wgpu, wgpu::WgpuDevice};
     use burn::{
         backend::NdArray,
         tensor::{Int, Tensor, TensorData},
@@ -318,5 +339,51 @@ mod tests {
 
         let selected = logits.argmax(2).into_data().to_vec::<i64>().unwrap();
         assert_eq!(selected, vec![5_971, 1_789, 19_053]);
+    }
+
+    /// Validates the opt-in GPU backend against the CPU reference on identical
+    /// checkpoint weights and input IDs.
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "requires the pinned fixture and a working WGPU adapter"]
+    fn wgpu_logits_match_cpu_logits() {
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
+        let cpu_device = Default::default();
+        let gpu_device = WgpuDevice::default();
+        let cpu = LlamaFactory::<NdArray<f32>>::new(cpu_device)
+            .load_native(&directory)
+            .unwrap();
+        let gpu = LlamaFactory::<Wgpu<f32, i32>>::new(gpu_device.clone())
+            .load_native(&directory)
+            .unwrap();
+        let ids = vec![1_i64, 15_043, 1_789];
+        let cpu_logits = cpu
+            .module()
+            .forward(Tensor::from_data(
+                TensorData::new(ids.clone(), [1, 3]),
+                &cpu_device,
+            ))
+            .slice([0..1, 0..3, 0..16])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let gpu_logits = gpu
+            .module()
+            .forward(Tensor::from_data(TensorData::new(ids, [1, 3]), &gpu_device))
+            .slice([0..1, 0..3, 0..16])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(cpu_logits.len(), gpu_logits.len());
+        for (index, (cpu, gpu)) in cpu_logits.into_iter().zip(gpu_logits).enumerate() {
+            let difference = (cpu - gpu).abs();
+            assert!(
+                difference <= 2e-4,
+                "logit {index}: CPU={cpu}, WGPU={gpu}, difference={difference}"
+            );
+        }
     }
 }

@@ -1,8 +1,12 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-07 09:55 BST (Europe/London)  
-**Source revision:** `29a0043` on `master`  
-**Repository state at update:** synchronized with `origin/master`
+**Last updated:** 2026-10-11 19:46 BST (Europe/London)
+
+**Source revision:** GPU execution milestone in this revision; parent `29a0043`
+on `master`
+
+**Repository state at update:** paged KV cache, synchronous executor,
+page-native decode attention, and opt-in GPU execution implemented together
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -19,17 +23,25 @@ request-local KV-cache storage, and expose that workflow through a Ratatui
 terminal application.
 
 The runtime foundation is also operational: requests have validated lifecycle
-transitions, scheduling is replaceable with FIFO as the baseline, deterministic
-workloads can be replayed, and a backend-neutral KV block manager can model
-capacity, allocation, freeing, and internal fragmentation.
+transitions, scheduling is replaceable with FIFO as the baseline, and a
+synchronous executor now drives real model sessions through prefill and
+single-token decode while maintaining lifecycle and live KV-memory state.
 
-The most important distinction in the current system is:
+The most important distinction in the current system is now:
 
-- **model-level KV caching works** using contiguous Burn tensors;
-- **logical block allocation works** in the runtime;
-- the two are not yet connected by physical paged tensor storage.
+- **logical block allocation works** in `ola-runtime`;
+- **physical per-layer K/V pages use those block tables** in `ola-burn`;
+- **decode attention consumes pages directly** using an online softmax without
+  reconstructing sequence-sized K/V tensors.
 
-That connection is the next major systems milestone.
+The portable WGPU path now runs the same model and cache implementation on the
+development GTX 1650. CPU and WGPU select identical fixture tokens, and sampled
+logits agree within the accelerator tolerance. Native CUDA support compiles,
+but local execution is blocked by the missing CUDA toolkit/NVRTC installation.
+
+The next major systems milestone is multi-request execution with
+iteration-level scheduling, followed by continuous batching and memory-aware
+admission.
 
 ## Current delivery status
 
@@ -39,19 +51,22 @@ That connection is the next major systems milestone.
 | Core request model | Working | IDs, timestamps, multimodal inputs, generation controls, validation |
 | Model selection | Working | Catalog, model definitions, architecture registry, factories |
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
+| Runtime executor | Baseline working | Executable models, prefill/decode stepping, events, results, failure/cancellation cleanup |
+| Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
 | Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank latency summaries |
-| Burn integration | Working | Backend-neutral adapter plus CPU `NdArray<f32>` execution |
+| Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
 | Generation sessions | Working | Prefill, cached one-token decode, greedy selection, EOS/limit checks |
-| Contiguous KV cache | Working | Per-layer compact K/V tensors and exact element-byte accounting |
-| KV block manager | Metadata working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
+| Paged KV cache | Working foundation | Per-layer physical pages addressed through runtime block tables |
+| KV block manager | Working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
 | Serving | Foundation working | Transport-neutral request/service boundary |
 | Terminal UI | Working foundation | Overview, chat, benchmarks, experiments, background local adapter |
-| Local UI integrations | Working | Llama chat, generation probe, KV pressure benchmark, FIFO experiment |
-| GPU execution | Not implemented | Hardware is available, but OlaRT still uses the CPU backend |
-| Paged tensor storage | Not implemented | Block metadata exists; attention still reads contiguous tensors |
+| Local UI integrations | Working | Llama chat and generation run through the executor; KV and FIFO probes remain available |
+| GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
+| Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
+| Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
 | Continuous batching | Not implemented | Sessions execute independently, one request at a time |
 | Production server | Not implemented | No async executor, streaming HTTP, or OpenAI-compatible API yet |
 
@@ -89,6 +104,15 @@ That connection is the next major systems milestone.
   - freeing and reuse;
   - occupancy and internal-fragmentation metrics;
   - explicit capacity and configuration errors.
+- Synchronous single-request executor with:
+  - runtime metadata plus attached executable models;
+  - scheduler-driven session creation;
+  - one prefill or decode operation per observable step;
+  - token, completion, and failure events;
+  - retained token/text results and terminal metrics;
+  - automatic lifecycle transitions;
+  - live KV-byte propagation and cleanup on completion, failure, or cancellation;
+  - monotonic step-time validation.
 
 ### `ola-burn`
 
@@ -103,13 +127,27 @@ That connection is the next major systems milestone.
   - split-half Llama rotary embeddings;
   - SwiGLU feed-forward layers;
   - final RMSNorm and vocabulary projection.
-- Request-local contiguous KV cache:
+- Shared, configurable KV page pool:
+  - fixed-size physical per-layer K/V pages;
+  - logical-to-physical mapping supplied by `ola-runtime::KvBlockManager`;
   - compact, unexpanded KV-head storage;
-  - prompt population during prefill;
-  - absolute RoPE position offsets during decode;
-  - one-token decode without full-sequence recomputation;
-  - exact cache-element byte reporting.
+  - atomic capacity failure before cache mutation;
+  - deterministic release and physical-block reuse;
+  - page-aware reserved-byte reporting, including internal fragmentation;
+  - prompt writes spanning page boundaries;
+  - absolute RoPE position offsets during one-token decode.
+- Page-native single-token attention:
+  - consumes logical pages in block-table order;
+  - never concatenates K/V pages into a sequence-sized tensor;
+  - combines per-page scores with a numerically stable online softmax;
+  - preserves grouped-query head semantics;
+  - matches full-sequence logits across multiple page sizes.
 - Original full-sequence forward path retained as a numerical oracle.
+- Feature-gated accelerator selection:
+  - portable WGPU execution through the platform graphics stack;
+  - native CUDA compilation through Burn/CubeCL;
+  - backend-generic token selection across differing integer element types;
+  - CPU/WGPU fixture-logit comparison with an explicit tolerance.
 
 ### `ola-bench`
 
@@ -132,7 +170,8 @@ That connection is the next major systems milestone.
 - Typed snapshot/command adapter contract.
 - Background local worker so model work does not block terminal input.
 - Optional local Llama loading using `--model` or `OLA_MODEL_DIR`.
-- Real cached chat generation.
+- Explicit CPU/WGPU/CUDA selection using `--backend` or `OLA_BACKEND`.
+- Real cached chat generation through the runtime executor.
 - Llama generation latency/throughput probe.
 - Real KV block-pressure benchmark.
 - Real fixed-workload FIFO experiment.
@@ -141,12 +180,26 @@ That connection is the next major systems milestone.
 
 ## Correctness and verification evidence
 
-At the source revision recorded above:
+At the working tree recorded above:
 
-- `cargo test --workspace`: **39 passed**, **2 ignored external-fixture tests**.
+- `cargo test --workspace`: **47 passed**, **2 ignored external-fixture tests**.
+- `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
+  **2 passed** against the pinned artifact.
 - Pinned Llama scalar-oracle conformance test: **passed manually**.
 - Pinned UI-to-Llama background integration test: **passed manually**.
+- WGPU UI-to-executor generation integration test: **passed manually**.
+- WGPU fixture logits versus CPU fixture logits: **passed manually** with a
+  `2e-4` absolute tolerance over the selected sample.
+- CPU and WGPU generation selected the same fixture tokens: **passed
+  manually** (`[1789, 19053]` after prompt tokens `[1, 15043]`).
+- The WGPU example completed on the development NVIDIA GeForce GTX 1650.
+- Native CUDA feature compilation: **passed**; native execution correctly
+  reports the missing local CUDA toolkit/NVRTC prerequisite.
 - Cached decode logits match full-sequence logits at every tested step.
+- Paged cache tests cover cross-page reconstruction, non-contiguous mappings,
+  atomic capacity failure, release, and physical-block reuse.
+- Executor tests cover prefill/decode progression, retained output, live memory
+  accounting, execution failure, cancellation, and regressive timestamps.
 - KV allocator tests cover deterministic mapping, atomic out-of-capacity
   failure, freeing/reuse, invalid configuration, and fragmentation metrics.
 - Ratatui screens render through `TestBackend`, including the small-terminal
@@ -172,25 +225,38 @@ cargo test --workspace
 cargo run -p ola-burn --example run_llama -- \
   /path/to/llama-artifact "Hello" 8
 
+# Run the same path on a WGPU-compatible GPU
+cargo run -p ola-burn --features wgpu --example run_llama -- \
+  --backend wgpu /path/to/llama-artifact "Hello" 8
+
 # Open the UI with runtime/KV/FIFO probes
 cargo run -p ola-ui
 
 # Open the UI with local Llama chat
 cargo run -p ola-ui -- --model /path/to/llama-artifact
+
+# Open the UI with WGPU-backed local Llama chat
+cargo run -p ola-ui --features wgpu -- \
+  --backend wgpu --model /path/to/llama-artifact
 ```
 
 ## Known limitations
 
-- The executable Llama path uses CPU `NdArray<f32>`; CUDA is not wired in.
-- The cache grows with `Tensor::cat`, so each append copies prior contiguous
-  cache contents.
-- Runtime block tables do not yet address physical Burn tensor pages.
+- Page-native attention is a correctness-first composition of portable Burn
+  operations, not a fused CUDA/WGPU kernel; performance must be measured before
+  making speed claims.
+- Native CUDA is wired and compiles, but this machine cannot execute it until a
+  compatible CUDA toolkit providing NVRTC is installed. WGPU is the currently
+  validated local GPU path.
+- Physical page tensors are materialized lazily and retained at the pool's
+  high-water mark for deterministic reuse.
 - There is no cache eviction, preemption, swapping, prefix reuse, or
   quantization.
 - Generation is batch size one and greedy only.
-- There is no runtime executor coordinating queued requests with model sessions.
-- Runtime memory accounting is not yet updated automatically from live model
-  allocations.
+- The synchronous executor runs one active request at a time; it does not yet
+  continuously batch or interleave multiple sessions.
+- Executor results are retained in memory and there is no result eviction or
+  persistence policy yet.
 - Checkpoint loading accepts one SafeTensors file only.
 - RoPE scaling, tied embeddings, projection biases, and non-SiLU Llama variants
   are rejected.
@@ -199,29 +265,25 @@ cargo run -p ola-ui -- --model /path/to/llama-artifact
 
 ## Recommended next milestones
 
-1. **Physical paged KV storage**
-   - define the backend-facing page storage contract;
-   - allocate per-layer K/V pages using runtime block tables;
-   - remove contiguous `Tensor::cat` growth;
-   - compare every cached logit with the existing oracle.
-
-2. **Runtime executor loop**
-   - associate admitted requests with loaded model sessions;
-   - drive prefill and decode from scheduler decisions;
-   - propagate live KV occupancy into `RuntimeState::memory`;
-   - expose live request progress to `ola-ui`.
-
-3. **GPU execution path**
-   - add a deliberate Burn accelerator feature/backend;
-   - validate numerical conformance before benchmarking;
-   - record device, dtype, context, warm-up, and compilation conditions.
-
-4. **Multi-request execution**
-   - add continuous/iteration-level batching;
+1. **Multi-request execution**
+   - allow several live generation sessions to advance at token boundaries;
+   - define explicit iteration plans before adding tensor batching;
    - introduce memory-aware admission and scheduling baselines;
    - measure TTFT, inter-token latency, throughput, and fragmentation.
 
-5. **Serving and experiment infrastructure**
+2. **Continuous tensor batching**
+   - batch compatible prefill and decode work on the selected backend;
+   - keep per-request block tables, lifecycle, cancellation, and outputs
+     isolated;
+   - compare throughput and latency against the single-request oracle.
+
+3. **Paged-attention optimization**
+   - benchmark page size and fragmentation tradeoffs;
+   - fuse page traversal, score reduction, and value accumulation where the
+     selected accelerator backend permits;
+   - retain per-step numerical comparison with the full-sequence oracle.
+
+4. **Serving and experiment infrastructure**
    - add streaming output and an HTTP boundary;
    - persist structured benchmark configurations and results;
    - make UI benchmark and experiment catalogs data-driven.
@@ -239,6 +301,20 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
+- **2026-10-11 19:46 BST — GPU milestone in this revision:** Added opt-in WGPU
+  and CUDA backends to the example and terminal workbench, validated WGPU
+  fixture generation and CPU-logit agreement on the GTX 1650, and documented
+  the native CUDA toolkit requirement.
+- **2026-10-07 22:00 BST — working tree on `29a0043`:** Replaced contiguous
+  decode-time K/V gathering with direct page traversal and a stable online
+  softmax; verified cached logits across 1-, 2-, 4-, and 16-token pages.
+- **2026-10-07 21:35 BST — working tree on `29a0043`:** Added the synchronous
+  executor, executable-model attachment, incremental events and results, live
+  KV accounting, cleanup semantics, and routed local UI Llama generation
+  through the new execution path.
+- **2026-10-07 15:35 BST — working tree on `29a0043`:** Connected the runtime
+  block allocator to configurable, shared Burn K/V page storage; added
+  cross-page, reuse, capacity, accounting, and cached-logit correctness tests.
 - **2026-10-07 09:55 BST — `29a0043`:** Created the dedicated report after
   merging cached Llama decoding, the KV block manager, pinned conformance work,
   and the Ratatui workbench with local integrations.

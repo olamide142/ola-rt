@@ -48,6 +48,18 @@ cargo run -p ola-ui -- --model /path/to/llama-artifact
 `OLA_MODEL_DIR` may provide the path instead. Model loading and launched work
 stay off the terminal thread; the UI refreshes their state once per second.
 
+CPU is the default compute backend. To run model chat and its generation
+benchmark through WGPU:
+
+```text
+cargo run -p ola-ui --features wgpu -- \
+  --backend wgpu --model /path/to/llama-artifact
+```
+
+The equivalent environment selection is `OLA_BACKEND=wgpu`. `cuda` is also a
+supported feature/backend pair, but native CUDA execution requires a local CUDA
+toolkit/NVRTC installation in addition to the NVIDIA driver.
+
 Navigation uses `1`–`4` or `Tab`, arrow keys select table entries, `Enter`
 opens or runs the selected item, `r` refreshes, and `q` exits. On the Chat
 screen, `Enter` or `i` starts editing; `Enter` submits and `Esc` cancels editing.

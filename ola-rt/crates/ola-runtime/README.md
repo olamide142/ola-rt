@@ -14,9 +14,9 @@ request. This is a deliberate research boundary: schedulers can be compared or
 replaced without allowing experimental code to mutate runtime bookkeeping.
 
 The current scheduler is FIFO. The trait is already sufficient for priority,
-deadline, estimated-size, and memory-aware baselines. Batching and execution
-policy will be introduced only after a model executor makes their decision
-requirements measurable.
+deadline, estimated-size, and memory-aware baselines. Batching and richer
+execution policy will be introduced after the baseline executor makes their
+decision requirements measurable.
 
 Lifecycle timestamps are supplied by callers. That allows the same runtime to
 operate with real monotonic time, simulation time, or recorded trace time.
@@ -42,6 +42,28 @@ The manager owns metadata only. It does not allocate Burn tensors, move device
 memory, evict sequences, or yet update `RuntimeState::memory` automatically.
 Keeping those concerns separate lets CPU, CUDA, and simulated storage use the
 same allocation and scheduling experiments.
+
+## Synchronous executor
+
+`Executor` connects lifecycle scheduling to executable `ola-model` artifacts.
+It intentionally performs at most one model operation per `step`: either a
+queued request's prefill or one active request's decode. Each step emits a typed
+token, failure, or idle event, making execution traces deterministic without
+hiding model work inside an asynchronous loop.
+
+The baseline executor:
+
+- attaches executable models to registered runtime metadata;
+- accepts one text or token input per request;
+- owns one active `GenerationSession` at a time;
+- records first-token and completion lifecycle transitions;
+- propagates active session KV bytes into `RuntimeState::memory`;
+- drops session/cache state on completion, failure, and cancellation;
+- retains final token IDs, decoded text, and session metrics;
+- rejects regressive step timestamps without losing active state.
+
+The executor is synchronous by design. Continuous batching, multiple active
+sessions, result eviction, and streaming transports remain later layers.
 
 ## Minimal lifecycle
 

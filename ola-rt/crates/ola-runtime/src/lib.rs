@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod error;
+mod executor;
 mod kv_cache;
 mod model_registry;
 mod runtime;
@@ -8,6 +9,7 @@ mod scheduler;
 mod state;
 
 pub use error::RuntimeError;
+pub use executor::{ExecutionResult, Executor, ExecutorError, ExecutorEvent};
 pub use kv_cache::{
     KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId,
 };
