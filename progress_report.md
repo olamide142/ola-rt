@@ -1,11 +1,12 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-11 20:01 BST (Europe/London)
+**Last updated:** 2026-10-12 13:03 BST (Europe/London)
 
-**Source revision:** working tree based on GPU milestone `27841d9` on `master`
+**Source revision:** working tree based on multi-request milestone `5827879` on
+`master`
 
-**Repository state at update:** GPU milestone merged and pushed; multi-request
-iteration execution implemented locally and awaiting its full verification pass
+**Repository state at update:** multi-request milestone merged and pushed;
+memory-aware admission implemented and verified locally; not yet committed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -38,12 +39,18 @@ development GTX 1650. CPU and WGPU select identical fixture tokens, and sampled
 logits agree within the accelerator tolerance. Native CUDA support compiles,
 but local execution is blocked by the missing CUDA toolkit/NVRTC installation.
 
-The multi-request control-plane milestone is now underway. A configurable
+The multi-request control-plane milestone is merged. A configurable
 executor can keep several sessions live, advance each existing session once at
 an iteration boundary, refill released slots, isolate cancellation and results,
 and aggregate their KV usage. It deliberately executes each model operation
 individually so the next tensor-batching implementation has a deterministic
 correctness oracle.
+
+The current working tree adds the next policy layer: Llama publishes its real
+physical KV geometry, and a strict admission baseline makes page-rounded
+worst-case reservations before session creation. Temporary model-pool or device
+pressure defers work without changing lifecycle state; impossible requests are
+rejected terminally instead of blocking FIFO indefinitely.
 
 ## Current delivery status
 
@@ -56,6 +63,7 @@ correctness oracle.
 | Runtime executor | Multi-request baseline working | Configurable live sessions, single-operation steps, iteration steps, stable interleaving, results, failure/cancellation cleanup |
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
+| Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
 | Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank latency summaries |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
@@ -89,6 +97,7 @@ correctness oracle.
 - Generic architecture registry and factory selection.
 - Shared tokenizer and model weights with isolated request sessions.
 - Backend-neutral `prefill`, `decode`, and session-metrics contracts.
+- Backend-neutral physical KV resource profiles for pre-session planning.
 - Explicit distinction between catalog availability and runtime residency.
 
 ### `ola-runtime`
@@ -117,6 +126,10 @@ correctness oracle.
   - retained token/text results and terminal metrics;
   - automatic lifecycle transitions;
   - aggregate live KV-byte propagation and per-request cleanup;
+  - conservative live KV reservations distinct from observed usage;
+  - replaceable admission policy after scheduler selection;
+  - strict page-rounded model-pool and optional device-budget enforcement;
+  - typed temporary deferral and permanent rejection outcomes;
   - monotonic step-time validation.
 
 ### `ola-burn`
@@ -141,6 +154,8 @@ correctness oracle.
   - page-aware reserved-byte reporting, including internal fragmentation;
   - prompt writes spanning page boundaries;
   - absolute RoPE position offsets during one-token decode.
+  - backend-neutral publication of the exact physical pool geometry used by
+    runtime admission.
 - Page-native single-token attention:
   - consumes logical pages in block-table order;
   - never concatenates K/V pages into a sequence-sized tensor;
@@ -187,12 +202,16 @@ correctness oracle.
 
 At the working tree recorded above:
 
-- `cargo test --workspace`: **50 passed**, **2 ignored external-fixture tests**.
+- `cargo test --workspace`: **56 passed**, **2 ignored external-fixture tests**.
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
 - Pinned Llama scalar-oracle conformance test: **passed manually**.
 - Pinned UI-to-Llama background integration test: **passed manually**.
 - WGPU UI-to-executor generation integration test: **passed manually**.
+- Strict-admission CPU UI-to-executor generation integration test: **passed
+  manually** against the pinned fixture.
+- Strict-admission WGPU UI-to-executor generation integration test: **passed
+  manually** on the GTX 1650 against the pinned fixture.
 - WGPU fixture logits versus CPU fixture logits: **passed manually** with a
   `2e-4` absolute tolerance over the selected sample.
 - CPU and WGPU generation selected the same fixture tokens: **passed
@@ -261,8 +280,10 @@ cargo run -p ola-ui --features wgpu -- \
 - Generation is batch size one and greedy only.
 - The synchronous executor interleaves multiple sessions but invokes their
   model operations individually; it does not yet form tensor batches.
-- Admission is bounded by request count, not predicted KV demand, token budget,
-  or device capacity.
+- Admission reserves worst-case KV demand; it does not yet predict early EOS or
+  reclaim part of a reservation as a sequence approaches completion.
+- Device-wide admission is enforced only when a caller supplies a capacity and
+  non-KV accounting; automatic GPU-memory telemetry is not wired in yet.
 - Executor results are retained in memory and there is no result eviction or
   persistence policy yet.
 - Checkpoint loading accepts one SafeTensors file only.
@@ -273,9 +294,9 @@ cargo run -p ola-ui --features wgpu -- \
 
 ## Recommended next milestones
 
-1. **Admission and iteration policy**
-   - introduce memory-aware admission and token-budget baselines;
-   - separate batch-composition decisions from their execution mechanism;
+1. **Batch-composition policy**
+   - add an explicit per-iteration token budget;
+   - separate prefill/decode selection from the execution mechanism;
    - measure TTFT, inter-token latency, throughput, and fragmentation.
 
 2. **Continuous tensor batching**
@@ -308,10 +329,16 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
-- **2026-10-11 20:01 BST — working tree on `27841d9`:** Began the
-  multi-request phase with configurable live sessions, deterministic
-  iteration-level execution, slot refill, aggregate KV accounting, and
-  isolated cancellation/results.
+- **2026-10-12 13:03 BST — working tree on `5827879`:** Verified strict
+  admission through both CPU and GTX 1650 WGPU UI-to-executor generation paths;
+  the pinned external fixture hashes matched the conformance record.
+- **2026-10-11 21:31 BST — working tree on `5827879`:** Added physical KV
+  resource profiles and a replaceable strict admission baseline with
+  page-rounded reservations, model/device capacity checks, typed defer/reject
+  outcomes, and FIFO-safe lifecycle behavior.
+- **2026-10-11 20:01 BST — multi-request milestone `5827879`:** Added
+  configurable live sessions, deterministic iteration-level execution, slot
+  refill, aggregate KV accounting, and isolated cancellation/results.
 - **2026-10-11 19:46 BST — GPU milestone `27841d9`:** Added opt-in WGPU
   and CUDA backends to the example and terminal workbench, validated WGPU
   fixture generation and CPU-logit agreement on the GTX 1650, and documented

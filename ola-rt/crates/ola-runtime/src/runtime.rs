@@ -103,10 +103,42 @@ impl<S: Scheduler> Runtime<S> {
         &mut self,
         started_at: Timestamp,
     ) -> Result<Option<InferenceSession>, RuntimeError> {
+        let Some(id) = self.select_next()? else {
+            return Ok(None);
+        };
+
+        self.start_selected(id, started_at).map(Some)
+    }
+
+    /// Asks the scheduler for the next queued request without transitioning it.
+    ///
+    /// This two-stage form lets an executor apply admission policy to the
+    /// scheduler's candidate while leaving deferred work queued.
+    pub fn select_next(&mut self) -> Result<Option<RequestId>, RuntimeError> {
         let Some(id) = self.scheduler.select(&self.state) else {
             return Ok(None);
         };
 
+        if !self.state.queue.contains(&id) {
+            return Err(RuntimeError::InvalidSchedule(id));
+        }
+        let record = self
+            .state
+            .requests
+            .get(&id)
+            .ok_or(RuntimeError::InvalidSchedule(id))?;
+        if record.status != RequestStatus::Queued {
+            return Err(RuntimeError::InvalidSchedule(id));
+        }
+        Ok(Some(id))
+    }
+
+    /// Starts a scheduler-selected queued request after external admission.
+    pub fn start_selected(
+        &mut self,
+        id: RequestId,
+        started_at: Timestamp,
+    ) -> Result<InferenceSession, RuntimeError> {
         let Some(position) = self.state.queue.iter().position(|queued| *queued == id) else {
             return Err(RuntimeError::InvalidSchedule(id));
         };
@@ -126,11 +158,41 @@ impl<S: Scheduler> Runtime<S> {
         self.state.queue.remove(position);
         self.state.active.insert(id);
 
-        Ok(Some(InferenceSession {
+        Ok(InferenceSession {
             request_id: id,
             model_id,
             started_at,
-        }))
+        })
+    }
+
+    /// Terminates a queued request that cannot satisfy admission constraints.
+    pub fn reject(
+        &mut self,
+        request_id: RequestId,
+        message: impl Into<String>,
+        rejected_at: Timestamp,
+    ) -> Result<(), RuntimeError> {
+        let record = self
+            .state
+            .requests
+            .get_mut(&request_id)
+            .ok_or(RuntimeError::UnknownRequest(request_id))?;
+        if record.status != RequestStatus::Queued {
+            return Err(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "reject",
+            });
+        }
+        ensure_not_before(
+            request_id,
+            "admission rejection",
+            record.timing.queued_at,
+            rejected_at,
+        )?;
+        self.state.queue.retain(|queued| *queued != request_id);
+        record.status = RequestStatus::Failed(message.into());
+        record.timing.completed_at = Some(rejected_at);
+        Ok(())
     }
 
     /// Records the first externally observable generated token.

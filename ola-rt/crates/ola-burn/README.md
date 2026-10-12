@@ -87,6 +87,11 @@ Capacity is shared by the live sessions for one loaded model. Physical tensors
 are materialized lazily and retained at the pool's high-water mark so released
 block IDs can be reused without changing their physical identity.
 
+Loaded Llama artifacts publish the same bytes-per-token, page size, and total
+pool capacity as a backend-neutral `KvCacheProfile`. The runtime's strict
+admission policy therefore reserves against the physical Burn pool before
+creating a session rather than discovering overcommit during prefill.
+
 ## Running a local artifact
 
 From the implementation workspace:

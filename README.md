@@ -911,8 +911,8 @@ vertical slice — October 2026.
 
 Current engineering focus:
 
-- extend the synchronous executor into continuous multi-request batching;
-- add memory-aware admission and iteration-level scheduling baselines;
+- define explicit per-iteration batch-composition and token-budget policy;
+- turn deterministic multi-session iterations into tensor-level batches;
 - optimize page-native attention with accelerator-specific fusion.
 
 ---

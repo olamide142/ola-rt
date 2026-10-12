@@ -9,7 +9,10 @@ use ola_model::{
     CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, SessionMetrics,
 };
 
-use crate::{FifoScheduler, Runtime, RuntimeError, RuntimeState, Scheduler};
+use crate::{
+    AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, FifoScheduler, Runtime,
+    RuntimeError, RuntimeState, Scheduler, UnconstrainedAdmission,
+};
 
 /// Final output retained after successful execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +63,20 @@ pub enum ExecutorEvent {
         /// Stable human-readable diagnostic retained in runtime state.
         message: String,
     },
+    /// Admission policy left a scheduler-selected request queued.
+    Deferred {
+        /// Request that remains at the scheduler boundary.
+        request_id: RequestId,
+        /// Typed resource constraint that prevented admission.
+        reason: AdmissionReason,
+    },
+    /// Admission policy terminated a request that can never fit.
+    Rejected {
+        /// Request moved directly from queued to failed.
+        request_id: RequestId,
+        /// Typed permanent resource constraint.
+        reason: AdmissionReason,
+    },
 }
 
 /// Observable result of one iteration-level scheduling boundary.
@@ -75,6 +92,8 @@ pub struct ExecutorIteration {
     pub queued_requests: usize,
     /// Physical KV bytes attributed to all live sessions.
     pub kv_cache_bytes: u64,
+    /// Worst-case KV bytes committed to all live requests.
+    pub reserved_kv_bytes: u64,
 }
 
 impl ExecutorIteration {
@@ -140,12 +159,14 @@ impl From<RuntimeError> for ExecutorError {
 
 struct ActiveGeneration {
     request_id: RequestId,
+    model_id: ModelId,
     model: CausalLanguageModel,
     session: Box<dyn GenerationSession>,
     generated: Vec<u32>,
     last_token: GeneratedToken,
     max_new_tokens: usize,
     last_step_at: Timestamp,
+    reserved_kv_bytes: u64,
 }
 
 /// Deterministic synchronous model executor.
@@ -162,6 +183,7 @@ pub struct Executor<S = FifoScheduler> {
     active: BTreeMap<RequestId, ActiveGeneration>,
     ready: VecDeque<RequestId>,
     max_active_requests: usize,
+    admission: Box<dyn AdmissionPolicy>,
     results: BTreeMap<RequestId, ExecutionResult>,
 }
 
@@ -180,6 +202,7 @@ impl<S: Scheduler> Executor<S> {
             active: BTreeMap::new(),
             ready: VecDeque::new(),
             max_active_requests: 1,
+            admission: Box::new(UnconstrainedAdmission),
             results: BTreeMap::new(),
         }
     }
@@ -195,6 +218,15 @@ impl<S: Scheduler> Executor<S> {
         let mut executor = Self::new(runtime);
         executor.max_active_requests = max_active_requests;
         Ok(executor)
+    }
+
+    /// Replaces the compatibility admission rule with an explicit policy.
+    pub fn with_admission_policy<P>(mut self, policy: P) -> Self
+    where
+        P: AdmissionPolicy + 'static,
+    {
+        self.admission = Box::new(policy);
+        self
     }
 
     /// Registers runtime metadata and its corresponding executable atomically.
@@ -279,7 +311,12 @@ impl<S: Scheduler> Executor<S> {
         let available_slots = self.max_active_requests.saturating_sub(self.active.len());
         let admission_count = available_slots.min(self.runtime.state().queued_len());
         for _ in 0..admission_count {
-            events.push(self.start_next(at)?);
+            let event = self.start_next(at)?;
+            let deferred = matches!(event, ExecutorEvent::Deferred { .. });
+            events.push(event);
+            if deferred {
+                break;
+            }
         }
         if events.is_empty() {
             events.push(ExecutorEvent::Idle);
@@ -291,6 +328,7 @@ impl<S: Scheduler> Executor<S> {
             active_requests: self.active.len(),
             queued_requests: self.runtime.state().queued_len(),
             kv_cache_bytes: self.runtime.state().memory.kv_cache_bytes,
+            reserved_kv_bytes: self.reserved_kv_bytes(),
         })
     }
 
@@ -319,34 +357,68 @@ impl<S: Scheduler> Executor<S> {
         self.max_active_requests
     }
 
+    /// Returns worst-case page-rounded KV bytes committed to live requests.
+    pub fn reserved_kv_bytes(&self) -> u64 {
+        self.active
+            .values()
+            .map(|active| active.reserved_kv_bytes)
+            .sum()
+    }
+
     /// Borrows the underlying runtime for read-only inspection.
     pub const fn runtime(&self) -> &Runtime<S> {
         &self.runtime
     }
 
     fn start_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
-        let Some(lease) = self.runtime.schedule_next(at)? else {
+        let Some(request_id) = self.runtime.select_next()? else {
             return Ok(ExecutorEvent::Idle);
         };
         let request = self
             .runtime
             .state()
-            .request(lease.request_id)
-            .expect("a scheduled request retains its runtime record")
+            .request(request_id)
+            .expect("a selected request retains its runtime record")
             .request
             .clone();
-        let Some(model) = self.models.get(&lease.model_id).cloned() else {
+        let model_id = request.spec.model.clone();
+        let Some(model) = self.models.get(&model_id).cloned() else {
+            self.runtime.start_selected(request_id, at)?;
             return self.fail_started(
-                lease.request_id,
-                format!("model `{}` has no executable attached", lease.model_id),
+                request_id,
+                format!("model `{model_id}` has no executable attached"),
                 at,
             );
         };
 
         let prompt_tokens = match prepare_prompt(&model, &request) {
             Ok(tokens) => tokens,
-            Err(error) => return self.fail_started(lease.request_id, error.to_string(), at),
+            Err(error) => {
+                self.runtime.start_selected(request_id, at)?;
+                return self.fail_started(request_id, error.to_string(), at);
+            }
         };
+        let context = AdmissionContext {
+            request_id,
+            model_id: model_id.clone(),
+            prompt_tokens: prompt_tokens.len(),
+            max_new_tokens: request.spec.generation.max_new_tokens,
+            kv_cache: model.kv_cache_profile(),
+            memory: self.runtime.state().memory,
+            reserved_kv_bytes: self.reserved_kv_bytes(),
+            model_reserved_kv_bytes: self.reserved_kv_bytes_for_model(&model_id),
+        };
+        let reserved_kv_bytes = match self.admission.decide(&context) {
+            AdmissionDecision::Admit { reserved_kv_bytes } => reserved_kv_bytes,
+            AdmissionDecision::Defer(reason) => {
+                return Ok(ExecutorEvent::Deferred { request_id, reason });
+            }
+            AdmissionDecision::Reject(reason) => {
+                self.runtime.reject(request_id, reason.to_string(), at)?;
+                return Ok(ExecutorEvent::Rejected { request_id, reason });
+            }
+        };
+        let lease = self.runtime.start_selected(request_id, at)?;
         let mut session = match model.create_session(request.spec.generation.clone()) {
             Ok(session) => session,
             Err(error) => return self.fail_started(lease.request_id, error.to_string(), at),
@@ -358,12 +430,14 @@ impl<S: Scheduler> Executor<S> {
         self.runtime.mark_first_token(lease.request_id, at)?;
         let active = ActiveGeneration {
             request_id: lease.request_id,
+            model_id,
             model,
             session,
             generated: vec![token.id],
             last_token: token,
             max_new_tokens: request.spec.generation.max_new_tokens,
             last_step_at: at,
+            reserved_kv_bytes,
         };
         self.observe_token(active, ExecutionPhase::Prefill, at)
     }
@@ -402,11 +476,12 @@ impl<S: Scheduler> Executor<S> {
 
     fn observe_token(
         &mut self,
-        active: ActiveGeneration,
+        mut active: ActiveGeneration,
         phase: ExecutionPhase,
         at: Timestamp,
     ) -> Result<ExecutorEvent, ExecutorError> {
         let metrics = active.session.metrics();
+        active.reserved_kv_bytes = active.reserved_kv_bytes.max(metrics.kv_cache_bytes);
         let finished =
             active.last_token.is_end_of_sequence || active.generated.len() >= active.max_new_tokens;
         let event = ExecutorEvent::Token {
@@ -478,6 +553,14 @@ impl<S: Scheduler> Executor<S> {
         }
         Ok(())
     }
+
+    fn reserved_kv_bytes_for_model(&self, model_id: &ModelId) -> u64 {
+        self.active
+            .values()
+            .filter(|active| &active.model_id == model_id)
+            .map(|active| active.reserved_kv_bytes)
+            .sum()
+    }
 }
 
 fn prepare_prompt(
@@ -506,7 +589,8 @@ fn prepare_prompt(
 mod tests {
     use ola_core::GenerationConfig;
     use ola_model::{
-        CausalModel, ExecutionStage, GeneratedToken, GenerationSession, SessionMetrics, Tokenizer,
+        CausalModel, ExecutionStage, GeneratedToken, GenerationSession, KvCacheProfile,
+        SessionMetrics, Tokenizer,
     };
 
     use super::*;
@@ -600,6 +684,11 @@ mod tests {
 
     fn artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IncrementModel)
+    }
+
+    fn profiled_artifact(capacity_bytes: u64) -> CausalLanguageModel {
+        let profile = KvCacheProfile::new(8, 4, capacity_bytes).unwrap();
+        artifact().with_kv_cache_profile(profile)
     }
 
     fn request(prompt: &str, max_new_tokens: usize) -> RequestSpec {
@@ -860,6 +949,126 @@ mod tests {
         assert!(matches!(
             result,
             Err(ExecutorError::InvalidActiveRequestLimit(0))
+        ));
+    }
+
+    #[test]
+    fn memory_aware_admission_defers_until_a_model_pool_reservation_is_released() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_admission_policy(crate::MemoryAwareAdmission);
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                profiled_artifact(32),
+            )
+            .unwrap();
+        let first = executor.submit(request("1", 4), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 4), Timestamp::ZERO).unwrap();
+
+        let initial = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        assert!(matches!(
+            initial.events.as_slice(),
+            [
+                ExecutorEvent::Token {
+                    request_id,
+                    phase: ExecutionPhase::Prefill,
+                    ..
+                },
+                ExecutorEvent::Deferred {
+                    request_id: deferred,
+                    reason: AdmissionReason::ModelKvCapacity {
+                        required_bytes: 32,
+                        available_bytes: 0,
+                    },
+                }
+            ] if *request_id == first && *deferred == second
+        ));
+        assert_eq!(initial.active_requests, 1);
+        assert_eq!(initial.queued_requests, 1);
+        assert_eq!(initial.kv_cache_bytes, 8);
+        assert_eq!(initial.reserved_kv_bytes, 32);
+        assert_eq!(
+            executor.state().request(second).unwrap().status,
+            RequestStatus::Queued
+        );
+
+        executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        executor.step_iteration(Timestamp::from_micros(30)).unwrap();
+        let refilled = executor.step_iteration(Timestamp::from_micros(40)).unwrap();
+
+        assert!(matches!(
+            refilled.events.as_slice(),
+            [
+                ExecutorEvent::Token {
+                    request_id,
+                    phase: ExecutionPhase::Decode,
+                    finished: true,
+                    ..
+                },
+                ExecutorEvent::Token {
+                    request_id: admitted,
+                    phase: ExecutionPhase::Prefill,
+                    ..
+                }
+            ] if *request_id == first && *admitted == second
+        ));
+        assert_eq!(refilled.active_requests, 1);
+        assert_eq!(refilled.queued_requests, 0);
+        assert_eq!(refilled.reserved_kv_bytes, 32);
+    }
+
+    #[test]
+    fn memory_aware_admission_can_enforce_a_device_wide_budget() {
+        let mut runtime = Runtime::default();
+        runtime.state_mut().memory.capacity_bytes = 80;
+        runtime.state_mut().memory.weights_bytes = 32;
+        let mut executor = Executor::with_max_active_requests(runtime, 2)
+            .unwrap()
+            .with_admission_policy(crate::MemoryAwareAdmission);
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                profiled_artifact(128),
+            )
+            .unwrap();
+        executor.submit(request("1", 4), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 4), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert!(matches!(
+            iteration.events.last(),
+            Some(ExecutorEvent::Deferred {
+                request_id,
+                reason: AdmissionReason::DeviceMemoryCapacity {
+                    required_bytes: 32,
+                    available_bytes: 16,
+                },
+            }) if *request_id == second
+        ));
+    }
+
+    #[test]
+    fn strict_memory_policy_rejects_models_without_a_resource_profile() {
+        let mut executor = Executor::default().with_admission_policy(crate::MemoryAwareAdmission);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let request = executor.submit(request("1", 2), Timestamp::ZERO).unwrap();
+
+        let event = executor.step(Timestamp::from_micros(1)).unwrap();
+
+        assert_eq!(
+            event,
+            ExecutorEvent::Rejected {
+                request_id: request,
+                reason: AdmissionReason::MissingKvCacheProfile,
+            }
+        );
+        assert!(matches!(
+            &executor.state().request(request).unwrap().status,
+            RequestStatus::Failed(message) if message.contains("no KV-cache resource profile")
         ));
     }
 }

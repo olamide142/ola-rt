@@ -69,6 +69,12 @@ implementation-selected entropy.
 observability work: prompt tokens, generated tokens, and KV-cache bytes. It is a
 snapshot, not a promise about a particular cache layout.
 
+An architecture may also attach a `KvCacheProfile` to the loaded model. Unlike
+live metrics, this describes physical planning facts known before a session
+starts: bytes per token, token positions per page, and total shared pool
+capacity. The runtime uses that profile for conservative admission without
+depending on Burn tensors or Llama-specific configuration types.
+
 ## Availability versus residency
 
 Catalog membership means an artifact is configured and selectable. It does not

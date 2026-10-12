@@ -134,6 +134,8 @@ Implemented:
 - deterministic fixed-size KV block allocation and fragmentation metrics;
 - a synchronous multi-request executor with iteration-level stepping and
   aggregate live KV-memory accounting;
+- page-rounded, memory-aware admission against model KV pools and optional
+  device-wide budgets;
 - a transport-neutral generation service;
 - a Ratatui workbench with background local Llama generation, KV benchmarks,
   and FIFO runtime experiments;
@@ -154,7 +156,7 @@ Deliberately deferred:
 
 - tensors in the public runtime API;
 - fused accelerator attention, eviction, preemption, and prefix reuse;
-- tensor-level continuous batching and memory-aware admission;
+- tensor-level continuous batching and preemption;
 - probabilistic sampling;
 - sharded and remotely materialized checkpoints;
 - RoPE-scaled and tied-embedding Llama variants;

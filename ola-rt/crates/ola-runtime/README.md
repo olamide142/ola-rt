@@ -72,9 +72,25 @@ The baseline executor:
 - retains final token IDs, decoded text, and session metrics;
 - rejects regressive iteration timestamps before advancing any live session.
 
-The executor is synchronous by design. Tensor-level batching, memory-aware
-admission, preemption, result eviction, and streaming transports remain later
-layers.
+## Admission policy
+
+Admission is separate from queue selection. The scheduler first identifies a
+queued candidate; an `AdmissionPolicy` then receives its tokenized prompt
+length, generation limit, model KV profile, device accounting, and outstanding
+reservations. A deferred candidate remains queued without a lifecycle
+transition.
+
+`MemoryAwareAdmission` is the strict baseline. It reserves worst-case KV demand
+for `prompt_tokens + max_new_tokens - 1`, rounded to complete physical pages. It
+enforces both the model's shared KV-pool capacity and an optional device-wide
+budget in `MemoryState::capacity_bytes`. A zero device capacity means no
+device-wide budget has been configured; the real model-pool bound is still
+enforced. Temporary pressure produces a typed `Deferred` event. A request that
+cannot fit even without competition produces `Rejected` and moves directly
+from queued to failed, avoiding permanent FIFO head-of-line blocking.
+
+The executor is synchronous by design. Tensor-level batching, preemption,
+result eviction, and streaming transports remain later layers.
 
 ## Minimal lifecycle
 

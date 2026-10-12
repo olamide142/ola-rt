@@ -110,10 +110,13 @@ impl<B: Backend> LlamaFactory<B> {
         let cache_config = self
             .kv_cache
             .unwrap_or_else(|| LlamaKvCacheConfig::for_model(&config));
+        let cache_profile = cache_config
+            .profile::<B>(&config)
+            .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
         let model =
             BurnLlamaModel::with_kv_cache(module, config, self.device.clone(), cache_config)
                 .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
-        Ok(CausalLanguageModel::new(tokenizer, model))
+        Ok(CausalLanguageModel::new(tokenizer, model).with_kv_cache_profile(cache_profile))
     }
 
     /// Loads configuration and weights while leaving tokenization to the caller.

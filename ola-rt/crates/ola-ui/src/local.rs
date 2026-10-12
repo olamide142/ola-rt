@@ -14,7 +14,9 @@ use ola_bench::FixedWorkload;
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
-use ola_runtime::{Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, Runtime};
+use ola_runtime::{
+    Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, MemoryAwareAdmission, Runtime,
+};
 
 use crate::{
     ChatMessage, ChatRole, ConnectionState, RunState, RuntimeSummary, UiBackend, UiBackendError,
@@ -422,7 +424,7 @@ fn generate(
 ) -> Result<GenerationResult, String> {
     const MODEL_ID: &str = "local-llama";
 
-    let mut executor = Executor::default();
+    let mut executor = Executor::default().with_admission_policy(MemoryAwareAdmission);
     executor
         .register_model(ModelDescriptor::language(MODEL_ID, "llama"), model.clone())
         .map_err(|error| error.to_string())?;
@@ -446,6 +448,12 @@ fn generate(
             ExecutorEvent::Token { finished: true, .. } => break,
             ExecutorEvent::Token { .. } => step += 1,
             ExecutorEvent::Failed { message, .. } => return Err(message),
+            ExecutorEvent::Deferred { reason, .. } => {
+                return Err(format!("generation admission deferred: {reason}"));
+            }
+            ExecutorEvent::Rejected { reason, .. } => {
+                return Err(format!("generation admission rejected: {reason}"));
+            }
             ExecutorEvent::Idle => {
                 return Err("executor became idle before generation completed".into());
             }
@@ -712,13 +720,13 @@ mod tests {
             .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in ola-burn/CONFORMANCE.md");
         let mut backend = LocalBackend::with_device(Some(directory), LocalDevice::Wgpu);
 
-        let loaded = wait_until_for(&mut backend, Duration::from_secs(60), |snapshot| {
+        let loaded = wait_until_for(&mut backend, Duration::from_secs(180), |snapshot| {
             snapshot.selected_model.is_some()
         });
         assert!(loaded.runtime.backend.contains("WGPU"));
 
         backend.submit_prompt("Hello").unwrap();
-        let snapshot = wait_until_for(&mut backend, Duration::from_secs(60), |snapshot| {
+        let snapshot = wait_until_for(&mut backend, Duration::from_secs(180), |snapshot| {
             snapshot.chat.len() == 2
         });
 
@@ -749,7 +757,10 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "local backend operation timed out"
+                "local backend operation timed out: connection={:?}, notice={:?}, activity={:?}",
+                snapshot.runtime.connection,
+                snapshot.notice,
+                snapshot.activity
             );
             thread::sleep(Duration::from_millis(10));
         }

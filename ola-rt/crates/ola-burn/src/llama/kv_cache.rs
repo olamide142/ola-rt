@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use burn::tensor::{Tensor, backend::Backend};
+use ola_model::KvCacheProfile;
 use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
 
 use super::LlamaConfig;
@@ -39,6 +40,39 @@ impl LlamaKvCacheConfig {
     /// Returns the number of token positions in each physical block.
     pub const fn tokens_per_block(self) -> usize {
         self.tokens_per_block
+    }
+
+    pub(crate) fn profile<B: Backend>(
+        self,
+        model: &LlamaConfig,
+    ) -> Result<KvCacheProfile, KvBlockError> {
+        if self.capacity_tokens == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "capacity_tokens must be greater than zero",
+            ));
+        }
+        if self.tokens_per_block == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "tokens_per_block must be greater than zero",
+            ));
+        }
+        let element_bytes = std::mem::size_of::<B::FloatElem>() as u64;
+        let bytes_per_token = checked_product(&[
+            model.num_hidden_layers as u64,
+            2,
+            model.num_key_value_heads as u64,
+            model.attention_head_dim() as u64,
+            element_bytes,
+        ])?;
+        let total_blocks = self.capacity_tokens.div_ceil(self.tokens_per_block);
+        let capacity_bytes = checked_product(&[
+            total_blocks as u64,
+            self.tokens_per_block as u64,
+            bytes_per_token,
+        ])?;
+        KvCacheProfile::new(bytes_per_token, self.tokens_per_block, capacity_bytes).ok_or(
+            KvBlockError::InvalidConfiguration("KV-cache profile must be non-empty"),
+        )
     }
 }
 
@@ -137,33 +171,12 @@ impl<B: Backend> LlamaKvPool<B> {
         config: LlamaKvCacheConfig,
         device: B::Device,
     ) -> Result<Self, KvBlockError> {
-        if config.capacity_tokens == 0 {
-            return Err(KvBlockError::InvalidConfiguration(
-                "capacity_tokens must be greater than zero",
-            ));
-        }
-        if config.tokens_per_block == 0 {
-            return Err(KvBlockError::InvalidConfiguration(
-                "tokens_per_block must be greater than zero",
-            ));
-        }
-
-        let element_bytes = std::mem::size_of::<B::FloatElem>() as u64;
-        let bytes_per_token = checked_product(&[
-            model.num_hidden_layers as u64,
-            2,
-            model.num_key_value_heads as u64,
-            model.attention_head_dim() as u64,
-            element_bytes,
-        ])?;
-        let total_blocks = config.capacity_tokens.div_ceil(config.tokens_per_block);
-        let capacity_bytes = checked_product(&[
-            total_blocks as u64,
-            config.tokens_per_block as u64,
-            bytes_per_token,
-        ])?;
-        let manager =
-            KvBlockManager::new(capacity_bytes, config.tokens_per_block, bytes_per_token)?;
+        let profile = config.profile::<B>(model)?;
+        let manager = KvBlockManager::new(
+            profile.capacity_bytes(),
+            profile.tokens_per_block(),
+            profile.bytes_per_token(),
+        )?;
         let physical_blocks = manager.metrics().total_blocks;
         let layers = (0..model.num_hidden_layers)
             .map(|_| LlamaLayerPages {

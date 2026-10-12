@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod admission;
 mod error;
 mod executor;
 mod kv_cache;
@@ -8,6 +9,10 @@ mod runtime;
 mod scheduler;
 mod state;
 
+pub use admission::{
+    AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
+    UnconstrainedAdmission,
+};
 pub use error::RuntimeError;
 pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,

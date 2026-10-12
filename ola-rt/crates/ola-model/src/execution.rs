@@ -117,6 +117,55 @@ pub struct SessionMetrics {
     pub kv_cache_bytes: u64,
 }
 
+/// Physical layout and capacity of one model's shared paged KV pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCacheProfile {
+    bytes_per_token: u64,
+    tokens_per_block: usize,
+    capacity_bytes: u64,
+}
+
+impl KvCacheProfile {
+    /// Creates a valid non-empty paged-cache profile.
+    pub const fn new(
+        bytes_per_token: u64,
+        tokens_per_block: usize,
+        capacity_bytes: u64,
+    ) -> Option<Self> {
+        if bytes_per_token == 0 || tokens_per_block == 0 || capacity_bytes == 0 {
+            return None;
+        }
+        Some(Self {
+            bytes_per_token,
+            tokens_per_block,
+            capacity_bytes,
+        })
+    }
+
+    /// Returns bytes occupied by one token position before page rounding.
+    pub const fn bytes_per_token(self) -> u64 {
+        self.bytes_per_token
+    }
+
+    /// Returns token positions reserved together in one physical page.
+    pub const fn tokens_per_block(self) -> usize {
+        self.tokens_per_block
+    }
+
+    /// Returns total physical bytes shared by this model's live sessions.
+    pub const fn capacity_bytes(self) -> u64 {
+        self.capacity_bytes
+    }
+
+    /// Conservatively estimates page-rounded bytes for a token count.
+    pub fn estimate_bytes(self, tokens: usize) -> Option<u64> {
+        let blocks = tokens.div_ceil(self.tokens_per_block);
+        (blocks as u64)
+            .checked_mul(self.tokens_per_block as u64)?
+            .checked_mul(self.bytes_per_token)
+    }
+}
+
 /// Mutable, request-local causal-generation state.
 ///
 /// The required call order is exactly one `prefill`, followed by zero or more
@@ -148,6 +197,7 @@ pub trait GenerationSession: Send {
 pub struct CausalLanguageModel {
     tokenizer: Arc<dyn Tokenizer>,
     model: Arc<dyn CausalModel>,
+    kv_cache_profile: Option<KvCacheProfile>,
 }
 
 impl CausalLanguageModel {
@@ -160,12 +210,28 @@ impl CausalLanguageModel {
         Self {
             tokenizer: Arc::new(tokenizer),
             model: Arc::new(model),
+            kv_cache_profile: None,
         }
     }
 
     /// Combines already shared tokenizer and model implementations.
     pub const fn from_shared(tokenizer: Arc<dyn Tokenizer>, model: Arc<dyn CausalModel>) -> Self {
-        Self { tokenizer, model }
+        Self {
+            tokenizer,
+            model,
+            kv_cache_profile: None,
+        }
+    }
+
+    /// Attaches physical KV-pool metadata for admission planning.
+    pub const fn with_kv_cache_profile(mut self, profile: KvCacheProfile) -> Self {
+        self.kv_cache_profile = Some(profile);
+        self
+    }
+
+    /// Returns physical KV-pool metadata when the architecture supplied it.
+    pub const fn kv_cache_profile(&self) -> Option<KvCacheProfile> {
+        self.kv_cache_profile
     }
 
     /// Returns the artifact-compatible tokenizer.
@@ -193,6 +259,7 @@ impl fmt::Debug for CausalLanguageModel {
             .debug_struct("CausalLanguageModel")
             .field("tokenizer", &"dyn Tokenizer")
             .field("model", &"dyn CausalModel")
+            .field("kv_cache_profile", &self.kv_cache_profile)
             .finish()
     }
 }
