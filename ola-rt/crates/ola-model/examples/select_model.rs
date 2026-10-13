@@ -111,6 +111,10 @@ impl GenerationSession for IncrementSession {
     fn metrics(&self) -> SessionMetrics {
         self.metrics
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, sync::Arc};
+use std::{any::Any, error::Error, fmt, sync::Arc};
 
 use ola_core::GenerationConfig;
 
@@ -93,6 +93,38 @@ pub trait CausalModel: Send + Sync {
         &self,
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError>;
+
+    /// Attempts one tensor-batched prefill across compatible sessions.
+    ///
+    /// `prompt_tokens` contains one complete, non-empty prompt per session.
+    /// Prompts may have different lengths. Returning `None` declares that this
+    /// implementation has no batched path; the runtime then calls
+    /// [`GenerationSession::prefill`] independently. Returning `Some` must
+    /// produce exactly one result per input session in the same order.
+    /// Implementations must validate the complete batch before mutating any
+    /// request state whenever failure can be detected in advance.
+    fn prefill_batch(
+        &self,
+        _sessions: &mut [&mut dyn GenerationSession],
+        _prompt_tokens: &[&[u32]],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        None
+    }
+
+    /// Attempts one tensor-batched decode across compatible sessions.
+    ///
+    /// Returning `None` declares that this implementation has no batched path;
+    /// the runtime then calls [`GenerationSession::decode`] independently.
+    /// Returning `Some` must produce exactly one result per input session in
+    /// the same order. Implementations must validate the complete batch before
+    /// mutating session state whenever failure can be detected in advance.
+    fn decode_batch(
+        &self,
+        _sessions: &mut [&mut dyn GenerationSession],
+        _input_tokens: &[u32],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        None
+    }
 }
 
 /// One generated token and its terminal status.
@@ -187,6 +219,14 @@ pub trait GenerationSession: Send {
 
     /// Returns a cheap snapshot suitable for telemetry and policy state.
     fn metrics(&self) -> SessionMetrics;
+
+    /// Exposes concrete request state to its owning model's optional batched
+    /// execution implementation.
+    ///
+    /// Runtime code must treat the returned value as opaque. Downcasting is
+    /// reserved for the same architecture implementation that created the
+    /// session.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Executable causal-language artifact produced by an architecture factory.
@@ -250,6 +290,24 @@ impl CausalLanguageModel {
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
         self.model.create_session(generation)
+    }
+
+    /// Attempts a model-specific tensor-batched prefill.
+    pub fn prefill_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_tokens: &[&[u32]],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        self.model.prefill_batch(sessions, prompt_tokens)
+    }
+
+    /// Attempts a model-specific tensor-batched decode.
+    pub fn decode_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        input_tokens: &[u32],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        self.model.decode_batch(sessions, input_tokens)
     }
 }
 
@@ -358,6 +416,10 @@ mod tests {
 
         fn metrics(&self) -> SessionMetrics {
             self.metrics
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
         }
     }
 

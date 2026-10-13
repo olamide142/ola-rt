@@ -451,6 +451,13 @@ fn generate(
             ExecutorEvent::Deferred { reason, .. } => {
                 return Err(format!("generation admission deferred: {reason}"));
             }
+            ExecutorEvent::BatchDeferred {
+                phase, token_cost, ..
+            } => {
+                return Err(format!(
+                    "generation deferred by batch policy during {phase:?} (cost {token_cost} tokens)"
+                ));
+            }
             ExecutorEvent::Rejected { reason, .. } => {
                 return Err(format!("generation admission rejected: {reason}"));
             }

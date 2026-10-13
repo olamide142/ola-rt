@@ -53,10 +53,20 @@ continuous-batching control-plane boundary: it advances every request that was
 active at iteration entry once, then fills slots released by completions or
 failures. Each token event identifies whether prefill or decode produced it.
 
-The iteration path still invokes request sessions individually. That is
-intentional: its deterministic lifecycle, output, cancellation, and accounting
-semantics are the correctness oracle for a later backend operation that packs
-compatible requests into one tensor batch.
+The iteration path groups selected prefill and decode operations by loaded
+model. A model may implement `CausalModel::prefill_batch` and `decode_batch` to
+pack compatible groups into tensor invocations; models that return `None`
+retain the independent-session correctness path. Prefill batches may contain
+different prompt lengths. Lifecycle events are restored to deterministic
+request order even when backend invocation order groups models differently.
+
+`ExecutorIteration::execution_batches` records decode invocations and
+successful prefill invocations as `Tensor` or `Individual`, including request
+IDs in tensor-row order, meaningful input positions, and artificial padding
+positions. This prevents policy composition from being mistaken for actual
+tensor batching and makes padding overhead measurable in benchmarks. Session
+state, output tokens, KV accounting, failure, completion, and cancellation
+remain request-local on both paths.
 
 The baseline executor:
 
@@ -64,6 +74,8 @@ The baseline executor:
 - accepts one text or token input per request;
 - owns a configurable, positive number of active `GenerationSession` values;
 - advances live requests in stable round-robin order;
+- tensor-batches compatible prefill and decode through optional model hooks;
+- falls back to isolated execution for models without batch support;
 - admits queued work through the configured scheduler when slots are free;
 - records first-token and completion lifecycle transitions;
 - aggregates all live session KV bytes into `RuntimeState::memory`;
@@ -89,8 +101,55 @@ enforced. Temporary pressure produces a typed `Deferred` event. A request that
 cannot fit even without competition produces `Rejected` and moves directly
 from queued to failed, avoiding permanent FIFO head-of-line blocking.
 
-The executor is synchronous by design. Tensor-level batching, preemption,
-result eviction, and streaming transports remain later layers.
+## Batch composition and token budgets
+
+Batch composition is separate from both queue selection and memory admission.
+At each `step_iteration` boundary, the executor presents eligible operations as
+`BatchCandidate` values. A candidate identifies its request, prefill/decode
+phase, and input-token cost. Decode costs one token position; prefill costs the
+tokenized prompt length.
+
+The configured `BatchPolicy` chooses work without mutating lifecycle state.
+The executor validates that every returned request is an eligible, unique
+candidate before doing model work. `ExecutorIteration::plan` then records the
+selected and policy-deferred candidates in deterministic order, while
+`BatchDeferred` events explain individual deferrals to observers.
+
+`UnboundedBatchPolicy` is the compatibility default and preserves the earlier
+behavior of advancing every eligible operation. `FifoTokenBudgetPolicy` is the
+bounded baseline: it selects the FIFO prefix that fits a positive per-iteration
+input-token budget. If the head prefill is larger than the complete budget, it
+runs alone so a valid request cannot starve forever. The plan records its real
+cost even though that cost exceeds the nominal limit.
+
+Prefill tensor grouping has a separate `PrefillBatcher` boundary. The
+compatibility `UnbucketedPrefillBatcher` puts all same-model prompts together.
+`PowerOfTwoPrefillBatcher` groups lengths by their next power of two, bounding
+padding within a group while retaining batches for nearby prompt lengths.
+Grouping may change backend invocation order, but lifecycle events are restored
+to scheduler order.
+
+```rust,no_run
+use ola_runtime::{
+    Executor, FifoTokenBudgetPolicy, PowerOfTwoPrefillBatcher, Runtime,
+};
+
+let policy = FifoTokenBudgetPolicy::new(256).expect("the budget is positive");
+let executor = Executor::with_max_active_requests(Runtime::default(), 8)?
+    .with_batch_policy(policy)
+    .with_prefill_batcher(PowerOfTwoPrefillBatcher);
+
+# Ok::<(), ola_runtime::ExecutorError>(())
+```
+
+This policy controls iteration-level composition only. The compatibility
+`Executor::step` method still performs one directly selected operation.
+`step_iteration` may tensor-batch selected prefill and decode work when the
+attached model supports it; selection and execution mechanism remain
+separately observable.
+
+The executor is synchronous by design. Preemption, result eviction, and
+streaming transports remain later layers.
 
 ## Minimal lifecycle
 

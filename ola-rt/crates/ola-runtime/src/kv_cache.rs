@@ -229,6 +229,61 @@ impl KvBlockManager {
         Ok(())
     }
 
+    /// Atomically reserves token growth for several logical sequences.
+    ///
+    /// Every sequence is validated and total block demand is checked before
+    /// any block table or token count changes. Sequence IDs may appear only
+    /// once in a batch. This is the allocator boundary used by tensor-batched
+    /// decode so one capacity failure cannot advance only part of a batch.
+    pub fn append_batch(&mut self, requests: &[(KvSequenceId, usize)]) -> Result<(), KvBlockError> {
+        let mut seen = BTreeSet::new();
+        let mut total_additional_blocks = 0_usize;
+        let mut plans = Vec::with_capacity(requests.len());
+        for &(sequence, additional_tokens) in requests {
+            if !seen.insert(sequence) {
+                return Err(KvBlockError::DuplicateSequence(sequence));
+            }
+            let allocation = self
+                .sequences
+                .get(&sequence)
+                .ok_or(KvBlockError::UnknownSequence(sequence))?;
+            let new_token_count = allocation
+                .cached_tokens
+                .checked_add(additional_tokens)
+                .ok_or(KvBlockError::TokenCountOverflow(sequence))?;
+            let required_blocks = blocks_for_tokens(new_token_count, self.tokens_per_block);
+            let additional_blocks = required_blocks - allocation.blocks.len();
+            total_additional_blocks = total_additional_blocks
+                .checked_add(additional_blocks)
+                .ok_or(KvBlockError::ConfigurationOverflow)?;
+            plans.push((sequence, new_token_count, additional_blocks));
+        }
+        if total_additional_blocks > self.free_blocks.len() {
+            return Err(KvBlockError::BatchInsufficientCapacity {
+                requested_blocks: total_additional_blocks,
+                available_blocks: self.free_blocks.len(),
+            });
+        }
+
+        for (sequence, new_token_count, additional_blocks) in plans {
+            let mut acquired = Vec::with_capacity(additional_blocks);
+            for _ in 0..additional_blocks {
+                acquired.push(
+                    self.free_blocks
+                        .pop_first()
+                        .expect("batch capacity was checked before block allocation"),
+                );
+            }
+            let allocation = self
+                .sequences
+                .get_mut(&sequence)
+                .expect("batch sequence existence was validated before mutation");
+            allocation.blocks.extend(acquired);
+            allocation.cached_tokens = new_token_count;
+        }
+        Ok(())
+    }
+
     /// Releases a sequence and returns all of its blocks to the free list.
     pub fn free(&mut self, sequence: KvSequenceId) -> Result<KvRelease, KvBlockError> {
         let allocation = self
@@ -326,6 +381,15 @@ pub enum KvBlockError {
         /// Blocks free at the time of the request.
         available_blocks: usize,
     },
+    /// One atomic batch referenced the same sequence more than once.
+    DuplicateSequence(KvSequenceId),
+    /// Combined batch growth exceeded immediately free physical blocks.
+    BatchInsufficientCapacity {
+        /// Total additional blocks needed by the batch.
+        requested_blocks: usize,
+        /// Blocks free before any batch mutation.
+        available_blocks: usize,
+    },
 }
 
 impl fmt::Display for KvBlockError {
@@ -361,6 +425,17 @@ impl fmt::Display for KvBlockError {
             } => write!(
                 formatter,
                 "KV sequence `{sequence}` needs {requested_blocks} additional blocks but only {available_blocks} are free"
+            ),
+            Self::DuplicateSequence(sequence) => write!(
+                formatter,
+                "KV batch references sequence `{sequence}` more than once"
+            ),
+            Self::BatchInsufficientCapacity {
+                requested_blocks,
+                available_blocks,
+            } => write!(
+                formatter,
+                "KV batch needs {requested_blocks} additional blocks but only {available_blocks} are free"
             ),
         }
     }
@@ -441,6 +516,34 @@ mod tests {
                 internal_fragmentation_tokens: 3,
                 internal_fragmentation_bytes: 6,
             }
+        );
+    }
+
+    #[test]
+    fn batch_append_is_atomic_across_sequences() {
+        let mut manager = KvBlockManager::new(16, 4, 1).unwrap();
+        let first = manager.allocate().unwrap();
+        let second = manager.allocate().unwrap();
+
+        manager.append_batch(&[(first, 1), (second, 5)]).unwrap();
+        assert_eq!(manager.cached_tokens(first), Ok(1));
+        assert_eq!(manager.cached_tokens(second), Ok(5));
+        assert_eq!(manager.metrics().free_blocks, 1);
+
+        let before_failure = manager.metrics();
+        assert_eq!(
+            manager.append_batch(&[(first, 4), (second, 4)]),
+            Err(KvBlockError::BatchInsufficientCapacity {
+                requested_blocks: 2,
+                available_blocks: 1,
+            })
+        );
+        assert_eq!(manager.metrics(), before_failure);
+        assert_eq!(manager.cached_tokens(first), Ok(1));
+        assert_eq!(manager.cached_tokens(second), Ok(5));
+        assert_eq!(
+            manager.append_batch(&[(first, 1), (first, 1)]),
+            Err(KvBlockError::DuplicateSequence(first))
         );
     }
 

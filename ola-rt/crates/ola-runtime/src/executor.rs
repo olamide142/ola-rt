@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
 };
@@ -10,8 +10,10 @@ use ola_model::{
 };
 
 use crate::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, FifoScheduler, Runtime,
-    RuntimeError, RuntimeState, Scheduler, UnconstrainedAdmission,
+    AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, BatchCandidate,
+    BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, ExecutionBatch, FifoScheduler,
+    IterationPlan, PrefillBatcher, Runtime, RuntimeError, RuntimeState, Scheduler,
+    UnboundedBatchPolicy, UnbucketedPrefillBatcher, UnconstrainedAdmission,
 };
 
 /// Final output retained after successful execution.
@@ -70,6 +72,15 @@ pub enum ExecutorEvent {
         /// Typed resource constraint that prevented admission.
         reason: AdmissionReason,
     },
+    /// Batch policy left otherwise eligible work for a later iteration.
+    BatchDeferred {
+        /// Request that remains queued or active.
+        request_id: RequestId,
+        /// Model phase whose token cost did not fit the current plan.
+        phase: ExecutionPhase,
+        /// Input token positions that the operation would process.
+        token_cost: usize,
+    },
     /// Admission policy terminated a request that can never fit.
     Rejected {
         /// Request moved directly from queued to failed.
@@ -86,6 +97,10 @@ pub struct ExecutorIteration {
     pub at: Timestamp,
     /// Per-request outcomes in deterministic execution order.
     pub events: Vec<ExecutorEvent>,
+    /// Auditable batch-policy decision for this iteration.
+    pub plan: IterationPlan,
+    /// Model invocations used to execute the selected plan.
+    pub execution_batches: Vec<ExecutionBatch>,
     /// Live generation sessions after the iteration.
     pub active_requests: usize,
     /// Requests still waiting for admission after the iteration.
@@ -114,6 +129,8 @@ pub enum ExecutorError {
     DuplicateExecutableModel(ModelId),
     /// A multi-request executor requires at least one active slot.
     InvalidActiveRequestLimit(usize),
+    /// A batch policy selected an unknown request or selected one twice.
+    InvalidBatchSelection(RequestId),
 }
 
 impl fmt::Display for ExecutorError {
@@ -136,6 +153,12 @@ impl fmt::Display for ExecutorError {
                 write!(
                     formatter,
                     "active request limit must be positive, got {limit}"
+                )
+            }
+            Self::InvalidBatchSelection(request) => {
+                write!(
+                    formatter,
+                    "batch policy returned invalid or duplicate request `{request}`"
                 )
             }
         }
@@ -169,14 +192,41 @@ struct ActiveGeneration {
     reserved_kv_bytes: u64,
 }
 
+struct PendingPrefill {
+    request_id: RequestId,
+    model_id: ModelId,
+    model: CausalLanguageModel,
+    session: Box<dyn GenerationSession>,
+    prompt_tokens: Vec<u32>,
+    max_new_tokens: usize,
+    reserved_kv_bytes: u64,
+}
+
+enum PrefillPreparation {
+    Ready(PendingPrefill),
+    Event(ExecutorEvent),
+}
+
+struct PrefillBatchOutcome {
+    indexed_events: Vec<(usize, ExecutorEvent)>,
+    execution_batches: Vec<ExecutionBatch>,
+}
+
+struct PrefillGroup {
+    model_id: ModelId,
+    bucket: usize,
+    members: Vec<(usize, PendingPrefill)>,
+}
+
 /// Deterministic synchronous model executor.
 ///
 /// Each [`step`](Self::step) performs at most one model operation: a queued
 /// request's prefill or an active request's single-token decode.
 /// [`step_iteration`](Self::step_iteration) advances every session that was
 /// active at the iteration boundary once, then fills newly available slots.
-/// The sessions still execute individually; this control-plane baseline is the
-/// correctness oracle for later tensor batching.
+/// Compatible prefill and decode operations may share tensor invocations;
+/// models without a matching batch hook retain the individual correctness
+/// path.
 pub struct Executor<S = FifoScheduler> {
     runtime: Runtime<S>,
     models: BTreeMap<ModelId, CausalLanguageModel>,
@@ -184,6 +234,8 @@ pub struct Executor<S = FifoScheduler> {
     ready: VecDeque<RequestId>,
     max_active_requests: usize,
     admission: Box<dyn AdmissionPolicy>,
+    batch_policy: Box<dyn BatchPolicy>,
+    prefill_batcher: Box<dyn PrefillBatcher>,
     results: BTreeMap<RequestId, ExecutionResult>,
 }
 
@@ -203,6 +255,8 @@ impl<S: Scheduler> Executor<S> {
             ready: VecDeque::new(),
             max_active_requests: 1,
             admission: Box::new(UnconstrainedAdmission),
+            batch_policy: Box::new(UnboundedBatchPolicy),
+            prefill_batcher: Box::new(UnbucketedPrefillBatcher),
             results: BTreeMap::new(),
         }
     }
@@ -226,6 +280,32 @@ impl<S: Scheduler> Executor<S> {
         P: AdmissionPolicy + 'static,
     {
         self.admission = Box::new(policy);
+        self
+    }
+
+    /// Replaces the unbounded iteration composer with an explicit policy.
+    ///
+    /// This affects [`step_iteration`](Self::step_iteration). The single-work
+    /// compatibility method [`step`](Self::step) continues to execute one
+    /// available operation directly.
+    pub fn with_batch_policy<P>(mut self, policy: P) -> Self
+    where
+        P: BatchPolicy + 'static,
+    {
+        self.batch_policy = Box::new(policy);
+        self
+    }
+
+    /// Replaces the compatibility prefill grouper with a length-bucketing rule.
+    ///
+    /// This affects tensor shape only after admission and batch-policy
+    /// selection. It does not reorder lifecycle events or allow different
+    /// loaded models to share an invocation.
+    pub fn with_prefill_batcher<P>(mut self, batcher: P) -> Self
+    where
+        P: PrefillBatcher + 'static,
+    {
+        self.prefill_batcher = Box::new(batcher);
         self
     }
 
@@ -302,22 +382,92 @@ impl<S: Scheduler> Executor<S> {
     /// same iteration.
     pub fn step_iteration(&mut self, at: Timestamp) -> Result<ExecutorIteration, ExecutorError> {
         self.validate_iteration_time(at)?;
-        let decode_count = self.ready.len();
+        let mut plan = IterationPlan::default();
         let mut events = Vec::with_capacity(self.max_active_requests);
-        for _ in 0..decode_count {
-            events.push(self.decode_next(at)?);
+        let mut execution_batches = Vec::new();
+        let decode_candidates = self
+            .ready
+            .iter()
+            .copied()
+            .map(|request_id| BatchCandidate {
+                request_id,
+                phase: BatchPhase::Decode,
+                token_cost: 1,
+            })
+            .collect::<Vec<_>>();
+        let selected = self.select_batch_candidates(&plan, &decode_candidates)?;
+        let mut selected_decodes = Vec::new();
+        let mut indexed_events = Vec::new();
+        for (index, candidate) in decode_candidates.into_iter().enumerate() {
+            if selected.contains(&candidate.request_id) {
+                plan.scheduled.push(candidate);
+                selected_decodes.push((index, candidate.request_id));
+            } else {
+                plan.deferred.push(candidate);
+                indexed_events.push((
+                    index,
+                    ExecutorEvent::BatchDeferred {
+                        request_id: candidate.request_id,
+                        phase: ExecutionPhase::Decode,
+                        token_cost: candidate.token_cost,
+                    },
+                ));
+            }
         }
+        let selected_ids = selected_decodes
+            .iter()
+            .map(|(_, request_id)| *request_id)
+            .collect::<Vec<_>>();
+        let (decode_events, decode_batches) = self.decode_selected_batch(&selected_ids, at)?;
+        indexed_events.extend(
+            selected_decodes
+                .into_iter()
+                .zip(decode_events)
+                .map(|((index, _), event)| (index, event)),
+        );
+        indexed_events.sort_by_key(|(index, _)| *index);
+        events.extend(indexed_events.into_iter().map(|(_, event)| event));
+        execution_batches.extend(decode_batches);
 
         let available_slots = self.max_active_requests.saturating_sub(self.active.len());
         let admission_count = available_slots.min(self.runtime.state().queued_len());
-        for _ in 0..admission_count {
-            let event = self.start_next(at)?;
-            let deferred = matches!(event, ExecutorEvent::Deferred { .. });
-            events.push(event);
-            if deferred {
-                break;
+        let mut pending = Vec::with_capacity(admission_count);
+        let mut admission_events = Vec::new();
+        let mut pending_reserved_kv_bytes = 0_u64;
+        let mut pending_model_reservations = BTreeMap::<ModelId, u64>::new();
+        for index in 0..admission_count {
+            let preparation = self.prepare_next_prefill(
+                at,
+                &mut plan,
+                pending_reserved_kv_bytes,
+                &pending_model_reservations,
+            )?;
+            match preparation {
+                PrefillPreparation::Ready(prepared) => {
+                    pending_reserved_kv_bytes =
+                        pending_reserved_kv_bytes.saturating_add(prepared.reserved_kv_bytes);
+                    *pending_model_reservations
+                        .entry(prepared.model_id.clone())
+                        .or_default() += prepared.reserved_kv_bytes;
+                    pending.push((index, prepared));
+                }
+                PrefillPreparation::Event(event) => {
+                    let deferred = matches!(
+                        event,
+                        ExecutorEvent::Deferred { .. } | ExecutorEvent::BatchDeferred { .. }
+                    );
+                    admission_events.push((index, event));
+                    if deferred {
+                        break;
+                    }
+                }
             }
         }
+        let prefill = self.prefill_selected_batch(pending, at)?;
+        admission_events.extend(prefill.indexed_events);
+        admission_events.sort_by_key(|(index, _)| *index);
+        events.extend(admission_events.into_iter().map(|(_, event)| event));
+        execution_batches.extend(prefill.execution_batches);
         if events.is_empty() {
             events.push(ExecutorEvent::Idle);
         }
@@ -325,6 +475,8 @@ impl<S: Scheduler> Executor<S> {
         Ok(ExecutorIteration {
             at,
             events,
+            plan,
+            execution_batches,
             active_requests: self.active.len(),
             queued_requests: self.runtime.state().queued_len(),
             kv_cache_bytes: self.runtime.state().memory.kv_cache_bytes,
@@ -370,7 +522,250 @@ impl<S: Scheduler> Executor<S> {
         &self.runtime
     }
 
+    /// Validates, admits, and creates one request-local session without running
+    /// its prompt. Delaying execution lets the iteration group newly admitted
+    /// requests into model-compatible prefill batches.
+    fn prepare_next_prefill(
+        &mut self,
+        at: Timestamp,
+        plan: &mut IterationPlan,
+        pending_reserved_kv_bytes: u64,
+        pending_model_reservations: &BTreeMap<ModelId, u64>,
+    ) -> Result<PrefillPreparation, ExecutorError> {
+        let Some(request_id) = self.runtime.select_next()? else {
+            return Ok(PrefillPreparation::Event(ExecutorEvent::Idle));
+        };
+        let request = self
+            .runtime
+            .state()
+            .request(request_id)
+            .expect("a selected request retains its runtime record")
+            .request
+            .clone();
+        let model_id = request.spec.model.clone();
+        let Some(model) = self.models.get(&model_id).cloned() else {
+            self.runtime.start_selected(request_id, at)?;
+            let event = self.fail_started(
+                request_id,
+                format!("model `{model_id}` has no executable attached"),
+                at,
+            )?;
+            return Ok(PrefillPreparation::Event(event));
+        };
+        let prompt_tokens = match prepare_prompt(&model, &request) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                self.runtime.start_selected(request_id, at)?;
+                let event = self.fail_started(request_id, error.to_string(), at)?;
+                return Ok(PrefillPreparation::Event(event));
+            }
+        };
+        let context = AdmissionContext {
+            request_id,
+            model_id: model_id.clone(),
+            prompt_tokens: prompt_tokens.len(),
+            max_new_tokens: request.spec.generation.max_new_tokens,
+            kv_cache: model.kv_cache_profile(),
+            memory: self.runtime.state().memory,
+            reserved_kv_bytes: self
+                .reserved_kv_bytes()
+                .saturating_add(pending_reserved_kv_bytes),
+            model_reserved_kv_bytes: self.reserved_kv_bytes_for_model(&model_id).saturating_add(
+                pending_model_reservations
+                    .get(&model_id)
+                    .copied()
+                    .unwrap_or(0),
+            ),
+        };
+        let reserved_kv_bytes = match self.admission.decide(&context) {
+            AdmissionDecision::Admit { reserved_kv_bytes } => reserved_kv_bytes,
+            AdmissionDecision::Defer(reason) => {
+                return Ok(PrefillPreparation::Event(ExecutorEvent::Deferred {
+                    request_id,
+                    reason,
+                }));
+            }
+            AdmissionDecision::Reject(reason) => {
+                self.runtime.reject(request_id, reason.to_string(), at)?;
+                return Ok(PrefillPreparation::Event(ExecutorEvent::Rejected {
+                    request_id,
+                    reason,
+                }));
+            }
+        };
+        let candidate = BatchCandidate {
+            request_id,
+            phase: BatchPhase::Prefill,
+            token_cost: prompt_tokens.len(),
+        };
+        let selected = self.select_batch_candidates(plan, &[candidate])?;
+        if selected.is_empty() {
+            plan.deferred.push(candidate);
+            return Ok(PrefillPreparation::Event(ExecutorEvent::BatchDeferred {
+                request_id,
+                phase: ExecutionPhase::Prefill,
+                token_cost: candidate.token_cost,
+            }));
+        }
+        plan.scheduled.push(candidate);
+
+        let lease = self.runtime.start_selected(request_id, at)?;
+        let session = match model.create_session(request.spec.generation.clone()) {
+            Ok(session) => session,
+            Err(error) => {
+                let event = self.fail_started(lease.request_id, error.to_string(), at)?;
+                return Ok(PrefillPreparation::Event(event));
+            }
+        };
+        Ok(PrefillPreparation::Ready(PendingPrefill {
+            request_id: lease.request_id,
+            model_id,
+            model,
+            session,
+            prompt_tokens,
+            max_new_tokens: request.spec.generation.max_new_tokens,
+            reserved_kv_bytes,
+        }))
+    }
+
+    /// Executes prepared prompts in stable model groups and returns events
+    /// tagged with their original admission positions.
+    fn prefill_selected_batch(
+        &mut self,
+        prepared: Vec<(usize, PendingPrefill)>,
+        at: Timestamp,
+    ) -> Result<PrefillBatchOutcome, ExecutorError> {
+        let mut groups: Vec<PrefillGroup> = Vec::new();
+        for (index, pending) in prepared {
+            let bucket = self.prefill_batcher.bucket(pending.prompt_tokens.len());
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.model_id == pending.model_id && group.bucket == bucket)
+            {
+                group.members.push((index, pending));
+            } else {
+                groups.push(PrefillGroup {
+                    model_id: pending.model_id.clone(),
+                    bucket,
+                    members: vec![(index, pending)],
+                });
+            }
+        }
+
+        let mut indexed_events = Vec::new();
+        let mut execution_batches = Vec::new();
+        for group in groups {
+            let mut members = group.members;
+            let model = members[0].1.model.clone();
+            let prompts = members
+                .iter()
+                .map(|(_, pending)| pending.prompt_tokens.clone())
+                .collect::<Vec<_>>();
+            let prompt_slices = prompts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let batched = if members.len() > 1 {
+                let mut sessions: Vec<&mut dyn GenerationSession> =
+                    Vec::with_capacity(members.len());
+                for (_, pending) in &mut members {
+                    sessions.push(pending.session.as_mut());
+                }
+                model.prefill_batch(&mut sessions, &prompt_slices)
+            } else {
+                None
+            };
+
+            if let Some(mut results) = batched {
+                if results.len() != members.len() {
+                    let message = format!(
+                        "model returned {} batched prefill results for {} sessions",
+                        results.len(),
+                        members.len()
+                    );
+                    results = (0..members.len())
+                        .map(|_| {
+                            Err(ModelExecutionError::new(
+                                ola_model::ExecutionStage::Prefill,
+                                message.clone(),
+                            ))
+                        })
+                        .collect();
+                }
+                execution_batches.push(ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: members
+                        .iter()
+                        .map(|(_, pending)| pending.request_id)
+                        .collect(),
+                    mode: BatchExecutionMode::Tensor,
+                    input_tokens: prompts.iter().map(Vec::len).sum(),
+                    padding_tokens: prompts
+                        .iter()
+                        .map(Vec::len)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_mul(prompts.len())
+                        .saturating_sub(prompts.iter().map(Vec::len).sum()),
+                });
+                for ((index, pending), result) in members.into_iter().zip(results) {
+                    let event = self.finish_prefill(pending, result, at)?;
+                    indexed_events.push((index, event));
+                }
+            } else {
+                for (index, mut pending) in members {
+                    execution_batches.push(ExecutionBatch {
+                        phase: BatchPhase::Prefill,
+                        request_ids: vec![pending.request_id],
+                        mode: BatchExecutionMode::Individual,
+                        input_tokens: pending.prompt_tokens.len(),
+                        padding_tokens: 0,
+                    });
+                    let result = pending.session.prefill(&pending.prompt_tokens);
+                    let event = self.finish_prefill(pending, result, at)?;
+                    indexed_events.push((index, event));
+                }
+            }
+        }
+        Ok(PrefillBatchOutcome {
+            indexed_events,
+            execution_batches,
+        })
+    }
+
+    fn finish_prefill(
+        &mut self,
+        pending: PendingPrefill,
+        result: Result<GeneratedToken, ModelExecutionError>,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => {
+                return self.fail_started(pending.request_id, error.to_string(), at);
+            }
+        };
+        self.runtime.mark_first_token(pending.request_id, at)?;
+        let active = ActiveGeneration {
+            request_id: pending.request_id,
+            model_id: pending.model_id,
+            model: pending.model,
+            session: pending.session,
+            generated: vec![token.id],
+            last_token: token,
+            max_new_tokens: pending.max_new_tokens,
+            last_step_at: at,
+            reserved_kv_bytes: pending.reserved_kv_bytes,
+        };
+        self.observe_token(active, ExecutionPhase::Prefill, at)
+    }
+
     fn start_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
+        self.start_next_with_plan(at, None)
+    }
+
+    fn start_next_with_plan(
+        &mut self,
+        at: Timestamp,
+        plan: Option<&mut IterationPlan>,
+    ) -> Result<ExecutorEvent, ExecutorError> {
         let Some(request_id) = self.runtime.select_next()? else {
             return Ok(ExecutorEvent::Idle);
         };
@@ -418,6 +813,23 @@ impl<S: Scheduler> Executor<S> {
                 return Ok(ExecutorEvent::Rejected { request_id, reason });
             }
         };
+        if let Some(plan) = plan {
+            let candidate = BatchCandidate {
+                request_id,
+                phase: BatchPhase::Prefill,
+                token_cost: prompt_tokens.len(),
+            };
+            let selected = self.select_batch_candidates(plan, &[candidate])?;
+            if selected.is_empty() {
+                plan.deferred.push(candidate);
+                return Ok(ExecutorEvent::BatchDeferred {
+                    request_id,
+                    phase: ExecutionPhase::Prefill,
+                    token_cost: candidate.token_cost,
+                });
+            }
+            plan.scheduled.push(candidate);
+        }
         let lease = self.runtime.start_selected(request_id, at)?;
         let mut session = match model.create_session(request.spec.generation.clone()) {
             Ok(session) => session,
@@ -446,6 +858,15 @@ impl<S: Scheduler> Executor<S> {
         let Some(request_id) = self.ready.pop_front() else {
             return Ok(ExecutorEvent::Idle);
         };
+        self.decode_removed(request_id, 0, at)
+    }
+
+    fn decode_removed(
+        &mut self,
+        request_id: RequestId,
+        ready_position: usize,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
         let mut active = self
             .active
             .remove(&request_id)
@@ -453,7 +874,7 @@ impl<S: Scheduler> Executor<S> {
         if at < active.last_step_at {
             let previous = active.last_step_at;
             self.active.insert(request_id, active);
-            self.ready.push_front(request_id);
+            self.ready.insert(ready_position, request_id);
             return Err(RuntimeError::TimestampRegression {
                 request: request_id,
                 event: "executor step",
@@ -472,6 +893,146 @@ impl<S: Scheduler> Executor<S> {
         active.last_token = token;
         active.last_step_at = at;
         self.observe_token(active, ExecutionPhase::Decode, at)
+    }
+
+    fn decode_selected_batch(
+        &mut self,
+        request_ids: &[RequestId],
+        at: Timestamp,
+    ) -> Result<(Vec<ExecutorEvent>, Vec<ExecutionBatch>), ExecutorError> {
+        if request_ids.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let selected = request_ids.iter().copied().collect::<BTreeSet<_>>();
+        self.ready
+            .retain(|request_id| !selected.contains(request_id));
+
+        let mut groups: Vec<(ModelId, Vec<(usize, ActiveGeneration)>)> = Vec::new();
+        for (index, request_id) in request_ids.iter().copied().enumerate() {
+            let active = self
+                .active
+                .remove(&request_id)
+                .expect("selected decode requests retain active sessions");
+            if let Some((_, members)) = groups
+                .iter_mut()
+                .find(|(model_id, _)| model_id == &active.model_id)
+            {
+                members.push((index, active));
+            } else {
+                groups.push((active.model_id.clone(), vec![(index, active)]));
+            }
+        }
+
+        let mut indexed_events = Vec::with_capacity(request_ids.len());
+        let mut execution_batches = Vec::new();
+        for (_, mut members) in groups {
+            let input_tokens = members
+                .iter()
+                .map(|(_, active)| active.last_token.id)
+                .collect::<Vec<_>>();
+            let model = members[0].1.model.clone();
+            let batched = if members.len() > 1 {
+                {
+                    let mut sessions: Vec<&mut dyn GenerationSession> =
+                        Vec::with_capacity(members.len());
+                    for (_, active) in &mut members {
+                        sessions.push(active.session.as_mut());
+                    }
+                    model.decode_batch(&mut sessions, &input_tokens)
+                }
+            } else {
+                None
+            };
+
+            if let Some(mut results) = batched {
+                if results.len() != members.len() {
+                    let message = format!(
+                        "model returned {} batched decode results for {} sessions",
+                        results.len(),
+                        members.len()
+                    );
+                    results = (0..members.len())
+                        .map(|_| {
+                            Err(ModelExecutionError::new(
+                                ola_model::ExecutionStage::Decode,
+                                message.clone(),
+                            ))
+                        })
+                        .collect();
+                }
+                execution_batches.push(ExecutionBatch {
+                    phase: BatchPhase::Decode,
+                    request_ids: members
+                        .iter()
+                        .map(|(_, active)| active.request_id)
+                        .collect(),
+                    mode: BatchExecutionMode::Tensor,
+                    input_tokens: members.len(),
+                    padding_tokens: 0,
+                });
+                for ((index, active), result) in members.into_iter().zip(results) {
+                    let event = self.finish_decode(active, result, at)?;
+                    indexed_events.push((index, event));
+                }
+            } else {
+                for (index, mut active) in members {
+                    execution_batches.push(ExecutionBatch {
+                        phase: BatchPhase::Decode,
+                        request_ids: vec![active.request_id],
+                        mode: BatchExecutionMode::Individual,
+                        input_tokens: 1,
+                        padding_tokens: 0,
+                    });
+                    let result = active.session.decode(active.last_token.id);
+                    let event = self.finish_decode(active, result, at)?;
+                    indexed_events.push((index, event));
+                }
+            }
+        }
+        indexed_events.sort_by_key(|(index, _)| *index);
+        Ok((
+            indexed_events.into_iter().map(|(_, event)| event).collect(),
+            execution_batches,
+        ))
+    }
+
+    fn finish_decode(
+        &mut self,
+        mut active: ActiveGeneration,
+        result: Result<GeneratedToken, ModelExecutionError>,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
+        let token = match result {
+            Ok(token) => token,
+            Err(error) => {
+                return self.fail_started(active.request_id, error.to_string(), at);
+            }
+        };
+        active.generated.push(token.id);
+        active.last_token = token;
+        active.last_step_at = at;
+        self.observe_token(active, ExecutionPhase::Decode, at)
+    }
+
+    fn select_batch_candidates(
+        &mut self,
+        plan: &IterationPlan,
+        candidates: &[BatchCandidate],
+    ) -> Result<BTreeSet<RequestId>, ExecutorError> {
+        let context = BatchContext {
+            scheduled: plan.scheduled.clone(),
+            candidates: candidates.to_vec(),
+        };
+        let mut selected = BTreeSet::new();
+        for request_id in self.batch_policy.select(&context) {
+            let is_candidate = candidates
+                .iter()
+                .any(|candidate| candidate.request_id == request_id);
+            if !is_candidate || !selected.insert(request_id) {
+                return Err(ExecutorError::InvalidBatchSelection(request_id));
+            }
+        }
+        Ok(selected)
     }
 
     fn observe_token(
@@ -636,6 +1197,45 @@ mod tests {
         ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
             Ok(Box::new(IncrementSession::default()))
         }
+
+        fn prefill_batch(
+            &self,
+            sessions: &mut [&mut dyn GenerationSession],
+            prompt_tokens: &[&[u32]],
+        ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+            Some(
+                sessions
+                    .iter_mut()
+                    .zip(prompt_tokens.iter().copied())
+                    .map(|(session, prompt)| session.prefill(prompt))
+                    .collect(),
+            )
+        }
+
+        fn decode_batch(
+            &self,
+            sessions: &mut [&mut dyn GenerationSession],
+            input_tokens: &[u32],
+        ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+            Some(
+                sessions
+                    .iter_mut()
+                    .zip(input_tokens.iter().copied())
+                    .map(|(session, input_token)| session.decode(input_token))
+                    .collect(),
+            )
+        }
+    }
+
+    struct IndividualIncrementModel;
+
+    impl CausalModel for IndividualIncrementModel {
+        fn create_session(
+            &self,
+            _generation: GenerationConfig,
+        ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
+            Ok(Box::new(IncrementSession::default()))
+        }
     }
 
     #[derive(Default)]
@@ -680,10 +1280,18 @@ mod tests {
         fn metrics(&self) -> SessionMetrics {
             self.metrics
         }
+
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
     }
 
     fn artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IncrementModel)
+    }
+
+    fn individual_artifact() -> CausalLanguageModel {
+        CausalLanguageModel::new(NumericTokenizer, IndividualIncrementModel)
     }
 
     fn profiled_artifact(capacity_bytes: u64) -> CausalLanguageModel {
@@ -860,6 +1468,16 @@ mod tests {
         assert_eq!(admitted.active_requests, 2);
         assert_eq!(admitted.queued_requests, 1);
         assert_eq!(admitted.kv_cache_bytes, 16);
+        assert_eq!(
+            admitted.execution_batches,
+            vec![ExecutionBatch {
+                phase: BatchPhase::Prefill,
+                request_ids: vec![first, second],
+                mode: BatchExecutionMode::Tensor,
+                input_tokens: 2,
+                padding_tokens: 0,
+            }]
+        );
 
         let refilled = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
         assert!(matches!(
@@ -889,6 +1507,25 @@ mod tests {
         assert_eq!(refilled.queued_requests, 0);
         assert_eq!(refilled.kv_cache_bytes, 16);
         assert_eq!(
+            refilled.execution_batches,
+            vec![
+                ExecutionBatch {
+                    phase: BatchPhase::Decode,
+                    request_ids: vec![first, second],
+                    mode: BatchExecutionMode::Tensor,
+                    input_tokens: 2,
+                    padding_tokens: 0,
+                },
+                ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: vec![third],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(
             executor.state().active_ids().collect::<Vec<_>>(),
             vec![second]
         );
@@ -908,6 +1545,62 @@ mod tests {
         assert_eq!(executor.result(first).unwrap().token_ids, vec![2, 3]);
         assert_eq!(executor.result(second).unwrap().token_ids, vec![11, 12, 13]);
         assert_eq!(executor.result(third).unwrap().token_ids, vec![21]);
+    }
+
+    #[test]
+    fn iteration_falls_back_to_individual_execution_when_model_has_no_batch_path() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "individual-increment"),
+                individual_artifact(),
+            )
+            .unwrap();
+        let first = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 3), Timestamp::ZERO).unwrap();
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(
+            admitted.execution_batches,
+            vec![
+                ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: vec![first],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                },
+                ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: vec![second],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                },
+            ]
+        );
+
+        let decoded = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+
+        assert_eq!(
+            decoded.execution_batches,
+            vec![
+                ExecutionBatch {
+                    phase: BatchPhase::Decode,
+                    request_ids: vec![first],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                },
+                ExecutionBatch {
+                    phase: BatchPhase::Decode,
+                    request_ids: vec![second],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -950,6 +1643,166 @@ mod tests {
             result,
             Err(ExecutorError::InvalidActiveRequestLimit(0))
         ));
+    }
+
+    #[test]
+    fn token_budget_records_selected_and_deferred_iteration_work() {
+        let policy = crate::FifoTokenBudgetPolicy::new(2).unwrap();
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 3)
+            .unwrap()
+            .with_batch_policy(policy);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 3), Timestamp::ZERO).unwrap();
+        let third = executor.submit(request("20", 1), Timestamp::ZERO).unwrap();
+
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(admitted.plan.scheduled_tokens(), 2);
+        assert_eq!(
+            admitted.plan.scheduled,
+            vec![
+                BatchCandidate {
+                    request_id: first,
+                    phase: BatchPhase::Prefill,
+                    token_cost: 1,
+                },
+                BatchCandidate {
+                    request_id: second,
+                    phase: BatchPhase::Prefill,
+                    token_cost: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            admitted.plan.deferred,
+            vec![BatchCandidate {
+                request_id: third,
+                phase: BatchPhase::Prefill,
+                token_cost: 1,
+            }]
+        );
+        assert!(matches!(
+            admitted.events.last(),
+            Some(ExecutorEvent::BatchDeferred {
+                request_id,
+                phase: ExecutionPhase::Prefill,
+                token_cost: 1,
+            }) if *request_id == third
+        ));
+        assert_eq!(admitted.active_requests, 2);
+        assert_eq!(admitted.queued_requests, 1);
+
+        let decoded = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        assert_eq!(decoded.plan.scheduled_tokens(), 2);
+        assert!(
+            decoded
+                .plan
+                .scheduled
+                .iter()
+                .all(|candidate| candidate.phase == BatchPhase::Decode)
+        );
+        assert_eq!(decoded.plan.deferred[0].request_id, third);
+        assert_eq!(
+            decoded.execution_batches,
+            vec![ExecutionBatch {
+                phase: BatchPhase::Decode,
+                request_ids: vec![first, second],
+                mode: BatchExecutionMode::Tensor,
+                input_tokens: 2,
+                padding_tokens: 0,
+            }]
+        );
+        assert_eq!(
+            executor.state().request(third).unwrap().status,
+            RequestStatus::Queued
+        );
+    }
+
+    #[test]
+    fn power_of_two_prefill_buckets_reduce_padding_without_reordering_events() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 3)
+            .unwrap()
+            .with_prefill_batcher(crate::PowerOfTwoPrefillBatcher);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor
+            .submit(request("1 2 3 4 5", 1), Timestamp::ZERO)
+            .unwrap();
+        let second = executor
+            .submit(request("1 2 3 4 5 6 7 8 9", 1), Timestamp::ZERO)
+            .unwrap();
+        let third = executor
+            .submit(request("1 2 3 4 5 6 7", 1), Timestamp::ZERO)
+            .unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert!(matches!(
+            iteration.events.as_slice(),
+            [
+                ExecutorEvent::Token { request_id: first_id, .. },
+                ExecutorEvent::Token { request_id: second_id, .. },
+                ExecutorEvent::Token { request_id: third_id, .. },
+            ] if *first_id == first && *second_id == second && *third_id == third
+        ));
+        assert_eq!(
+            iteration.execution_batches,
+            vec![
+                ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: vec![first, third],
+                    mode: BatchExecutionMode::Tensor,
+                    input_tokens: 12,
+                    padding_tokens: 2,
+                },
+                ExecutionBatch {
+                    phase: BatchPhase::Prefill,
+                    request_ids: vec![second],
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 9,
+                    padding_tokens: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            iteration
+                .execution_batches
+                .iter()
+                .map(|batch| batch.padding_tokens)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn oversized_prefill_runs_alone_and_reports_its_actual_cost() {
+        let policy = crate::FifoTokenBudgetPolicy::new(2).unwrap();
+        let mut executor = Executor::default().with_batch_policy(policy);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let request = executor
+            .submit(request("1 2 3", 1), Timestamp::ZERO)
+            .unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(iteration.plan.scheduled_tokens(), 3);
+        assert_eq!(
+            iteration.plan.scheduled,
+            vec![BatchCandidate {
+                request_id: request,
+                phase: BatchPhase::Prefill,
+                token_cost: 3,
+            }]
+        );
+        assert!(iteration.plan.deferred.is_empty());
+        assert_eq!(executor.state().queued_len(), 0);
+        assert!(executor.result(request).is_some());
     }
 
     #[test]

@@ -108,6 +108,52 @@ impl<B: Backend> LlamaKvCache<B> {
         Ok(())
     }
 
+    /// Atomically grows several caches backed by the same physical pool.
+    pub(crate) fn reserve_batch(
+        caches: &mut [&mut Self],
+        additional_tokens: usize,
+    ) -> Result<(), KvBlockError> {
+        let additional_tokens = vec![additional_tokens; caches.len()];
+        Self::reserve_batch_lengths(caches, &additional_tokens)
+    }
+
+    /// Atomically grows several caches by request-specific token counts.
+    ///
+    /// Variable-length prefill uses this boundary before any layer writes so a
+    /// capacity failure cannot leave only a prefix of the batch reserved.
+    pub(crate) fn reserve_batch_lengths(
+        caches: &mut [&mut Self],
+        additional_tokens: &[usize],
+    ) -> Result<(), KvBlockError> {
+        if caches.len() != additional_tokens.len() {
+            return Err(KvBlockError::InvalidConfiguration(
+                "batched cache and token-count lengths must match",
+            ));
+        }
+        let Some(first) = caches.first() else {
+            return Ok(());
+        };
+        let pool = first.pool.clone();
+        if caches.iter().any(|cache| !Arc::ptr_eq(&pool, &cache.pool)) {
+            return Err(KvBlockError::InvalidConfiguration(
+                "batched caches must share one physical pool",
+            ));
+        }
+        let mut reservations = Vec::with_capacity(caches.len());
+        for (cache, &additional_tokens) in caches.iter().zip(additional_tokens) {
+            cache
+                .tokens
+                .checked_add(additional_tokens)
+                .ok_or(KvBlockError::TokenCountOverflow(cache.sequence))?;
+            reservations.push((cache.sequence, additional_tokens));
+        }
+        lock_pool(&pool).manager.append_batch(&reservations)?;
+        for (cache, &additional_tokens) in caches.iter_mut().zip(additional_tokens) {
+            cache.tokens += additional_tokens;
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_layer(
         &self,
         layer: usize,
@@ -417,5 +463,38 @@ mod tests {
         drop(first);
         waiting.reserve(1).unwrap();
         assert_eq!(waiting.block_ids(), vec![0]);
+    }
+
+    #[test]
+    fn variable_length_batch_reservation_is_atomic() {
+        let pool = LlamaKvPool::<TestBackend>::new(
+            &tiny_config(),
+            LlamaKvCacheConfig::new(8, 2),
+            Default::default(),
+        )
+        .unwrap();
+        let pool = Arc::new(Mutex::new(pool));
+        let mut first = LlamaKvCache::allocate(pool.clone()).unwrap();
+        let mut second = LlamaKvCache::allocate(pool).unwrap();
+
+        LlamaKvCache::reserve_batch_lengths(&mut [&mut first, &mut second], &[1, 3]).unwrap();
+        assert_eq!((first.tokens(), second.tokens()), (1, 3));
+        assert_eq!(
+            (first.block_ids(), second.block_ids()),
+            (vec![0], vec![1, 2])
+        );
+
+        let error = LlamaKvCache::reserve_batch_lengths(&mut [&mut first, &mut second], &[2, 2])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            KvBlockError::BatchInsufficientCapacity { .. }
+        ));
+        assert_eq!((first.tokens(), second.tokens()), (1, 3));
+        assert_eq!(
+            (first.block_ids(), second.block_ids()),
+            (vec![0], vec![1, 2])
+        );
     }
 }

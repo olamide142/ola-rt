@@ -25,6 +25,7 @@ workload against which those abstractions can be tested.
 | `ola-model` | Model catalog, artifact sources, architecture selection | Tensor execution, scheduling, downloads |
 | `ola-runtime` | Model registry, request lifecycle, state, scheduling | HTTP, model kernels |
 | `ola-burn` | Adapting Burn concepts to OlaRT interfaces | Scheduling or serving |
+| `ola-observe` | Runtime event measurements and latency derivation | Lifecycle mutation, policy decisions |
 | `ola-serve` | Transport-neutral service boundary | HTTP-framework details, execution policy |
 | `ola-bench` | Deterministic workload construction, replay, summaries | Runtime production logic |
 | `ola-ui` | Ratatui workbench and integration contracts | Model kernels, scheduling policy |
@@ -32,8 +33,8 @@ workload against which those abstractions can be tested.
 Dependencies point inward. `ola-core` knows nothing about the other crates.
 `ola-model` describes available artifacts and selects an architecture factory.
 The runtime tracks models that are actually resident and available for requests.
-Serving and benchmarking call the runtime. The Burn adapter implements a core
-interface without leaking Burn types into the runtime.
+Serving, observation, and benchmarking call the runtime. The Burn adapter
+implements a core interface without leaking Burn types into the runtime.
 
 ## Model selection
 
@@ -136,6 +137,13 @@ Implemented:
   aggregate live KV-memory accounting;
 - page-rounded, memory-aware admission against model KV pools and optional
   device-wide budgets;
+- replaceable iteration batch composition with auditable plans and a
+  starvation-safe FIFO input-token budget;
+- model-grouped prefill and decode execution with explicit tensor/individual
+  records and real Burn Llama variable-length tensor paths;
+- replaceable prompt-length bucketing with explicit dense-padding accounting;
+- backend-neutral observation of iteration work, interval rates, cumulative
+  counters, and terminal request latency boundaries;
 - a transport-neutral generation service;
 - a Ratatui workbench with background local Llama generation, KV benchmarks,
   and FIFO runtime experiments;
@@ -156,7 +164,7 @@ Deliberately deferred:
 
 - tensors in the public runtime API;
 - fused accelerator attention, eviction, preemption, and prefix reuse;
-- tensor-level continuous batching and preemption;
+- fused multi-request paged attention and preemption;
 - probabilistic sampling;
 - sharded and remotely materialized checkpoints;
 - RoPE-scaled and tied-embedding Llama variants;
@@ -195,7 +203,14 @@ latency distribution.
 
 ## Verification
 
-Run from this directory:
+From the repository root, `make help` lists the maintained developer commands.
+The complete default quality gate is:
+
+```text
+make verify
+```
+
+The underlying commands, when run directly from this directory, are:
 
 ```text
 cargo fmt --all -- --check

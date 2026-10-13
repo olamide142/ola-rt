@@ -3915,6 +3915,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ola-observe"
+version = "0.1.0"
+dependencies = [
+ "ola-core",
+ "ola-model",
+ "ola-runtime",
+]
+
+[[package]]
 name = "ola-runtime"
 version = "0.1.0"
 dependencies = [

@@ -1,12 +1,14 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-12 13:03 BST (Europe/London)
+**Last updated:** 2026-10-13 09:46 BST (Europe/London)
 
-**Source revision:** working tree based on multi-request milestone `5827879` on
+**Source revision:** working tree based on admission milestone `540dee2` on
 `master`
 
-**Repository state at update:** multi-request milestone merged and pushed;
-memory-aware admission implemented and verified locally; not yet committed
+**Repository state at update:** admission milestone merged and pushed;
+batch-composition/token-budget policy, root developer Makefile, observability,
+variable-length tensor-batched Llama prefill/decode, and prompt-length
+bucketing with padding measurements implemented locally; not yet committed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -39,32 +41,64 @@ development GTX 1650. CPU and WGPU select identical fixture tokens, and sampled
 logits agree within the accelerator tolerance. Native CUDA support compiles,
 but local execution is blocked by the missing CUDA toolkit/NVRTC installation.
 
-The multi-request control-plane milestone is merged. A configurable
-executor can keep several sessions live, advance each existing session once at
-an iteration boundary, refill released slots, isolate cancellation and results,
-and aggregate their KV usage. It deliberately executes each model operation
-individually so the next tensor-batching implementation has a deterministic
-correctness oracle.
+The multi-request control-plane milestone is merged. A configurable executor
+can keep several sessions live, advance each existing session once at an
+iteration boundary, refill released slots, isolate cancellation and results,
+and aggregate their KV usage. The individual execution path remains available
+as a deterministic correctness oracle and fallback when a model does not
+implement tensor batching.
 
-The current working tree adds the next policy layer: Llama publishes its real
-physical KV geometry, and a strict admission baseline makes page-rounded
-worst-case reservations before session creation. Temporary model-pool or device
-pressure defers work without changing lifecycle state; impossible requests are
-rejected terminally instead of blocking FIFO indefinitely.
+Memory-aware admission is merged: Llama publishes its real physical KV
+geometry, and the strict baseline makes page-rounded worst-case reservations
+before session creation. Temporary model-pool or device pressure defers work
+without changing lifecycle state; impossible requests are rejected terminally
+instead of blocking FIFO indefinitely.
+
+The current working tree adds explicit batch composition at the iteration
+boundary. An unbounded compatibility policy preserves existing behavior, while
+a FIFO token-budget baseline limits input positions processed per iteration.
+Every iteration returns a deterministic plan of selected and deferred prefill
+and decode operations. Oversized head prefills run alone to guarantee progress.
+A root Makefile now exposes the maintained build, test, lint, docs, UI,
+conformance, and GPU workflows through `make help`.
+
+The working tree also introduces `ola-observe`, a read-only consumer of
+executor iterations and runtime lifecycle records. It derives documented queue,
+TTFT, prefill, service, end-to-end, decode-span, and aggregate inter-token
+latencies; records iteration work and memory snapshots; exposes interval token
+rates; and retains cumulative counters without reading a wall clock.
+
+Compatible prefill and decode operations are now grouped by loaded model and
+offered to optional model-level tensor paths. Burn Llama right-pads
+variable-length prompts and batches embeddings, projections, normalization,
+MLP, LM head, and token selection. Only real prompt prefixes enter each
+request's cache. Decode retains request-local RoPE positions and page traversal;
+both phases retain isolated block tables, lifecycle, and results. KV growth is
+atomic across each complete batch. Every iteration records whether operations
+used a real tensor batch or individual fallback.
+
+Prefill grouping is now independently replaceable. The compatibility strategy
+keeps one same-model group, while the power-of-two strategy separates distant
+prompt lengths to limit right-padding waste without changing scheduler-visible
+event order. Execution records and `ola-observe` report real input positions,
+padding positions, dense-input rate, and input-token efficiency so policy
+comparisons can measure the compute tradeoff rather than infer it.
 
 ## Current delivery status
 
 | Area | Status | Current capability |
 | --- | --- | --- |
-| Workspace architecture | Working | Seven crates with explicit dependency boundaries |
+| Workspace architecture | Working | Eight crates with explicit dependency boundaries |
 | Core request model | Working | IDs, timestamps, multimodal inputs, generation controls, validation |
 | Model selection | Working | Catalog, model definitions, architecture registry, factories |
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
-| Runtime executor | Multi-request baseline working | Configurable live sessions, single-operation steps, iteration steps, stable interleaving, results, failure/cancellation cleanup |
+| Runtime executor | Tensor batching working | Configurable sessions, iteration planning, model-grouped tensor prefill/decode, fallback execution, stable events/results |
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
-| Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank latency summaries |
+| Batch composition | Token-budget and bucketing baseline | Replaceable selection policy, auditable plans, FIFO token budget, optional power-of-two prefill buckets |
+| Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
+| Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank distribution summaries |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -77,7 +111,7 @@ rejected terminally instead of blocking FIFO indefinitely.
 | GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
-| Continuous batching | Control-plane foundation | Iterations advance multiple isolated sessions and continuously refill slots; tensor operations are not yet batched |
+| Continuous batching | Tensor foundation working | Compatible same-model variable-length prefill and decode are tensorized; decode page traversal remains request-local |
 | Production server | Not implemented | No async executor, streaming HTTP, or OpenAI-compatible API yet |
 
 ## Implemented system
@@ -96,7 +130,8 @@ rejected terminally instead of blocking FIFO indefinitely.
 - Separates model identity, architecture identity, and artifact source.
 - Generic architecture registry and factory selection.
 - Shared tokenizer and model weights with isolated request sessions.
-- Backend-neutral `prefill`, `decode`, and session-metrics contracts.
+- Backend-neutral individual and optional batched prefill/decode contracts plus
+  session metrics.
 - Backend-neutral physical KV resource profiles for pre-session planning.
 - Explicit distinction between catalog availability and runtime residency.
 
@@ -130,6 +165,17 @@ rejected terminally instead of blocking FIFO indefinitely.
   - replaceable admission policy after scheduler selection;
   - strict page-rounded model-pool and optional device-budget enforcement;
   - typed temporary deferral and permanent rejection outcomes;
+  - replaceable iteration-level batch-composition policy;
+  - explicit prefill/decode candidates with input-token costs;
+  - auditable selected/deferred iteration plans and batch-deferral events;
+  - FIFO token-budget enforcement with oversized-prefill progress;
+  - model-compatible grouping of selected prefill and decode work;
+  - replaceable prefill-length grouping with unbucketed compatibility and
+    power-of-two strategies;
+  - optional phase-specific tensor-batch hooks with transparent individual
+    fallback;
+  - explicit tensor/individual execution records with request-row order, real
+    input positions, and padding positions;
   - monotonic step-time validation.
 
 ### `ola-burn`
@@ -156,6 +202,20 @@ rejected terminally instead of blocking FIFO indefinitely.
   - absolute RoPE position offsets during one-token decode.
   - backend-neutral publication of the exact physical pool geometry used by
     runtime admission.
+- Atomic multi-sequence KV growth for tensor decode.
+- Atomic request-specific KV growth for variable-length tensor prefill.
+- Tensor-batched variable-length prefill:
+  - right-padded dense transformer computation with causal isolation;
+  - per-row final real-token selection;
+  - cache writes restricted to each request's real prompt prefix;
+  - output, cache metrics, and subsequent decode agreement with independent
+    sessions.
+- Tensor-batched cached decode across compatible live sessions:
+  - batched embeddings, Q/K/V and output projections, norms, MLP, LM head,
+    argmax, and host token read;
+  - request-local rotary positions and physical-page attention;
+  - output and metrics agreement with independent decode at unequal positions;
+  - executor-to-Llama integration coverage proving the tensor path is used.
 - Page-native single-token attention:
   - consumes logical pages in block-table order;
   - never concatenates K/V pages into a sequence-sized tensor;
@@ -175,6 +235,23 @@ rejected terminally instead of blocking FIFO indefinitely.
 - Fixed workload generator with explicit request shapes.
 - Replay into any compatible runtime scheduler.
 - Nearest-rank latency summaries in microseconds.
+
+### `ola-observe`
+
+- Read-only observation of executor iterations and retained runtime state.
+- Explicit microsecond formulas for queue latency, TTFT, prefill latency,
+  service latency, end-to-end latency, and decode span.
+- Aggregate mean inter-token latency for terminal requests with at least two
+  observed output tokens.
+- Selected prefill/decode work, input-token cost, policy deferrals, emitted
+  tokens, terminal outcomes, live request counts, and KV snapshots per
+  iteration.
+- Executed real input positions, artificial right-padding positions,
+  dense-input rate, and input-token efficiency.
+- Input/output token rates over non-zero caller-supplied observation intervals.
+- Cumulative counters and retained terminal measurements in stable request-ID
+  order.
+- Timestamp-regression and invalid-request diagnostics without wall-clock reads.
 
 ### `ola-serve`
 
@@ -202,7 +279,8 @@ rejected terminally instead of blocking FIFO indefinitely.
 
 At the working tree recorded above:
 
-- `cargo test --workspace`: **56 passed**, **2 ignored external-fixture tests**.
+- `cargo test --workspace`: **73 unit tests and 4 documentation tests passed**;
+  **2 external-fixture tests ignored** by default.
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
 - Pinned Llama scalar-oracle conformance test: **passed manually**.
@@ -219,12 +297,28 @@ At the working tree recorded above:
 - The WGPU example completed on the development NVIDIA GeForce GTX 1650.
 - Native CUDA feature compilation: **passed**; native execution correctly
   reports the missing local CUDA toolkit/NVRTC prerequisite.
+- Current WGPU and CUDA feature compilation: **passed**. A fresh live WGPU run
+  was not completed because `nvidia-smi` could not communicate with the NVIDIA
+  driver during this update; the successful GTX 1650 results above are retained
+  historical evidence rather than represented as a new run.
 - Cached decode logits match full-sequence logits at every tested step.
 - Paged cache tests cover cross-page reconstruction, non-contiguous mappings,
   atomic capacity failure, release, and physical-block reuse.
 - Executor tests cover prefill/decode progression, retained output, live memory
   accounting, execution failure, cancellation, regressive timestamps,
-  multi-session iteration order, slot refill, and isolated cancellation.
+  multi-session iteration order, slot refill, isolated cancellation, token
+  budget deferral, auditable plans, and oversized-prefill progress.
+- Batch-policy tests cover FIFO prefix selection across phases, invalid zero
+  budgets, and the deliberate oversized-prefill escape hatch.
+- Tensor-batching tests cover atomic fixed- and variable-length multi-sequence
+  KV reservation, prefill output/cache/subsequent-decode agreement at unequal
+  prompt lengths, decode agreement at unequal positions, executor grouping,
+  transparent fallback, and execution-mode records.
+- Prefill-bucketing tests cover power-of-two boundaries, padding accounting,
+  nearby-length grouping, distant-length splitting, and FIFO event restoration.
+- Observation tests cover every documented latency boundary, interval rates,
+  dense padding efficiency, cumulative counts, regressive timestamps,
+  single-token inter-token handling, and failure atomicity.
 - KV allocator tests cover deterministic mapping, atomic out-of-capacity
   failure, freeing/reuse, invalid configuration, and fragmentation metrics.
 - Ratatui screens render through `TestBackend`, including the small-terminal
@@ -265,6 +359,11 @@ cargo run -p ola-ui --features wgpu -- \
   --backend wgpu --model /path/to/llama-artifact
 ```
 
+From the repository root, the same maintained workflows are discoverable with
+`make help`; `make verify` runs formatting, checks, tests, Clippy, and docs.
+Model commands accept `MODEL=/path/to/llama-artifact`, with optional `PROMPT`
+and `TOKENS` variables.
+
 ## Known limitations
 
 - Page-native attention is a correctness-first composition of portable Burn
@@ -277,13 +376,17 @@ cargo run -p ola-ui --features wgpu -- \
   high-water mark for deterministic reuse.
 - There is no cache eviction, preemption, swapping, prefix reuse, or
   quantization.
-- Generation is batch size one and greedy only.
-- The synchronous executor interleaves multiple sessions but invokes their
-  model operations individually; it does not yet form tensor batches.
+- Variable-length prefill uses right padding to the longest prompt in its
+  execution group. Power-of-two bucketing is available but not yet selected
+  adaptively; chunked prefill is not implemented. Generation remains greedy.
+- Decode batches still traverse each request's physical pages independently;
+  page attention is not yet a fused ragged multi-request kernel.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
   reclaim part of a reservation as a sequence approaches completion.
 - Device-wide admission is enforced only when a caller supplies a capacity and
   non-KV accounting; automatic GPU-memory telemetry is not wired in yet.
+- Inter-token latency currently uses the terminal decode span divided by token
+  gaps; individual token timestamps are not retained yet.
 - Executor results are retained in memory and there is no result eviction or
   persistence policy yet.
 - Checkpoint loading accepts one SafeTensors file only.
@@ -294,16 +397,18 @@ cargo run -p ola-ui --features wgpu -- \
 
 ## Recommended next milestones
 
-1. **Batch-composition policy**
-   - add an explicit per-iteration token budget;
-   - separate prefill/decode selection from the execution mechanism;
-   - measure TTFT, inter-token latency, throughput, and fragmentation.
-
-2. **Continuous tensor batching**
-   - batch compatible prefill and decode work on the selected backend;
+1. **Optimize continuous tensor batching**
+   - benchmark unbucketed versus power-of-two prompt grouping;
+   - add chunked prefill or an adaptive padding/throughput strategy;
+   - optimize the request-local portion of tensor-batched paged attention;
    - keep per-request block tables, lifecycle, cancellation, and outputs
      isolated;
    - compare throughput and latency against the single-request oracle.
+
+2. **Measurement and policy experiments**
+   - feed the new observation records into reproducible benchmark summaries;
+   - compare token budgets and prefill/decode mixes under fixed traces;
+   - expose repeatable configurations and results through the workbench.
 
 3. **Paged-attention optimization**
    - benchmark page size and fragmentation tradeoffs;
@@ -329,6 +434,26 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
+- **2026-10-13 09:46 BST — working tree on `540dee2`:** Added replaceable
+  prefill-length grouping, power-of-two buckets, per-invocation padding
+  accounting, observer efficiency/rate measurements, and deterministic
+  grouping/event-order coverage.
+- **2026-10-13 08:02 BST — working tree on `540dee2`:** Added optional
+  variable-length batched prefill, right-padded Burn Llama execution with
+  real-prefix cache writes, atomic per-request KV reservation, executor
+  grouping/fallback records, and independent-session oracle coverage.
+- **2026-10-12 18:55 BST — working tree on `540dee2`:** Added optional
+  model-level batched decode, executor grouping and tensor/fallback records,
+  atomic multi-sequence KV growth, real Burn Llama tensor decode, observation
+  counters, numerical oracle comparison, and executor integration coverage.
+- **2026-10-12 17:40 BST — working tree on `540dee2`:** Added the
+  `ola-observe` crate with documented lifecycle latency formulas, iteration
+  measurements and rates, cumulative counters, terminal request capture, and
+  deterministic tests.
+- **2026-10-12 16:40 BST — working tree on `540dee2`:** Added replaceable
+  batch composition, auditable selected/deferred iteration plans, a FIFO
+  input-token budget with oversized-prefill progress, and a documented root
+  Makefile for verification, UI, fixture, and GPU workflows.
 - **2026-10-12 13:03 BST — working tree on `5827879`:** Verified strict
   admission through both CPU and GTX 1650 WGPU UI-to-executor generation paths;
   the pinned external fixture hashes matched the conformance record.

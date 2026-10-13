@@ -1,9 +1,10 @@
 //! Correctness-first Burn implementation of the Hugging Face Llama format.
 //!
 //! This module intentionally starts with a narrow, inspectable execution path:
-//! one request at a time, greedy decoding, and a block-paged KV cache. The
-//! original full-sequence path remains available as a correctness oracle while
-//! cached decoding processes only the newest token.
+//! greedy decoding and a block-paged KV cache. Individual sessions remain the
+//! correctness oracle, while compatible variable-length prefill and cached
+//! decode operations can share model tensor work without sharing request-local
+//! cache state.
 
 mod config;
 mod factory;

@@ -911,8 +911,10 @@ vertical slice — October 2026.
 
 Current engineering focus:
 
-- define explicit per-iteration batch-composition and token-budget policy;
-- turn deterministic multi-session iterations into tensor-level batches;
+- compare prompt-length bucketing and token-budget policies using measured
+  padding overhead;
+- optimize tensor-batched prefill/decode and page-native attention;
+- compare batching policies using the new lifecycle and iteration measurements;
 - optimize page-native attention with accelerator-specific fusion.
 
 ---

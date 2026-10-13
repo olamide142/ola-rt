@@ -48,7 +48,9 @@ SwiGLU MLPs, final RMSNorm, and the language-model head.
 
 The baseline is intentionally simple and easy to inspect:
 
-- batch size is one at the `GenerationSession` boundary;
+- the direct `GenerationSession` API processes one request at a time;
+- the shared model can tensor-batch compatible variable-length prefills and
+  one-token decode operations;
 - only greedy decoding (`temperature = 0`) is accepted;
 - prefill writes compact keys and values into fixed-size per-layer pages;
 - runtime block tables map each sequence's logical blocks to physical pages;
@@ -91,6 +93,30 @@ Loaded Llama artifacts publish the same bytes-per-token, page size, and total
 pool capacity as a backend-neutral `KvCacheProfile`. The runtime's strict
 admission policy therefore reserves against the physical Burn pool before
 creating a session rather than discovering overcommit during prefill.
+
+## Tensor-batched prefill and decode
+
+Variable-length prompt batches are right-padded for dense transformer work.
+Causal attention ensures that a real prompt position cannot observe its padded
+suffix. Each row's final real-token logits are selected independently, and
+only real K/V positions are written into that request's physical pages. Cache
+reservation uses the request-specific prompt lengths and succeeds or fails
+atomically for the complete batch.
+
+The optional model-level batch path processes one cached token for several
+sessions sharing the loaded artifact. It batches embeddings, Q/K/V projections,
+attention-output projection, normalization, MLP layers, vocabulary projection,
+argmax, and the host token read. RoPE application and page traversal remain
+request-local because live sequences may occupy different absolute positions
+and different numbers of physical pages.
+
+Each session keeps its own logical block table and generation state. KV growth
+uses `KvBlockManager::append_batch`, which validates every sequence and combined
+capacity before mutating any allocation. Tests compare batched output and
+session metrics with independent prefill and decode, including prompts with
+different lengths and decode at different positions. Executor integration
+tests verify that compatible Llama requests report real `Tensor` batches for
+both phases. The individual paths remain numerical and lifecycle oracles.
 
 ## Running a local artifact
 

@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod admission;
+mod batch;
 mod error;
 mod executor;
 mod kv_cache;
@@ -12,6 +13,11 @@ mod state;
 pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
     UnconstrainedAdmission,
+};
+pub use batch::{
+    BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, ExecutionBatch,
+    FifoTokenBudgetPolicy, IterationPlan, PowerOfTwoPrefillBatcher, PrefillBatcher,
+    UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
 pub use error::RuntimeError;
 pub use executor::{

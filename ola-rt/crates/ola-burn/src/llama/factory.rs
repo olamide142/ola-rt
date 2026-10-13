@@ -280,6 +280,10 @@ mod tests {
     };
 
     use super::*;
+    #[cfg(feature = "wgpu")]
+    use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
+    #[cfg(feature = "wgpu")]
+    use ola_runtime::{BatchExecutionMode, Executor, Runtime};
 
     #[test]
     fn factory_is_registered_by_architecture_not_model_name() {
@@ -388,5 +392,50 @@ mod tests {
                 "logit {index}: CPU={cpu}, WGPU={gpu}, difference={difference}"
             );
         }
+    }
+
+    /// Exercises the actual WGPU session path through runtime tensor grouping.
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "requires the pinned fixture and a working WGPU adapter"]
+    fn wgpu_executor_tensor_batches_prefill_and_decode() {
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
+        let artifact = LlamaFactory::<Wgpu<f32, i32>>::new(WgpuDevice::default())
+            .load_local(directory)
+            .unwrap();
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
+            .unwrap();
+        let generation = GenerationConfig {
+            max_new_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: Some(0),
+        };
+        for prompt in ["Hello", "Hello world"] {
+            let mut request = RequestSpec::text("tiny", prompt);
+            request.generation = generation.clone();
+            executor.submit(request, Timestamp::ZERO).unwrap();
+        }
+        let admitted = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+
+        assert_eq!(admitted.execution_batches.len(), 1);
+        assert_eq!(
+            admitted.execution_batches[0].mode,
+            BatchExecutionMode::Tensor
+        );
+        assert_eq!(admitted.execution_batches[0].request_ids.len(), 2);
+
+        let decoded = executor.step_iteration(Timestamp::from_micros(2)).unwrap();
+
+        assert_eq!(decoded.execution_batches.len(), 1);
+        assert_eq!(
+            decoded.execution_batches[0].mode,
+            BatchExecutionMode::Tensor
+        );
+        assert_eq!(decoded.execution_batches[0].request_ids.len(), 2);
     }
 }

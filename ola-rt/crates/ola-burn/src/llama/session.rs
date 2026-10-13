@@ -79,6 +79,283 @@ where
             terminal: false,
         }))
     }
+
+    fn prefill_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_tokens: &[&[u32]],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        let batch_size = sessions.len();
+        if prompt_tokens.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Prefill,
+                    format!(
+                        "batch has {batch_size} sessions but {} prompts",
+                        prompt_tokens.len()
+                    ),
+                ),
+            ));
+        }
+        if batch_size == 0 {
+            return Some(Vec::new());
+        }
+        let mut typed = Vec::with_capacity(batch_size);
+        for session in sessions {
+            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession<B>>() else {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        "batched session was not created by this Llama backend",
+                    ),
+                ));
+            };
+            typed.push(session);
+        }
+        for (index, (session, prompt)) in typed.iter().zip(prompt_tokens).enumerate() {
+            if let Err(error) = session.validate_prefill_input(prompt) {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        format!("batch request at index {index} is invalid: {error}"),
+                    ),
+                ));
+            }
+        }
+
+        let sequence_lengths = prompt_tokens
+            .iter()
+            .map(|prompt| prompt.len())
+            .collect::<Vec<_>>();
+        let padded_length = sequence_lengths.iter().copied().max().unwrap_or(0);
+        let mut token_values = Vec::with_capacity(batch_size * padded_length);
+        for prompt in prompt_tokens {
+            token_values.extend(prompt.iter().copied().map(i64::from));
+            token_values.resize(token_values.len() + padded_length - prompt.len(), 0);
+        }
+        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [batch_size, padded_length]),
+            &self.device,
+        );
+        let logits = {
+            let mut caches = typed
+                .iter_mut()
+                .map(|session| {
+                    session
+                        .cache
+                        .as_mut()
+                        .expect("Llama sessions allocate a cache at creation")
+                })
+                .collect::<Vec<_>>();
+            match self
+                .module
+                .prefill_batch(input_ids, caches.as_mut_slice(), &sequence_lengths)
+            {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return Some(batch_error(
+                        batch_size,
+                        cache_error(ExecutionStage::Prefill, error),
+                    ));
+                }
+            }
+        };
+        let final_rows = sequence_lengths
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, length)| {
+                logits.clone().slice([
+                    index..index + 1,
+                    length - 1..length,
+                    0..self.config.vocab_size,
+                ])
+            })
+            .collect::<Vec<_>>();
+        let selected = match Tensor::cat(final_rows, 0)
+            .argmax(2)
+            .into_data()
+            .to_vec::<B::IntElem>()
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        format!("failed to read batched selected tokens: {error}"),
+                    ),
+                ));
+            }
+        };
+        if selected.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Prefill,
+                    format!(
+                        "backend returned {} token selections for batch size {batch_size}",
+                        selected.len()
+                    ),
+                ),
+            ));
+        }
+
+        Some(
+            typed
+                .into_iter()
+                .zip(prompt_tokens.iter().copied())
+                .zip(selected)
+                .map(|((session, prompt), selected)| {
+                    let selected = selected.elem::<i64>();
+                    let id = u32::try_from(selected).map_err(|_| {
+                        ModelExecutionError::new(
+                            ExecutionStage::Prefill,
+                            "backend returned a token ID outside the u32 range",
+                        )
+                    })?;
+                    session.tokens.extend_from_slice(prompt);
+                    session.metrics.prompt_tokens = prompt.len();
+                    session.metrics.kv_cache_bytes = session
+                        .cache
+                        .as_ref()
+                        .expect("a live Llama session owns a cache")
+                        .bytes();
+                    Ok(session.record_selected_token(id))
+                })
+                .collect(),
+        )
+    }
+
+    fn decode_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        input_tokens: &[u32],
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        let batch_size = sessions.len();
+        if input_tokens.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Decode,
+                    format!(
+                        "batch has {batch_size} sessions but {} input tokens",
+                        input_tokens.len()
+                    ),
+                ),
+            ));
+        }
+        let mut typed = Vec::with_capacity(batch_size);
+        for session in sessions {
+            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession<B>>() else {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Decode,
+                        "batched session was not created by this Llama backend",
+                    ),
+                ));
+            };
+            typed.push(session);
+        }
+        for (index, (session, input_token)) in
+            typed.iter().zip(input_tokens.iter().copied()).enumerate()
+        {
+            if let Err(error) = session.validate_decode_input(input_token) {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Decode,
+                        format!("batch request at index {index} is invalid: {error}"),
+                    ),
+                ));
+            }
+        }
+
+        let token_values = input_tokens
+            .iter()
+            .copied()
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let input_ids: Tensor<B, 2, Int> =
+            Tensor::from_data(TensorData::new(token_values, [batch_size, 1]), &self.device);
+        let logits = {
+            let mut caches = typed
+                .iter_mut()
+                .map(|session| {
+                    session
+                        .cache
+                        .as_mut()
+                        .expect("Llama sessions allocate a cache at creation")
+                })
+                .collect::<Vec<_>>();
+            match self.module.decode_batch(input_ids, caches.as_mut_slice()) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return Some(batch_error(
+                        batch_size,
+                        cache_error(ExecutionStage::Decode, error),
+                    ));
+                }
+            }
+        };
+        let selected = match logits
+            .slice([0..batch_size, 0..1, 0..self.config.vocab_size])
+            .argmax(2)
+            .into_data()
+            .to_vec::<B::IntElem>()
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Decode,
+                        format!("failed to read batched selected tokens: {error}"),
+                    ),
+                ));
+            }
+        };
+        if selected.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Decode,
+                    format!(
+                        "backend returned {} token selections for batch size {batch_size}",
+                        selected.len()
+                    ),
+                ),
+            ));
+        }
+
+        Some(
+            typed
+                .into_iter()
+                .zip(input_tokens.iter().copied())
+                .zip(selected)
+                .map(|((session, input_token), selected)| {
+                    let selected = selected.elem::<i64>();
+                    let id = u32::try_from(selected).map_err(|_| {
+                        ModelExecutionError::new(
+                            ExecutionStage::Decode,
+                            "backend returned a token ID outside the u32 range",
+                        )
+                    })?;
+                    session.tokens.push(input_token);
+                    session.metrics.kv_cache_bytes = session
+                        .cache
+                        .as_ref()
+                        .expect("a live Llama session owns a cache")
+                        .bytes();
+                    Ok(session.record_selected_token(id))
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Request-local state for correctness-first cached Llama decoding.
@@ -118,15 +395,19 @@ where
         let id = u32::try_from(selected).map_err(|_| {
             ModelExecutionError::new(stage, "backend returned a token ID outside the u32 range")
         })?;
+        Ok(self.record_selected_token(id))
+    }
+
+    fn record_selected_token(&mut self, id: u32) -> GeneratedToken {
         let is_end_of_sequence = self.config.eos_token_id.contains(&id);
         self.last_generated = Some(id);
         self.metrics.generated_tokens += 1;
         self.terminal =
             is_end_of_sequence || self.metrics.generated_tokens >= self.generation.max_new_tokens;
-        Ok(GeneratedToken {
+        GeneratedToken {
             id,
             is_end_of_sequence,
-        })
+        }
     }
 
     fn validate_token(&self, token: u32, stage: ExecutionStage) -> Result<(), ModelExecutionError> {
@@ -158,50 +439,8 @@ where
         }
         Ok(())
     }
-}
 
-impl<B> GenerationSession for LlamaSession<B>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
-    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<GeneratedToken, ModelExecutionError> {
-        if !self.tokens.is_empty() || self.last_generated.is_some() {
-            return Err(ModelExecutionError::new(
-                ExecutionStage::Prefill,
-                "prefill may be called exactly once per session",
-            ));
-        }
-        if prompt_tokens.is_empty() {
-            return Err(ModelExecutionError::new(
-                ExecutionStage::Prefill,
-                "prompt must contain at least one token",
-            ));
-        }
-        for &token in prompt_tokens {
-            self.validate_token(token, ExecutionStage::Prefill)?;
-        }
-        self.validate_context_length(prompt_tokens.len(), ExecutionStage::Prefill)?;
-        let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
-        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
-            TensorData::new(token_values, [1, prompt_tokens.len()]),
-            &self.device,
-        );
-        let cache = self
-            .cache
-            .as_mut()
-            .expect("sessions allocate a cache at creation");
-        let logits = self
-            .module
-            .prefill(input_ids, cache)
-            .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
-        self.metrics.kv_cache_bytes = cache.bytes();
-        self.tokens.extend_from_slice(prompt_tokens);
-        self.metrics.prompt_tokens = prompt_tokens.len();
-        self.select_token(logits, ExecutionStage::Prefill)
-    }
-
-    fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
+    fn validate_decode_input(&self, input_token: u32) -> Result<(), ModelExecutionError> {
         let expected = self.last_generated.ok_or_else(|| {
             ModelExecutionError::new(
                 ExecutionStage::Decode,
@@ -223,7 +462,57 @@ where
             ));
         }
         self.validate_token(input_token, ExecutionStage::Decode)?;
-        self.validate_context_length(self.tokens.len() + 1, ExecutionStage::Decode)?;
+        self.validate_context_length(self.tokens.len() + 1, ExecutionStage::Decode)
+    }
+
+    fn validate_prefill_input(&self, prompt_tokens: &[u32]) -> Result<(), ModelExecutionError> {
+        if !self.tokens.is_empty() || self.last_generated.is_some() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prefill may be called exactly once per session",
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prompt must contain at least one token",
+            ));
+        }
+        for &token in prompt_tokens {
+            self.validate_token(token, ExecutionStage::Prefill)?;
+        }
+        self.validate_context_length(prompt_tokens.len(), ExecutionStage::Prefill)
+    }
+}
+
+impl<B> GenerationSession for LlamaSession<B>
+where
+    B: Backend + 'static,
+    B::Device: Send + Sync,
+{
+    fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<GeneratedToken, ModelExecutionError> {
+        self.validate_prefill_input(prompt_tokens)?;
+        let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
+        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [1, prompt_tokens.len()]),
+            &self.device,
+        );
+        let cache = self
+            .cache
+            .as_mut()
+            .expect("sessions allocate a cache at creation");
+        let logits = self
+            .module
+            .prefill(input_ids, cache)
+            .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
+        self.metrics.kv_cache_bytes = cache.bytes();
+        self.tokens.extend_from_slice(prompt_tokens);
+        self.metrics.prompt_tokens = prompt_tokens.len();
+        self.select_token(logits, ExecutionStage::Prefill)
+    }
+
+    fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
+        self.validate_decode_input(input_token)?;
         let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
             TensorData::new(vec![i64::from(input_token)], [1, 1]),
             &self.device,
@@ -246,19 +535,67 @@ where
     fn metrics(&self) -> SessionMetrics {
         self.metrics
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 fn cache_error(stage: ExecutionStage, error: KvBlockError) -> ModelExecutionError {
     ModelExecutionError::new(stage, format!("KV cache: {error}"))
 }
 
+fn batch_error(
+    batch_size: usize,
+    error: ModelExecutionError,
+) -> Vec<Result<GeneratedToken, ModelExecutionError>> {
+    (0..batch_size).map(|_| Err(error.clone())).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use burn::backend::NdArray;
+    use ola_core::{ModelDescriptor, RequestSpec, Timestamp};
+    use ola_model::{CausalLanguageModel, Tokenizer};
+    use ola_runtime::{BatchExecutionMode, BatchPhase, ExecutionBatch, Executor, Runtime};
 
     use super::*;
 
     type TestBackend = NdArray<f32>;
+
+    #[derive(Clone, Copy)]
+    struct NumericTokenizer;
+
+    impl Tokenizer for NumericTokenizer {
+        fn encode(
+            &self,
+            text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Vec<u32>, ModelExecutionError> {
+            text.split_whitespace()
+                .map(|piece| {
+                    piece.parse().map_err(|_| {
+                        ModelExecutionError::new(
+                            ExecutionStage::Tokenize,
+                            "expected numeric token IDs",
+                        )
+                    })
+                })
+                .collect()
+        }
+
+        fn decode(
+            &self,
+            token_ids: &[u32],
+            _skip_special_tokens: bool,
+        ) -> Result<String, ModelExecutionError> {
+            Ok(token_ids
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+    }
 
     fn tiny_model() -> BurnLlamaModel<TestBackend> {
         let config = LlamaConfig {
@@ -284,7 +621,7 @@ mod tests {
         let device = Default::default();
         TestBackend::seed(&device, 11);
         let module = LlamaForCausalLM::init(&config, &device);
-        BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(16, 16))
+        BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(64, 16))
             .unwrap()
     }
 
@@ -315,6 +652,122 @@ mod tests {
                 kv_cache_bytes: 512,
             }
         );
+    }
+
+    #[test]
+    fn batched_prefill_matches_individual_sessions_with_different_lengths() {
+        let model = tiny_model();
+        let mut first = model.create_session(greedy(3)).unwrap();
+        let mut second = model.create_session(greedy(3)).unwrap();
+        let mut first_oracle = model.create_session(greedy(3)).unwrap();
+        let mut second_oracle = model.create_session(greedy(3)).unwrap();
+        let first_prompt = [1, 4];
+        let second_prompt = [1, 5, 7];
+        let expected = vec![
+            first_oracle.prefill(&first_prompt).unwrap(),
+            second_oracle.prefill(&second_prompt).unwrap(),
+        ];
+
+        let (batched, first_metrics, second_metrics) = {
+            let mut sessions: Vec<&mut dyn GenerationSession> =
+                vec![first.as_mut(), second.as_mut()];
+            let batched = model
+                .prefill_batch(&mut sessions, &[&first_prompt, &second_prompt])
+                .expect("Burn Llama implements tensor-batched prefill")
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (batched, sessions[0].metrics(), sessions[1].metrics())
+        };
+
+        assert_eq!(batched, expected);
+        assert_eq!(first_metrics, first_oracle.metrics());
+        assert_eq!(second_metrics, second_oracle.metrics());
+        assert_eq!(
+            first.decode(batched[0].id).unwrap(),
+            first_oracle.decode(expected[0].id).unwrap()
+        );
+        assert_eq!(
+            second.decode(batched[1].id).unwrap(),
+            second_oracle.decode(expected[1].id).unwrap()
+        );
+    }
+
+    #[test]
+    fn batched_decode_matches_individual_sessions_with_different_positions() {
+        let model = tiny_model();
+        let mut first = model.create_session(greedy(3)).unwrap();
+        let mut second = model.create_session(greedy(3)).unwrap();
+        let mut first_oracle = model.create_session(greedy(3)).unwrap();
+        let mut second_oracle = model.create_session(greedy(3)).unwrap();
+        let first_token = first.prefill(&[1, 4]).unwrap();
+        let second_token = second.prefill(&[1, 5, 7]).unwrap();
+        let first_oracle_token = first_oracle.prefill(&[1, 4]).unwrap();
+        let second_oracle_token = second_oracle.prefill(&[1, 5, 7]).unwrap();
+        assert_eq!(first_token, first_oracle_token);
+        assert_eq!(second_token, second_oracle_token);
+
+        let (batched, first_metrics, second_metrics) = {
+            let mut sessions: Vec<&mut dyn GenerationSession> =
+                vec![first.as_mut(), second.as_mut()];
+            let batched = model
+                .decode_batch(&mut sessions, &[first_token.id, second_token.id])
+                .expect("Burn Llama implements tensor-batched decode")
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            (batched, sessions[0].metrics(), sessions[1].metrics())
+        };
+        let expected = vec![
+            first_oracle.decode(first_oracle_token.id).unwrap(),
+            second_oracle.decode(second_oracle_token.id).unwrap(),
+        ];
+
+        assert_eq!(batched, expected);
+        assert_eq!(first_metrics, first_oracle.metrics());
+        assert_eq!(second_metrics, second_oracle.metrics());
+    }
+
+    #[test]
+    fn executor_uses_the_llama_tensor_decode_path_for_compatible_requests() {
+        let artifact = CausalLanguageModel::new(NumericTokenizer, tiny_model());
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
+            .unwrap();
+        let mut first_spec = RequestSpec::text("tiny", "1 4");
+        first_spec.generation = greedy(3);
+        let mut second_spec = RequestSpec::text("tiny", "1 5 7");
+        second_spec.generation = greedy(3);
+        let first = executor.submit(first_spec, Timestamp::ZERO).unwrap();
+        let second = executor.submit(second_spec, Timestamp::ZERO).unwrap();
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(
+            admitted.execution_batches,
+            vec![ExecutionBatch {
+                phase: BatchPhase::Prefill,
+                request_ids: vec![first, second],
+                mode: BatchExecutionMode::Tensor,
+                input_tokens: 5,
+                padding_tokens: 1,
+            }]
+        );
+
+        let decoded = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+
+        assert_eq!(
+            decoded.execution_batches,
+            vec![ExecutionBatch {
+                phase: BatchPhase::Decode,
+                request_ids: vec![first, second],
+                mode: BatchExecutionMode::Tensor,
+                input_tokens: 2,
+                padding_tokens: 0,
+            }]
+        );
+        assert_eq!(decoded.active_requests, 2);
+        assert_eq!(decoded.plan.scheduled_tokens(), 2);
     }
 
     #[test]
