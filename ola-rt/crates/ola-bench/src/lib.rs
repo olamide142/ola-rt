@@ -3,7 +3,10 @@
 use std::{error::Error, fmt, time::Duration};
 
 use ola_core::{Input, ModelId, RequestId, RequestSpec, Timestamp};
-use ola_runtime::{Runtime, RuntimeError, Scheduler};
+use ola_runtime::{
+    PowerOfTwoPrefillBatcher, PrefillBatcher, Runtime, RuntimeError, Scheduler,
+    UnbucketedPrefillBatcher,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 /// One request arrival in a workload trace.
@@ -95,6 +98,137 @@ impl FixedWorkload {
     }
 }
 
+/// Deterministic compute-shape summary for one prefill grouping strategy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrefillBatchSummary {
+    /// Prompt rows represented by the trace.
+    pub requests: usize,
+    /// Model invocations produced after grouping.
+    pub invocations: usize,
+    /// Invocations containing at least two prompt rows.
+    pub tensor_invocations: usize,
+    /// Single-row invocations using the individual execution path.
+    pub individual_invocations: usize,
+    /// Real prompt positions across every invocation.
+    pub input_tokens: usize,
+    /// Artificial right-padding positions across every invocation.
+    pub padding_tokens: usize,
+}
+
+impl PrefillBatchSummary {
+    /// Returns real plus artificial dense input positions.
+    pub fn dense_input_tokens(self) -> usize {
+        self.input_tokens.saturating_add(self.padding_tokens)
+    }
+
+    /// Returns the fraction of dense positions carrying real prompt tokens.
+    pub fn input_token_efficiency(self) -> Option<f64> {
+        let dense = self.dense_input_tokens();
+        if dense == 0 {
+            None
+        } else {
+            Some(self.input_tokens as f64 / dense as f64)
+        }
+    }
+}
+
+/// Side-by-side deterministic shape comparison for the built-in strategies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrefillBatchComparison {
+    /// All prompts grouped together after model compatibility.
+    pub unbucketed: PrefillBatchSummary,
+    /// Prompts grouped by next-power-of-two length.
+    pub power_of_two: PrefillBatchSummary,
+}
+
+impl PrefillBatchComparison {
+    /// Returns padding positions avoided by power-of-two grouping.
+    pub fn padding_tokens_saved(self) -> usize {
+        self.unbucketed
+            .padding_tokens
+            .saturating_sub(self.power_of_two.padding_tokens)
+    }
+
+    /// Returns the fraction of baseline padding avoided by bucketing.
+    pub fn padding_reduction(self) -> Option<f64> {
+        if self.unbucketed.padding_tokens == 0 {
+            None
+        } else {
+            Some(self.padding_tokens_saved() as f64 / self.unbucketed.padding_tokens as f64)
+        }
+    }
+}
+
+/// Analyzes one same-model prompt-length trace with a caller-supplied grouper.
+///
+/// This measures deterministic tensor shape, not elapsed performance. Groups
+/// retain first-seen bucket order, matching the executor's stable grouping
+/// semantics. Every prompt length must be positive.
+pub fn summarize_prefill_batches(
+    prompt_lengths: &[usize],
+    batcher: &mut dyn PrefillBatcher,
+) -> Result<PrefillBatchSummary, WorkloadError> {
+    if prompt_lengths.is_empty() {
+        return Err(WorkloadError::NoPromptLengths);
+    }
+    if prompt_lengths.contains(&0) {
+        return Err(WorkloadError::EmptyPrompt);
+    }
+
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &prompt_tokens in prompt_lengths {
+        let bucket = batcher.bucket(prompt_tokens);
+        if let Some((_, lengths)) = groups.iter_mut().find(|(key, _)| *key == bucket) {
+            lengths.push(prompt_tokens);
+        } else {
+            groups.push((bucket, vec![prompt_tokens]));
+        }
+    }
+
+    let mut summary = PrefillBatchSummary {
+        requests: prompt_lengths.len(),
+        invocations: groups.len(),
+        ..PrefillBatchSummary::default()
+    };
+    for (_, lengths) in groups {
+        if lengths.len() > 1 {
+            summary.tensor_invocations += 1;
+        } else {
+            summary.individual_invocations += 1;
+        }
+        let input_tokens = lengths.iter().try_fold(0_usize, |total, length| {
+            total
+                .checked_add(*length)
+                .ok_or(WorkloadError::TokenCountOverflow)
+        })?;
+        let padded_length = lengths.iter().copied().max().unwrap_or(0);
+        let dense_tokens = padded_length
+            .checked_mul(lengths.len())
+            .ok_or(WorkloadError::TokenCountOverflow)?;
+        summary.input_tokens = summary
+            .input_tokens
+            .checked_add(input_tokens)
+            .ok_or(WorkloadError::TokenCountOverflow)?;
+        summary.padding_tokens = summary
+            .padding_tokens
+            .checked_add(dense_tokens - input_tokens)
+            .ok_or(WorkloadError::TokenCountOverflow)?;
+    }
+    Ok(summary)
+}
+
+/// Compares the unbucketed baseline with power-of-two prompt grouping.
+pub fn compare_prefill_batching(
+    prompt_lengths: &[usize],
+) -> Result<PrefillBatchComparison, WorkloadError> {
+    let unbucketed = summarize_prefill_batches(prompt_lengths, &mut UnbucketedPrefillBatcher)?;
+    let power_of_two = summarize_prefill_batches(prompt_lengths, &mut PowerOfTwoPrefillBatcher)?;
+    Ok(PrefillBatchComparison {
+        unbucketed,
+        power_of_two,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Nearest-rank latency distribution summary in microseconds.
 pub struct LatencySummary {
@@ -152,6 +286,12 @@ pub enum WorkloadError {
     EventsOutOfOrder,
     /// Arrival time cannot be represented by `Timestamp`.
     TimestampOverflow,
+    /// A prefill-shape trace must include at least one prompt.
+    NoPromptLengths,
+    /// Model prefill does not accept a zero-token prompt.
+    EmptyPrompt,
+    /// Prompt shape arithmetic exceeded the platform token-count range.
+    TokenCountOverflow,
 }
 
 impl fmt::Display for WorkloadError {
@@ -161,6 +301,9 @@ impl fmt::Display for WorkloadError {
             Self::NoOutputTokens => "workload requests must generate at least one token",
             Self::EventsOutOfOrder => "workload events must be ordered by arrival time",
             Self::TimestampOverflow => "workload timestamps exceed the supported range",
+            Self::NoPromptLengths => "prefill workload must contain at least one prompt",
+            Self::EmptyPrompt => "prefill workload prompts must contain at least one token",
+            Self::TokenCountOverflow => "prefill workload token counts overflowed",
         };
         formatter.write_str(message)
     }
@@ -208,5 +351,51 @@ mod tests {
         assert_eq!(summary.p50_micros, 3);
         assert_eq!(summary.p95_micros, 100);
         assert_eq!(summary.p99_micros, 100);
+    }
+
+    #[test]
+    fn compares_prefill_padding_without_claiming_elapsed_performance() {
+        let comparison = compare_prefill_batching(&[5, 9, 7]).unwrap();
+
+        assert_eq!(
+            comparison.unbucketed,
+            PrefillBatchSummary {
+                requests: 3,
+                invocations: 1,
+                tensor_invocations: 1,
+                individual_invocations: 0,
+                input_tokens: 21,
+                padding_tokens: 6,
+            }
+        );
+        assert_eq!(
+            comparison.power_of_two,
+            PrefillBatchSummary {
+                requests: 3,
+                invocations: 2,
+                tensor_invocations: 1,
+                individual_invocations: 1,
+                input_tokens: 21,
+                padding_tokens: 2,
+            }
+        );
+        assert_eq!(comparison.padding_tokens_saved(), 4);
+        assert_eq!(comparison.padding_reduction(), Some(2.0 / 3.0));
+        assert_eq!(
+            comparison.power_of_two.input_token_efficiency(),
+            Some(21.0 / 23.0)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_zero_length_prefill_traces() {
+        assert_eq!(
+            compare_prefill_batching(&[]),
+            Err(WorkloadError::NoPromptLengths)
+        );
+        assert_eq!(
+            compare_prefill_batching(&[4, 0]),
+            Err(WorkloadError::EmptyPrompt)
+        );
     }
 }

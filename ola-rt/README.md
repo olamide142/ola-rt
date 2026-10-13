@@ -148,6 +148,8 @@ Implemented:
 - a Ratatui workbench with background local Llama generation, KV benchmarks,
   and FIFO runtime experiments;
 - deterministic fixed-workload generation and replay;
+- deterministic prefill-grouping comparison with padding and invocation
+  summaries;
 - basic latency summaries;
 - a Burn device adapter;
 - opt-in WGPU and native CUDA Burn backends, with WGPU inference numerically

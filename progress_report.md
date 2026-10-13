@@ -1,14 +1,14 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-13 09:46 BST (Europe/London)
+**Last updated:** 2026-10-13 14:09 BST (Europe/London)
 
-**Source revision:** working tree based on admission milestone `540dee2` on
-`master`
+**Source revision:** working tree based on continuous-batching milestone
+`c788f1a` on `master`
 
-**Repository state at update:** admission milestone merged and pushed;
-batch-composition/token-budget policy, root developer Makefile, observability,
-variable-length tensor-batched Llama prefill/decode, and prompt-length
-bucketing with padding measurements implemented locally; not yet committed
+**Repository state at update:** batching, Makefile, observability,
+variable-length Llama prefill/decode, and prompt bucketing committed locally;
+deterministic bucketing comparison and UI experiment implemented after that
+commit; not yet committed or pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -84,6 +84,12 @@ event order. Execution records and `ola-observe` report real input positions,
 padding positions, dense-input rate, and input-token efficiency so policy
 comparisons can measure the compute tradeoff rather than infer it.
 
+The benchmark layer now compares the same prompt-length trace under unbucketed
+and power-of-two grouping. It reports padding saved, input efficiency, and the
+invocation-count tradeoff without presenting deterministic shape arithmetic as
+elapsed performance. The comparison is runnable from the terminal workbench's
+Experiments screen without loading a model.
+
 ## Current delivery status
 
 | Area | Status | Current capability |
@@ -98,7 +104,7 @@ comparisons can measure the compute tradeoff rather than infer it.
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
 | Batch composition | Token-budget and bucketing baseline | Replaceable selection policy, auditable plans, FIFO token budget, optional power-of-two prefill buckets |
 | Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
-| Workloads and metrics | Foundation working | Fixed trace generation, replay, nearest-rank distribution summaries |
+| Workloads and metrics | Foundation working | Fixed trace replay, nearest-rank latency summaries, deterministic prefill grouping comparisons |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -107,7 +113,7 @@ comparisons can measure the compute tradeoff rather than infer it.
 | KV block manager | Working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
 | Serving | Foundation working | Transport-neutral request/service boundary |
 | Terminal UI | Working foundation | Overview, chat, benchmarks, experiments, background local adapter |
-| Local UI integrations | Working | Llama chat and generation run through the executor; KV and FIFO probes remain available |
+| Local UI integrations | Working | Executor-backed Llama chat/generation, KV/FIFO probes, and prefill-bucketing comparison |
 | GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
@@ -235,6 +241,10 @@ comparisons can measure the compute tradeoff rather than infer it.
 - Fixed workload generator with explicit request shapes.
 - Replay into any compatible runtime scheduler.
 - Nearest-rank latency summaries in microseconds.
+- Deterministic same-model prefill-shape summaries with invocation counts, real
+  inputs, padding inputs, and efficiency.
+- Side-by-side unbucketed versus power-of-two comparison with explicit padding
+  savings and no implied wall-clock claim.
 
 ### `ola-observe`
 
@@ -272,6 +282,8 @@ comparisons can measure the compute tradeoff rather than infer it.
 - Llama generation latency/throughput probe.
 - Real KV block-pressure benchmark.
 - Real fixed-workload FIFO experiment.
+- Model-independent prefill-bucketing experiment showing padding, invocation,
+  and efficiency tradeoffs.
 - Completed-job KV usage is reported as an observation, not falsely retained as
   live allocated memory.
 
@@ -279,7 +291,7 @@ comparisons can measure the compute tradeoff rather than infer it.
 
 At the working tree recorded above:
 
-- `cargo test --workspace`: **73 unit tests and 4 documentation tests passed**;
+- `cargo test --workspace`: **77 unit tests and 5 documentation tests passed**;
   **2 external-fixture tests ignored** by default.
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
@@ -316,6 +328,8 @@ At the working tree recorded above:
   transparent fallback, and execution-mode records.
 - Prefill-bucketing tests cover power-of-two boundaries, padding accounting,
   nearby-length grouping, distant-length splitting, and FIFO event restoration.
+- Benchmark/UI tests cover invalid traces and the reproducible bucketing
+  comparison surfaced through the workbench.
 - Observation tests cover every documented latency boundary, interval rates,
   dense padding efficiency, cumulative counts, regressive timestamps,
   single-token inter-token handling, and failure atomicity.
@@ -398,7 +412,8 @@ and `TOKENS` variables.
 ## Recommended next milestones
 
 1. **Optimize continuous tensor batching**
-   - benchmark unbucketed versus power-of-two prompt grouping;
+   - execute the grouping comparison against a loaded model to measure latency
+     and throughput alongside deterministic shape costs;
    - add chunked prefill or an adaptive padding/throughput strategy;
    - optimize the request-local portion of tensor-batched paged attention;
    - keep per-request block tables, lifecycle, cancellation, and outputs
@@ -434,6 +449,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
+- **2026-10-13 14:09 BST — working tree on `c788f1a`:** Added deterministic
+  unbucketed-versus-power-of-two prefill comparison, padding/invocation/
+  efficiency summaries, input validation, documentation, and a runnable UI
+  experiment.
+- **2026-10-13 09:46 BST — `c788f1a`:** Committed the continuous-batching,
+  Makefile, observability, variable-length prefill/decode, and prompt-bucketing
+  milestone.
 - **2026-10-13 09:46 BST — working tree on `540dee2`:** Added replaceable
   prefill-length grouping, power-of-two buckets, per-invocation padding
   accounting, observer efficiency/rate measurements, and deterministic

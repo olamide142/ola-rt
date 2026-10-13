@@ -10,7 +10,7 @@ use burn::backend::Cuda;
 use burn::backend::NdArray;
 #[cfg(feature = "wgpu")]
 use burn::backend::Wgpu;
-use ola_bench::FixedWorkload;
+use ola_bench::{FixedWorkload, compare_prefill_batching};
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
@@ -32,6 +32,7 @@ type WgpuBackend = Wgpu<f32, i32>;
 const LLAMA_BENCHMARK: &str = "llama-generation";
 const KV_BENCHMARK: &str = "kv-block-pressure";
 const FIFO_EXPERIMENT: &str = "fifo-workload";
+const PREFILL_BUCKET_EXPERIMENT: &str = "prefill-bucketing";
 const MAX_ACTIVITY: usize = 100;
 
 /// Compute backend selected for local model execution.
@@ -110,13 +111,22 @@ impl LocalBackend {
                     last_result: None,
                 },
             ],
-            experiments: vec![WorkItem {
-                id: FIFO_EXPERIMENT.into(),
-                name: "FIFO workload".into(),
-                description: "Replay and complete a deterministic runtime trace".into(),
-                state: RunState::Ready,
-                last_result: None,
-            }],
+            experiments: vec![
+                WorkItem {
+                    id: FIFO_EXPERIMENT.into(),
+                    name: "FIFO workload".into(),
+                    description: "Replay and complete a deterministic runtime trace".into(),
+                    state: RunState::Ready,
+                    last_result: None,
+                },
+                WorkItem {
+                    id: PREFILL_BUCKET_EXPERIMENT.into(),
+                    name: "Prefill bucketing".into(),
+                    description: "Compare unbucketed and power-of-two padding work".into(),
+                    state: RunState::Ready,
+                    last_result: None,
+                },
+            ],
             activity: vec![if loading_model {
                 "background model load started".into()
             } else {
@@ -525,6 +535,14 @@ fn run_experiment(id: &str) -> WorkerEvent {
             },
             Err(message) => work_failed(WorkKind::Experiment, id, message),
         },
+        PREFILL_BUCKET_EXPERIMENT => match prefill_bucketing_probe() {
+            Ok(result) => WorkerEvent::WorkComplete {
+                kind: WorkKind::Experiment,
+                id: id.into(),
+                result,
+            },
+            Err(message) => work_failed(WorkKind::Experiment, id, message),
+        },
         _ => work_failed(WorkKind::Experiment, id, "unknown experiment ID"),
     }
 }
@@ -616,6 +634,30 @@ fn fifo_workload_probe() -> Result<String, String> {
     ))
 }
 
+fn prefill_bucketing_probe() -> Result<String, String> {
+    const PROMPT_LENGTHS: &[usize] = &[5, 7, 9, 15, 17, 31, 33, 63];
+    let comparison = compare_prefill_batching(PROMPT_LENGTHS).map_err(|error| error.to_string())?;
+    let baseline_efficiency = comparison
+        .unbucketed
+        .input_token_efficiency()
+        .unwrap_or(0.0)
+        * 100.0;
+    let bucketed_efficiency = comparison
+        .power_of_two
+        .input_token_efficiency()
+        .unwrap_or(0.0)
+        * 100.0;
+    let reduction = comparison.padding_reduction().unwrap_or(0.0) * 100.0;
+    Ok(format!(
+        "{} prompts · padding {} → {} ({reduction:.1}% less) · invocations {} → {} · efficiency {baseline_efficiency:.1}% → {bucketed_efficiency:.1}%",
+        PROMPT_LENGTHS.len(),
+        comparison.unbucketed.padding_tokens,
+        comparison.power_of_two.padding_tokens,
+        comparison.unbucketed.invocations,
+        comparison.power_of_two.invocations,
+    ))
+}
+
 fn work_failed(kind: WorkKind, id: &str, message: impl Into<String>) -> WorkerEvent {
     WorkerEvent::WorkFailed {
         kind,
@@ -684,6 +726,16 @@ mod tests {
     }
 
     #[test]
+    fn prefill_bucketing_probe_reports_the_compute_shape_tradeoff() {
+        let summary = prefill_bucketing_probe().unwrap();
+
+        assert!(summary.contains("8 prompts"));
+        assert!(summary.contains("padding"));
+        assert!(summary.contains("invocations"));
+        assert!(summary.contains("efficiency"));
+    }
+
+    #[test]
     fn local_backend_exposes_non_model_work_without_an_artifact() {
         let mut backend = LocalBackend::new(None);
         let snapshot = backend.snapshot().unwrap();
@@ -691,6 +743,32 @@ mod tests {
         assert_eq!(snapshot.runtime.connection, ConnectionState::Connected);
         assert_eq!(snapshot.benchmarks[1].state, RunState::Ready);
         assert!(backend.submit_prompt("hello").is_err());
+    }
+
+    #[test]
+    fn local_backend_runs_the_prefill_bucketing_experiment() {
+        let mut backend = LocalBackend::new(None);
+
+        backend.start_experiment(PREFILL_BUCKET_EXPERIMENT).unwrap();
+        let snapshot = wait_until(&mut backend, |snapshot| {
+            snapshot
+                .experiments
+                .iter()
+                .find(|item| item.id == PREFILL_BUCKET_EXPERIMENT)
+                .is_some_and(|item| item.state == RunState::Succeeded)
+        });
+        let experiment = snapshot
+            .experiments
+            .iter()
+            .find(|item| item.id == PREFILL_BUCKET_EXPERIMENT)
+            .unwrap();
+
+        assert!(
+            experiment
+                .last_result
+                .as_deref()
+                .is_some_and(|result| result.contains("padding 324 → 52"))
+        );
     }
 
     #[test]

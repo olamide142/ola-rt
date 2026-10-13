@@ -25,7 +25,9 @@ thread and currently connects:
 - a local Hugging Face Llama artifact through `ola-burn`;
 - cached greedy chat generation and a generation microbenchmark;
 - the real `KvBlockManager` through a deterministic pressure benchmark;
-- `FixedWorkload` replay through the FIFO runtime as an experiment.
+- `FixedWorkload` replay through the FIFO runtime as an experiment;
+- unbucketed versus power-of-two prefill shape comparison, including padding
+  and invocation tradeoffs.
 
 The bundled `DisconnectedBackend` remains available as a minimal adapter
 template for remote or alternative integrations.
