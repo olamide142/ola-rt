@@ -3896,6 +3896,7 @@ dependencies = [
  "burn",
  "burn-store",
  "ola-core",
+ "ola-kernel",
  "ola-model",
  "ola-runtime",
  "serde",
@@ -3906,6 +3907,13 @@ dependencies = [
 [[package]]
 name = "ola-core"
 version = "0.1.0"
+
+[[package]]
+name = "ola-kernel"
+version = "0.1.0"
+dependencies = [
+ "burn",
+]
 
 [[package]]
 name = "ola-model"

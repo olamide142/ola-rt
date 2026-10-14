@@ -4,6 +4,7 @@ members = [
     "crates/ola-bench",
     "crates/ola-burn",
     "crates/ola-core",
+    "crates/ola-kernel",
     "crates/ola-model",
     "crates/ola-observe",
     "crates/ola-runtime",
@@ -26,6 +27,7 @@ crossterm = "0.29"
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
 ola-core = { path = "crates/ola-core" }
+ola-kernel = { path = "crates/ola-kernel" }
 ola-model = { path = "crates/ola-model" }
 ola-observe = { path = "crates/ola-observe" }
 ola-runtime = { path = "crates/ola-runtime" }

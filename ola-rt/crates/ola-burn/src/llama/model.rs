@@ -6,6 +6,10 @@ use burn::{
         ops::AttentionModuleOptions,
     },
 };
+use ola_kernel::{
+    PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvPage,
+    PortablePagedAttention,
+};
 use ola_runtime::KvBlockError;
 
 use super::{LlamaConfig, kv_cache::LlamaKvCache};
@@ -527,39 +531,21 @@ impl<B: Backend> LlamaAttention<B> {
         query: Tensor<B, 4>,
         pages: Vec<(Tensor<B, 4>, Tensor<B, 4>)>,
     ) -> Tensor<B, 4> {
-        let [_, _, query_length, _] = query.dims();
-        debug_assert_eq!(query_length, 1);
-        let groups = self.num_attention_heads / self.num_key_value_heads;
-        let scale = (self.head_dim as f32).sqrt();
-        let mut pages = pages.into_iter();
-        let (first_key, first_value) = pages
-            .next()
-            .expect("decode attention requires at least one populated cache page");
-        let first_key = repeat_key_value(first_key, groups);
-        let first_value = repeat_key_value(first_value, groups);
-        let scores = query
-            .clone()
-            .matmul(first_key.swap_dims(2, 3))
-            .div_scalar(scale);
-        let mut running_max = scores.clone().max_dim(3);
-        let weights = (scores - running_max.clone()).exp();
-        let mut running_sum = weights.clone().sum_dim(3);
-        let mut running_output = weights.matmul(first_value);
-
-        for (key, value) in pages {
-            let key = repeat_key_value(key, groups);
-            let value = repeat_key_value(value, groups);
-            let scores = query.clone().matmul(key.swap_dims(2, 3)).div_scalar(scale);
-            let page_max = scores.clone().max_dim(3);
-            let new_max = running_max.clone().max_pair(page_max);
-            let previous_scale = (running_max - new_max.clone()).exp();
-            let weights = (scores - new_max.clone()).exp();
-            running_sum = running_sum * previous_scale.clone() + weights.clone().sum_dim(3);
-            running_output = running_output * previous_scale + weights.matmul(value);
-            running_max = new_max;
-        }
-
-        running_output / running_sum
+        let config = PagedAttentionConfig::new(
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        .expect("validated Llama dimensions must form a paged-attention configuration");
+        let pages = pages
+            .into_iter()
+            .map(|(key, value)| PagedKvPage::new(key, value))
+            .collect();
+        let input = PagedAttentionInput::new(query, pages, config)
+            .expect("Llama cache pages must satisfy the paged-attention contract");
+        PortablePagedAttention::new()
+            .execute(input)
+            .expect("portable paged attention must execute validated input")
     }
 
     fn project_attention_output(&self, context: Tensor<B, 4>) -> Tensor<B, 3> {

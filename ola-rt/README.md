@@ -24,6 +24,7 @@ workload against which those abstractions can be tested.
 | `ola-core` | Backend-neutral domain types and identifiers | Queues, policy, Burn tensors |
 | `ola-model` | Model catalog, artifact sources, architecture selection | Tensor execution, scheduling, downloads |
 | `ola-runtime` | Model registry, request lifecycle, state, scheduling | HTTP, model kernels |
+| `ola-kernel` | Replaceable tensor-kernel contracts and portable references | Scheduling, model weights, KV allocation |
 | `ola-burn` | Adapting Burn concepts to OlaRT interfaces | Scheduling or serving |
 | `ola-observe` | Runtime event measurements and latency derivation | Lifecycle mutation, policy decisions |
 | `ola-serve` | Transport-neutral service boundary | HTTP-framework details, execution policy |
@@ -152,6 +153,8 @@ Implemented:
   summaries;
 - basic latency summaries;
 - a Burn device adapter;
+- a first replaceable kernel contract with validated paged-attention inputs,
+  stable implementation metadata, and a portable online-softmax reference;
 - opt-in WGPU and native CUDA Burn backends, with WGPU inference numerically
   validated on the development GPU;
 - strict parsing of compatible Hugging Face Llama configurations;
