@@ -93,6 +93,22 @@ Done when FIFO, priority, estimated-cost, and deadline-aware policies share one 
 
 Done when a new policy or kernel comparison requires neither bespoke UI code nor a one-off report schema.
 
+## Adaptive execution policy
+
+Online tuning of policy configuration. Design note:
+`ola-rt/crates/ola-runtime/ADAPTIVE_POLICY.md`. Depends on P4 calibration for
+cost-aware knobs.
+
+- [ ] Add an `AdaptivePolicy` wrapper holding configuration θ and an inner `ComposedPolicy`.
+- [ ] Validate candidate plans inside the wrapper and fall back to a known-safe configuration.
+- [ ] Record the wrapper's descriptor, θ, and update counter in every `DecisionRecord`.
+- [ ] Give `observe` arrival times (or the planning snapshot) so rewards can use TTFT and completion latency.
+- [ ] Decide whether slot count and chunk size stay executor ceilings or move into the plan.
+- [ ] Keep randomness seeded and consumed only in `observe`.
+- [ ] Pretrain and evaluate offline in the P3 virtual-time harness against the baselines.
+
+Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures.
+
 ## P5: Runtime driver and serving
 
 - [ ] Define an asynchronous runtime/executor driver.
