@@ -2,6 +2,9 @@
 
 mod plan_report;
 mod report;
+mod simulation;
+mod synthetic;
+mod trace;
 
 use std::{
     error::Error,
@@ -34,6 +37,12 @@ pub use report::{
     PrefillReportError, PrefillReportProtocol, PrefillReportSample, PrefillReportStrategySummary,
     PrefillReportTrial,
 };
+pub use simulation::{
+    CostModel, SchedulingRun, SimulationConfig, SimulationError, TrialIteration, TrialOutcome,
+    TrialRequest, run_scheduling_trial, trace_request_spec,
+};
+pub use synthetic::{KvGeometry, synthetic_artifact, synthetic_prompt, synthetic_token};
+pub use trace::{SchedulingTrace, TraceParameters, TraceRequest};
 
 #[derive(Clone, Debug, PartialEq)]
 /// One request arrival in a workload trace.

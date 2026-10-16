@@ -68,9 +68,9 @@ Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 - [ ] Compare fixed and adaptive token budgets.
 - [ ] Define starvation and fairness measurements.
 - [ ] Test cancellation, failure, and memory-pressure isolation.
-- [ ] Add mixed short/long prompt traces.
-- [ ] Add prefill/decode competition traces.
-- [ ] Add overload and impossible-request traces.
+- [x] Add mixed short/long prompt traces.
+- [x] Add prefill/decode competition traces.
+- [x] Add overload and impossible-request traces.
 - [ ] Compare queue latency, TTFT, completion latency, throughput, memory, fairness, and deferrals.
 
 Done when FIFO, priority, estimated-cost, and deadline-aware policies share one reproducible comparison protocol.

@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–3 are
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–4 are
 implemented.
 
 ## Goal
@@ -184,7 +184,12 @@ Each step keeps `make verify` and `make test-fixture` green.
    budget it matches `FifoTokenBudgetPolicy` exactly (tested). Selection
    records in `PlanReport` carry queue and live counts.
 4. **Simulation harness.** Add `SyntheticModel`, the virtual-clock cost
-   model, seeded trace generators, and `run_scheduling_trial`.
+   model, seeded trace generators, and `run_scheduling_trial`. **Done**
+   in `ola-bench` (`synthetic.rs`, `trace.rs`, `simulation.rs`). Default
+   cost: 200 µs per iteration, 300 µs per invocation, 4 µs per dense token;
+   default KV pool: 1024 tokens in 16-token pages. Under light load ranking
+   rarely matters because queues stay short, so ordering comparisons use the
+   `overload` trace.
 5. **Metrics and comparison.** Add `SchedulingSummary` (latencies,
    throughput, memory, deferrals, slowdown, Jain fairness, starvation,
    deadline misses), `compare_schedulers`, and the reproducibility test.
