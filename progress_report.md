@@ -1,14 +1,17 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 17:47 BST (Europe/London)
+**Last updated:** 2026-10-16 20:50 BST (Europe/London)
 
-**Source revision:** working tree based on `f2fd10d` on `master`
+**Source revision:** working tree based on `c63196b` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), and P4 (experiment
 framework) are complete; every benchmark and experiment is a registered
 experiment with a versioned, interval-carrying report that the workbench and
-the `ola` CLI run identically; current branch commits are not pushed
+the `ola` CLI run identically. P5 (runtime driver and serving) is in
+progress: a driver thread with streaming, cancellable request handles and
+bounded admission works; HTTP is not yet built. Current branch commits are
+not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -167,14 +170,14 @@ performance claim.
 | Generation sessions | Working | Prefill, cached one-token decode, greedy selection, EOS/limit checks |
 | Paged KV cache | Working foundation | Per-layer physical pages addressed through runtime block tables |
 | KV block manager | Working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
-| Serving | Foundation working | Transport-neutral request/service boundary |
+| Serving | Driver working | A dedicated thread owns the executor; async or blocking handles submit, stream text deltas, cancel (including on drop), and report status; bounded in-flight admission; abort shutdown |
 | Terminal UI | Working foundation | Overview, chat, benchmarks, experiments, background local adapter |
 | Local UI integrations | Working | Llama chat/generation, KV/FIFO probes, fixed/adaptive shape experiments, real-model prefill benchmarks, and repeated mixed-workload chunk fairness sweep |
 | GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
 | Continuous batching | Tensor foundation working | Compatible same-model variable-length prefill and decode are tensorized; decode page traversal remains request-local |
-| Production server | Not implemented | No async executor, streaming HTTP, or OpenAI-compatible API yet |
+| Production server | Not implemented | No HTTP endpoints, readiness reporting, draining shutdown, or OpenAI-compatible API yet |
 
 ## Implemented system
 
@@ -390,9 +393,18 @@ performance claim.
 
 ### `ola-serve`
 
-- Transport-independent generation request boundary.
-- Runtime submission, model discovery, and health foundation.
-- HTTP framework and asynchronous execution intentionally deferred.
+- `Driver`: one thread owns the `Executor`, blocks when idle, and backs off
+  after iterations without progress (design in `SERVING.md`).
+- `RuntimeHandle`, `Submission`, `RequestHandle`, and `Reply` work under any
+  async runtime or blocking on plain threads (tokio `sync` channels only).
+- Streams of `Token` text deltas (via `ola_model::IncrementalDecoder`) end in
+  exactly one `Finished`, `Failed`, or `Cancelled` event; results move out of
+  the executor.
+- Cancellation, including dropping an unfinished handle or submission,
+  releases sessions and KV; `detach` opts out.
+- Client-side bounded in-flight admission (`Overloaded`), distinct
+  `ServeError` kinds, and abort shutdown that returns the executor.
+- `MonotonicClock` and `ManualClock` (`ola-core`) stamp arrivals and steps.
 
 ### `ola-ui`
 
@@ -428,14 +440,17 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 212 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 228 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 5
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
   time) for prefill bucketing and the five-seed scheduler study; `ola
   experiment compare` flags a doubled FIFO p95 as a regression with exit 1
   and an identical study as clean with exit 0.
-- `make test-fixture` against the pinned artifact: **5 passed** — the model
+- The driver tests use a scripted model whose calls wait on a test gate,
+  making cancellation and shutdown races deterministic; the suite passed
+  1,300 consecutive runs, 800 of them under CPU contention.
+- `make test-fixture` against the pinned artifact (at the P4 close): **5 passed** — the model
   experiments' conformance, scalar-oracle
   logits within `2e-5`, the UI integration, planned multi-request execution
   matching single-request output, and every scheduling baseline reproducing
@@ -589,12 +604,14 @@ and `TOKENS` variables.
   and do not yet carry the cost-aware grouping policy's estimates or reasons.
 - Inter-token latency currently uses the terminal decode span divided by token
   gaps; individual token timestamps are not retained yet.
-- Executor results are retained in memory and there is no result eviction or
-  persistence policy yet.
+- Results delivered through the driver leave the executor, but runtime
+  request records are still retained until the P5 retention table lands;
+  results are never persisted.
 - Checkpoint loading accepts one SafeTensors file only.
 - RoPE scaling, tied embeddings, projection biases, and non-SiLU Llama variants
   are rejected.
-- The serving layer has no streaming transport or HTTP implementation.
+- The serving layer has no HTTP transport yet, and shutdown aborts rather
+  than drains.
 - Benchmark probes are foundations, not publication-quality performance claims.
 - Scheduling comparisons default to an illustrative cost model and a
   synthetic model. `cost-calibration` can now supply a measured cost model,
@@ -632,8 +649,8 @@ and `TOKENS` variables.
    - retain per-step numerical comparison with the full-sequence oracle.
 
 4. **Serving and experiment infrastructure**
-   - add streaming output and an HTTP boundary;
-   - add a runtime driver that owns the executor loop (P5).
+   - finish P5: retention, readiness, draining shutdown, HTTP with
+     server-sent events, and `/v1/completions`.
 
 ## Update protocol
 
@@ -647,6 +664,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 20:50 BST — working tree on `c63196b`:** P5 steps 1–2: clocks, result and
+  record retention controls, incremental detokenization, and the driver
+  thread with streaming, cancellable request handles and bounded admission.
+  Reconciled `todo.md`: kernel, residency, and prefix-cache instrumentation
+  moved to the milestones that create them; the milestone order now matches
+  the work order; bundled items split; every milestone has a testable exit
+  criterion; working rules are plain bullets.
 
 - **2026-10-16 17:47 BST — working tree on `f2fd10d`:** Completed P4: the
   `ola-experiment/1` report with typed metrics, raw samples, recomputed

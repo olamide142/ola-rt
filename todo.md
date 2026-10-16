@@ -26,7 +26,7 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [x] Represent tensor groups and individual fallbacks.
 - [x] Represent real input and padding positions.
 - [x] Represent request-local KV growth and release actions. (Growth as row positions, reservations on `Admit`, predicted releases; unpredicted releases in divergences.)
-- [ ] Represent model, backend/device, and kernel selections. (Model done; device and kernel wait for the kernel track.)
+- [x] Represent model selections. (Backend/device and kernel selections moved to the kernel track.)
 - [x] Record token, memory, padding, and invocation-cost estimates. (Grouping cost estimates arrive with the P2 decision record.)
 - [x] Record deferrals and policy reasons. (Policy reasons arrive with the P2 decision record.)
 - [x] Validate plans before lifecycle, session, or KV mutation.
@@ -35,8 +35,7 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [x] Test duplicate, stale, invalid, and over-capacity plans.
 - [x] Compare planned execution against the single-request correctness path.
 
-Done when one iteration can be explained by a complete, validated plan before model execution begins. **Met 2026-10-16;** the three open items above carry into P2 and the kernel track.
-
+Done when one iteration can be explained by a complete, validated plan before model execution begins. **Met 2026-10-16.**
 
 ## P2: Composable execution policy
 
@@ -51,7 +50,7 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
 - [x] Add capability checks and explicit fallbacks.
 - [x] Prevent policies from mutating authoritative runtime state.
 - [x] Give every reportable policy a stable name and configuration.
-- [ ] Test scheduler, admission, batching, memory, and kernel-selection conflicts. (All but kernel selection done; that waits for the kernel track.)
+- [x] Test scheduler, admission, batching, and memory conflicts. (Kernel-selection conflicts moved to the kernel track.)
 
 Done when existing FIFO, memory admission, token budgeting, and grouping run through the unified policy path without output or lifecycle regressions. **Met 2026-10-16.**
 
@@ -81,7 +80,7 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 
 - [x] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
 - [x] Retain raw measurements alongside derived summaries.
-- [x] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity. (The kernel field exists; nothing sets it until the kernel track.)
+- [x] Record model, device, revision, build, policy, warm-up, repetitions, and workload identity. (Reports have a kernel field; populating it is in the kernel track.)
 - [x] Generalize versioned persistence beyond prefill reports.
 - [x] Keep report creation non-overwriting by default.
 - [x] Validate schema versions and sample consistency.
@@ -97,7 +96,8 @@ Done when a new policy or kernel comparison requires neither bespoke UI code nor
 
 ## Adaptive execution policy
 
-Online tuning of policy configuration. Design note:
+Optional research track, outside the milestone sequence. Online tuning of
+policy configuration. Design note:
 `ola-rt/crates/ola-runtime/ADAPTIVE_POLICY.md`. Depends on P4 calibration for
 cost-aware knobs.
 
@@ -120,9 +120,11 @@ Design: `ola-rt/crates/ola-serve/SERVING.md`.
 - [x] Stream tokens without polling retained executor results.
 - [x] Propagate client cancellation into session and KV cleanup.
 - [x] Define bounded queues and backpressure.
-- [ ] Define result retention, eviction, and persistence.
+- [ ] Define result retention and eviction.
 - [x] Translate a process monotonic clock into OlaRT timestamps.
-- [ ] Expose health, readiness, and loaded-model state.
+- [ ] Expose process health.
+- [ ] Expose readiness to accept work.
+- [ ] Expose loaded-model state.
 - [ ] Add a minimal HTTP generation endpoint.
 - [ ] Add streaming HTTP responses.
 - [ ] Add an OpenAI-compatible boundary after the native API stabilizes.
@@ -136,17 +138,17 @@ Done when a client can submit, observe, stream, cancel, and retrieve a request w
 
 - [ ] Retain per-token timestamps.
 - [ ] Report real TPOT distributions instead of a terminal-span average.
-- [ ] Record scheduler, admission, batching, memory, and kernel choices.
-- [ ] Record kernel and model-operation latency with documented boundaries.
+- [ ] Record scheduler, admission, batching, and memory choices.
+- [ ] Record model-operation latency with documented boundaries.
 - [ ] Add automatic GPU memory telemetry.
 - [ ] Add GPU utilization and device-activity telemetry.
-- [ ] Report model residency and load/unload events.
-- [ ] Add prefix-cache metrics when prefix caching exists.
 - [ ] Add stable request, iteration, and plan correlation IDs.
 - [ ] Add structured tracing for CLI, server, and experiments.
 - [ ] Keep observation read-only with respect to policy and runtime state.
 
-Done when a request can be traced from arrival through every decision, execution batch, kernel, token, and terminal result.
+Kernel, prefix-cache, and model-residency instrumentation belong to the milestones that create those capabilities (kernel track, P7, P8).
+
+Done when a request can be traced from arrival through every decision, execution batch, token, and terminal result, with per-token timestamps and correlation IDs, and the traces are covered by tests.
 
 ## P7: Memory and cache policy
 
@@ -155,13 +157,14 @@ Done when a request can be traced from arrival through every decision, execution
 - [ ] Add safe request preemption.
 - [ ] Evaluate swapping after eviction and preemption semantics stabilize.
 - [ ] Add prefix detection and prefix-cache reuse.
+- [ ] Add prefix-cache hit, reuse, and eviction metrics.
 - [ ] Track prefix ownership, lifetime, accounting, and isolation.
 - [ ] Define recovery when a planned batch cannot obtain its KV allocation.
 - [ ] Add fragmentation-aware admission or placement experiments.
 - [ ] Test cache pressure, preemption, cancellation, and recovery.
 - [ ] Preserve deterministic policies for workload replay.
 
-Done when memory pressure can produce an explicit measured action other than indefinite deferral or permanent rejection.
+Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, or preempts with recorded reasons instead of deferring indefinitely or rejecting; prefix reuse produces identical outputs with measured savings; and the pressure, preemption, cancellation, and recovery tests are deterministic.
 
 ## P8: Model and runtime usability
 
@@ -172,9 +175,12 @@ Done when memory pressure can produce an explicit measured action other than ind
 - [ ] Decide support for projection biases and activation variants.
 - [ ] Add a second architecture through the architecture registry.
 - [ ] Define model load, unload, placement, and residency operations.
+- [ ] Report model residency and load/unload events.
 - [ ] Account for model weights, workspace, and non-KV memory automatically.
 - [ ] Load configuration for models, devices, limits, policies, and experiments.
 - [ ] Add a stable high-level runtime builder after policy boundaries settle.
+
+Done when a second architecture and a sharded checkpoint load through the registry and pass conformance tests, seeded sampling is reproducible, and a runtime can be built from a configuration file.
 
 ## Kernel follow-up track
 
@@ -182,6 +188,8 @@ Route kernel choices through framework plan, policy, capability, and benchmark b
 
 - [ ] Finish and validate the CubeCL paged-attention extension.
 - [ ] Define kernel capabilities and selection constraints.
+- [ ] Represent backend/device and kernel selections in `ExecutionPlan`.
+- [ ] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
 - [ ] Add provider selection and portable fallback.
 - [ ] Compare every optimized implementation with the portable reference.
 - [ ] Fuse page traversal, score reduction, and value accumulation.
@@ -191,7 +199,10 @@ Route kernel choices through framework plan, policy, capability, and benchmark b
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs.
 - [ ] Compare optimized paths against the single-request oracle.
 - [ ] Record kernel identity, target, configuration, and fallback in reports.
+- [ ] Record kernel choices and kernel latency in observability traces.
 - [ ] Require warm-ups, repetitions, distributions, workload identity, and numerical conformance before making performance claims.
+
+Done when policy selects an optimized paged-attention kernel with a portable fallback, it matches the reference within tolerance, and a study-grade report measures its effect.
 
 ## Later inference-engine work
 
@@ -204,30 +215,36 @@ Route kernel choices through framework plan, policy, capability, and benchmark b
 - [ ] Heterogeneous CPU/GPU execution
 - [ ] VLM and multimodal execution
 - [ ] Vision and OlaDetection workloads
+- [ ] Persistent request results
 - [ ] Learned cost models and policies
 - [ ] Model-independent graph/model IR and compiler passes
 
 ## Working rules
 
-- [ ] Keep authoritative lifecycle mutation inside the runtime.
-- [ ] Make policies consume state and return decisions.
-- [ ] Validate plans before model or memory work.
-- [ ] Keep sessions, block tables, cancellation, and results request-local.
-- [ ] Preserve a portable correctness path for every optimized path.
-- [ ] Require output or numerical equivalence in comparisons.
-- [ ] Keep backend tensors out of the public runtime API unless research evidence requires changing that boundary.
-- [ ] Record limitations and negative results.
-- [ ] Update this TODO and `progress_report.md` whenever milestones change.
+- Keep authoritative lifecycle mutation inside the runtime.
+- Make policies consume state and return decisions.
+- Validate plans before model or memory work.
+- Keep sessions, block tables, cancellation, and results request-local.
+- Preserve a portable correctness path for every optimized path.
+- Require output or numerical equivalence in comparisons.
+- Keep backend tensors out of the public runtime API unless research evidence requires changing that boundary.
+- Record limitations and negative results.
+- Update this TODO and `progress_report.md` with every committed step, not only when milestones change.
 
 ## Milestone order
 
-1. Stabilize and checkpoint the current tree.
-2. Introduce the small execution-plan IR.
-3. Route existing behavior through a composable execution policy.
-4. Add comparable scheduler and policy baselines.
-5. Generalize experiments, reports, and the workbench catalog.
-6. Complete observability needed to explain policy outcomes.
-7. Add the asynchronous streaming service boundary.
-8. Add memory and cache policies.
-9. Use the framework to select and evaluate optimized kernels.
-10. Expand model support, then move toward distributed and multimodal research.
+Section numbers are stable identifiers; this list is the order of work.
+
+1. P0: Stabilize and checkpoint the current tree.
+2. P1: Introduce the small execution-plan IR.
+3. P2: Route existing behavior through a composable execution policy.
+4. P3: Add comparable scheduler and policy baselines.
+5. P4: Generalize experiments, reports, and the workbench catalog.
+6. P5: Add the asynchronous streaming service boundary.
+7. P6: Complete observability needed to explain policy outcomes.
+8. P7: Add memory and cache policies.
+9. Kernel track: Use the framework to select and evaluate optimized kernels.
+10. P8: Expand model support, then move toward distributed and multimodal research.
+
+The adaptive execution policy is an optional research track. It became
+available after P4 and blocks no milestone above.
