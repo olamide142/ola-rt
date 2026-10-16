@@ -103,6 +103,16 @@ pub trait CausalModel: Send + Sync {
         false
     }
 
+    /// Declares which tensor-batched hooks below this model implements.
+    ///
+    /// Planners read this before execution to record whether work is
+    /// expected to share a tensor invocation. A declared hook may still return
+    /// `None`; the runtime then falls back to individual execution and
+    /// records the divergence. The default declares no batched paths.
+    fn batch_capabilities(&self) -> BatchCapabilities {
+        BatchCapabilities::NONE
+    }
+
     /// Attempts one tensor-batched prefill across compatible sessions.
     ///
     /// `prompt_tokens` contains one complete, non-empty prompt per session.
@@ -150,6 +160,33 @@ pub trait CausalModel: Send + Sync {
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
         None
     }
+}
+
+/// Tensor-batched execution paths implemented by a [`CausalModel`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BatchCapabilities {
+    /// [`CausalModel::prefill_batch`] packs complete prompts.
+    pub prefill: bool,
+    /// [`CausalModel::prefill_chunk_batch`] packs resumable prompt chunks.
+    pub chunked_prefill: bool,
+    /// [`CausalModel::decode_batch`] packs single-token decodes.
+    pub decode: bool,
+}
+
+impl BatchCapabilities {
+    /// No batched paths; every operation uses its session individually.
+    pub const NONE: Self = Self {
+        prefill: false,
+        chunked_prefill: false,
+        decode: false,
+    };
+
+    /// Every batched hook is implemented.
+    pub const ALL: Self = Self {
+        prefill: true,
+        chunked_prefill: true,
+        decode: true,
+    };
 }
 
 /// One generated token and its terminal status.
@@ -334,6 +371,11 @@ impl CausalLanguageModel {
         self.model.supports_chunked_prefill()
     }
 
+    /// Returns the tensor-batched paths the model declares.
+    pub fn batch_capabilities(&self) -> BatchCapabilities {
+        self.model.batch_capabilities()
+    }
+
     /// Returns the artifact-compatible tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
@@ -510,6 +552,13 @@ mod tests {
         assert_eq!(first_token.id, 3);
         assert_eq!(first.metrics().generated_tokens, 1);
         assert_eq!(second.metrics(), SessionMetrics::default());
+    }
+
+    #[test]
+    fn models_declare_no_batched_paths_by_default() {
+        let artifact = CausalLanguageModel::new(NumericTokenizer, IncrementModel);
+
+        assert_eq!(artifact.batch_capabilities(), BatchCapabilities::NONE);
     }
 
     #[test]

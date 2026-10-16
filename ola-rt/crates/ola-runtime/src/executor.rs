@@ -1429,8 +1429,8 @@ fn prepare_prompt(
 mod tests {
     use ola_core::GenerationConfig;
     use ola_model::{
-        CausalModel, ExecutionStage, GeneratedToken, GenerationSession, KvCacheProfile,
-        SessionMetrics, Tokenizer,
+        BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
+        KvCacheProfile, SessionMetrics, Tokenizer,
     };
 
     use super::*;
@@ -1472,6 +1472,10 @@ mod tests {
     impl CausalModel for IncrementModel {
         fn supports_chunked_prefill(&self) -> bool {
             true
+        }
+
+        fn batch_capabilities(&self) -> BatchCapabilities {
+            BatchCapabilities::ALL
         }
 
         fn create_session(

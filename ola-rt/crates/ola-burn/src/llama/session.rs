@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use ola_core::GenerationConfig;
 use ola_model::{
-    CausalModel, ExecutionStage, GeneratedToken, GenerationSession, ModelExecutionError,
-    PrefillOutcome, SessionMetrics,
+    BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
+    ModelExecutionError, PrefillOutcome, SessionMetrics,
 };
 use ola_runtime::KvBlockError;
 
@@ -41,6 +41,10 @@ impl BurnLlamaModel {
 impl CausalModel for BurnLlamaModel {
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+
+    fn batch_capabilities(&self) -> BatchCapabilities {
+        BatchCapabilities::ALL
     }
 
     fn create_session(

@@ -1691,8 +1691,8 @@ mod tests {
 
     use ola_core::ModelDescriptor;
     use ola_model::{
-        CausalModel, ExecutionStage, GeneratedToken, GenerationSession, ModelExecutionError,
-        PrefillOutcome, SessionMetrics, Tokenizer,
+        BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
+        ModelExecutionError, PrefillOutcome, SessionMetrics, Tokenizer,
     };
 
     use super::*;
@@ -2130,6 +2130,10 @@ mod tests {
     impl CausalModel for IncrementModel {
         fn supports_chunked_prefill(&self) -> bool {
             true
+        }
+
+        fn batch_capabilities(&self) -> BatchCapabilities {
+            BatchCapabilities::ALL
         }
 
         fn create_session(

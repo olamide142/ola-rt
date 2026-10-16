@@ -213,7 +213,7 @@ Each step keeps `make verify` and the fixture tests green.
 1. Add the `plan.rs` types and `validate`, with unit tests for duplicate,
    stale, invalid, and over-capacity plans. No executor changes. **Done.**
 2. Add `BatchCapabilities` to `ola-model`, implemented by Burn Llama and the
-   test models.
+   test models. **Done.**
 3. Build a planner for decodes and continued prefills, which do not depend on
    outcomes, and drive them through plan → validate → commit. Keep the
    current admission path.
