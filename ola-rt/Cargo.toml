@@ -41,6 +41,7 @@ ratatui = "0.30.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 tokenizers = { version = "0.22.1", default-features = false, features = ["onig"] }
+tokio = { version = "1.50", default-features = false }
 
 # Burn 0.22.0's optional Fusion dependency references burn-remote 0.22.0,
 # which was not published to crates.io with the rest of that release.

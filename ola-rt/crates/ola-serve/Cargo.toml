@@ -7,7 +7,12 @@ rust-version.workspace = true
 
 [dependencies]
 ola-core.workspace = true
+ola-model.workspace = true
 ola-runtime.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
 
 [lints]
 workspace = true

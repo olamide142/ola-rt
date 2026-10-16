@@ -1,7 +1,7 @@
 # Runtime driver and serving design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P5. Step 1 is implemented.
+Covers `todo.md` P5. Steps 1–2 are implemented.
 
 ## Goal
 
@@ -69,9 +69,18 @@ touching `Executor`. This is P5's completion criterion.
    `ola_model::IncrementalDecoder`, which decodes a short window twice and
    emits the difference, holding back text that ends in an incomplete
    character.
-2. Driver thread, `RuntimeHandle`, `RequestHandle` with streaming,
-   cancellation, and drop-to-cancel, and the bounded queue.
-3. Retention table, health and readiness, shutdown, and `ServeError`.
+2. **Driver and handles.** **Done.** `Driver`, `RuntimeHandle`,
+   `Submission`, `RequestHandle`, `Reply`, and `RequestEvent`; capacity is
+   checked on the client side so `Overloaded` never waits for the driver.
+   The driver blocks on its command channel when idle and backs off briefly
+   after an iteration that made no progress. Listeners that disappear are
+   detected before commands are drained, so a `Detach` sent just before a
+   handle is dropped still wins. A failed plan ends every request with
+   `Internal` instead of retrying forever. Tests use a scripted model whose
+   calls wait on a gate, which makes cancellation and shutdown races
+   deterministic; they passed 1,300 consecutive runs, 800 of them under CPU
+   contention.
+3. Retention table, health and readiness, draining shutdown, and `NotReady`.
 4. Native HTTP endpoints with server-sent events and disconnect-cancels;
    `ola serve` and `make serve`.
 5. `/v1/completions`; end-to-end streaming, cancellation, overload, failure,

@@ -4772,7 +4772,9 @@ name = "ola-serve"
 version = "0.1.0"
 dependencies = [
  "ola-core",
+ "ola-model",
  "ola-runtime",
+ "tokio",
 ]
 
 [[package]]

@@ -394,6 +394,11 @@ impl Executor {
         Ok(())
     }
 
+    /// Returns the executable attached for `id`, if any.
+    pub fn model(&self, id: &ModelId) -> Option<&CausalLanguageModel> {
+        self.models.get(id)
+    }
+
     /// Validates and queues a request on the owned runtime.
     pub fn submit(
         &mut self,
