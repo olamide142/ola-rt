@@ -186,7 +186,8 @@ pub struct Estimate {
     pub min: f64,
     /// Maximum.
     pub max: f64,
-    /// 95% interval for the mean, when computed.
+    /// Seeded 95% percentile-bootstrap interval for the mean; `None` with a
+    /// single repetition.
     pub ci95: Option<Interval>,
 }
 
@@ -204,12 +205,12 @@ impl Estimate {
         };
         Some(Self {
             n: sorted.len(),
-            mean: sorted.iter().sum::<f64>() / count(sorted.len()),
+            mean: sorted.iter().sum::<f64>() / super::statistics::as_f64(sorted.len()),
             p50: rank(50),
             p95: rank(95),
             min: sorted[0],
             max: sorted[sorted.len() - 1],
-            ci95: None,
+            ci95: super::statistics::bootstrap_mean_interval(&sorted),
         })
     }
 }
@@ -494,11 +495,6 @@ fn file_safe(id: &str) -> String {
             }
         })
         .collect()
-}
-
-#[allow(clippy::cast_precision_loss, reason = "repetition counts are tiny")]
-fn count(value: usize) -> f64 {
-    value as f64
 }
 
 /// Failure to build, encode, decode, or persist a report.

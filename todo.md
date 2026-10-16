@@ -85,8 +85,8 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [ ] Generalize versioned persistence beyond prefill reports.
 - [x] Keep report creation non-overwriting by default.
 - [x] Validate schema versions and sample consistency.
-- [ ] Compare reports across models, devices, policies, kernels, and revisions.
-- [ ] Report regressions and uncertainty rather than relying on one run.
+- [x] Compare reports across models, devices, policies, kernels, and revisions.
+- [x] Report regressions and uncertainty rather than relying on one run.
 - [ ] Expand calibration to multiple shapes and confidence intervals.
 - [ ] Make UI benchmark and experiment catalogs data-driven.
 - [ ] Run the same named experiments through the CLI and UI.

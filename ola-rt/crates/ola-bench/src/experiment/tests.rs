@@ -183,3 +183,183 @@ fn content_digests_match_fnv1a_test_vectors() {
     assert_eq!(content_digest(b""), "cbf29ce484222325");
     assert_eq!(content_digest(b"a"), "af63dc4c8601ec8c");
 }
+
+fn report_from(variants: &[(&str, &[f64], &[f64])]) -> ExperimentReport {
+    let repetitions = variants[0].1.len();
+    let mut parts = parts();
+    parts.protocol.repetitions = repetitions;
+    parts.metrics.push(MetricSpec::new(
+        "iterations",
+        Unit::Count,
+        TimeDomain::Untimed,
+        Direction::Neither,
+    ));
+    parts.variants = variants
+        .iter()
+        .map(|(label, _, _)| Variant::policy(*label, format!("policy-{label}")))
+        .collect();
+    parts.samples = variants
+        .iter()
+        .flat_map(|(label, completion, throughput)| {
+            completion.iter().zip(*throughput).enumerate().map(
+                |(repetition, (completion, throughput))| {
+                    let mut sample = sample(label, repetition, *completion, *throughput);
+                    sample.values.insert("iterations".into(), *completion);
+                    sample
+                },
+            )
+        })
+        .collect();
+    ExperimentReport::new(parts).unwrap()
+}
+
+fn verdicts(comparison: &ReportComparison) -> Vec<(&str, Change)> {
+    comparison
+        .metrics
+        .iter()
+        .map(|metric| (metric.metric.name.as_str(), metric.change))
+        .collect()
+}
+
+#[test]
+fn bootstrap_intervals_are_reproducible_and_bracket_the_mean() {
+    assert_eq!(Estimate::of(&[5.0]).unwrap().ci95, None);
+    let flat = Estimate::of(&[2.0, 2.0, 2.0]).unwrap().ci95.unwrap();
+    assert_eq!((flat.low, flat.high), (2.0, 2.0));
+
+    let values = [10.0, 12.0, 9.0, 14.0, 11.0, 13.0];
+    let estimate = Estimate::of(&values).unwrap();
+    let interval = estimate.ci95.unwrap();
+    assert!(interval.low <= estimate.mean && estimate.mean <= interval.high);
+    assert!(estimate.min <= interval.low && interval.high <= estimate.max);
+    let mut shuffled = values;
+    shuffled.reverse();
+    assert_eq!(Estimate::of(&shuffled).unwrap().ci95, Some(interval));
+
+    let width = |values: &[f64]| {
+        let interval = Estimate::of(values).unwrap().ci95.unwrap();
+        interval.high - interval.low
+    };
+    let many = values.iter().cycle().take(60).copied().collect::<Vec<_>>();
+    assert!(width(&many) < width(&values));
+}
+
+#[test]
+fn comparisons_classify_by_direction_intervals_and_threshold() {
+    let baseline = report_from(&[(
+        "fifo",
+        &[100.0, 102.0, 98.0, 101.0, 99.0],
+        &[10.0, 10.2, 9.8, 10.1, 9.9],
+    )]);
+    let faster_but_slower_throughput = report_from(&[(
+        "fifo",
+        &[80.0, 81.0, 79.0, 82.0, 78.0],
+        &[8.0, 8.1, 7.9, 8.2, 7.8],
+    )]);
+    let comparison = compare_reports(
+        &baseline,
+        &faster_but_slower_throughput,
+        CompareOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        verdicts(&comparison),
+        [
+            ("completion_p95", Change::Improved),
+            ("throughput", Change::Regressed),
+            ("iterations", Change::Informational),
+        ]
+    );
+    assert_eq!(comparison.regressions().count(), 1);
+    assert!(comparison.identity_differences.is_empty());
+
+    // Overlapping intervals.
+    let noisy = report_from(&[(
+        "fifo",
+        &[90.0, 110.0, 95.0, 105.0, 100.0],
+        &[9.0, 11.0, 9.5, 10.5, 10.0],
+    )]);
+    // Separated, but under the 5% threshold.
+    let slight = report_from(&[(
+        "fifo",
+        &[103.0, 103.1, 102.9, 103.0, 103.0],
+        &[10.3, 10.31, 10.29, 10.3, 10.3],
+    )]);
+    for candidate in [&noisy, &slight] {
+        let comparison = compare_reports(&baseline, candidate, CompareOptions::default()).unwrap();
+        assert!(
+            comparison.metrics.iter().all(|metric| matches!(
+                metric.change,
+                Change::Inconclusive | Change::Informational
+            ))
+        );
+    }
+}
+
+#[test]
+fn single_runs_never_yield_a_verdict() {
+    let baseline = report_from(&[("fifo", &[100.0], &[10.0])]);
+    let candidate = report_from(&[("fifo", &[50.0], &[20.0])]);
+
+    let comparison = compare_reports(&baseline, &candidate, CompareOptions::default()).unwrap();
+
+    assert!(
+        comparison
+            .metrics
+            .iter()
+            .all(|metric| matches!(metric.change, Change::Inconclusive | Change::Informational))
+    );
+}
+
+#[test]
+fn comparisons_report_identity_differences_and_refuse_incomparable_reports() {
+    let baseline = report_from(&[("fifo", &[1.0, 2.0], &[1.0, 2.0])]);
+    let mut candidate = baseline.clone();
+    candidate.metadata.model = Some("tiny-llama".into());
+    candidate.variants[0].policy = Some("policy-changed".into());
+    let comparison = compare_reports(&baseline, &candidate, CompareOptions::default()).unwrap();
+    let fields = comparison
+        .identity_differences
+        .iter()
+        .map(|difference| difference.field.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(fields, ["model", "variant fifo policy"]);
+
+    let mut other_workload = baseline.clone();
+    other_workload.workload.digest = content_digest(b"other");
+    assert!(matches!(
+        compare_reports(&baseline, &other_workload, CompareOptions::default()),
+        Err(CompareError::DifferentWorkload { .. })
+    ));
+    let allowed = compare_reports(
+        &baseline,
+        &other_workload,
+        CompareOptions {
+            allow_workload_mismatch: true,
+            ..CompareOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(allowed.identity_differences[0].field, "workload");
+
+    let mut other_experiment = baseline.clone();
+    other_experiment.experiment.id = "different".into();
+    assert!(matches!(
+        compare_reports(&baseline, &other_experiment, CompareOptions::default()),
+        Err(CompareError::DifferentExperiment { .. })
+    ));
+    let mut host = baseline.clone();
+    host.experiment.domain = TimeDomain::Host;
+    assert_eq!(
+        compare_reports(&baseline, &host, CompareOptions::default()),
+        Err(CompareError::DifferentDomain)
+    );
+
+    let mut extra_variant = report_from(&[
+        ("fifo", &[1.0, 2.0], &[1.0, 2.0]),
+        ("sjf", &[1.0, 2.0], &[1.0, 2.0]),
+    ]);
+    extra_variant.workload = baseline.workload.clone();
+    let comparison = compare_reports(&baseline, &extra_variant, CompareOptions::default()).unwrap();
+    assert_eq!(comparison.unmatched, ["variant sjf (candidate only)"]);
+}

@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Step 1 is implemented.
+Covers `todo.md` P4. Steps 1–2 are implemented.
 
 ## Goal
 
@@ -189,7 +189,11 @@ Each step keeps `make verify` and `make test-fixture` green.
    records the commit but not whether the working tree had uncommitted
    changes.
 2. **Statistics and comparison.** Add `Estimate` with seeded bootstrap,
-   `compare` with identity diffs and regression classification.
+   `compare` with identity diffs and regression classification. **Done.**
+   Intervals use 2,000 resamples seeded from the values' bit patterns, so
+   recompute-on-read reproduces them; a single repetition has no interval
+   and therefore never yields a verdict. `SplitMix64` moved to a shared
+   `random` module.
 3. **Experiment trait and registry.** Add both, and port the five
    model-independent experiments, including the scheduler comparison as a
    multi-seed study.
