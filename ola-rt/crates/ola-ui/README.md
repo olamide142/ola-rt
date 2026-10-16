@@ -60,9 +60,12 @@ cargo run -p ola-ui -- --model /path/to/llama-artifact
 `OLA_MODEL_DIR` may provide the path instead. Model loading and launched work
 stay off the terminal thread; the UI refreshes their state once per second.
 
-Benchmark persistence is opt-in. Pass `--results-dir <directory>` or set
-`OLA_BENCH_RESULTS_DIR`; each completed prefill-strategy benchmark then creates
-a versioned JSON file without overwriting existing reports:
+The benchmark and experiment lists come from `ola-bench`'s
+`ExperimentRegistry`; each entry is labelled as a probe (not for publication)
+or a study, with its clock (virtual, host, or untimed). Report persistence is
+opt-in. Pass `--results-dir <directory>` or set `OLA_BENCH_RESULTS_DIR`; every
+completed run then writes an `ola-experiment/1` JSON report without
+overwriting existing files:
 
 ```text
 cargo run -p ola-ui -- \
@@ -70,9 +73,10 @@ cargo run -p ola-ui -- \
   --results-dir /path/to/benchmark-results
 ```
 
-The report uses the selected backend label by default. Set
-`OLA_BENCH_DEVICE_LABEL` for a more specific hardware identifier and
-`OLA_SOFTWARE_REVISION` for a commit or build identifier.
+Reports record the selected backend label by default; set
+`OLA_BENCH_DEVICE_LABEL` for a more specific hardware identifier. The build
+revision is captured at compile time from git, or from `OLA_REVISION` when set
+during the build.
 
 CPU is the default compute backend. To run model chat and its generation
 benchmarks through WGPU:

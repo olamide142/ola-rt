@@ -1,42 +1,25 @@
 use std::{
-    fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use burn::tensor::Device;
 use ola_bench::{
-    DEFAULT_STARVATION_FACTOR, FixedWorkload, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
-    PrefillExecutionConfig, PrefillReportError, PrefillThreeWayTrialConfig, PrefillTrialConfig,
-    SchedulingSummary, SchedulingTrace, SimulationConfig, TraceParameters,
-    analyze_cost_aware_prefill, benchmark_chunked_prefill_execution,
-    benchmark_prefill_fairness_trials, benchmark_prefill_trials,
-    benchmark_three_way_prefill_trials, calibrate_prefill_invocation_overhead,
-    compare_prefill_batching, compare_schedulers,
+    ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentKind,
+    ExperimentRegistry, Requirement, TimeDomain,
 };
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
-use ola_runtime::{
-    ComposedPolicy, ExecutionPolicy, Executor, ExecutorEvent, JobCost, KvBlockManager,
-    KvBlockMetrics, MemoryAwareAdmission, PriorityScheduler, Runtime, ShortestJobFirst,
-};
+use ola_runtime::{ComposedPolicy, Executor, ExecutorEvent, MemoryAwareAdmission};
 
 use crate::{
     ChatMessage, ChatRole, ConnectionState, RunState, RuntimeSummary, UiBackend, UiBackendError,
     WorkItem, WorkspaceSnapshot,
 };
 
-const LLAMA_BENCHMARK: &str = "llama-generation";
-const PREFILL_EXECUTION_BENCHMARK: &str = "llama-prefill-strategies";
-const CHUNKED_PREFILL_BENCHMARK: &str = "llama-chunked-prefill";
-const KV_BENCHMARK: &str = "kv-block-pressure";
-const FIFO_EXPERIMENT: &str = "fifo-workload";
-const PREFILL_BUCKET_EXPERIMENT: &str = "prefill-bucketing";
-const ADAPTIVE_PREFILL_EXPERIMENT: &str = "adaptive-prefill-cost";
-const SCHEDULER_EXPERIMENT: &str = "scheduler-comparison";
 const MAX_ACTIVITY: usize = 100;
 
 /// Compute backend selected for local model execution.
@@ -70,6 +53,7 @@ pub struct LocalBackend {
     commands: Sender<WorkerCommand>,
     events: Receiver<WorkerEvent>,
     snapshot: WorkspaceSnapshot,
+    descriptors: Vec<ExperimentDescriptor>,
 }
 
 impl LocalBackend {
@@ -96,6 +80,7 @@ impl LocalBackend {
         let (command_sender, command_receiver) = mpsc::channel();
         let (event_sender, event_receiver) = mpsc::channel();
         let loading_model = model_directory.is_some();
+        let descriptors = ExperimentRegistry::builtin().descriptors();
         thread::Builder::new()
             .name("ola-ui-worker".into())
             .spawn(move || {
@@ -119,66 +104,8 @@ impl LocalBackend {
                 backend: device.label().into(),
                 ..RuntimeSummary::default()
             },
-            benchmarks: vec![
-                WorkItem {
-                    id: LLAMA_BENCHMARK.into(),
-                    name: "Llama generation".into(),
-                    description: "Cached greedy generation latency and throughput".into(),
-                    state: RunState::Unavailable,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: PREFILL_EXECUTION_BENCHMARK.into(),
-                    name: "Llama prefill strategies".into(),
-                    description: "Calibrate and compare three prefill groupers".into(),
-                    state: RunState::Unavailable,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: CHUNKED_PREFILL_BENCHMARK.into(),
-                    name: "Llama chunked prefill".into(),
-                    description: "Compare complete prompts with resumable prompt segments".into(),
-                    state: RunState::Unavailable,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: KV_BENCHMARK.into(),
-                    name: "KV block pressure".into(),
-                    description: "Allocator throughput, occupancy, and fragmentation".into(),
-                    state: RunState::Ready,
-                    last_result: None,
-                },
-            ],
-            experiments: vec![
-                WorkItem {
-                    id: FIFO_EXPERIMENT.into(),
-                    name: "FIFO workload".into(),
-                    description: "Replay and complete a deterministic runtime trace".into(),
-                    state: RunState::Ready,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: PREFILL_BUCKET_EXPERIMENT.into(),
-                    name: "Prefill bucketing".into(),
-                    description: "Compare unbucketed and power-of-two padding work".into(),
-                    state: RunState::Ready,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: ADAPTIVE_PREFILL_EXPERIMENT.into(),
-                    name: "Adaptive prefill cost".into(),
-                    description: "Balance dense padding against invocation overhead".into(),
-                    state: RunState::Ready,
-                    last_result: None,
-                },
-                WorkItem {
-                    id: SCHEDULER_EXPERIMENT.into(),
-                    name: "Scheduler comparison".into(),
-                    description: "FIFO, SJF, and priority on seeded traces in virtual time".into(),
-                    state: RunState::Ready,
-                    last_result: None,
-                },
-            ],
+            benchmarks: work_items(&descriptors, ExperimentCategory::Benchmark),
+            experiments: work_items(&descriptors, ExperimentCategory::Experiment),
             activity: vec![if loading_model {
                 "background model load started".into()
             } else {
@@ -195,6 +122,7 @@ impl LocalBackend {
             commands: command_sender,
             events: event_receiver,
             snapshot,
+            descriptors,
         }
     }
 
@@ -222,24 +150,15 @@ impl LocalBackend {
                 self.snapshot.runtime.connection = ConnectionState::Connected;
                 self.snapshot.runtime.resident_models = 1;
                 self.snapshot.notice = Some("Local Llama generation is ready".into());
-                set_work_state(
-                    &mut self.snapshot.benchmarks,
-                    LLAMA_BENCHMARK,
-                    RunState::Ready,
-                    None,
-                );
-                set_work_state(
-                    &mut self.snapshot.benchmarks,
-                    PREFILL_EXECUTION_BENCHMARK,
-                    RunState::Ready,
-                    None,
-                );
-                set_work_state(
-                    &mut self.snapshot.benchmarks,
-                    CHUNKED_PREFILL_BENCHMARK,
-                    RunState::Ready,
-                    None,
-                );
+                for descriptor in &self.descriptors {
+                    if descriptor.requirements.contains(&Requirement::LoadedModel) {
+                        let items = match descriptor.category {
+                            ExperimentCategory::Benchmark => &mut self.snapshot.benchmarks,
+                            ExperimentCategory::Experiment => &mut self.snapshot.experiments,
+                        };
+                        set_work_state(items, descriptor.id, RunState::Ready, None);
+                    }
+                }
                 self.record_activity(format!("model loaded: {name}"));
             }
             WorkerEvent::ModelFailed(message) => {
@@ -273,28 +192,36 @@ impl LocalBackend {
                 self.record_activity(format!("generation failed: {message}"));
             }
             WorkerEvent::WorkComplete { kind, id, result } => {
+                let needs_model = self.needs_model(&id);
                 let items = match kind {
                     WorkKind::Benchmark => &mut self.snapshot.benchmarks,
                     WorkKind::Experiment => &mut self.snapshot.experiments,
                 };
                 set_work_state(items, &id, RunState::Succeeded, Some(result.clone()));
-                if is_model_benchmark(&id) {
+                if needs_model {
                     self.snapshot.runtime.connection = ConnectionState::Connected;
                 }
                 self.record_activity(format!("{id} completed: {result}"));
             }
             WorkerEvent::WorkFailed { kind, id, message } => {
+                let needs_model = self.needs_model(&id);
                 let items = match kind {
                     WorkKind::Benchmark => &mut self.snapshot.benchmarks,
                     WorkKind::Experiment => &mut self.snapshot.experiments,
                 };
                 set_work_state(items, &id, RunState::Failed, Some(message.clone()));
-                if is_model_benchmark(&id) {
+                if needs_model {
                     self.snapshot.runtime.connection = ConnectionState::Connected;
                 }
                 self.record_activity(format!("{id} failed: {message}"));
             }
         }
+    }
+
+    fn needs_model(&self, id: &str) -> bool {
+        self.descriptors.iter().any(|descriptor| {
+            descriptor.id == id && descriptor.requirements.contains(&Requirement::LoadedModel)
+        })
     }
 
     fn record_activity(&mut self, message: String) {
@@ -304,6 +231,47 @@ impl LocalBackend {
                 .activity
                 .drain(0..self.snapshot.activity.len() - MAX_ACTIVITY);
         }
+    }
+
+    fn start_work(&mut self, kind: WorkKind, id: &str) -> Result<(), UiBackendError> {
+        self.drain_events()?;
+        let noun = match kind {
+            WorkKind::Benchmark => "benchmark",
+            WorkKind::Experiment => "experiment",
+        };
+        let items = match kind {
+            WorkKind::Benchmark => &self.snapshot.benchmarks,
+            WorkKind::Experiment => &self.snapshot.experiments,
+        };
+        let state = find_work(items, id)?;
+        if state == RunState::Unavailable {
+            return Err(UiBackendError::new(format!(
+                "{noun} `{id}` is unavailable with the current connections"
+            )));
+        }
+        if state == RunState::Running {
+            return Err(UiBackendError::new(format!(
+                "{noun} `{id}` is already running"
+            )));
+        }
+        let needs_model = self.needs_model(id);
+        if needs_model && self.snapshot.runtime.connection == ConnectionState::Busy {
+            return Err(UiBackendError::new("the local model is already busy"));
+        }
+        self.send(WorkerCommand::Run {
+            kind,
+            id: id.to_owned(),
+        })?;
+        let items = match kind {
+            WorkKind::Benchmark => &mut self.snapshot.benchmarks,
+            WorkKind::Experiment => &mut self.snapshot.experiments,
+        };
+        set_work_state(items, id, RunState::Running, None);
+        if needs_model {
+            self.snapshot.runtime.connection = ConnectionState::Busy;
+        }
+        self.record_activity(format!("{noun} started: {id}"));
+        Ok(())
     }
 
     fn send(&self, command: WorkerCommand) -> Result<(), UiBackendError> {
@@ -340,49 +308,17 @@ impl UiBackend for LocalBackend {
     }
 
     fn start_benchmark(&mut self, id: &str) -> Result<(), UiBackendError> {
-        self.drain_events()?;
-        let state = find_work(&self.snapshot.benchmarks, id)?;
-        if state == RunState::Unavailable {
-            return Err(UiBackendError::new(format!(
-                "benchmark `{id}` is unavailable with the current connections"
-            )));
-        }
-        if state == RunState::Running {
-            return Err(UiBackendError::new(format!(
-                "benchmark `{id}` is already running"
-            )));
-        }
-        if is_model_benchmark(id) && self.snapshot.runtime.connection == ConnectionState::Busy {
-            return Err(UiBackendError::new("the local model is already busy"));
-        }
-        self.send(WorkerCommand::Benchmark(id.to_owned()))?;
-        set_work_state(&mut self.snapshot.benchmarks, id, RunState::Running, None);
-        if is_model_benchmark(id) {
-            self.snapshot.runtime.connection = ConnectionState::Busy;
-        }
-        self.record_activity(format!("benchmark started: {id}"));
-        Ok(())
+        self.start_work(WorkKind::Benchmark, id)
     }
 
     fn start_experiment(&mut self, id: &str) -> Result<(), UiBackendError> {
-        self.drain_events()?;
-        let state = find_work(&self.snapshot.experiments, id)?;
-        if state == RunState::Running {
-            return Err(UiBackendError::new(format!(
-                "experiment `{id}` is already running"
-            )));
-        }
-        self.send(WorkerCommand::Experiment(id.to_owned()))?;
-        set_work_state(&mut self.snapshot.experiments, id, RunState::Running, None);
-        self.record_activity(format!("experiment started: {id}"));
-        Ok(())
+        self.start_work(WorkKind::Experiment, id)
     }
 }
 
 enum WorkerCommand {
     Chat(String),
-    Benchmark(String),
-    Experiment(String),
+    Run { kind: WorkKind, id: String },
 }
 
 #[derive(Clone, Copy)]
@@ -445,6 +381,14 @@ fn worker_loop(
                 }
             });
 
+    let registry = ExperimentRegistry::builtin();
+    let context = ExperimentContext {
+        model: model.clone(),
+        model_label: model.as_ref().and(model_name.clone()),
+        device: Some(
+            std::env::var("OLA_BENCH_DEVICE_LABEL").unwrap_or_else(|_| device.label().to_owned()),
+        ),
+    };
     while let Ok(command) = commands.recv() {
         let event = match command {
             WorkerCommand::Chat(prompt) => match model.as_ref() {
@@ -458,19 +402,85 @@ fn worker_loop(
                 },
                 None => WorkerEvent::ChatFailed("no local Llama model is loaded".into()),
             },
-            WorkerCommand::Benchmark(id) => run_benchmark(
-                &id,
-                model.as_ref(),
-                model_name.as_deref(),
-                device,
-                results_directory.as_deref(),
-            ),
-            WorkerCommand::Experiment(id) => run_experiment(&id),
+            WorkerCommand::Run { kind, id } => {
+                run_work(&registry, &context, results_directory.as_deref(), kind, &id)
+            }
         };
         if events.send(event).is_err() {
             break;
         }
     }
+}
+
+/// Runs one registry experiment, saving its report when a results directory
+/// is configured.
+fn run_work(
+    registry: &ExperimentRegistry,
+    context: &ExperimentContext,
+    results_directory: Option<&Path>,
+    kind: WorkKind,
+    id: &str,
+) -> WorkerEvent {
+    let outcome = match registry.run(id, context, &[]) {
+        Ok(outcome) => outcome,
+        Err(error) => return work_failed(kind, id, error.to_string()),
+    };
+    let mut result = format!(
+        "{} · {}",
+        outcome.summary,
+        kind_label(
+            outcome.report.experiment.kind,
+            outcome.report.experiment.domain,
+        )
+    );
+    if let Some(directory) = results_directory {
+        match outcome.report.write_new(directory) {
+            Ok(path) => result.push_str(&format!(" · saved {}", path.display())),
+            Err(error) => return work_failed(kind, id, format!("could not save report: {error}")),
+        }
+    }
+    WorkerEvent::WorkComplete {
+        kind,
+        id: id.to_owned(),
+        result,
+    }
+}
+
+/// Labels whether a result may support a claim, and which clock it uses.
+fn kind_label(kind: ExperimentKind, domain: TimeDomain) -> String {
+    let kind = match kind {
+        ExperimentKind::Probe => "probe, not for publication",
+        ExperimentKind::Study => "study",
+    };
+    let domain = match domain {
+        TimeDomain::Virtual => "virtual time",
+        TimeDomain::Host => "host time",
+        TimeDomain::Untimed => "untimed",
+    };
+    format!("{kind}, {domain}")
+}
+
+/// Builds one workbench list from registry descriptors.
+fn work_items(descriptors: &[ExperimentDescriptor], category: ExperimentCategory) -> Vec<WorkItem> {
+    descriptors
+        .iter()
+        .filter(|descriptor| descriptor.category == category)
+        .map(|descriptor| WorkItem {
+            id: descriptor.id.to_owned(),
+            name: descriptor.name.to_owned(),
+            description: format!(
+                "{} ({})",
+                descriptor.description,
+                kind_label(descriptor.kind, descriptor.domain)
+            ),
+            state: if descriptor.requirements.contains(&Requirement::LoadedModel) {
+                RunState::Unavailable
+            } else {
+                RunState::Ready
+            },
+            last_result: None,
+        })
+        .collect()
 }
 
 fn load_model(
@@ -570,540 +580,12 @@ fn generate(
     })
 }
 
-fn run_benchmark(
-    id: &str,
-    model: Option<&CausalLanguageModel>,
-    model_name: Option<&str>,
-    device: LocalDevice,
-    results_directory: Option<&Path>,
-) -> WorkerEvent {
-    match id {
-        KV_BENCHMARK => match kv_block_pressure() {
-            Ok((result, _)) => WorkerEvent::WorkComplete {
-                kind: WorkKind::Benchmark,
-                id: id.into(),
-                result,
-            },
-            Err(message) => work_failed(WorkKind::Benchmark, id, message),
-        },
-        LLAMA_BENCHMARK => match model {
-            Some(model) => match generate(model, "Hello", 8) {
-                Ok(generation) => {
-                    let seconds = generation.elapsed.as_secs_f64();
-                    let throughput = if seconds == 0.0 {
-                        0.0
-                    } else {
-                        generation.metrics.generated_tokens as f64 / seconds
-                    };
-                    WorkerEvent::WorkComplete {
-                        kind: WorkKind::Benchmark,
-                        id: id.into(),
-                        result: format!(
-                            "{} tokens · {:.2} tok/s · {} KV",
-                            generation.metrics.generated_tokens,
-                            throughput,
-                            format_bytes(generation.metrics.kv_cache_bytes)
-                        ),
-                    }
-                }
-                Err(message) => work_failed(WorkKind::Benchmark, id, message),
-            },
-            None => work_failed(WorkKind::Benchmark, id, "no local Llama model is loaded"),
-        },
-        PREFILL_EXECUTION_BENCHMARK => match model {
-            Some(model) => match prefill_execution_probe(
-                model,
-                model_name.unwrap_or("local-llama"),
-                device,
-                results_directory,
-            ) {
-                Ok(result) => WorkerEvent::WorkComplete {
-                    kind: WorkKind::Benchmark,
-                    id: id.into(),
-                    result,
-                },
-                Err(message) => work_failed(WorkKind::Benchmark, id, message),
-            },
-            None => work_failed(WorkKind::Benchmark, id, "no local Llama model is loaded"),
-        },
-        CHUNKED_PREFILL_BENCHMARK => match model {
-            Some(model) => match chunked_prefill_probe(model) {
-                Ok(result) => WorkerEvent::WorkComplete {
-                    kind: WorkKind::Benchmark,
-                    id: id.into(),
-                    result,
-                },
-                Err(message) => work_failed(WorkKind::Benchmark, id, message),
-            },
-            None => work_failed(WorkKind::Benchmark, id, "no local Llama model is loaded"),
-        },
-        _ => work_failed(WorkKind::Benchmark, id, "unknown benchmark ID"),
-    }
-}
-
-fn prefill_execution_probe(
-    model: &CausalLanguageModel,
-    model_name: &str,
-    device: LocalDevice,
-    results_directory: Option<&Path>,
-) -> Result<String, String> {
-    const PROMPT_LENGTHS: &[usize] = &[2, 3, 5, 7];
-    const CALIBRATION_WARMUP_TRIALS: usize = 1;
-    const CALIBRATION_TRIALS: usize = 4;
-    const COMPARISON_WARMUP_TRIALS: usize = 1;
-    const COMPARISON_TRIALS: usize = 3;
-    let execution = PrefillExecutionConfig {
-        prompts: PROMPT_LENGTHS
-            .iter()
-            .map(|length| vec![1; *length])
-            .collect(),
-        max_new_tokens: 2,
-    };
-    let calibration_config = PrefillTrialConfig {
-        execution: execution.clone(),
-        warmup_trials: CALIBRATION_WARMUP_TRIALS,
-        measured_trials: CALIBRATION_TRIALS,
-    };
-    let calibration_comparison =
-        benchmark_prefill_trials(model, &calibration_config).map_err(|error| error.to_string())?;
-    let calibration = calibrate_prefill_invocation_overhead(&calibration_comparison)
-        .map_err(|error| error.to_string())?;
-    let config = PrefillThreeWayTrialConfig {
-        execution: PrefillExecutionConfig {
-            prompts: execution.prompts,
-            max_new_tokens: execution.max_new_tokens,
-        },
-        warmup_trials: COMPARISON_WARMUP_TRIALS,
-        measured_trials: COMPARISON_TRIALS,
-        adaptive_invocation_overhead_tokens: calibration.invocation_overhead_tokens,
-    };
-    let comparison =
-        benchmark_three_way_prefill_trials(model, &config).map_err(|error| error.to_string())?;
-    let baseline = &comparison.unbucketed;
-    let bucketed = &comparison.power_of_two;
-    let adaptive = &comparison.cost_aware;
-    let baseline_shape = &baseline.samples[0];
-    let bucketed_shape = &bucketed.samples[0];
-    let adaptive_shape = &adaptive.samples[0];
-    let mut summary = format!(
-        "{} prompts · calibrated {} token-equivalent call cost from {} → {} p50 · {COMPARISON_TRIALS} rotating trials + {COMPARISON_WARMUP_TRIALS} warmup · prefill p50 U/P/A {} / {} / {} · padding U/P/A {} / {} / {} · calls U/P/A {} / {} / {} · throughput U/P/A {:.2} / {:.2} / {:.2} tok/s · peak KV U/P/A {} / {} / {}",
-        PROMPT_LENGTHS.len(),
-        calibration.invocation_overhead_tokens,
-        format_duration(Duration::from_micros(calibration.unbucketed_p50_micros)),
-        format_duration(Duration::from_micros(calibration.power_of_two_p50_micros)),
-        format_duration(Duration::from_micros(
-            baseline.prefill_iteration_latency.p50_micros
-        )),
-        format_duration(Duration::from_micros(
-            bucketed.prefill_iteration_latency.p50_micros
-        )),
-        format_duration(Duration::from_micros(
-            adaptive.prefill_iteration_latency.p50_micros
-        )),
-        baseline_shape.prefill_padding_tokens,
-        bucketed_shape.prefill_padding_tokens,
-        adaptive_shape.prefill_padding_tokens,
-        baseline_shape.prefill_invocations,
-        bucketed_shape.prefill_invocations,
-        adaptive_shape.prefill_invocations,
-        baseline.output_tokens_per_second().unwrap_or(0.0),
-        bucketed.output_tokens_per_second().unwrap_or(0.0),
-        adaptive.output_tokens_per_second().unwrap_or(0.0),
-        format_bytes(baseline.peak_kv_cache_bytes()),
-        format_bytes(bucketed.peak_kv_cache_bytes()),
-        format_bytes(adaptive.peak_kv_cache_bytes()),
-    );
-    if let Some(directory) = results_directory {
-        let recorded_at_unix_micros = unix_time_micros()?;
-        let report = PrefillBenchmarkReport::new_three_way(
-            PrefillBenchmarkMetadata {
-                recorded_at_unix_micros,
-                model: model_name.to_owned(),
-                device: std::env::var("OLA_BENCH_DEVICE_LABEL")
-                    .unwrap_or_else(|_| device.label().to_owned()),
-                software_revision: std::env::var("OLA_SOFTWARE_REVISION")
-                    .unwrap_or_else(|_| format!("ola-ui {}", env!("CARGO_PKG_VERSION"))),
-            },
-            &config,
-            &comparison,
-        )
-        .map_err(|error| error.to_string())?;
-        let path = persist_prefill_report(directory, recorded_at_unix_micros, &report)
-            .map_err(|error| error.to_string())?;
-        summary.push_str(&format!(" · saved {}", path.display()));
-    }
-    Ok(summary)
-}
-
-fn chunked_prefill_probe(model: &CausalLanguageModel) -> Result<String, String> {
-    const CHUNK_SIZE: usize = 3;
-    const FAIRNESS_CHUNK_SIZES: &[usize] = &[2, 4, 8];
-    let comparison = benchmark_chunked_prefill_execution(
-        model,
-        &PrefillExecutionConfig {
-            prompts: vec![vec![1; 7], vec![1; 5]],
-            max_new_tokens: 2,
-        },
-        CHUNK_SIZE,
-    )
-    .map_err(|error| error.to_string())?;
-    let fairness = benchmark_prefill_fairness_trials(
-        model,
-        &PrefillExecutionConfig {
-            prompts: vec![vec![1; 2], vec![1; 15], vec![1; 4], vec![1; 7]],
-            max_new_tokens: 3,
-        },
-        2,
-        FAIRNESS_CHUNK_SIZES,
-        1,
-        3,
-    )
-    .map_err(|error| error.to_string())?;
-    let request_iterations = |run: &ola_bench::PrefillFairnessRun| {
-        run.requests
-            .iter()
-            .map(|request| {
-                format!(
-                    "{}/{}",
-                    request.first_token_iteration, request.completion_iteration
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let request_latency = |latencies: &[ola_bench::PrefillFairnessLatency]| {
-        latencies
-            .iter()
-            .map(|latency| {
-                format!(
-                    "{}:{}/{}:{}/{}",
-                    latency.request_index,
-                    latency.ttft.p50_micros / 1_000,
-                    latency.ttft.p95_micros / 1_000,
-                    latency.completion.p50_micros / 1_000,
-                    latency.completion.p95_micros / 1_000
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    let chunked_latencies = fairness.chunked_latency();
-    let fairness_summary = fairness
-        .chunked
-        .iter()
-        .enumerate()
-        .map(|(index, runs)| {
-            let run = &runs[0];
-            format!(
-                "{}tok [{}] / {} iterations p50/p95 TTFT/completion ms [{}]",
-                run.chunk_size.unwrap_or_default(),
-                request_iterations(run),
-                run.iterations,
-                request_latency(&chunked_latencies[index])
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Ok(format!(
-        "2 prompts (7/5 tokens) · chunk size {CHUNK_SIZE} · prefill calls {} → {} · tensor calls {} → {} · iterations {} → {} · prefill {} → {} · output preserved · peak KV {} → {} · fairness (1 warm-up, 3 measured, two active) request TTFT/completion iterations baseline [{}], p50/p95 ms [{}], chunks {fairness_summary}",
-        comparison.unchunked.prefill_invocations,
-        comparison.chunked.prefill_invocations,
-        comparison.unchunked.tensor_prefill_invocations,
-        comparison.chunked.tensor_prefill_invocations,
-        comparison.unchunked.iterations,
-        comparison.chunked.iterations,
-        format_duration(comparison.unchunked.prefill_iteration_elapsed),
-        format_duration(comparison.chunked.prefill_iteration_elapsed),
-        format_bytes(comparison.unchunked.peak_kv_cache_bytes),
-        format_bytes(comparison.chunked.peak_kv_cache_bytes),
-        request_iterations(&fairness.unchunked[0]),
-        request_latency(&fairness.unchunked_latency()),
-    ))
-}
-
-fn unix_time_micros() -> Result<u64, String> {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?;
-    u64::try_from(elapsed.as_micros())
-        .map_err(|_| "current Unix timestamp exceeds the report format".to_owned())
-}
-
-fn persist_prefill_report(
-    directory: &Path,
-    recorded_at_unix_micros: u64,
-    report: &PrefillBenchmarkReport,
-) -> Result<PathBuf, PrefillReportError> {
-    fs::create_dir_all(directory)?;
-    for suffix in 0..1_000_u16 {
-        let filename = if suffix == 0 {
-            format!("prefill-strategies-{recorded_at_unix_micros}.json")
-        } else {
-            format!("prefill-strategies-{recorded_at_unix_micros}-{suffix}.json")
-        };
-        let path = directory.join(filename);
-        match report.write_json_new(&path) {
-            Ok(()) => return Ok(path),
-            Err(PrefillReportError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(PrefillReportError::Io(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not reserve a unique prefill report filename",
-    )))
-}
-
-fn run_experiment(id: &str) -> WorkerEvent {
-    match id {
-        FIFO_EXPERIMENT => match fifo_workload_probe() {
-            Ok(result) => WorkerEvent::WorkComplete {
-                kind: WorkKind::Experiment,
-                id: id.into(),
-                result,
-            },
-            Err(message) => work_failed(WorkKind::Experiment, id, message),
-        },
-        PREFILL_BUCKET_EXPERIMENT => match prefill_bucketing_probe() {
-            Ok(result) => WorkerEvent::WorkComplete {
-                kind: WorkKind::Experiment,
-                id: id.into(),
-                result,
-            },
-            Err(message) => work_failed(WorkKind::Experiment, id, message),
-        },
-        ADAPTIVE_PREFILL_EXPERIMENT => match adaptive_prefill_probe() {
-            Ok(result) => WorkerEvent::WorkComplete {
-                kind: WorkKind::Experiment,
-                id: id.into(),
-                result,
-            },
-            Err(message) => work_failed(WorkKind::Experiment, id, message),
-        },
-        SCHEDULER_EXPERIMENT => match scheduler_comparison_probe() {
-            Ok(result) => WorkerEvent::WorkComplete {
-                kind: WorkKind::Experiment,
-                id: id.into(),
-                result,
-            },
-            Err(message) => work_failed(WorkKind::Experiment, id, message),
-        },
-        _ => work_failed(WorkKind::Experiment, id, "unknown experiment ID"),
-    }
-}
-
-fn kv_block_pressure() -> Result<(String, KvBlockMetrics), String> {
-    const CAPACITY: u64 = 64 * 1024 * 1024;
-    const TOKENS_PER_BLOCK: usize = 16;
-    const BYTES_PER_TOKEN: u64 = 4 * 1024;
-    const SEQUENCES: usize = 128;
-
-    let started = Instant::now();
-    let mut manager = KvBlockManager::new(CAPACITY, TOKENS_PER_BLOCK, BYTES_PER_TOKEN)
-        .map_err(|error| error.to_string())?;
-    let mut sequences = Vec::with_capacity(SEQUENCES);
-    for index in 0..SEQUENCES {
-        let sequence = manager.allocate().map_err(|error| error.to_string())?;
-        manager
-            .append(sequence, 1 + index % 96)
-            .map_err(|error| error.to_string())?;
-        sequences.push(sequence);
-    }
-    for (index, sequence) in sequences.into_iter().enumerate() {
-        if index.is_multiple_of(3) {
-            manager.free(sequence).map_err(|error| error.to_string())?;
-        }
-    }
-    let elapsed = started.elapsed();
-    let metrics = manager.metrics();
-    let fragmentation = if metrics.allocated_bytes == 0 {
-        0.0
-    } else {
-        metrics.internal_fragmentation_bytes as f64 / metrics.allocated_bytes as f64 * 100.0
-    };
-    Ok((
-        format!(
-            "{} live · {} blocks / {} · {} · {:.1}% fragment · {}",
-            metrics.live_sequences,
-            metrics.allocated_blocks,
-            metrics.total_blocks,
-            format_bytes(metrics.allocated_bytes),
-            fragmentation,
-            format_duration(elapsed)
-        ),
-        metrics,
-    ))
-}
-
-fn fifo_workload_probe() -> Result<String, String> {
-    const REQUESTS: usize = 100;
-    let workload = FixedWorkload {
-        model: "ui-probe".into(),
-        requests: REQUESTS,
-        prompt_tokens: 32,
-        output_tokens: 16,
-        interarrival: Duration::from_micros(100),
-    }
-    .build()
-    .map_err(|error| error.to_string())?;
-    let mut runtime = Runtime::default();
-    runtime
-        .register_model(ModelDescriptor::language("ui-probe", "probe"))
-        .map_err(|error| error.to_string())?;
-    let started = Instant::now();
-    let submitted = workload
-        .replay(&mut runtime)
-        .map_err(|error| error.to_string())?;
-    let mut observed = Vec::with_capacity(REQUESTS);
-    for index in 0..REQUESTS {
-        let base = 20_000 + index as u64 * 3;
-        let session = runtime
-            .start_queue_head(Timestamp::from_micros(base))
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "FIFO returned no request while work remained".to_owned())?;
-        observed.push(session.request_id);
-        runtime
-            .mark_first_token(session.request_id, Timestamp::from_micros(base + 1))
-            .map_err(|error| error.to_string())?;
-        runtime
-            .complete(session.request_id, Timestamp::from_micros(base + 2))
-            .map_err(|error| error.to_string())?;
-    }
-    if observed != submitted {
-        return Err("FIFO execution order differed from arrival order".into());
-    }
-    let elapsed = started.elapsed();
-    Ok(format!(
-        "{REQUESTS} requests · FIFO order verified · {}",
-        format_duration(elapsed)
-    ))
-}
-
-fn prefill_bucketing_probe() -> Result<String, String> {
-    const PROMPT_LENGTHS: &[usize] = &[5, 7, 9, 15, 17, 31, 33, 63];
-    let comparison = compare_prefill_batching(PROMPT_LENGTHS).map_err(|error| error.to_string())?;
-    let baseline_efficiency = comparison
-        .unbucketed
-        .input_token_efficiency()
-        .unwrap_or(0.0)
-        * 100.0;
-    let bucketed_efficiency = comparison
-        .power_of_two
-        .input_token_efficiency()
-        .unwrap_or(0.0)
-        * 100.0;
-    let reduction = comparison.padding_reduction().unwrap_or(0.0) * 100.0;
-    Ok(format!(
-        "{} prompts · padding {} → {} ({reduction:.1}% less) · invocations {} → {} · efficiency {baseline_efficiency:.1}% → {bucketed_efficiency:.1}%",
-        PROMPT_LENGTHS.len(),
-        comparison.unbucketed.padding_tokens,
-        comparison.power_of_two.padding_tokens,
-        comparison.unbucketed.invocations,
-        comparison.power_of_two.invocations,
-    ))
-}
-
-/// Compares scheduling baselines on seeded traces with the synthetic model
-/// and virtual time, so the result is identical on every machine.
-fn scheduler_comparison_probe() -> Result<String, String> {
-    const REQUESTS: usize = 120;
-    let millis = |micros: u64| micros as f64 / 1_000.0;
-    let fifo = || ComposedPolicy::default().with_admission(MemoryAwareAdmission);
-    let config = SimulationConfig::default();
-
-    let overload = SchedulingTrace::overload(TraceParameters {
-        seed: 3,
-        requests: REQUESTS,
-        mean_interarrival_micros: 2_000,
-    });
-    let sizes = compare_schedulers(
-        &overload,
-        &config,
-        vec![
-            Box::new(fifo()) as Box<dyn ExecutionPolicy>,
-            Box::new(fifo().with_scheduler(ShortestJobFirst::new(JobCost::Prompt))),
-        ],
-        DEFAULT_STARVATION_FACTOR,
-    )
-    .map_err(|error| error.to_string())?;
-    let line = |label: &str, summary: &SchedulingSummary| {
-        format!(
-            "{label} p50/p95 {:.1}/{:.1} ms, fairness {:.2}, starved {}",
-            millis(summary.completion.p50_micros),
-            millis(summary.completion.p95_micros),
-            summary.slowdown.jain_fairness,
-            summary.starved,
-        )
-    };
-
-    let priorities = SchedulingTrace::priority_classes(TraceParameters {
-        seed: 3,
-        requests: REQUESTS,
-        mean_interarrival_micros: 300,
-    });
-    let urgency = compare_schedulers(
-        &priorities,
-        &config,
-        vec![
-            Box::new(fifo()) as Box<dyn ExecutionPolicy>,
-            Box::new(fifo().with_scheduler(PriorityScheduler::new())),
-        ],
-        DEFAULT_STARVATION_FACTOR,
-    )
-    .map_err(|error| error.to_string())?;
-    let urgent_p95 = |summary: &SchedulingSummary| {
-        summary
-            .classes
-            .iter()
-            .find(|class| class.class == "priority=5")
-            .map_or(0.0, |class| millis(class.completion.p95_micros))
-    };
-
-    Ok(format!(
-        "{REQUESTS} requests, virtual time · overload: {} · {} · priority classes: urgent p95 fifo {:.1} ms → priority {:.1} ms",
-        line("fifo", &sizes.summaries[0]),
-        line("shortest-job-first", &sizes.summaries[1]),
-        urgent_p95(&urgency.summaries[0]),
-        urgent_p95(&urgency.summaries[1]),
-    ))
-}
-
-fn adaptive_prefill_probe() -> Result<String, String> {
-    const INVOCATION_OVERHEAD_TOKENS: usize = 32;
-    const DIVERSE: &[usize] = &[5, 7, 9, 63];
-    const CLUSTERED: &[usize] = &[5, 6, 7, 8];
-    let diverse = analyze_cost_aware_prefill(DIVERSE, INVOCATION_OVERHEAD_TOKENS)
-        .map_err(|error| error.to_string())?;
-    let clustered = analyze_cost_aware_prefill(CLUSTERED, INVOCATION_OVERHEAD_TOKENS)
-        .map_err(|error| error.to_string())?;
-    Ok(format!(
-        "{INVOCATION_OVERHEAD_TOKENS} token-equivalent call cost · diverse {:?}: cost {} → {}, {} padding / {} calls · clustered {:?}: cost {} → {}, {} padding / {} calls",
-        diverse.decision.selected,
-        diverse.decision.unbucketed.estimated_cost,
-        diverse.decision.power_of_two.estimated_cost,
-        diverse.selected.padding_tokens,
-        diverse.selected.invocations,
-        clustered.decision.selected,
-        clustered.decision.unbucketed.estimated_cost,
-        clustered.decision.power_of_two.estimated_cost,
-        clustered.selected.padding_tokens,
-        clustered.selected.invocations,
-    ))
-}
-
 fn work_failed(kind: WorkKind, id: &str, message: impl Into<String>) -> WorkerEvent {
     WorkerEvent::WorkFailed {
         kind,
         id: id.into(),
         message: message.into(),
     }
-}
-
-fn is_model_benchmark(id: &str) -> bool {
-    matches!(
-        id,
-        LLAMA_BENCHMARK | PREFILL_EXECUTION_BENCHMARK | CHUNKED_PREFILL_BENCHMARK
-    )
 }
 
 fn find_work(items: &[WorkItem], id: &str) -> Result<RunState, UiBackendError> {
@@ -1145,45 +627,12 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
-
-    #[test]
-    fn kv_probe_exercises_real_block_accounting() {
-        let (summary, metrics) = kv_block_pressure().unwrap();
-
-        assert_eq!(metrics.live_sequences, 85);
-        assert!(metrics.allocated_blocks > 0);
-        assert!(metrics.internal_fragmentation_bytes > 0);
-        assert!(summary.contains("fragment"));
-    }
-
-    #[test]
-    fn fifo_probe_replays_and_completes_the_real_runtime_workload() {
-        let summary = fifo_workload_probe().unwrap();
-
-        assert!(summary.contains("100 requests"));
-        assert!(summary.contains("verified"));
-    }
-
-    #[test]
-    fn prefill_bucketing_probe_reports_the_compute_shape_tradeoff() {
-        let summary = prefill_bucketing_probe().unwrap();
-
-        assert!(summary.contains("8 prompts"));
-        assert!(summary.contains("padding"));
-        assert!(summary.contains("invocations"));
-        assert!(summary.contains("efficiency"));
-    }
-
-    #[test]
-    fn adaptive_prefill_probe_selects_per_workload_shape() {
-        let summary = adaptive_prefill_probe().unwrap();
-
-        assert!(summary.contains("diverse PowerOfTwo"));
-        assert!(summary.contains("cost 284 → 182"));
-        assert!(summary.contains("clustered Unbucketed"));
-        assert!(summary.contains("cost 64 → 64"));
-    }
 
     #[test]
     fn local_backend_exposes_non_model_work_without_an_artifact() {
@@ -1195,14 +644,14 @@ mod tests {
             snapshot
                 .benchmarks
                 .iter()
-                .find(|item| item.id == KV_BENCHMARK)
+                .find(|item| item.id == "kv-block-pressure")
                 .is_some_and(|item| item.state == RunState::Ready)
         );
         assert!(
             snapshot
                 .benchmarks
                 .iter()
-                .find(|item| item.id == PREFILL_EXECUTION_BENCHMARK)
+                .find(|item| item.id == "llama-prefill-strategies")
                 .is_some_and(|item| item.state == RunState::Unavailable)
         );
         assert!(backend.submit_prompt("hello").is_err());
@@ -1212,18 +661,18 @@ mod tests {
     fn local_backend_runs_the_prefill_bucketing_experiment() {
         let mut backend = LocalBackend::new(None);
 
-        backend.start_experiment(PREFILL_BUCKET_EXPERIMENT).unwrap();
+        backend.start_experiment("prefill-bucketing").unwrap();
         let snapshot = wait_until(&mut backend, |snapshot| {
             snapshot
                 .experiments
                 .iter()
-                .find(|item| item.id == PREFILL_BUCKET_EXPERIMENT)
+                .find(|item| item.id == "prefill-bucketing")
                 .is_some_and(|item| item.state == RunState::Succeeded)
         });
         let experiment = snapshot
             .experiments
             .iter()
-            .find(|item| item.id == PREFILL_BUCKET_EXPERIMENT)
+            .find(|item| item.id == "prefill-bucketing")
             .unwrap();
 
         assert!(
@@ -1238,44 +687,89 @@ mod tests {
     fn local_backend_runs_the_scheduler_comparison_experiment() {
         let mut backend = LocalBackend::new(None);
 
-        backend.start_experiment(SCHEDULER_EXPERIMENT).unwrap();
-        let snapshot = wait_until(&mut backend, |snapshot| {
+        backend.start_experiment("scheduler-comparison").unwrap();
+        let snapshot = wait_until_for(&mut backend, Duration::from_secs(120), |snapshot| {
             snapshot
                 .experiments
                 .iter()
-                .find(|item| item.id == SCHEDULER_EXPERIMENT)
+                .find(|item| item.id == "scheduler-comparison")
                 .is_some_and(|item| item.state == RunState::Succeeded)
         });
         let result = snapshot
             .experiments
             .iter()
-            .find(|item| item.id == SCHEDULER_EXPERIMENT)
+            .find(|item| item.id == "scheduler-comparison")
             .and_then(|item| item.last_result.as_deref())
             .unwrap();
 
-        assert!(result.contains("120 requests, virtual time"));
-        assert!(result.contains("shortest-job-first p50/p95"));
-        assert!(result.contains("urgent p95 fifo 159.4 ms → priority 23.6 ms"));
+        assert!(result.starts_with("overload, 5 seeds × 120 requests, virtual time"));
+        assert!(result.contains("sjf"));
+        assert!(result.ends_with("study, virtual time"));
+    }
+
+    #[test]
+    fn workbench_lists_come_from_the_experiment_registry() {
+        let mut backend = LocalBackend::new(None);
+        let snapshot = backend.snapshot().unwrap();
+        let descriptors = ExperimentRegistry::builtin().descriptors();
+        let ids = |category| {
+            descriptors
+                .iter()
+                .filter(|descriptor| descriptor.category == category)
+                .map(|descriptor| descriptor.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            snapshot
+                .benchmarks
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ids(ExperimentCategory::Benchmark)
+        );
+        assert_eq!(
+            snapshot
+                .experiments
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ids(ExperimentCategory::Experiment)
+        );
+        let fifo = snapshot
+            .experiments
+            .iter()
+            .find(|item| item.id == "fifo-workload")
+            .unwrap();
+        assert!(
+            fifo.description
+                .ends_with("(probe, not for publication, host time)")
+        );
+        assert!(
+            snapshot
+                .benchmarks
+                .iter()
+                .filter(|item| item.id.starts_with("llama-") || item.id == "cost-calibration")
+                .all(|item| item.state == RunState::Unavailable)
+        );
     }
 
     #[test]
     fn local_backend_runs_the_adaptive_prefill_experiment() {
         let mut backend = LocalBackend::new(None);
 
-        backend
-            .start_experiment(ADAPTIVE_PREFILL_EXPERIMENT)
-            .unwrap();
+        backend.start_experiment("adaptive-prefill-cost").unwrap();
         let snapshot = wait_until(&mut backend, |snapshot| {
             snapshot
                 .experiments
                 .iter()
-                .find(|item| item.id == ADAPTIVE_PREFILL_EXPERIMENT)
+                .find(|item| item.id == "adaptive-prefill-cost")
                 .is_some_and(|item| item.state == RunState::Succeeded)
         });
         let result = snapshot
             .experiments
             .iter()
-            .find(|item| item.id == ADAPTIVE_PREFILL_EXPERIMENT)
+            .find(|item| item.id == "adaptive-prefill-cost")
             .and_then(|item| item.last_result.as_deref())
             .unwrap();
 
@@ -1394,41 +888,39 @@ mod tests {
         assert_eq!(snapshot.runtime.kv_cache_bytes, 0);
         assert_eq!(snapshot.runtime.connection, ConnectionState::Connected);
 
-        backend
-            .start_benchmark(PREFILL_EXECUTION_BENCHMARK)
-            .unwrap();
+        backend.start_benchmark("llama-prefill-strategies").unwrap();
         let snapshot = wait_until_for(&mut backend, Duration::from_secs(180), |snapshot| {
             snapshot
                 .benchmarks
                 .iter()
-                .find(|item| item.id == PREFILL_EXECUTION_BENCHMARK)
+                .find(|item| item.id == "llama-prefill-strategies")
                 .is_some_and(|item| item.state == RunState::Succeeded)
         });
         let result = snapshot
             .benchmarks
             .iter()
-            .find(|item| item.id == PREFILL_EXECUTION_BENCHMARK)
+            .find(|item| item.id == "llama-prefill-strategies")
             .and_then(|item| item.last_result.as_deref())
             .unwrap();
         assert!(result.contains("calibrated"));
-        assert!(result.contains("3 rotating trials + 1 warmup"));
+        assert!(result.contains("5 rotating trials + 1 warmup"));
         assert!(result.contains("prefill p50 U/P/A"));
         assert!(result.contains("padding U/P/A 11 / 2 /"));
         assert!(result.contains("saved"));
         assert_eq!(snapshot.runtime.connection, ConnectionState::Connected);
 
-        backend.start_benchmark(CHUNKED_PREFILL_BENCHMARK).unwrap();
+        backend.start_benchmark("llama-chunked-prefill").unwrap();
         let snapshot = wait_until_for(&mut backend, Duration::from_secs(180), |snapshot| {
             snapshot
                 .benchmarks
                 .iter()
-                .find(|item| item.id == CHUNKED_PREFILL_BENCHMARK)
+                .find(|item| item.id == "llama-chunked-prefill")
                 .is_some_and(|item| item.state == RunState::Succeeded)
         });
         let chunked = snapshot
             .benchmarks
             .iter()
-            .find(|item| item.id == CHUNKED_PREFILL_BENCHMARK)
+            .find(|item| item.id == "llama-chunked-prefill")
             .and_then(|item| item.last_result.as_deref())
             .unwrap();
         assert!(chunked.contains("chunk size 3"));
@@ -1438,25 +930,35 @@ mod tests {
         assert!(chunked.contains("fairness (1 warm-up, 3 measured, two active)"));
         assert!(chunked.contains("p50/p95 ms"));
 
+        // Every run with a results directory saves a versioned report.
         let paths = fs::read_dir(&results_directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 1);
-        let report = PrefillBenchmarkReport::read_json(&paths[0]).unwrap();
-        assert_eq!(report.protocol.warmup_trials, 1);
-        assert_eq!(report.protocol.measured_trials, 3);
-        assert!(
-            report
-                .protocol
-                .adaptive_invocation_overhead_tokens
-                .is_some()
+        assert_eq!(paths.len(), 2);
+        let reports = paths
+            .iter()
+            .map(|path| ola_bench::ExperimentReport::read(path).unwrap())
+            .collect::<Vec<_>>();
+        let strategies = reports
+            .iter()
+            .find(|report| report.experiment.id == "llama-prefill-strategies")
+            .unwrap();
+        assert_eq!(strategies.protocol.warmups, 1);
+        assert_eq!(strategies.protocol.repetitions, 5);
+        assert_eq!(strategies.variants.len(), 3);
+        assert_eq!(
+            strategies.metadata.model.as_deref(),
+            Some("ola-rt-tiny-random-llama")
         );
-        assert_eq!(report.trials.len(), 3);
-        assert!(report.trials.iter().all(|trial| trial.cost_aware.is_some()));
-        assert!(report.cost_aware.is_some());
-        assert_eq!(report.metadata.model, "ola-rt-tiny-random-llama");
-        fs::remove_file(&paths[0]).unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|report| report.experiment.id == "llama-chunked-prefill")
+        );
+        for path in paths {
+            fs::remove_file(path).unwrap();
+        }
         fs::remove_dir(results_directory).unwrap();
     }
 

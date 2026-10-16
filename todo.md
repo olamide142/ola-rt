@@ -88,7 +88,7 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [x] Compare reports across models, devices, policies, kernels, and revisions.
 - [x] Report regressions and uncertainty rather than relying on one run.
 - [x] Expand calibration to multiple shapes and confidence intervals.
-- [ ] Make UI benchmark and experiment catalogs data-driven.
+- [x] Make UI benchmark and experiment catalogs data-driven.
 - [ ] Run the same named experiments through the CLI and UI.
 - [x] Separate simulation-time metrics from host performance.
 - [x] Label operational probes versus publication-quality experiments.

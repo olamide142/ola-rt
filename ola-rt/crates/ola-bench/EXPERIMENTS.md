@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Steps 1–5 are implemented.
+Covers `todo.md` P4. Steps 1–6 are implemented.
 
 ## Goal
 
@@ -224,7 +224,14 @@ Each step keeps `make verify` and `make test-fixture` green.
    `Executor::with_policy_measurements` now delivers in every snapshot. On
    tiny Llama (debug build) one call costs about one token of work.
 6. **Data-driven UI.** Build the catalogue from the registry and remove the
-   bespoke code.
+   bespoke code. **Done.**
+   `ola-ui` builds both lists from the registry, gates model-dependent
+   entries on the loaded model, runs everything through one worker path,
+   labels each entry and result with its kind and clock, and saves an
+   `ola-experiment/1` report for every run when a results directory is set
+   (previously only prefill strategies saved, as schema v2). `local.rs`
+   shrank from 1,517 to 1,019 lines; `OLA_SOFTWARE_REVISION` is replaced by
+   the build-time revision.
 7. **CLI and parity.** Add `ola-cli` and the UI/CLI parity test, then update
    documentation and `progress_report.md`.
 
