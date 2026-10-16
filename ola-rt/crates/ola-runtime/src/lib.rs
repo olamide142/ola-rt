@@ -44,7 +44,9 @@ pub use plan::{
 };
 pub use policy::{ExecutionPolicy, PolicyDecision, PolicyDescriptor, PolicyError};
 pub use runtime::Runtime;
-pub use scheduler::{FifoScheduler, Scheduler};
+pub use scheduler::{
+    EarliestDeadlineFirst, FifoScheduler, JobCost, PriorityScheduler, Scheduler, ShortestJobFirst,
+};
 pub use snapshot::{
     DeviceSnapshot, ExecutorLimits, ModelSnapshot, PlanningSnapshot, PolicyMeasurements,
     QueuedRequest,

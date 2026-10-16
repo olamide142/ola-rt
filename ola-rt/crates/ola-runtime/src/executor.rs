@@ -2688,6 +2688,32 @@ mod tests {
     }
 
     #[test]
+    fn priority_scheduling_admits_urgent_work_first() {
+        let mut executor = Executor::default()
+            .with_policy(ComposedPolicy::default().with_scheduler(crate::PriorityScheduler::new()));
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let normal = executor.submit(request("1", 1), Timestamp::ZERO).unwrap();
+        let mut urgent = request("10", 1);
+        urgent.priority = ola_core::Priority::new(5);
+        let urgent = executor.submit(urgent, Timestamp::from_micros(1)).unwrap();
+
+        let first = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        let second = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+
+        assert_eq!(first.decision.ranking.ranked, vec![urgent, normal]);
+        assert!(matches!(
+            first.events.as_slice(),
+            [ExecutorEvent::Token { request_id, finished: true, .. }] if *request_id == urgent
+        ));
+        assert!(matches!(
+            second.events.as_slice(),
+            [ExecutorEvent::Token { request_id, finished: true, .. }] if *request_id == normal
+        ));
+    }
+
+    #[test]
     fn admissions_and_preparation_failures_are_planned_before_execution() {
         let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
         executor

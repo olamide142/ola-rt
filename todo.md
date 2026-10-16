@@ -57,10 +57,12 @@ Done when existing FIFO, memory admission, token budgeting, and grouping run thr
 
 ## P3: Scheduler and policy baselines
 
+Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
+
 - [ ] Preserve FIFO as the correctness baseline.
-- [ ] Add priority scheduling.
-- [ ] Add deadline-aware scheduling.
-- [ ] Add estimated-size or shortest-job-first scheduling.
+- [x] Add priority scheduling.
+- [x] Add deadline-aware scheduling.
+- [x] Add estimated-size or shortest-job-first scheduling.
 - [ ] Add a memory/cache-aware baseline.
 - [ ] Add configurable prefill/decode mixing.
 - [ ] Compare fixed and adaptive token budgets.
