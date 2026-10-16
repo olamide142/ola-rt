@@ -110,6 +110,9 @@ state ──► Planner (reads state, consults policies) ──► ExecutionPlan
   row names the wrong model, positions do not start at the cursor or end past
   the prompt, the final-chunk flag is wrong, a decode row is not exactly its
   next position, or event indices are not exactly `0..n`;
+- **unsupported chunking:** a partial prompt row targets a model without
+  resumable prefill (it would fail the request at execution), or a prompt
+  row on a resumable model exceeds the executor's chunk size;
 - **bad release:** a predicted release is not a limit-reaching decode row in
   this plan;
 - **over capacity:** live minus predicted releases plus admissions exceeds

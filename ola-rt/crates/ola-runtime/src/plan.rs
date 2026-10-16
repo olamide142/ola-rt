@@ -298,6 +298,8 @@ struct ValidationView<'a> {
     prefilling: &'a BTreeMap<RequestId, PrefillView>,
     decoding: &'a BTreeMap<RequestId, DecodeView>,
     model_kv_capacity: BTreeMap<&'a ModelId, u64>,
+    chunked_models: BTreeSet<&'a ModelId>,
+    prefill_chunk_size: Option<usize>,
 }
 
 struct QueuedView<'a> {
@@ -335,6 +337,13 @@ impl<'a> ValidationView<'a> {
                         .map(|profile| (model_id, profile.capacity_bytes()))
                 })
                 .collect(),
+            chunked_models: snapshot
+                .models
+                .iter()
+                .filter(|(_, model)| model.chunked_prefill)
+                .map(|(model_id, _)| model_id)
+                .collect(),
+            prefill_chunk_size: snapshot.limits.prefill_chunk_size,
         }
     }
 
@@ -379,6 +388,18 @@ pub enum PlanError {
     },
     /// A row's positions or final-chunk flag contradict the request state.
     InvalidPositions(RequestId),
+    /// A partial prompt row targets a model without resumable prefill, which
+    /// would fail the request at execution.
+    UnsupportedPartialPrefill(RequestId),
+    /// A prompt row on a resumable model exceeds the executor's chunk size.
+    ChunkTooLong {
+        /// Offending request.
+        request_id: RequestId,
+        /// Positions the row processes.
+        tokens: usize,
+        /// Configured chunk size.
+        limit: usize,
+    },
     /// Event indices are not exactly `0..n`.
     InvalidEventOrder,
     /// A predicted release is not a row in this plan that must finish its
@@ -474,6 +495,18 @@ impl fmt::Display for PlanError {
             Self::InvalidPositions(id) => write!(
                 formatter,
                 "planned positions for request {id:?} contradict its sequence state"
+            ),
+            Self::UnsupportedPartialPrefill(id) => write!(
+                formatter,
+                "request {id:?} has a partial prompt row but its model cannot resume prefill"
+            ),
+            Self::ChunkTooLong {
+                request_id,
+                tokens,
+                limit,
+            } => write!(
+                formatter,
+                "request {request_id:?} processes {tokens} prompt tokens but the chunk size is {limit}"
             ),
             Self::InvalidEventOrder => {
                 formatter.write_str("planned event indices are not a contiguous permutation")
@@ -815,6 +848,22 @@ fn validate_row(
         if !valid {
             return Err(PlanError::InvalidPositions(request_id));
         }
+        let resumable = view.chunked_models.contains(expected);
+        if !row.final_prompt_chunk && !resumable {
+            return Err(PlanError::UnsupportedPartialPrefill(request_id));
+        }
+        // Models without resumable prefill always process whole prompts, so
+        // the chunk size only bounds resumable models.
+        if let Some(limit) = view.prefill_chunk_size
+            && resumable
+            && row.input_tokens() > limit
+        {
+            return Err(PlanError::ChunkTooLong {
+                request_id,
+                tokens: row.input_tokens(),
+                limit,
+            });
+        }
     }
     Ok(())
 }
@@ -1018,6 +1067,54 @@ mod tests {
             executed_and_deferred.validate(&view(), true),
             Err(PlanError::DuplicateRequest(id(4)))
         );
+    }
+
+    #[test]
+    fn rejects_partial_prompts_on_models_that_cannot_resume_them() {
+        // The fixture admits request 1 with a partial row (0..2 of 5).
+        let mut snapshot = view();
+        snapshot.models.get_mut(&model()).unwrap().chunked_prefill = false;
+
+        assert_eq!(
+            plan().validate(&snapshot, true),
+            Err(PlanError::UnsupportedPartialPrefill(id(1)))
+        );
+    }
+
+    #[test]
+    fn enforces_the_chunk_size_on_resumable_models_only() {
+        // The continued row for request 2 processes four positions.
+        let mut limited = view();
+        limited.limits.prefill_chunk_size = Some(3);
+        assert_eq!(
+            plan().validate(&limited, true),
+            Err(PlanError::ChunkTooLong {
+                request_id: id(2),
+                tokens: 4,
+                limit: 3,
+            })
+        );
+
+        limited.limits.prefill_chunk_size = Some(4);
+        assert_eq!(plan().validate(&limited, true), Ok(()));
+
+        // A model without resumable prefill processes whole prompts, so a
+        // configured chunk size does not bound its complete-prompt rows.
+        let mut whole_prompts = plan();
+        whole_prompts.batches[2].rows[0].positions = 0..5;
+        whole_prompts.batches[2].rows[0].final_prompt_chunk = true;
+        let mut unchunked = view();
+        unchunked.limits.prefill_chunk_size = Some(2);
+        unchunked.models.get_mut(&model()).unwrap().chunked_prefill = false;
+        unchunked.prefilling.clear();
+        whole_prompts.batches.remove(1);
+        whole_prompts.batches[1].rows[0].event_index = 2;
+        unchunked
+            .decoding
+            .get_mut(&id(4))
+            .unwrap()
+            .reserved_kv_bytes = 0;
+        assert_eq!(whole_prompts.validate(&unchunked, true), Ok(()));
     }
 
     #[test]

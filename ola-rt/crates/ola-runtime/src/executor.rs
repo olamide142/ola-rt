@@ -2714,6 +2714,61 @@ mod tests {
     }
 
     #[test]
+    fn partial_prompts_on_non_resumable_models_are_rejected_before_execution() {
+        /// Shortens every first prompt row to one token, which a model
+        /// without resumable prefill cannot execute.
+        struct Truncating;
+
+        impl ExecutionPolicy for Truncating {
+            fn descriptor(&self) -> PolicyDescriptor {
+                PolicyDescriptor::new("truncating")
+            }
+
+            fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
+                let mut decision = ComposedPolicy::default().plan(snapshot)?;
+                for row in decision
+                    .plan
+                    .batches
+                    .iter_mut()
+                    .flat_map(|batch| &mut batch.rows)
+                {
+                    row.positions = row.positions.start..row.positions.start + 1;
+                    row.final_prompt_chunk = false;
+                }
+                Ok(decision)
+            }
+
+            fn enforces_model_kv_capacity(&self) -> bool {
+                false
+            }
+        }
+
+        let mut executor = Executor::default().with_policy(Truncating);
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "individual-increment"),
+                individual_artifact(),
+            )
+            .unwrap();
+        let request_id = executor
+            .submit(request("1 2 3", 2), Timestamp::ZERO)
+            .unwrap();
+
+        let error = executor
+            .step_iteration(Timestamp::from_micros(10))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ExecutorError::InvalidPlan(PlanError::UnsupportedPartialPrefill(request_id))
+        );
+        assert_eq!(
+            executor.state().request(request_id).unwrap().status,
+            RequestStatus::Queued
+        );
+    }
+
+    #[test]
     fn admissions_and_preparation_failures_are_planned_before_execution() {
         let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
         executor
