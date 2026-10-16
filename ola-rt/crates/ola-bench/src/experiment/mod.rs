@@ -2,16 +2,26 @@
 //!
 //! See `EXPERIMENTS.md` in this crate.
 
+mod builtin;
 mod compare;
 mod metric;
+mod registry;
 mod report;
 mod statistics;
 
+pub use builtin::{
+    AdaptivePrefillCost, FifoWorkload, KvBlockPressure, PrefillBucketing, SchedulerComparison,
+};
 pub use compare::{
     Change, CompareError, CompareOptions, IdentityDifference, MetricComparison, ReportComparison,
     compare_reports,
 };
 pub use metric::{Direction, MetricSpec, TimeDomain, Unit};
+pub use registry::{
+    Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
+    ExperimentOutcome, ExperimentRegistry, HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS,
+    ParameterSpec, ParameterValue, Parameters, Requirement, STUDY_MIN_REPETITIONS,
+};
 pub use report::{
     BuildInfo, EXPERIMENT_SCHEMA, Estimate, ExperimentIdentity, ExperimentKind, ExperimentReport,
     Interval, Protocol, ReportError, ReportParts, RunMetadata, Sample, Variant, VariantSummary,

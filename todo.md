@@ -79,7 +79,7 @@ Done when FIFO, priority, estimated-cost, and deadline-aware policies share one 
 
 Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 
-- [ ] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
+- [x] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
 - [x] Retain raw measurements alongside derived summaries.
 - [ ] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity.
 - [ ] Generalize versioned persistence beyond prefill reports.
@@ -90,8 +90,8 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [ ] Expand calibration to multiple shapes and confidence intervals.
 - [ ] Make UI benchmark and experiment catalogs data-driven.
 - [ ] Run the same named experiments through the CLI and UI.
-- [ ] Separate simulation-time metrics from host performance.
-- [ ] Label operational probes versus publication-quality experiments.
+- [x] Separate simulation-time metrics from host performance.
+- [x] Label operational probes versus publication-quality experiments.
 
 Done when a new policy or kernel comparison requires neither bespoke UI code nor a one-off report schema.
 

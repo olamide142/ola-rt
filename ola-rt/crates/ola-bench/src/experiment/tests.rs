@@ -363,3 +363,150 @@ fn comparisons_report_identity_differences_and_refuse_incomparable_reports() {
     let comparison = compare_reports(&baseline, &extra_variant, CompareOptions::default()).unwrap();
     assert_eq!(comparison.unmatched, ["variant sjf (candidate only)"]);
 }
+
+fn run(id: &str, overrides: &[(&str, &str)]) -> Result<ExperimentOutcome, ExperimentError> {
+    let overrides = overrides
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect::<Vec<_>>();
+    ExperimentRegistry::builtin().run(id, &ExperimentContext::default(), &overrides)
+}
+
+#[test]
+fn every_builtin_experiment_runs_with_its_defaults() {
+    let registry = ExperimentRegistry::builtin();
+    let descriptors = registry.descriptors();
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|descriptor| descriptor.id)
+            .collect::<Vec<_>>(),
+        [
+            "kv-block-pressure",
+            "fifo-workload",
+            "prefill-bucketing",
+            "adaptive-prefill-cost",
+            "scheduler-comparison",
+        ]
+    );
+    for descriptor in descriptors {
+        let outcome = run(descriptor.id, &[]).unwrap();
+        assert_eq!(outcome.report.experiment.id, descriptor.id);
+        assert!(
+            !outcome.summary.is_empty(),
+            "{} has no summary",
+            descriptor.id
+        );
+        outcome.report.validate().unwrap();
+    }
+}
+
+#[test]
+fn ported_probes_keep_their_results() {
+    let bucketing = run("prefill-bucketing", &[]).unwrap();
+    assert!(bucketing.summary.contains("8 prompts · padding 324 → 52"));
+    let unbucketed = &bucketing.report.summary("unbucketed").unwrap().estimates;
+    assert_eq!(unbucketed["padding_tokens"].mean, 324.0);
+
+    let adaptive = run("adaptive-prefill-cost", &[]).unwrap();
+    assert!(adaptive.summary.contains("diverse PowerOfTwo"));
+    assert!(adaptive.summary.contains("clustered Unbucketed"));
+
+    let fifo = run("fifo-workload", &[("requests", "10")]).unwrap();
+    assert!(
+        fifo.summary
+            .starts_with("10 requests · FIFO order verified")
+    );
+    assert_eq!(fifo.report.experiment.kind, ExperimentKind::Probe);
+}
+
+#[test]
+fn the_scheduler_study_repeats_over_seeds_with_intervals() {
+    let first = run("scheduler-comparison", &[("requests", "40")]).unwrap();
+    let report = &first.report;
+
+    assert_eq!(report.experiment.kind, ExperimentKind::Study);
+    assert_eq!(report.experiment.domain, TimeDomain::Virtual);
+    assert_eq!(report.protocol.repetitions, 5);
+    assert_eq!(report.workload.seeds, [1, 2, 3, 4, 5]);
+    assert_eq!(report.variants.len(), 5);
+    assert!(
+        report
+            .summaries
+            .iter()
+            .all(|summary| summary.estimates["completion_p95"].ci95.is_some())
+    );
+    assert!(
+        first
+            .summary
+            .starts_with("overload, 5 seeds × 40 requests, virtual time")
+    );
+
+    // Virtual time: a second run differs only in when it was recorded.
+    let mut second = run("scheduler-comparison", &[("requests", "40")]).unwrap();
+    second.report.metadata.recorded_at_unix_micros = report.metadata.recorded_at_unix_micros;
+    assert_eq!(second, first);
+}
+
+#[test]
+fn the_registry_validates_parameters_requirements_and_protocols() {
+    assert!(matches!(
+        run("missing", &[]),
+        Err(ExperimentError::UnknownExperiment(_))
+    ));
+    assert!(matches!(
+        run("fifo-workload", &[("requests", "many")]),
+        Err(ExperimentError::InvalidParameter { .. })
+    ));
+    assert!(matches!(
+        run("fifo-workload", &[("unknown", "1")]),
+        Err(ExperimentError::InvalidParameter { .. })
+    ));
+    assert!(matches!(
+        run(
+            "scheduler-comparison",
+            &[("trace", "nonsense"), ("requests", "10")]
+        ),
+        Err(ExperimentError::InvalidParameter { .. })
+    ));
+    // Two seeds are too few repetitions for a study.
+    assert!(matches!(
+        run(
+            "scheduler-comparison",
+            &[("seeds", "2"), ("requests", "10")]
+        ),
+        Err(ExperimentError::Nonconforming(_))
+    ));
+
+    struct NeedsModel;
+    impl Experiment for NeedsModel {
+        fn descriptor(&self) -> ExperimentDescriptor {
+            ExperimentDescriptor {
+                id: "needs-model",
+                name: "Needs model",
+                description: "",
+                category: ExperimentCategory::Benchmark,
+                kind: ExperimentKind::Probe,
+                domain: TimeDomain::Host,
+                payload_version: 1,
+                requirements: vec![Requirement::LoadedModel],
+                parameters: Vec::new(),
+            }
+        }
+
+        fn run(
+            &self,
+            _context: &ExperimentContext,
+            _parameters: &Parameters,
+        ) -> Result<ExperimentOutcome, ExperimentError> {
+            unreachable!("the registry checks requirements first")
+        }
+    }
+    let registry = ExperimentRegistry::new(vec![Box::new(NeedsModel)]);
+    assert!(matches!(
+        registry.run("needs-model", &ExperimentContext::default(), &[]),
+        Err(ExperimentError::MissingRequirement(
+            Requirement::LoadedModel
+        ))
+    ));
+}

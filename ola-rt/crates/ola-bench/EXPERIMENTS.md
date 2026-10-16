@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Steps 1–2 are implemented.
+Covers `todo.md` P4. Steps 1–3 are implemented.
 
 ## Goal
 
@@ -196,7 +196,14 @@ Each step keeps `make verify` and `make test-fixture` green.
    `random` module.
 3. **Experiment trait and registry.** Add both, and port the five
    model-independent experiments, including the scheduler comparison as a
-   multi-seed study.
+   multi-seed study. **Done.**
+   `ExperimentRegistry::builtin()` holds KV block pressure, FIFO workload,
+   prefill bucketing, adaptive prefill cost (probes), and the scheduler
+   comparison, now a virtual-time study over five seeds by default with all
+   five scheduling baselines on one chosen trace. Descriptors carry a
+   category (benchmark or experiment) so the UI can keep its two lists. The
+   registry checks requirements before a run and identity plus study
+   minimums after it. The UI still uses its own copies until step 6.
 4. **Model experiments.** Port Llama generation, prefill strategies (with
    the v2 import), and chunked prefill.
 5. **Calibration.** Add the multi-shape fit with intervals, feeding
