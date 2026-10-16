@@ -266,6 +266,33 @@ impl Runtime {
         Ok(())
     }
 
+    /// Removes a terminal request's record and returns it.
+    ///
+    /// Long-running drivers call this to bound retained state. Identifiers
+    /// are never reused, so a forgotten request cannot be confused with a
+    /// later one; lookups simply stop finding it.
+    pub fn forget_terminal(
+        &mut self,
+        request_id: RequestId,
+    ) -> Result<RequestRecord, RuntimeError> {
+        let record = self
+            .state
+            .requests
+            .get(&request_id)
+            .ok_or(RuntimeError::UnknownRequest(request_id))?;
+        if !record.status.is_terminal() {
+            return Err(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "forget",
+            });
+        }
+        Ok(self
+            .state
+            .requests
+            .remove(&request_id)
+            .expect("record was just found"))
+    }
+
     fn record_for_running(
         &mut self,
         request_id: RequestId,
@@ -411,5 +438,37 @@ mod tests {
             })
         );
         assert_eq!(runtime.state().queued_ids().collect::<Vec<_>>(), vec![id]);
+    }
+
+    #[test]
+    fn only_terminal_requests_can_be_forgotten_and_ids_are_not_reused() {
+        let mut runtime = Runtime::default();
+        runtime
+            .register_model(ModelDescriptor::language("tiny", "tiny-decoder"))
+            .unwrap();
+        let first = runtime
+            .submit(RequestSpec::text("tiny", "first"), Timestamp::ZERO)
+            .unwrap();
+
+        assert_eq!(
+            runtime.forget_terminal(first),
+            Err(RuntimeError::InvalidTransition {
+                request: first,
+                operation: "forget",
+            })
+        );
+        runtime.cancel(first, Timestamp::from_micros(1)).unwrap();
+        let record = runtime.forget_terminal(first).unwrap();
+        assert_eq!(record.status, RequestStatus::Cancelled);
+        assert!(runtime.state().request(first).is_none());
+        assert_eq!(
+            runtime.forget_terminal(first),
+            Err(RuntimeError::UnknownRequest(first))
+        );
+
+        let second = runtime
+            .submit(RequestSpec::text("tiny", "second"), Timestamp::ZERO)
+            .unwrap();
+        assert!(second > first);
     }
 }

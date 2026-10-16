@@ -16,7 +16,8 @@ use crate::{
     ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, LifecycleAction, ModelSnapshot,
     PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot,
     PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements, PrefillView, QueuedRequest,
-    ReleaseReason, Runtime, RuntimeError, RuntimeState, composed::is_complete_prompt,
+    ReleaseReason, RequestRecord, Runtime, RuntimeError, RuntimeState,
+    composed::is_complete_prompt,
 };
 
 /// Final output retained after successful execution.
@@ -478,6 +479,24 @@ impl Executor {
     /// Returns a completed result retained by request ID.
     pub fn result(&self, request_id: RequestId) -> Option<&ExecutionResult> {
         self.results.get(&request_id)
+    }
+
+    /// Moves a completed result out of the executor.
+    ///
+    /// Drivers that deliver results to their own handles call this so the
+    /// executor does not retain every output for its lifetime.
+    pub fn take_result(&mut self, request_id: RequestId) -> Option<ExecutionResult> {
+        self.results.remove(&request_id)
+    }
+
+    /// Removes everything retained for a terminal request: its runtime
+    /// record and any untaken result.
+    pub fn forget(
+        &mut self,
+        request_id: RequestId,
+    ) -> Result<(RequestRecord, Option<ExecutionResult>), ExecutorError> {
+        let record = self.runtime.forget_terminal(request_id)?;
+        Ok((record, self.results.remove(&request_id)))
     }
 
     /// Returns whether one request currently owns a generation session.
@@ -1665,6 +1684,35 @@ mod tests {
         ));
         assert_eq!(executor.result(id).unwrap().metrics.prompt_tokens, 5);
         assert_eq!(executor.state().memory.kv_cache_bytes, 0);
+    }
+
+    #[test]
+    fn results_can_be_taken_and_terminal_requests_forgotten() {
+        let mut executor = Executor::default();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let done = executor.submit(request("1 2", 1), Timestamp::ZERO).unwrap();
+        let waiting = executor.submit(request("1 2", 1), Timestamp::ZERO).unwrap();
+        executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+
+        assert!(matches!(
+            executor.forget(waiting),
+            Err(ExecutorError::Runtime(
+                RuntimeError::InvalidTransition { .. }
+            ))
+        ));
+        let taken = executor.take_result(done).unwrap();
+        assert_eq!(taken.token_ids, vec![3]);
+        assert_eq!(executor.result(done), None);
+        let (record, result) = executor.forget(done).unwrap();
+        assert_eq!(record.status, RequestStatus::Completed);
+        assert_eq!(result, None);
+        assert!(executor.state().request(done).is_none());
+
+        executor.cancel(waiting, Timestamp::from_micros(2)).unwrap();
+        let (record, _) = executor.forget(waiting).unwrap();
+        assert_eq!(record.status, RequestStatus::Cancelled);
     }
 
     #[test]

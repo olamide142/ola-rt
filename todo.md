@@ -113,13 +113,15 @@ Done when an adaptive policy improves a chosen reward over the best fixed baseli
 
 ## P5: Runtime driver and serving
 
+Design: `ola-rt/crates/ola-serve/SERVING.md`.
+
 - [ ] Define an asynchronous runtime/executor driver.
 - [ ] Add request handles for status, cancellation, tokens, and final results.
 - [ ] Stream tokens without polling retained executor results.
 - [ ] Propagate client cancellation into session and KV cleanup.
 - [ ] Define bounded queues and backpressure.
 - [ ] Define result retention, eviction, and persistence.
-- [ ] Translate a process monotonic clock into OlaRT timestamps.
+- [x] Translate a process monotonic clock into OlaRT timestamps.
 - [ ] Expose health, readiness, and loaded-model state.
 - [ ] Add a minimal HTTP generation endpoint.
 - [ ] Add streaming HTTP responses.

@@ -5,6 +5,7 @@ mod definition;
 mod error;
 mod execution;
 mod factory;
+mod streaming;
 
 pub use catalog::ModelCatalog;
 pub use definition::{ModelDefinition, ModelSource};
@@ -15,3 +16,4 @@ pub use execution::{
     Tokenizer,
 };
 pub use factory::{ArchitectureFactory, ArchitectureRegistry, LoadedModel};
+pub use streaming::IncrementalDecoder;

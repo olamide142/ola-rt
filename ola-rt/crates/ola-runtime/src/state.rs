@@ -19,6 +19,13 @@ pub enum RequestStatus {
     Failed(String),
 }
 
+impl RequestStatus {
+    /// Returns whether the request can no longer change state.
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed(_))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Monotonic lifecycle timestamps used to derive latency metrics.
 pub struct RequestTiming {

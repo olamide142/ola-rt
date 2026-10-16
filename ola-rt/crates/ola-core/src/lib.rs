@@ -12,4 +12,4 @@ pub use model::{ModelDescriptor, ModelDescriptorError, ModelKind};
 pub use request::{
     GenerationConfig, ImageInput, Input, Modality, Priority, Request, RequestError, RequestSpec,
 };
-pub use time::Timestamp;
+pub use time::{Clock, ManualClock, MonotonicClock, Timestamp};
