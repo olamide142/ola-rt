@@ -1,7 +1,7 @@
 # Runtime driver and serving design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P5. Steps 1–2 are implemented.
+Covers `todo.md` P5. Steps 1–3 are implemented.
 
 ## Goal
 
@@ -40,10 +40,10 @@ touching `Executor`. This is P5's completion criterion.
    past it, `submit` fails at once with `Overloaded`. Streaming never blocks
    the model loop: a request emits at most `max_new_tokens` + 1 events, so
    its buffer is bounded by construction.
-4. **Retention.** Terminal records stay in a bounded most-recently-used
-   table (default 1,024) so status lookups by ID keep working; older ones
-   are dropped from the driver and from runtime state with
-   `Executor::forget`. Persistence is out of scope for P5.
+4. **Retention.** When a request ends, its record leaves the executor
+   (`Executor::forget`) and its final status moves into a bounded table of
+   recently finished requests (default 1,024), evicted oldest first, so
+   status lookups by ID keep working. Persistence is out of scope for P5.
 5. **Clock.** `ola_core::Clock` converts a process `Instant` epoch into
    `Timestamp`s (`MonotonicClock`); `ManualClock` makes driver tests
    deterministic.
@@ -80,7 +80,17 @@ touching `Executor`. This is P5's completion criterion.
    calls wait on a gate, which makes cancellation and shutdown races
    deterministic; they passed 1,300 consecutive runs, 800 of them under CPU
    contention.
-3. Retention table, health and readiness, draining shutdown, and `NotReady`.
+3. **Retention, health, and draining.** **Done.** The finished-request
+   table; `Health` gauges (state, in-flight, queued, active, KV, iterations)
+   published as atomics after every command batch, iteration, and before
+   every terminal event, so they never lag what a client has seen;
+   `ServiceState` with `NoModels` and `NotReady`; a guard that marks the
+   service stopped however the thread exits, including by panic;
+   `ModelStatus` per registered model; and `Driver::drain`, whose deadline
+   is on the driver's clock so tests control it. Stress runs found the
+   gauges lagging terminal events, which led to publishing before each one;
+   the driver and lifecycle suites then passed 1,760 runs, 960 of them under
+   CPU contention.
 4. Native HTTP endpoints with server-sent events and disconnect-cancels;
    `ola serve` and `make serve`.
 5. `/v1/completions`; end-to-end streaming, cancellation, overload, failure,

@@ -1,14 +1,14 @@
 //! A dedicated thread that owns an [`Executor`] and serves it over channels.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     io,
     ops::ControlFlow,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
     },
     task::{Context, Poll},
@@ -16,8 +16,8 @@ use std::{
     time::Duration,
 };
 
-use ola_core::{Clock, ModelId, RequestId, RequestSpec, Timestamp};
-use ola_model::{IncrementalDecoder, SessionMetrics};
+use ola_core::{Clock, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp};
+use ola_model::{IncrementalDecoder, KvCacheProfile, SessionMetrics};
 use ola_runtime::{
     ExecutionPhase, Executor, ExecutorError, ExecutorEvent, RequestStatus, RequestTiming,
 };
@@ -34,6 +34,9 @@ pub struct DriverConfig {
     /// How long the driver waits for a command after an iteration that made
     /// no progress, such as when every queued request is deferred.
     pub stall_backoff: Duration,
+    /// Most finished requests whose final status stays queryable. Older
+    /// ones are forgotten, oldest first, and look unknown afterwards.
+    pub retain_finished: usize,
 }
 
 impl Default for DriverConfig {
@@ -41,6 +44,7 @@ impl Default for DriverConfig {
         Self {
             max_in_flight: 256,
             stall_backoff: Duration::from_millis(1),
+            retain_finished: 1024,
         }
     }
 }
@@ -102,6 +106,86 @@ pub struct RequestSnapshot {
     pub status: RequestStatus,
     /// Lifecycle timestamps in the driver clock's epoch.
     pub timing: RequestTiming,
+    /// Output tokens generated so far.
+    pub generated_tokens: usize,
+}
+
+/// Whether the driver is taking work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceState {
+    /// Accepting and executing requests.
+    Ready,
+    /// Running, but no model has an executable attached, so every request
+    /// would fail.
+    NoModels,
+    /// Finishing accepted requests before stopping; new work is refused.
+    Draining,
+    /// The driver thread has stopped or is about to.
+    Stopped,
+}
+
+impl ServiceState {
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Ready,
+            1 => Self::NoModels,
+            2 => Self::Draining,
+            _ => Self::Stopped,
+        }
+    }
+
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::NoModels => 1,
+            Self::Draining => 2,
+            Self::Stopped => 3,
+        }
+    }
+}
+
+/// Liveness and load, read without waiting for the driver thread.
+///
+/// Gauges are published after every command batch and iteration, so they
+/// stay readable, if slightly stale, while a long iteration runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Health {
+    /// Whether the driver is taking work.
+    pub state: ServiceState,
+    /// Submitted requests that have not finished.
+    pub in_flight: usize,
+    /// Configured limit on `in_flight`.
+    pub max_in_flight: usize,
+    /// Requests waiting for admission.
+    pub queued: usize,
+    /// Requests with a live generation session.
+    pub active: usize,
+    /// Physical KV bytes held by live sessions.
+    pub kv_cache_bytes: u64,
+    /// Worst-case KV bytes committed to live requests.
+    pub reserved_kv_bytes: u64,
+    /// Executor iterations completed since the driver started.
+    pub iterations: u64,
+}
+
+impl Health {
+    /// Returns whether new submissions would be accepted, capacity
+    /// permitting.
+    pub fn is_ready(&self) -> bool {
+        self.state == ServiceState::Ready
+    }
+}
+
+/// A registered model and whether it can execute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelStatus {
+    /// Registered metadata.
+    pub descriptor: ModelDescriptor,
+    /// Whether an executable model is attached; requests for a model
+    /// without one fail.
+    pub executable: bool,
+    /// Physical KV-pool geometry, when the architecture publishes one.
+    pub kv_cache_profile: Option<KvCacheProfile>,
 }
 
 type Responder<T> = oneshot::Sender<Result<T, ServeError>>;
@@ -124,19 +208,36 @@ enum Command {
         id: RequestId,
         reply: Responder<RequestSnapshot>,
     },
-    Shutdown,
+    Stop {
+        /// Finish accepted work until this time, or stop at once when `None`.
+        drain_until: Option<Timestamp>,
+    },
 }
 
 struct Shared {
     clock: Arc<dyn Clock>,
     max_in_flight: usize,
     in_flight: AtomicUsize,
-    accepting: AtomicBool,
+    state: AtomicU8,
+    queued: AtomicUsize,
+    active: AtomicUsize,
+    kv_cache_bytes: AtomicU64,
+    reserved_kv_bytes: AtomicU64,
+    iterations: AtomicU64,
+    models: Vec<ModelStatus>,
 }
 
 impl Shared {
     fn release(&self) {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn state(&self) -> ServiceState {
+        ServiceState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    fn set_state(&self, state: ServiceState) {
+        self.state.store(state.as_u8(), Ordering::SeqCst);
     }
 }
 
@@ -158,19 +259,48 @@ impl Driver {
         config: DriverConfig,
     ) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel();
+        let models = executor
+            .state()
+            .models()
+            .iter()
+            .map(|descriptor| {
+                let executable = executor.model(&descriptor.id);
+                ModelStatus {
+                    descriptor: descriptor.clone(),
+                    executable: executable.is_some(),
+                    kv_cache_profile: executable.and_then(|model| model.kv_cache_profile()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let state = if models.iter().any(|model| model.executable) {
+            ServiceState::Ready
+        } else {
+            ServiceState::NoModels
+        };
         let shared = Arc::new(Shared {
             clock: Arc::new(clock),
             max_in_flight: config.max_in_flight,
             in_flight: AtomicUsize::new(0),
-            accepting: AtomicBool::new(true),
+            state: AtomicU8::new(state.as_u8()),
+            queued: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            kv_cache_bytes: AtomicU64::new(0),
+            reserved_kv_bytes: AtomicU64::new(0),
+            iterations: AtomicU64::new(0),
+            models,
         });
         let worker = Worker {
             executor,
             commands: receiver,
             shared: Arc::clone(&shared),
             live: BTreeMap::new(),
+            finished: BTreeMap::new(),
+            finished_order: VecDeque::new(),
+            retain_finished: config.retain_finished,
             stall_backoff: config.stall_backoff,
+            drain_until: None,
         };
+        worker.publish();
         let thread = thread::Builder::new()
             .name("ola-driver".into())
             .spawn(move || worker.run())?;
@@ -190,15 +320,32 @@ impl Driver {
     ///
     /// An iteration already running completes first.
     pub fn shutdown(mut self) -> Result<Executor, ServeError> {
-        self.stop()
+        self.stop(None)
     }
 
-    fn stop(&mut self) -> Result<Executor, ServeError> {
+    /// Stops accepting work and lets accepted requests finish for up to
+    /// `grace` on the driver's clock, then ends the rest with
+    /// [`ServeError::ShuttingDown`] and returns the executor.
+    pub fn drain(mut self, grace: Duration) -> Result<Executor, ServeError> {
+        let now = self.handle.now();
+        let until = now
+            .checked_add(grace)
+            .unwrap_or(Timestamp::from_micros(u64::MAX));
+        self.stop(Some(until))
+    }
+
+    fn stop(&mut self, drain_until: Option<Timestamp>) -> Result<Executor, ServeError> {
         let thread = self.thread.take().ok_or(ServeError::ShuttingDown)?;
-        // The command goes first so that once `is_accepting` reads false the
-        // driver is guaranteed to stop at its next command check.
-        let _ = self.handle.commands.send(Command::Shutdown);
-        self.handle.shared.accepting.store(false, Ordering::SeqCst);
+        // The command goes first so that once the state reads as not ready
+        // the driver is guaranteed to see the stop at its next command check.
+        let _ = self.handle.commands.send(Command::Stop { drain_until });
+        if self.handle.shared.state() != ServiceState::Stopped {
+            self.handle.shared.set_state(if drain_until.is_some() {
+                ServiceState::Draining
+            } else {
+                ServiceState::Stopped
+            });
+        }
         thread
             .join()
             .map_err(|_| ServeError::Internal("the driver thread panicked".into()))
@@ -208,7 +355,7 @@ impl Driver {
 impl Drop for Driver {
     fn drop(&mut self) {
         if self.thread.is_some() {
-            let _ = self.stop();
+            let _ = self.stop(None);
         }
     }
 }
@@ -233,8 +380,12 @@ impl RuntimeHandle {
             events: None,
             runtime: self.clone(),
         };
-        if !self.is_accepting() {
-            return rejected(ServeError::ShuttingDown);
+        match self.shared.state() {
+            ServiceState::Ready => {}
+            ServiceState::NoModels => return rejected(ServeError::NotReady),
+            ServiceState::Draining | ServiceState::Stopped => {
+                return rejected(ServeError::ShuttingDown);
+            }
         }
         let limit = self.shared.max_in_flight;
         if self
@@ -281,7 +432,27 @@ impl RuntimeHandle {
 
     /// Returns whether the driver accepts new submissions.
     pub fn is_accepting(&self) -> bool {
-        self.shared.accepting.load(Ordering::SeqCst)
+        self.shared.state() == ServiceState::Ready
+    }
+
+    /// Returns liveness and load without waiting for the driver thread.
+    pub fn health(&self) -> Health {
+        let shared = &self.shared;
+        Health {
+            state: shared.state(),
+            in_flight: shared.in_flight.load(Ordering::SeqCst),
+            max_in_flight: shared.max_in_flight,
+            queued: shared.queued.load(Ordering::SeqCst),
+            active: shared.active.load(Ordering::SeqCst),
+            kv_cache_bytes: shared.kv_cache_bytes.load(Ordering::SeqCst),
+            reserved_kv_bytes: shared.reserved_kv_bytes.load(Ordering::SeqCst),
+            iterations: shared.iterations.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Returns every registered model in stable identifier order.
+    pub fn models(&self) -> &[ModelStatus] {
+        &self.shared.models
     }
 
     /// Returns the number of submitted requests that have not finished.
@@ -511,19 +682,43 @@ struct Worker {
     commands: mpsc::Receiver<Command>,
     shared: Arc<Shared>,
     live: BTreeMap<RequestId, Live>,
+    /// Final status of recently finished requests, bounded by
+    /// `retain_finished` and evicted in `finished_order`.
+    finished: BTreeMap<RequestId, RequestSnapshot>,
+    finished_order: VecDeque<RequestId>,
+    retain_finished: usize,
     stall_backoff: Duration,
+    /// Set while draining: accepted work may run until this time.
+    drain_until: Option<Timestamp>,
+}
+
+/// Marks the service stopped however the driver thread exits, including by
+/// panic, so health never reports a dead driver as ready.
+struct StoppedOnExit(Arc<Shared>);
+
+impl Drop for StoppedOnExit {
+    fn drop(&mut self) {
+        self.0.set_state(ServiceState::Stopped);
+    }
 }
 
 impl Worker {
     fn run(mut self) -> Executor {
+        let _stopped = StoppedOnExit(Arc::clone(&self.shared));
         while self.serve().is_continue() {}
         self.abort_all(|| RequestEvent::Failed(ServeError::ShuttingDown));
+        self.publish();
         self.executor
     }
 
     /// Runs one round: wait for work if there is none, apply commands, reap
     /// abandoned requests, and advance one iteration.
     fn serve(&mut self) -> ControlFlow<()> {
+        if let Some(until) = self.drain_until
+            && (!self.has_work() || self.shared.clock.now() >= until)
+        {
+            return ControlFlow::Break(());
+        }
         if !self.has_work() {
             match self.commands.recv() {
                 Ok(command) => self.apply(command)?,
@@ -539,7 +734,9 @@ impl Worker {
             .filter(|(_, live)| !live.detached && live.events.is_closed())
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        self.drain()?;
+        let applied = self.apply_pending();
+        self.publish();
+        applied?;
         for id in abandoned {
             if self.live.get(&id).is_some_and(|live| !live.detached) {
                 let _ = self.cancel(id);
@@ -552,10 +749,27 @@ impl Worker {
                 Err(RecvTimeoutError::Disconnected) => return ControlFlow::Break(()),
             }
         }
+        self.publish();
         ControlFlow::Continue(())
     }
 
-    fn drain(&mut self) -> ControlFlow<()> {
+    /// Publishes load gauges for [`RuntimeHandle::health`].
+    fn publish(&self) {
+        let shared = &self.shared;
+        let state = self.executor.state();
+        shared.queued.store(state.queued_len(), Ordering::SeqCst);
+        shared
+            .active
+            .store(self.executor.active_request_count(), Ordering::SeqCst);
+        shared
+            .kv_cache_bytes
+            .store(state.memory.kv_cache_bytes, Ordering::SeqCst);
+        shared
+            .reserved_kv_bytes
+            .store(self.executor.reserved_kv_bytes(), Ordering::SeqCst);
+    }
+
+    fn apply_pending(&mut self) -> ControlFlow<()> {
         loop {
             match self.commands.try_recv() {
                 Ok(command) => self.apply(command)?,
@@ -577,6 +791,11 @@ impl Worker {
                 events,
                 reply,
             } => {
+                if self.drain_until.is_some() {
+                    self.shared.release();
+                    let _ = reply.send(Err(ServeError::ShuttingDown));
+                    return ControlFlow::Continue(());
+                }
                 let model = spec.model.clone();
                 match self.executor.submit(spec, arrival_at) {
                     Ok(id) => {
@@ -613,29 +832,23 @@ impl Worker {
                 }
             }
             Command::Status { id, reply } => {
-                let snapshot = self
-                    .executor
-                    .state()
-                    .request(id)
-                    .map(|record| RequestSnapshot {
-                        id,
-                        status: record.status.clone(),
-                        timing: record.timing,
-                    })
-                    .ok_or(ServeError::UnknownRequest(id));
-                let _ = reply.send(snapshot);
+                let _ = reply.send(self.snapshot(id));
             }
-            Command::Shutdown => return ControlFlow::Break(()),
+            Command::Stop { drain_until: None } => return ControlFlow::Break(()),
+            Command::Stop {
+                drain_until: Some(until),
+            } => self.drain_until = Some(until),
         }
         ControlFlow::Continue(())
     }
 
     fn cancel(&mut self, id: RequestId) -> Result<(), ServeError> {
-        let Some(record) = self.executor.state().request(id) else {
-            return Err(ServeError::UnknownRequest(id));
-        };
-        if record.status.is_terminal() {
-            return Ok(());
+        if !self.live.contains_key(&id) {
+            return if self.finished.contains_key(&id) {
+                Ok(())
+            } else {
+                Err(ServeError::UnknownRequest(id))
+            };
         }
         match self.executor.cancel(id, self.shared.clock.now()) {
             Ok(()) => {
@@ -649,7 +862,10 @@ impl Worker {
     /// Advances one iteration and returns whether any request progressed.
     fn step(&mut self) -> bool {
         let iteration = match self.executor.step_iteration(self.shared.clock.now()) {
-            Ok(iteration) => iteration,
+            Ok(iteration) => {
+                self.shared.iterations.fetch_add(1, Ordering::SeqCst);
+                iteration
+            }
             Err(error) => {
                 // Planning failed before any work was committed. Retrying
                 // would fail the same way, so end every request rather than
@@ -757,11 +973,56 @@ impl Worker {
     ///
     /// Capacity is released first, so a client that sees the terminal event
     /// can immediately submit again.
+    ///
+    /// The request's runtime record moves into the bounded table of
+    /// finished requests, so the executor retains nothing for it.
     fn end(&mut self, id: RequestId, terminal: RequestEvent) {
-        if let Some(live) = self.live.remove(&id) {
-            self.shared.release();
-            let _ = live.events.send(terminal);
+        let Some(live) = self.live.remove(&id) else {
+            return;
+        };
+        self.shared.release();
+        if let Ok((record, _)) = self.executor.forget(id) {
+            self.retain(RequestSnapshot {
+                id,
+                status: record.status,
+                timing: record.timing,
+                generated_tokens: live.decoder.tokens().len(),
+            });
         }
+        // Gauges are republished first, so a client that has seen the
+        // terminal event never reads health that still counts the request.
+        self.publish();
+        let _ = live.events.send(terminal);
+    }
+
+    fn retain(&mut self, snapshot: RequestSnapshot) {
+        if self.retain_finished == 0 {
+            return;
+        }
+        while self.finished_order.len() >= self.retain_finished {
+            if let Some(oldest) = self.finished_order.pop_front() {
+                self.finished.remove(&oldest);
+            }
+        }
+        self.finished_order.push_back(snapshot.id);
+        self.finished.insert(snapshot.id, snapshot);
+    }
+
+    fn snapshot(&self, id: RequestId) -> Result<RequestSnapshot, ServeError> {
+        if let Some(live) = self.live.get(&id)
+            && let Some(record) = self.executor.state().request(id)
+        {
+            return Ok(RequestSnapshot {
+                id,
+                status: record.status.clone(),
+                timing: record.timing,
+                generated_tokens: live.decoder.tokens().len(),
+            });
+        }
+        self.finished
+            .get(&id)
+            .cloned()
+            .ok_or(ServeError::UnknownRequest(id))
     }
 
     /// Cancels every unfinished request in the executor, releasing its

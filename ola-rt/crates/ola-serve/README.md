@@ -31,9 +31,20 @@ while let Some(event) = request.next().await {           // or blocking_next()
   further submissions fail at once with `ServeError::Overloaded`. Streaming
   never blocks the driver: a request emits at most `max_new_tokens` + 1
   events.
-- **Shutdown.** `Driver::shutdown`, or dropping the driver, stops
-  accepting work, ends every unfinished request with
-  `ServeError::ShuttingDown`, and returns the executor.
+- **Retention.** A finished request's record leaves the executor and its
+  final status stays queryable until `retain_finished` (default 1,024)
+  newer requests have finished; after that it is unknown.
+- **Health.** `RuntimeHandle::health` reads state, load, KV gauges, and an
+  iteration counter without waiting for the driver, so it answers during a
+  long iteration. `ServiceState` is `Ready`, `NoModels` (submissions fail
+  with `NotReady`), `Draining`, or `Stopped`; a driver thread that panics
+  reports `Stopped`. `models` lists registered models and whether each is
+  executable.
+- **Shutdown.** `Driver::drain(grace)` refuses new work and lets accepted
+  requests finish until the grace period ends on the driver's clock.
+  `Driver::shutdown`, or dropping the driver, stops at once. Either way
+  unfinished requests end with `ServeError::ShuttingDown` and the executor
+  is returned.
 
 `Reply` and `Submission` are futures that work under any async runtime, and
 also offer a blocking `wait` for plain threads. The crate depends only on

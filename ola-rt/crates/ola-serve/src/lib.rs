@@ -4,7 +4,7 @@ mod driver;
 mod error;
 
 pub use driver::{
-    Driver, DriverConfig, GenerationOutput, Reply, RequestEvent, RequestHandle, RequestSnapshot,
-    RuntimeHandle, Submission,
+    Driver, DriverConfig, GenerationOutput, Health, ModelStatus, Reply, RequestEvent,
+    RequestHandle, RequestSnapshot, RuntimeHandle, ServiceState, Submission,
 };
 pub use error::ServeError;

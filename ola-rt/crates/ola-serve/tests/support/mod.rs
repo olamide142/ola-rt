@@ -22,6 +22,9 @@ pub const REPLY: &str = "héllo, 世界";
 /// Prompts starting with this fail during prefill.
 pub const FAIL_PROMPT: &str = "fail";
 
+/// Prompts starting with this panic the driver thread during prefill.
+pub const PANIC_PROMPT: &str = "panic";
+
 pub const MODEL: &str = "script";
 
 /// Counts model calls the driver may make; each prefill or decode takes one.
@@ -162,7 +165,9 @@ impl ScriptSession {
 impl GenerationSession for ScriptSession {
     fn prefill(&mut self, prompt: &[u32]) -> Result<GeneratedToken, ModelExecutionError> {
         self.gate.pass();
-        if ByteTokenizer.decode(prompt, true)?.starts_with(FAIL_PROMPT) {
+        let text = ByteTokenizer.decode(prompt, true)?;
+        assert!(!text.starts_with(PANIC_PROMPT), "scripted panic");
+        if text.starts_with(FAIL_PROMPT) {
             return Err(ModelExecutionError::new(
                 ExecutionStage::Prefill,
                 "scripted failure",

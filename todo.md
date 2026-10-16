@@ -120,16 +120,16 @@ Design: `ola-rt/crates/ola-serve/SERVING.md`.
 - [x] Stream tokens without polling retained executor results.
 - [x] Propagate client cancellation into session and KV cleanup.
 - [x] Define bounded queues and backpressure.
-- [ ] Define result retention and eviction.
+- [x] Define result retention and eviction.
 - [x] Translate a process monotonic clock into OlaRT timestamps.
-- [ ] Expose process health.
-- [ ] Expose readiness to accept work.
-- [ ] Expose loaded-model state.
+- [x] Expose process health.
+- [x] Expose readiness to accept work.
+- [x] Expose loaded-model state.
 - [ ] Add a minimal HTTP generation endpoint.
 - [ ] Add streaming HTTP responses.
 - [ ] Add an OpenAI-compatible boundary after the native API stabilizes.
 - [ ] Keep transport, runtime, model, admission, and execution errors distinct.
-- [ ] Add graceful shutdown and in-flight request handling.
+- [x] Add graceful shutdown and in-flight request handling.
 - [ ] Test streaming, cancellation, overload, failure, and shutdown.
 
 Done when a client can submit, observe, stream, cancel, and retrieve a request without accessing `Executor` directly.

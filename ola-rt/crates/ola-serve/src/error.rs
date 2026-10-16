@@ -26,6 +26,8 @@ pub enum ServeError {
     Execution(String),
     /// The request was cancelled before it finished.
     Cancelled,
+    /// The driver is running but cannot serve: no model is executable.
+    NotReady,
     /// The driver is stopping or has stopped and accepts no work.
     ShuttingDown,
     /// The executor reported an internal failure, such as an invalid plan.
@@ -58,6 +60,7 @@ impl fmt::Display for ServeError {
             }
             Self::Execution(message) => write!(formatter, "execution failed: {message}"),
             Self::Cancelled => formatter.write_str("request was cancelled"),
+            Self::NotReady => formatter.write_str("no model is ready to execute requests"),
             Self::ShuttingDown => formatter.write_str("the server is shutting down"),
             Self::Internal(message) => write!(formatter, "internal error: {message}"),
         }
