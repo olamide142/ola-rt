@@ -46,14 +46,14 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
 - [x] Define `ExecutionPolicy` as runtime state to `ExecutionPlan`.
 - [x] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.
 - [x] Keep individual sub-policies independently replaceable.
-- [ ] Make decisions deterministic for identical state and configuration.
+- [x] Make decisions deterministic for identical state and configuration.
 - [x] Record decision inputs, alternatives, estimates, and reasons.
 - [x] Add capability checks and explicit fallbacks.
 - [x] Prevent policies from mutating authoritative runtime state.
 - [x] Give every reportable policy a stable name and configuration.
-- [ ] Test scheduler, admission, batching, memory, and kernel-selection conflicts.
+- [ ] Test scheduler, admission, batching, memory, and kernel-selection conflicts. (All but kernel selection done; that waits for the kernel track.)
 
-Done when existing FIFO, memory admission, token budgeting, and grouping run through the unified policy path without output or lifecycle regressions.
+Done when existing FIFO, memory admission, token budgeting, and grouping run through the unified policy path without output or lifecycle regressions. **Met 2026-10-16.**
 
 ## P3: Scheduler and policy baselines
 

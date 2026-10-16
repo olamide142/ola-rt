@@ -1,13 +1,13 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 13:21 BST (Europe/London)
+**Last updated:** 2026-10-16 14:46 BST (Europe/London)
 
-**Source revision:** working tree based on `a88bf75` on `master`
+**Source revision:** working tree based on `36d4af2` on `master`
 
-**Repository state at update:** the P1 execution-plan IR is complete: every
-`step_iteration` is planned, validated, and committed as one `ExecutionPlan`
-(`7c8af6e`..`a88bf75`), and the working tree adds the planned-versus-single-
-request oracle test on the pinned fixture; current branch commits are not
+**Repository state at update:** P1 (execution-plan IR) and P2 (composable
+execution policy) are complete: every iteration is planned by a replaceable
+`ExecutionPolicy` from an immutable `PlanningSnapshot`, recorded in a
+`DecisionRecord`, validated, and committed; current branch commits are not
 pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -150,8 +150,9 @@ performance claim.
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
 | Runtime executor | Tensor batching working | Configurable sessions, iteration planning, model-grouped tensor prefill/decode, fallback execution, stable events/results |
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
-| Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
+| Scheduling | Baseline working | FIFO scheduler ranking from the planning snapshot, as one component of a composed execution policy |
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
+| Execution policy | Working | `ExecutionPolicy` plans from an immutable snapshot through `&self`; `ComposedPolicy` combines replaceable scheduler, admission, batch, and grouping components with stable descriptors and full decision records |
 | Execution planning | Working | Each iteration is a validated `ExecutionPlan` (admissions, invocations, deferrals, predicted releases) committed atomically; divergences recorded; versioned `PlanReport` JSON |
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
 | Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
@@ -407,18 +408,16 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, all tests, Clippy
-  with warnings denied, and documentation), with zero compiler warnings;
+- `make verify`: **passed** (formatting, workspace checks, 149 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 3
   fixture tests ignored by default.
 - `make test-fixture` against the pinned artifact: **3 passed** — scalar-oracle
-  logits within `2e-5`, the UI integration, and the new planned multi-request
-  execution matching each request's single-request output while exercising
-  tensor invocations, continued prefill, budget deferral, and predicted slot
-  reuse.
-- Plan validation is unit-tested for stale, duplicate, invalid-status,
-  inconsistent, bad-release, and over-capacity plans; executor tests cover
-  planned admissions, preparation failures, EOS-freed slots, tensor fallback,
-  and session-creation divergence.
+  logits within `2e-5`, the UI integration (now driven by `step_iteration`),
+  and planned multi-request execution matching single-request output.
+- Policy tests plan hand-built snapshots: identical snapshots give identical
+  decisions, and head-of-line deferral, oversized prefill under a budget,
+  predicted-release memory reuse, missing batch hooks, and an admission
+  policy violating its own KV guarantee each behave as specified.
 - A live WGPU run was not repeated in this update.
 
 Historical evidence from earlier revisions:
@@ -608,6 +607,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 14:46 BST — working tree on `36d4af2`:** Completed P2:
+  immutable, named sub-policies; `PlanningSnapshot` with a one-time
+  prompt-tokenization cache; `ExecutionPolicy` and `ComposedPolicy`;
+  scheduling removed from `Runtime`; `Executor::step()` retired;
+  `DecisionRecord` with ranking, admission inputs, batch selections,
+  grouping alternatives, and capability fallbacks; `PlanReport` schema v2;
+  determinism and conflict tests.
 
 - **2026-10-16 13:21 BST — working tree on `a88bf75`:** Completed the P1
   execution-plan IR: plan types and validation, declared model batch

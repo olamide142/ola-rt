@@ -1,7 +1,7 @@
 # ExecutionPolicy design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–5 are implemented.
+Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. All six steps are implemented.
 
 ## Goal
 
@@ -209,6 +209,9 @@ Each step keeps `make verify` and `make test-fixture` green.
 
    Kernel-selection conflicts are recorded as deferred until the kernel track
    adds a selection to the plan.
+
+   **Done** in `src/composed.rs` tests, planning hand-built snapshots without
+   an executor. The kernel-selection conflict remains deferred.
 
 ## Out of scope for P2
 

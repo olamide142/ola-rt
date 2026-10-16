@@ -601,3 +601,294 @@ const fn budget_deferral(candidate: BatchCandidate, event_index: usize) -> Plann
 pub(crate) fn is_complete_prompt(row: &PlannedRow) -> bool {
     row.positions.start == 0 && row.final_prompt_chunk
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ola_core::{Priority, Timestamp};
+    use ola_model::{BatchCapabilities, KvCacheProfile};
+
+    use super::*;
+    use crate::{
+        AdmissionOutcome, AdmissionReason, CostAwarePrefillBatcher, DecodeView, ExecutorLimits,
+        FifoTokenBudgetPolicy, MemoryAwareAdmission, MemoryState, ModelSnapshot,
+        PolicyMeasurements, PrefillView, QueuedRequest,
+    };
+
+    fn id(value: u64) -> RequestId {
+        RequestId::new(value)
+    }
+
+    fn model() -> ModelId {
+        "tiny".into()
+    }
+
+    /// Pages hold four tokens at eight bytes each, so every page is 32 bytes.
+    fn snapshot(
+        max_active_requests: usize,
+        kv_capacity_bytes: u64,
+        batch: BatchCapabilities,
+        queued: &[(u64, usize, usize)],
+    ) -> PlanningSnapshot {
+        PlanningSnapshot {
+            at: Timestamp::from_micros(100),
+            generation: 3,
+            limits: ExecutorLimits {
+                max_active_requests,
+                prefill_chunk_size: None,
+            },
+            queued: queued
+                .iter()
+                .map(|&(request, prompt_tokens, max_new_tokens)| QueuedRequest {
+                    request_id: id(request),
+                    model_id: model(),
+                    prompt_tokens: Ok(prompt_tokens),
+                    max_new_tokens,
+                    priority: Priority::default(),
+                    deadline: None,
+                    queued_at: Timestamp::ZERO,
+                })
+                .collect(),
+            prefilling: BTreeMap::new(),
+            decoding: BTreeMap::new(),
+            decode_order: Vec::new(),
+            prefill_order: Vec::new(),
+            models: BTreeMap::from([(
+                model(),
+                ModelSnapshot {
+                    attached: true,
+                    batch,
+                    chunked_prefill: true,
+                    kv_cache: KvCacheProfile::new(8, 4, kv_capacity_bytes),
+                },
+            )]),
+            memory: MemoryState::default(),
+            device: None,
+            measurements: PolicyMeasurements::default(),
+        }
+    }
+
+    fn add_decode(
+        snapshot: &mut PlanningSnapshot,
+        request: u64,
+        generated: usize,
+        max: usize,
+        reserved: u64,
+    ) {
+        snapshot.decoding.insert(
+            id(request),
+            DecodeView {
+                model_id: model(),
+                position: 4,
+                generated_tokens: generated,
+                max_new_tokens: max,
+                reserved_kv_bytes: reserved,
+            },
+        );
+        snapshot.decode_order.push(id(request));
+    }
+
+    fn plan(policy: &ComposedPolicy, snapshot: &PlanningSnapshot) -> PolicyDecision {
+        let decision = policy.plan(snapshot).unwrap();
+        decision
+            .plan
+            .validate(snapshot, policy.enforces_model_kv_capacity())
+            .unwrap();
+        decision
+    }
+
+    #[test]
+    fn identical_snapshots_produce_identical_decisions() {
+        let mut snapshot = snapshot(
+            4,
+            1_024,
+            BatchCapabilities::ALL,
+            &[(5, 3, 2), (6, 9, 2), (7, 1, 2)],
+        );
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        snapshot.prefilling.insert(
+            id(2),
+            PrefillView {
+                model_id: model(),
+                cursor: 2,
+                prompt_tokens: 6,
+                max_new_tokens: 3,
+                reserved_kv_bytes: 32,
+            },
+        );
+        snapshot.prefill_order.push(id(2));
+        snapshot.limits.prefill_chunk_size = Some(2);
+        let build = || {
+            ComposedPolicy::default()
+                .with_admission(MemoryAwareAdmission)
+                .with_batch(FifoTokenBudgetPolicy::new(5).unwrap())
+                .with_grouping(CostAwarePrefillBatcher::new(4))
+        };
+
+        let first = plan(&build(), &snapshot);
+        let second = plan(&build(), &snapshot.clone());
+
+        assert_eq!(first, second);
+        assert!(!first.record.selections.is_empty());
+        assert!(!first.record.grouping.is_empty());
+    }
+
+    #[test]
+    fn an_admission_deferral_blocks_later_requests_that_would_fit() {
+        // A live decode holds one of two pages; the head needs two pages and
+        // waits, so FIFO never considers the one-page request behind it.
+        let mut snapshot = snapshot(4, 64, BatchCapabilities::ALL, &[(5, 5, 4), (6, 1, 4)]);
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        let policy = ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+
+        let decision = plan(&policy, &snapshot);
+
+        assert!(decision.plan.lifecycle.is_empty());
+        assert_eq!(
+            decision.plan.deferrals,
+            vec![PlannedDeferral::Admission {
+                request_id: id(5),
+                reason: AdmissionReason::ModelKvCapacity {
+                    required_bytes: 64,
+                    available_bytes: 32,
+                },
+                event_index: 1,
+            }]
+        );
+        assert_eq!(decision.record.ranking.ranked, vec![id(5), id(6)]);
+        assert_eq!(decision.record.admissions.len(), 1);
+    }
+
+    #[test]
+    fn an_oversized_head_prefill_runs_alone_and_defers_the_rest() {
+        let snapshot = snapshot(4, 1_024, BatchCapabilities::ALL, &[(5, 5, 2), (6, 1, 2)]);
+        let policy = ComposedPolicy::default().with_batch(FifoTokenBudgetPolicy::new(2).unwrap());
+
+        let decision = plan(&policy, &snapshot);
+
+        assert_eq!(decision.plan.batches.len(), 1);
+        assert_eq!(decision.plan.batches[0].rows[0].request_id, id(5));
+        assert_eq!(decision.plan.batches[0].rows[0].positions, 0..5);
+        assert_eq!(
+            decision.plan.deferrals,
+            vec![PlannedDeferral::Budget {
+                request_id: id(6),
+                phase: BatchPhase::Prefill,
+                token_cost: 1,
+                event_index: 1,
+            }]
+        );
+        let budget = decision
+            .record
+            .admissions
+            .iter()
+            .map(|record| match &record.outcome {
+                AdmissionOutcome::Decided {
+                    budget_selected, ..
+                } => *budget_selected,
+                other => panic!("unexpected outcome {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(budget, vec![Some(true), Some(false)]);
+    }
+
+    #[test]
+    fn predicted_releases_free_memory_and_slots_for_admission() {
+        // The only slot and the whole pool belong to a decode that must end
+        // at its output limit this iteration.
+        let mut snapshot = snapshot(1, 32, BatchCapabilities::ALL, &[(5, 1, 4)]);
+        add_decode(&mut snapshot, 1, 3, 4, 32);
+        let policy = ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+
+        let decision = plan(&policy, &snapshot);
+
+        assert_eq!(decision.plan.predicted_releases, vec![id(1)]);
+        assert!(matches!(
+            decision.plan.lifecycle.as_slice(),
+            [LifecycleAction::Admit { request_id, reserved_kv_bytes: 32, .. }] if *request_id == id(5)
+        ));
+        let AdmissionOutcome::Decided { context, .. } = &decision.record.admissions[0].outcome
+        else {
+            panic!("admission should have run");
+        };
+        assert_eq!(context.model_reserved_kv_bytes, 0);
+
+        // Without the prediction the same request would wait for a slot.
+        let mut unpredictable = snapshot.clone();
+        unpredictable
+            .decoding
+            .get_mut(&id(1))
+            .unwrap()
+            .max_new_tokens = 8;
+        let waiting = plan(&policy, &unpredictable);
+        assert_eq!(
+            waiting.plan.deferrals,
+            vec![PlannedDeferral::Slots { request_id: id(5) }]
+        );
+    }
+
+    #[test]
+    fn missing_batch_hooks_split_groups_and_are_recorded() {
+        let snapshot = snapshot(4, 1_024, BatchCapabilities::NONE, &[(5, 2, 2), (6, 3, 2)]);
+
+        let decision = plan(&ComposedPolicy::default(), &snapshot);
+
+        assert_eq!(decision.plan.batches.len(), 2);
+        assert!(
+            decision
+                .plan
+                .batches
+                .iter()
+                .all(|batch| batch.mode == BatchExecutionMode::Individual)
+        );
+        assert_eq!(
+            decision.record.capability_fallbacks,
+            vec![CapabilityFallback {
+                phase: PlannedPhase::Prefill,
+                model_id: model(),
+                rows: 2,
+                missing: BatchHook::Prefill,
+            }]
+        );
+    }
+
+    #[test]
+    fn kv_validation_catches_admission_that_breaks_its_own_guarantee() {
+        /// Claims to respect the KV pool but always reserves 1 KiB.
+        struct OverAdmit;
+
+        impl AdmissionPolicy for OverAdmit {
+            fn decide(&self, _context: &AdmissionContext) -> AdmissionDecision {
+                AdmissionDecision::Admit {
+                    reserved_kv_bytes: 1_024,
+                }
+            }
+
+            fn descriptor(&self) -> PolicyDescriptor {
+                PolicyDescriptor::new("over-admit")
+            }
+
+            fn enforces_model_kv_capacity(&self) -> bool {
+                true
+            }
+        }
+
+        let snapshot = snapshot(4, 64, BatchCapabilities::ALL, &[(5, 1, 2)]);
+        let policy = ComposedPolicy::default().with_admission(OverAdmit);
+        let decision = policy.plan(&snapshot).unwrap();
+
+        assert_eq!(
+            decision
+                .plan
+                .validate(&snapshot, policy.enforces_model_kv_capacity()),
+            Err(crate::PlanError::KvCapacity {
+                model_id: model(),
+                reserved_bytes: 1_024,
+                capacity_bytes: 64,
+            })
+        );
+        // A permissive policy makes no such promise, so the same plan passes.
+        assert_eq!(decision.plan.validate(&snapshot, false), Ok(()));
+    }
+}
