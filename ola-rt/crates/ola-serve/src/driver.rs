@@ -62,6 +62,17 @@ pub struct GenerationOutput {
     pub metrics: SessionMetrics,
     /// Lifecycle timestamps in the driver clock's epoch.
     pub timing: RequestTiming,
+    /// Why generation stopped.
+    pub finish_reason: FinishReason,
+}
+
+/// Why a completed request stopped generating.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishReason {
+    /// The model emitted its end-of-sequence token.
+    EndOfSequence,
+    /// The request reached `max_new_tokens`.
+    Length,
 }
 
 /// Something that happened to one request.
@@ -887,6 +898,11 @@ impl Worker {
                     ..
                 } => {
                     progressed = true;
+                    let finished = finished.then_some(if token.is_end_of_sequence {
+                        FinishReason::EndOfSequence
+                    } else {
+                        FinishReason::Length
+                    });
                     self.deliver_token(request_id, token.id, generated_tokens, phase, finished);
                 }
                 ExecutorEvent::PrefillProgress { .. } => progressed = true,
@@ -921,7 +937,7 @@ impl Worker {
         token_id: u32,
         generated_tokens: usize,
         phase: ExecutionPhase,
-        finished: bool,
+        finished: Option<FinishReason>,
     ) {
         let Some(live) = self.live.get_mut(&id) else {
             return;
@@ -935,7 +951,7 @@ impl Worker {
             .map(|model| model.tokenizer())
         {
             text = live.decoder.push(tokenizer, token_id).unwrap_or_default();
-            if finished {
+            if finished.is_some() {
                 text.push_str(&live.decoder.finish(tokenizer).unwrap_or_default());
             }
         }
@@ -945,9 +961,9 @@ impl Worker {
             phase,
             generated_tokens,
         });
-        if !finished {
+        let Some(finish_reason) = finished else {
             return;
-        }
+        };
         let timing = self
             .executor
             .state()
@@ -961,6 +977,7 @@ impl Worker {
                 text: result.text,
                 metrics: result.metrics,
                 timing,
+                finish_reason,
             }),
             None => RequestEvent::Failed(ServeError::Internal(
                 "a finished request had no result".into(),

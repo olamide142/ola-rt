@@ -63,6 +63,7 @@ or `make serve MODEL=…` runs it.
 | `POST /v1/generate` | The result as JSON, or server-sent events with `"stream": true` |
 | `GET /v1/requests/{id}` | A live or recently finished request's status and timing |
 | `DELETE /v1/requests/{id}` | Cancel; 204, also for a request that already ended |
+| `POST /v1/completions` | OpenAI-compatible completions, JSON or streamed |
 
 ```text
 POST /v1/generate
@@ -77,6 +78,8 @@ rejected, including sampling controls: generation is greedy. A stream sends
 Closing the connection cancels the request, whether streaming or waiting for
 JSON. Timings are microseconds since the server started.
 
+A finished result includes `finish_reason`: `end_of_sequence` or `length`.
+
 Errors are `{"error": {"kind", "message"}}`:
 
 | Status | Kind |
@@ -88,3 +91,20 @@ Errors are `{"error": {"kind", "message"}}`:
 | 429 | `overloaded`, with `Retry-After: 1` |
 | 500 | `execution_failed`, `internal` |
 | 503 | `not_ready`, `shutting_down`, with `Retry-After: 1` |
+
+### OpenAI-compatible completions
+
+`POST /v1/completions` accepts `model`, `prompt` (one string or one token
+array), `max_tokens` (default 16), `stream`, and `user`, and answers with a
+`text_completion` object (`id` `cmpl-<request id>`, one choice,
+`finish_reason` `stop` or `length`, and `usage`). Streaming sends one chunk
+per non-empty text delta, a final chunk with `finish_reason` and `usage`,
+then `data: [DONE]`.
+
+Generation is greedy, so requests that would change the output are refused
+with 400 instead of being silently ignored: `temperature` other than 0,
+`top_p` other than 1, `n` or `best_of` other than 1, `logprobs`, `echo`,
+`suffix`, `stop`, `logit_bias`, non-zero penalties, batched prompts, and
+unknown fields. `seed` is accepted and has no effect. Errors use OpenAI's
+shape, `{"error": {"message", "type", "param", "code"}}`, with `type` set to
+the native kind. Chat completions need prompt templates and are not offered.

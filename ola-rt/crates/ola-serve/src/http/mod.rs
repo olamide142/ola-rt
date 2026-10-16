@@ -4,6 +4,8 @@
 //! call the handle, and map each [`ServeError`] to its own status. Malformed
 //! bodies are transport errors and never reach the driver.
 
+mod openai;
+
 use std::{collections::BTreeMap, convert::Infallible, future::Future, io};
 
 use axum::{
@@ -23,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::{
-    GenerationOutput, Health, RequestEvent, RequestHandle, RequestSnapshot, RuntimeHandle,
-    ServeError, ServiceState,
+    FinishReason, GenerationOutput, Health, RequestEvent, RequestHandle, RequestSnapshot,
+    RuntimeHandle, ServeError, ServiceState,
 };
 
 /// Builds the router for every native endpoint.
@@ -37,6 +39,7 @@ use crate::{
 /// | `POST /v1/generate` | Generate; JSON, or server-sent events with `stream` |
 /// | `GET /v1/requests/{id}` | A live or recently finished request's state |
 /// | `DELETE /v1/requests/{id}` | Cancel a request |
+/// | `POST /v1/completions` | OpenAI-compatible completions (greedy only) |
 pub fn router(runtime: RuntimeHandle) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -44,6 +47,7 @@ pub fn router(runtime: RuntimeHandle) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/generate", post(generate))
         .route("/v1/requests/{id}", get(status).delete(cancel))
+        .route("/v1/completions", post(openai::completions))
         .with_state(runtime)
 }
 
@@ -97,6 +101,7 @@ struct GenerateResponse {
     id: u64,
     text: String,
     token_ids: Vec<u32>,
+    finish_reason: &'static str,
     usage: Usage,
     timing: TimingJson,
 }
@@ -133,6 +138,10 @@ impl From<GenerationOutput> for GenerateResponse {
             id: output.request_id.get(),
             text: output.text,
             token_ids: output.token_ids,
+            finish_reason: match output.finish_reason {
+                FinishReason::EndOfSequence => "end_of_sequence",
+                FinishReason::Length => "length",
+            },
             usage: Usage {
                 prompt_tokens: output.metrics.prompt_tokens,
                 generated_tokens: output.metrics.generated_tokens,
@@ -274,13 +283,18 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.parts().0;
         let mut response = (status, Json(self.body())).into_response();
-        if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
+        if retryable(status) {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         response
     }
+}
+
+/// Returns whether a client should retry after a short wait.
+fn retryable(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE
 }
 
 /// Maps each serving error to an HTTP status and a stable machine-readable

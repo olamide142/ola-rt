@@ -1,19 +1,18 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 21:52 BST (Europe/London)
+**Last updated:** 2026-10-16 22:00 BST (Europe/London)
 
-**Source revision:** working tree based on `dac3969` on `master`
+**Source revision:** working tree based on `e172ea5` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
-execution policy), P3 (scheduler and policy baselines), and P4 (experiment
-framework) are complete; every benchmark and experiment is a registered
-experiment with a versioned, interval-carrying report that the workbench and
-the `ola` CLI run identically. P5 (runtime driver and serving) is in
-progress: a driver thread with streaming, cancellable request handles and
-bounded admission, bounded retention, health and readiness, draining
-shutdown, and a native HTTP API with server-sent events (`ola serve`) work;
-the OpenAI-compatible endpoint remains. Current branch commits are
-not pushed
+execution policy), P3 (scheduler and policy baselines), P4 (experiment
+framework), and P5 (runtime driver and serving) are complete. Every
+benchmark and experiment is a registered experiment with a versioned,
+interval-carrying report; `ola serve` serves a model over a native HTTP API
+and an OpenAI-compatible completions endpoint, with streaming,
+cancellation, backpressure, health, and draining shutdown, and its outputs
+match direct execution on tiny Llama. P6 (observability) is next. Current
+branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -179,7 +178,7 @@ performance claim.
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
 | Continuous batching | Tensor foundation working | Compatible same-model variable-length prefill and decode are tensorized; decode page traversal remains request-local |
-| Production server | Native API working | `ola serve`: health, readiness, models, JSON or server-sent-event generation, request status and cancellation, disconnect-cancels, distinct error statuses, drain on Ctrl-C; no OpenAI-compatible endpoint, auth, or TLS yet |
+| Production server | Native API working | `ola serve`: health, readiness, models, JSON or server-sent-event generation, request status and cancellation, disconnect-cancels, distinct error statuses, OpenAI-compatible `/v1/completions` (greedy); drain on Ctrl-C; no chat completions, auth, or TLS yet |
 
 ## Implemented system
 
@@ -420,6 +419,8 @@ performance claim.
   server-sent events), and `GET`/`DELETE /v1/requests/{id}`; malformed
   bodies are transport errors; each serving error has its own status and
   stable kind; closing a connection cancels, streaming or not.
+- `POST /v1/completions` (OpenAI-compatible, streamed or not) refuses
+  anything greedy decoding cannot honour instead of ignoring it.
 
 ### `ola-ui`
 
@@ -455,8 +456,8 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 242 tests, Clippy
-  with warnings denied, and documentation) with zero compiler warnings; 5
+- `make verify`: **passed** (formatting, workspace checks, 245 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 10
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
   time) for prefill bucketing and the five-seed scheduler study; `ola
@@ -471,8 +472,14 @@ At the working tree recorded above:
 - A live `ola serve` run on the tiny-Llama fixture answered health, models,
   JSON and streamed generation (deltas equal to the final text), and
   drained cleanly on Ctrl-C.
-- `make test-fixture` against the pinned artifact (at the P4 close): **5 passed** — the model
-  experiments' conformance, scalar-oracle
+- `make test-fixture` against the pinned artifact: **10 passed**. The five
+  serving tests drive `ola-serve` over real sockets and compare every output
+  with direct execution: JSON, streamed, and OpenAI outputs agree; four
+  concurrent clients each get their single-request output; HTTP
+  cancellation releases the KV cache; overload and an out-of-vocabulary
+  token fail only their own requests; draining finishes a running stream
+  while refusing new work (25 of 25 repeated runs passed). The others: the
+  model experiments' conformance, scalar-oracle
   logits within `2e-5`, the UI integration, planned multi-request execution
   matching single-request output, and every scheduling baseline reproducing
   single-request outputs on tiny Llama with at least three distinct
@@ -630,8 +637,9 @@ and `TOKENS` variables.
 - Checkpoint loading accepts one SafeTensors file only.
 - RoPE scaling, tied embeddings, projection biases, and non-SiLU Llama variants
   are rejected.
-- The HTTP server has no OpenAI-compatible endpoint, authentication, TLS,
-  or HTTP/2, and serves one model per process.
+- The HTTP server has no chat completions, authentication, TLS, or HTTP/2,
+  and serves one model per process. OpenAI compatibility covers greedy
+  `/v1/completions` only.
 - Benchmark probes are foundations, not publication-quality performance claims.
 - Scheduling comparisons default to an illustrative cost model and a
   synthetic model. `cost-calibration` can now supply a measured cost model,
@@ -668,9 +676,11 @@ and `TOKENS` variables.
      selected accelerator backend permits;
    - retain per-step numerical comparison with the full-sequence oracle.
 
-4. **Serving and experiment infrastructure**
-   - finish P5: `/v1/completions` and end-to-end serving tests on the
-     fixture.
+4. **Observability (P6, next)**
+   - retain per-token timestamps and report real TPOT distributions;
+   - add correlation IDs and structured tracing across CLI, server, and
+     experiments, so a served request can be traced through every decision
+     and batch.
 
 ## Update protocol
 
@@ -684,6 +694,11 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 22:00 BST — working tree on `e172ea5`:** Completed P5: OpenAI-compatible
+  `/v1/completions` with streaming, `finish_reason` on results, and
+  end-to-end serving tests on tiny Llama that compare every HTTP output
+  with direct execution.
 
 - **2026-10-16 21:52 BST — working tree on `dac3969`:** P5 step 4: native HTTP API
   (axum) with server-sent events, distinct error statuses, and

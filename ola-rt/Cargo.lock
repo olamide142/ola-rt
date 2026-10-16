@@ -4860,6 +4860,7 @@ dependencies = [
  "ola-runtime",
  "ola-serve",
  "ola-ui",
+ "serde_json",
  "tokio",
 ]
 

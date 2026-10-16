@@ -131,6 +131,17 @@ impl Response {
     }
 }
 
+impl Response {
+    /// Payloads of data-only server-sent events, in order.
+    fn data(&self) -> Vec<String> {
+        self.body
+            .split("\n\n")
+            .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
 fn dechunk(mut body: &str) -> String {
     let mut decoded = String::new();
     while let Some((size, rest)) = body.split_once("\r\n") {
@@ -177,6 +188,7 @@ fn generation_returns_the_result_and_the_request_stays_queryable() {
     let result = response.json();
     assert_eq!(result["text"], REPLY);
     assert_eq!(result["usage"]["prompt_tokens"], 2);
+    assert_eq!(result["finish_reason"], "end_of_sequence");
     let id = result["id"].as_u64().unwrap();
     assert!(result["timing"]["completed_us"].is_u64());
 
@@ -381,4 +393,129 @@ fn disconnecting_while_waiting_for_a_json_result_cancels_the_request() {
     gate.open_fully();
     let status = server.call("GET", "/v1/requests/1", None).json();
     assert_eq!(status["status"], "cancelled", "{status}");
+}
+
+fn completion(body: Value) -> Value {
+    let mut request = json!({ "model": support::MODEL, "prompt": "hi" });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(body.as_object().unwrap().clone());
+    request
+}
+
+#[test]
+fn openai_completions_return_text_finish_reason_and_usage() {
+    let gate = Gate::open();
+    let (driver, _) = driver(&gate, 1, DriverConfig::default());
+    let server = Server::start(driver.handle());
+
+    let response = server.call(
+        "POST",
+        "/v1/completions",
+        Some(completion(
+            json!({ "max_tokens": 64, "temperature": 0, "user": "u1" }),
+        )),
+    );
+    assert_eq!(response.status, 200, "{}", response.body);
+    let body = response.json();
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["id"], "cmpl-1");
+    assert_eq!(body["model"], "script");
+    assert!(body["created"].as_u64().unwrap() > 1_600_000_000);
+    let choice = &body["choices"][0];
+    assert_eq!(
+        (&choice["text"], &choice["index"], &choice["finish_reason"]),
+        (&json!(REPLY), &json!(0), &json!("stop"))
+    );
+    assert!(choice["logprobs"].is_null());
+    let usage = &body["usage"];
+    assert_eq!(
+        usage["total_tokens"].as_u64(),
+        Some(
+            usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
+        )
+    );
+
+    // OpenAI's default is 16 tokens; three stop at the limit mid-reply.
+    let short = server
+        .call(
+            "POST",
+            "/v1/completions",
+            Some(completion(json!({ "max_tokens": 3 }))),
+        )
+        .json();
+    assert_eq!(short["choices"][0]["text"], "hé");
+    assert_eq!(short["choices"][0]["finish_reason"], "length");
+    assert_eq!(short["usage"]["completion_tokens"], 3);
+}
+
+#[test]
+fn openai_streams_chunks_then_a_final_chunk_and_done() {
+    let gate = Gate::open();
+    let (driver, _) = driver(&gate, 1, DriverConfig::default());
+    let server = Server::start(driver.handle());
+
+    let response = server.call(
+        "POST",
+        "/v1/completions",
+        Some(completion(json!({ "max_tokens": 64, "stream": true }))),
+    );
+    assert_eq!(response.status, 200);
+    let data = response.data();
+    assert_eq!(data.last().unwrap(), "[DONE]");
+    let chunks = data[..data.len() - 1]
+        .iter()
+        .map(|chunk| serde_json::from_str::<Value>(chunk).unwrap())
+        .collect::<Vec<_>>();
+    let (last, deltas) = chunks.split_last().unwrap();
+    assert!(deltas.iter().all(|chunk| {
+        chunk["choices"][0]["finish_reason"].is_null()
+            && !chunk["choices"][0]["text"].as_str().unwrap().is_empty()
+            && chunk.get("usage").is_none()
+    }));
+    let text = deltas
+        .iter()
+        .map(|chunk| chunk["choices"][0]["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(text, REPLY);
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert!(last["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    assert!(chunks.iter().all(|chunk| chunk["id"] == "cmpl-1"));
+}
+
+#[test]
+fn openai_refuses_what_greedy_decoding_cannot_honour() {
+    let gate = Gate::open();
+    let (driver, _) = driver(&gate, 1, DriverConfig::default());
+    let server = Server::start(driver.handle());
+
+    let cases = [
+        (json!({ "temperature": 0.7 }), 400, "greedy"),
+        (json!({ "top_p": 0.9 }), 400, "greedy"),
+        (json!({ "n": 2 }), 400, "one choice"),
+        (json!({ "logprobs": 1 }), 400, "logprobs"),
+        (json!({ "stop": ["\n"] }), 400, "stop"),
+        (json!({ "prompt": ["a", "b"] }), 400, "batch of 2"),
+        (json!({ "unknown": true }), 400, "unknown"),
+        (json!({ "model": "missing" }), 404, "not registered"),
+    ];
+    for (body, status, message) in cases {
+        let response = server.call("POST", "/v1/completions", Some(completion(body.clone())));
+        let error = &response.json()["error"];
+        assert_eq!(response.status, status, "{body}: {}", response.body);
+        assert!(
+            error["message"].as_str().unwrap().contains(message),
+            "{body}: {error}"
+        );
+        assert!(error["type"].is_string() && error["param"].is_null() && error["code"].is_null());
+    }
+    let accepted = server.call(
+        "POST",
+        "/v1/completions",
+        Some(completion(
+            json!({ "temperature": 0, "top_p": 1, "n": 1, "seed": 7, "prompt": [105] }),
+        )),
+    );
+    assert_eq!(accepted.status, 200, "{}", accepted.body);
 }

@@ -127,12 +127,12 @@ Design: `ola-rt/crates/ola-serve/SERVING.md`.
 - [x] Expose loaded-model state.
 - [x] Add a minimal HTTP generation endpoint.
 - [x] Add streaming HTTP responses.
-- [ ] Add an OpenAI-compatible boundary after the native API stabilizes.
+- [x] Add an OpenAI-compatible boundary after the native API stabilizes.
 - [x] Keep transport, runtime, model, admission, and execution errors distinct.
 - [x] Add graceful shutdown and in-flight request handling.
-- [ ] Test streaming, cancellation, overload, failure, and shutdown.
+- [x] Test streaming, cancellation, overload, failure, and shutdown.
 
-Done when a client can submit, observe, stream, cancel, and retrieve a request without accessing `Executor` directly.
+Done when a client can submit, observe, stream, cancel, and retrieve a request without accessing `Executor` directly. **Met 2026-10-16.**
 
 ## P6: Observability closure
 

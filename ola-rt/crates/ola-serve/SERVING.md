@@ -1,7 +1,7 @@
 # Runtime driver and serving design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P5. Steps 1–4 are implemented.
+Covers `todo.md` P5. All five steps are implemented; P5 is complete.
 
 ## Goal
 
@@ -100,8 +100,18 @@ touching `Executor`. This is P5's completion criterion.
    real sockets. `ola serve` drains on Ctrl-C, and `make serve` wraps it. A
    live run against the tiny-Llama fixture streamed text matching the final
    result and drained cleanly.
-5. `/v1/completions`; end-to-end streaming, cancellation, overload, failure,
-   and shutdown tests, including the tiny-Llama fixture; docs.
+5. **OpenAI completions and end-to-end tests.** **Done.**
+   `POST /v1/completions` with streaming; anything greedy decoding cannot
+   honour is refused rather than ignored. `GenerationOutput` gained
+   `finish_reason`, taken from the final token's end-of-sequence flag.
+   Fixture tests in `ola-cli` (run by `make test-fixture`) serve the tiny
+   Llama over real sockets and compare every output with the same request
+   run directly on a fresh executor: JSON, streamed, and OpenAI outputs
+   agree; four concurrent clients each get their single-request output;
+   cancelling over HTTP releases the KV cache; overload and an
+   out-of-vocabulary token fail only their own requests; and draining lets a
+   running stream finish while refusing new work. They passed 25 of 25
+   repeated runs.
 
 ## Out of scope
 
