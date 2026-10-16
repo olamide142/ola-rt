@@ -20,6 +20,7 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt, stream};
 use ola_core::{GenerationConfig, Input, Priority, RequestId, RequestSpec};
+use ola_observe::TokenGaps;
 use ola_runtime::{ExecutionPhase, RequestStatus, RequestTiming};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -104,6 +105,35 @@ struct GenerateResponse {
     finish_reason: &'static str,
     usage: Usage,
     timing: TimingJson,
+    /// When each token was produced, in microseconds since the server
+    /// started.
+    token_us: Vec<u64>,
+    /// Gaps between consecutive tokens; absent with fewer than two tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inter_token: Option<InterTokenJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct InterTokenJson {
+    gaps: usize,
+    mean_us: u64,
+    p50_us: u64,
+    p90_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+impl From<TokenGaps> for InterTokenJson {
+    fn from(gaps: TokenGaps) -> Self {
+        Self {
+            gaps: gaps.gaps,
+            mean_us: gaps.mean_micros,
+            p50_us: gaps.p50_micros,
+            p90_us: gaps.p90_micros,
+            p99_us: gaps.p99_micros,
+            max_us: gaps.max_micros,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -134,7 +164,10 @@ impl From<RequestTiming> for TimingJson {
 
 impl From<GenerationOutput> for GenerateResponse {
     fn from(output: GenerationOutput) -> Self {
+        let inter_token = TokenGaps::of(&output.token_times).map(Into::into);
         Self {
+            token_us: output.token_times.iter().map(|at| at.as_micros()).collect(),
+            inter_token,
             id: output.request_id.get(),
             text: output.text,
             token_ids: output.token_ids,

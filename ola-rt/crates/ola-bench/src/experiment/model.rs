@@ -5,11 +5,13 @@ use std::{
     collections::BTreeMap,
     fs,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
+use ola_core::{Clock, GenerationConfig, ModelDescriptor, MonotonicClock, RequestSpec};
 use ola_model::CausalLanguageModel;
+use ola_observe::TokenGaps;
 use ola_runtime::{ComposedPolicy, Executor, ExecutorEvent, MemoryAwareAdmission};
 
 use super::builtin::{
@@ -50,11 +52,12 @@ impl Experiment for LlamaGeneration {
         ExperimentDescriptor {
             id: "llama-generation",
             name: "Llama generation",
-            description: "Cached greedy generation latency and throughput",
+            description: "Cached greedy generation: TTFT, inter-token latency, and throughput",
             category: ExperimentCategory::Benchmark,
             kind: ExperimentKind::Probe,
             domain: TimeDomain::Host,
-            payload_version: 1,
+            // 2: real per-token times; TTFT and inter-token gaps.
+            payload_version: 2,
             requirements: vec![Requirement::LoadedModel],
             parameters: vec![
                 ParameterSpec::text("prompt", "Prompt text", "Hello"),
@@ -69,8 +72,10 @@ impl Experiment for LlamaGeneration {
         parameters: &Parameters,
     ) -> Result<ExperimentOutcome, ExperimentError> {
         let model = loaded(context)?;
+        let clock = Arc::new(MonotonicClock::start());
         let mut executor = Executor::default()
-            .with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission));
+            .with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission))
+            .with_clock(clock.clone());
         executor
             .register_model(ModelDescriptor::language(MODEL_ID, "llama"), model.clone())
             .map_err(run_error)?;
@@ -81,14 +86,10 @@ impl Experiment for LlamaGeneration {
             top_p: 1.0,
             seed: Some(0),
         };
-        let request_id = executor
-            .submit(request, Timestamp::ZERO)
-            .map_err(run_error)?;
+        let request_id = executor.submit(request, clock.now()).map_err(run_error)?;
         let started = Instant::now();
-        'generation: for step in 1..=10_000_u64 {
-            let iteration = executor
-                .step_iteration(Timestamp::from_micros(step))
-                .map_err(run_error)?;
+        'generation: for _ in 0..10_000 {
+            let iteration = executor.step_iteration(clock.now()).map_err(run_error)?;
             for event in iteration.events {
                 match event {
                     ExecutorEvent::Token { finished: true, .. } => break 'generation,
@@ -109,6 +110,17 @@ impl Experiment for LlamaGeneration {
             .result(request_id)
             .ok_or_else(|| ExperimentError::Run("generation did not finish".into()))?;
         let generated = result.metrics.generated_tokens;
+        let timing = executor
+            .state()
+            .request(request_id)
+            .map(|record| record.timing)
+            .unwrap_or_default();
+        let ttft = timing.first_token_at.map_or(0, |first| {
+            first
+                .as_micros()
+                .saturating_sub(timing.queued_at.as_micros())
+        });
+        let gaps = TokenGaps::of(&result.token_times).unwrap_or_default();
         let throughput = if elapsed.is_zero() {
             0.0
         } else {
@@ -128,6 +140,10 @@ impl Experiment for LlamaGeneration {
                     Direction::Neither,
                 ),
                 MetricSpec::new("elapsed", Unit::Micros, TimeDomain::Host, Direction::Lower),
+                MetricSpec::new("ttft", Unit::Micros, TimeDomain::Host, Direction::Lower),
+                MetricSpec::new("itl_p50", Unit::Micros, TimeDomain::Host, Direction::Lower),
+                MetricSpec::new("itl_p90", Unit::Micros, TimeDomain::Host, Direction::Lower),
+                MetricSpec::new("itl_max", Unit::Micros, TimeDomain::Host, Direction::Lower),
                 MetricSpec::new(
                     "throughput",
                     Unit::TokensPerSecond,
@@ -146,12 +162,19 @@ impl Experiment for LlamaGeneration {
                 vec![values(&[
                     ("generated_tokens", as_f64(generated)),
                     ("elapsed", as_f64(elapsed.as_micros())),
+                    ("ttft", as_f64(ttft)),
+                    ("itl_p50", as_f64(gaps.p50_micros)),
+                    ("itl_p90", as_f64(gaps.p90_micros)),
+                    ("itl_max", as_f64(gaps.max_micros)),
                     ("throughput", throughput),
                     ("kv_cache_bytes", as_f64(result.metrics.kv_cache_bytes)),
                 ])],
             )],
             format!(
-                "{generated} tokens · {throughput:.2} tok/s · {} KV",
+                "{generated} tokens · TTFT {} · inter-token p50 {} max {} · {throughput:.2} tok/s · {} KV",
+                format_duration(Duration::from_micros(ttft)),
+                format_duration(Duration::from_micros(gaps.p50_micros)),
+                format_duration(Duration::from_micros(gaps.max_micros)),
                 format_bytes(result.metrics.kv_cache_bytes)
             ),
         )

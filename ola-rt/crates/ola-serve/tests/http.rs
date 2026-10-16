@@ -519,3 +519,37 @@ fn openai_refuses_what_greedy_decoding_cannot_honour() {
     );
     assert_eq!(accepted.status, 200, "{}", accepted.body);
 }
+
+#[test]
+fn results_report_each_token_time_and_the_gap_distribution() {
+    let gate = Gate::closed();
+    let (driver, clock) = driver(&gate, 1, DriverConfig::default());
+    let server = Server::start(driver.handle());
+    let mut client = server.connect("POST", "/v1/generate", Some(&generate("hi", false)));
+
+    // Each model call finishes 100 µs after the previous one, except the
+    // eighth, which stalls for 1 ms.
+    for call in 0..=REPLY.len() {
+        gate.wait_until_blocked();
+        let step = if call == 7 { 1_000 } else { 100 };
+        clock.advance(Duration::from_micros(step));
+        gate.permit(1);
+    }
+    let mut raw = Vec::new();
+    client.read_to_end(&mut raw).unwrap();
+    let result = Response::parse(&raw).json();
+
+    let token_us = result["token_us"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|time| time.as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(token_us.len(), REPLY.len() + 1);
+    assert_eq!(&token_us[..3], [100, 200, 300]);
+    assert_eq!(
+        result["inter_token"],
+        json!({ "gaps": 14, "mean_us": 164, "p50_us": 100, "p90_us": 100, "p99_us": 1000, "max_us": 1000 })
+    );
+    assert_eq!(result["timing"]["first_token_us"], 100);
+}

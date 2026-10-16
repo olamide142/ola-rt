@@ -4828,6 +4828,7 @@ version = "0.1.0"
 dependencies = [
  "ola-core",
  "ola-model",
+ "ola-observe",
  "ola-runtime",
  "serde",
  "serde_json",
@@ -4909,6 +4910,7 @@ dependencies = [
  "futures-util",
  "ola-core",
  "ola-model",
+ "ola-observe",
  "ola-runtime",
  "serde",
  "serde_json",

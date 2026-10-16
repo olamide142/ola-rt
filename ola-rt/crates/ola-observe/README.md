@@ -21,13 +21,21 @@ For a terminal request:
 | Service latency | `completed_at - started_at` |
 | End-to-end latency | `completed_at - queued_at` |
 | Decode span | `completed_at - first_token_at` |
-| Mean inter-token latency | decode span divided by `output_tokens - 1` |
+| Inter-token latency (TPOT) | distribution of `token[i] - token[i-1]` over observed token times |
 
 Fields whose lifecycle boundary was never reached remain `None`. For example,
 a request rejected while queued has end-to-end latency but no queue, prefill,
-or service latency. Mean inter-token latency is an aggregate span, not a record
-of each token gap, and is unavailable when fewer than two output tokens were
-observed.
+or service latency.
+
+Token times come from each `ExecutorEvent::Token`'s `at`: the time the model
+invocation that produced the token finished when the executor has a clock,
+otherwise the iteration's planning time. `TokenGaps` summarizes the gaps
+between consecutive tokens (count, mean, nearest-rank p50/p90/p99, max), so
+the first token contributes no gap and a stall shows in the tail instead of
+being averaged across the decode span. It is `None` with fewer than two
+observed tokens; an observer attached mid-generation summarizes only the
+gaps it saw. `TokenGaps::pooled` combines requests without bridging them. The
+observer keeps token times only until a request is summarized.
 
 ## Iteration measurements
 

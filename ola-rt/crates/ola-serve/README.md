@@ -78,7 +78,11 @@ rejected, including sampling controls: generation is greedy. A stream sends
 Closing the connection cancels the request, whether streaming or waiting for
 JSON. Timings are microseconds since the server started.
 
-A finished result includes `finish_reason`: `end_of_sequence` or `length`.
+A finished result includes `finish_reason` (`end_of_sequence` or `length`),
+`token_us` (when each token was produced, stamped as its model call
+finished), and `inter_token` (`gaps`, `mean_us`, `p50_us`, `p90_us`,
+`p99_us`, `max_us` over the gaps between consecutive tokens; absent with
+fewer than two tokens).
 
 Errors are `{"error": {"kind", "message"}}`:
 

@@ -1,5 +1,9 @@
 #![doc = include_str!("../README.md")]
 
+mod tokens;
+
+pub use tokens::TokenGaps;
+
 use std::{collections::BTreeMap, error::Error, fmt};
 
 use ola_core::{RequestId, Timestamp};
@@ -40,8 +44,9 @@ pub struct RequestMeasurement {
     pub end_to_end_micros: u64,
     /// Time from first generated token to terminal completion.
     pub decode_span_micros: Option<u64>,
-    /// Decode span divided by the number of inter-token gaps.
-    pub mean_inter_token_micros: Option<u64>,
+    /// Gaps between consecutive observed token times; `None` with fewer
+    /// than two observed tokens.
+    pub inter_token: Option<TokenGaps>,
 }
 
 impl RequestMeasurement {
@@ -50,10 +55,15 @@ impl RequestMeasurement {
     /// Returns `None` for queued or running records. Durations are saturating
     /// because lifecycle code already enforces monotonic timestamps and an
     /// observer should not introduce arithmetic panics in telemetry paths.
+    ///
+    /// `token_times` are the observed token timestamps in emission order;
+    /// they may be fewer than `output_tokens` when observation started
+    /// mid-generation, and then only observed gaps are summarized.
     pub fn from_record(
         request_id: RequestId,
         record: &RequestRecord,
         output_tokens: usize,
+        token_times: &[Timestamp],
     ) -> Option<Self> {
         let outcome = match &record.status {
             RequestStatus::Completed => RequestOutcome::Completed,
@@ -66,11 +76,6 @@ impl RequestMeasurement {
         let started_at = record.timing.started_at;
         let first_token_at = record.timing.first_token_at;
         let decode_span_micros = first_token_at.map(|first| elapsed(completed_at, first));
-        let mean_inter_token_micros = decode_span_micros.and_then(|span| {
-            let gaps = output_tokens.checked_sub(1)?;
-            let gaps = u64::try_from(gaps).ok()?;
-            span.checked_div(gaps)
-        });
 
         Some(Self {
             request_id,
@@ -84,7 +89,7 @@ impl RequestMeasurement {
             service_micros: started_at.map(|started| elapsed(completed_at, started)),
             end_to_end_micros: elapsed(completed_at, queued_at),
             decode_span_micros,
-            mean_inter_token_micros,
+            inter_token: TokenGaps::of(token_times),
         })
     }
 }
@@ -207,6 +212,8 @@ pub struct ObservationTotals {
 pub struct ExecutionObserver {
     previous_iteration_at: Option<Timestamp>,
     observed_output_tokens: BTreeMap<RequestId, usize>,
+    /// Token times of requests not yet terminal; dropped once summarized.
+    token_times: BTreeMap<RequestId, Vec<Timestamp>>,
     terminal_requests: BTreeMap<RequestId, RequestMeasurement>,
     totals: ObservationTotals,
 }
@@ -281,6 +288,7 @@ impl ExecutionObserver {
             reserved_kv_bytes: iteration.reserved_kv_bytes,
         };
         let mut output_updates: BTreeMap<RequestId, usize> = BTreeMap::new();
+        let mut new_token_times: BTreeMap<RequestId, Vec<Timestamp>> = BTreeMap::new();
         let mut terminal = Vec::new();
         for event in &iteration.events {
             match event {
@@ -288,9 +296,11 @@ impl ExecutionObserver {
                     request_id,
                     generated_tokens,
                     finished,
+                    at,
                     ..
                 } => {
                     measurement.emitted_output_tokens += 1;
+                    new_token_times.entry(*request_id).or_default().push(*at);
                     output_updates
                         .entry(*request_id)
                         .and_modify(|tokens| *tokens = (*tokens).max(*generated_tokens))
@@ -329,10 +339,26 @@ impl ExecutionObserver {
                 .copied()
                 .unwrap_or(previous_tokens)
                 .max(previous_tokens);
+            let times = self
+                .token_times
+                .get(&request_id)
+                .into_iter()
+                .flatten()
+                .chain(new_token_times.get(&request_id).into_iter().flatten())
+                .copied()
+                .collect::<Vec<_>>();
             let request_measurement =
-                RequestMeasurement::from_record(request_id, record, output_tokens)
+                RequestMeasurement::from_record(request_id, record, output_tokens, &times)
                     .ok_or(ObservationError::RequestNotTerminal(request_id))?;
             terminal_measurements.push(request_measurement);
+        }
+        // Nothing above can fail past this point, so the observer changes
+        // only for an accepted iteration.
+        for (request_id, times) in new_token_times {
+            self.token_times
+                .entry(request_id)
+                .or_default()
+                .extend(times);
         }
         for (request_id, generated_tokens) in output_updates {
             self.observed_output_tokens
@@ -341,6 +367,7 @@ impl ExecutionObserver {
                 .or_insert(generated_tokens);
         }
         for request_measurement in terminal_measurements {
+            self.token_times.remove(&request_measurement.request_id);
             self.terminal_requests
                 .insert(request_measurement.request_id, request_measurement);
         }
@@ -377,8 +404,15 @@ impl ExecutionObserver {
             .get(&request_id)
             .copied()
             .unwrap_or(0);
-        let measurement = RequestMeasurement::from_record(request_id, record, output_tokens)
-            .ok_or(ObservationError::RequestNotTerminal(request_id))?;
+        let times = self
+            .token_times
+            .get(&request_id)
+            .cloned()
+            .unwrap_or_default();
+        let measurement =
+            RequestMeasurement::from_record(request_id, record, output_tokens, &times)
+                .ok_or(ObservationError::RequestNotTerminal(request_id))?;
+        self.token_times.remove(&request_id);
         self.terminal_requests.insert(request_id, measurement);
         Ok(measurement)
     }
@@ -462,10 +496,12 @@ mod tests {
     #[test]
     fn derives_documented_request_latencies_from_lifecycle_boundaries() {
         let (runtime, request_id) = completed_runtime();
+        let times = [30, 40, 70].map(Timestamp::from_micros);
         let measurement = RequestMeasurement::from_record(
             request_id,
             runtime.state().request(request_id).unwrap(),
             3,
+            &times,
         )
         .unwrap();
 
@@ -476,17 +512,60 @@ mod tests {
         assert_eq!(measurement.service_micros, Some(50));
         assert_eq!(measurement.end_to_end_micros, 60);
         assert_eq!(measurement.decode_span_micros, Some(40));
-        assert_eq!(measurement.mean_inter_token_micros, Some(20));
+        // Real gaps are 10 and 30 µs; the old span average reported 20.
+        let gaps = measurement.inter_token.unwrap();
+        assert_eq!((gaps.gaps, gaps.p50_micros, gaps.max_micros), (2, 10, 30));
         assert_eq!(
             RequestMeasurement::from_record(
                 request_id,
                 runtime.state().request(request_id).unwrap(),
                 1,
+                &times[..1],
             )
             .unwrap()
-            .mean_inter_token_micros,
+            .inter_token,
             None
         );
+    }
+
+    #[test]
+    fn token_times_accumulate_across_iterations_and_are_dropped_when_summarized() {
+        let (runtime, request_id) = completed_runtime();
+        let token = |generated_tokens, at, finished| ExecutorIteration {
+            at: Timestamp::from_micros(at),
+            events: vec![ExecutorEvent::Token {
+                request_id,
+                token: GeneratedToken {
+                    id: 1,
+                    is_end_of_sequence: false,
+                },
+                generated_tokens,
+                kv_cache_bytes: 0,
+                phase: ExecutionPhase::Decode,
+                finished,
+                at: Timestamp::from_micros(at + 5),
+            }],
+            execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
+            divergences: Vec::new(),
+            execution_batches: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            kv_cache_bytes: 0,
+            reserved_kv_bytes: 0,
+        };
+        let mut observer = ExecutionObserver::default();
+        for (generated, at, finished) in [(1, 25, false), (2, 40, false), (3, 64, true)] {
+            observer
+                .observe_iteration(&token(generated, at, finished), runtime.state())
+                .unwrap();
+        }
+
+        // Token times come from the events (invocation finish), not the
+        // iteration start: 30, 45, 69.
+        let gaps = observer.request(request_id).unwrap().inter_token.unwrap();
+        assert_eq!((gaps.gaps, gaps.p50_micros, gaps.max_micros), (2, 15, 24));
+        assert!(observer.token_times.is_empty());
     }
 
     #[test]

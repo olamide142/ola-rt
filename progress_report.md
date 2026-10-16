@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 22:31 BST (Europe/London)
+**Last updated:** 2026-10-16 22:40 BST (Europe/London)
 
-**Source revision:** working tree based on `ff89d24` on `master`
+**Source revision:** working tree based on `748ebfb` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -13,7 +13,8 @@ and an OpenAI-compatible completions endpoint, with streaming,
 cancellation, backpressure, health, and draining shutdown, and its outputs
 match direct execution on tiny Llama. P6 (observability) is in progress:
 tokens and lifecycle events are now stamped when the model call producing
-them finishes, which corrected one P3 finding. Current
+them finishes, which corrected one P3 finding, and inter-token latency is
+reported as a real per-gap distribution. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -71,8 +72,8 @@ conformance, and GPU workflows through `make help`.
 
 The working tree also introduces `ola-observe`, a read-only consumer of
 executor iterations and runtime lifecycle records. It derives documented queue,
-TTFT, prefill, service, end-to-end, decode-span, and aggregate inter-token
-latencies; records iteration work and memory snapshots; exposes interval token
+TTFT, prefill, service, end-to-end, and decode-span latencies and per-gap
+inter-token distributions; records iteration work and memory snapshots; exposes interval token
 rates; and retains cumulative counters without reading a wall clock.
 
 Compatible prefill and decode operations are now grouped by loaded model and
@@ -372,6 +373,8 @@ performance claim.
 
 ### `ola-cli`
 
+- `llama-generation` reports TTFT and inter-token p50/p90/max in host time
+  (fixture: TTFT 11.4 ms, gaps ~10 ms, consistent with 243.5 ms elapsed).
 - `ola serve --model DIR`: loads a Llama artifact with memory-aware
   admission and serves the HTTP API, draining on Ctrl-C (`make serve`).
 - `ola` binary: `experiment list`, `experiment run` (model, backend,
@@ -384,8 +387,8 @@ performance claim.
 - Read-only observation of executor iterations and retained runtime state.
 - Explicit microsecond formulas for queue latency, TTFT, prefill latency,
   service latency, end-to-end latency, and decode span.
-- Aggregate mean inter-token latency for terminal requests with at least two
-  observed output tokens.
+- Inter-token gap distributions (`TokenGaps`: mean, p50/p90/p99, max) for
+  terminal requests with at least two observed tokens.
 - Selected prefill/decode work, input-token cost, policy deferrals, emitted
   tokens, terminal outcomes, live request counts, and KV snapshots per
   iteration.
@@ -458,7 +461,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 248 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 253 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 10
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -633,9 +636,6 @@ and `TOKENS` variables.
   in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
 - Execution plans record the model but not backend/device or kernel choices,
   and do not yet carry the cost-aware grouping policy's estimates or reasons.
-- Per-token timestamps are retained, but `ola-observe` still reports the
-  averaged inter-token latency until P6 step 2 replaces it with per-gap
-  distributions.
 - Batch timing measures from just before a model call to after its token IDs
   return to the host; work a backend leaves queued beyond that boundary is
   not attributed.
@@ -701,6 +701,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 22:40 BST — working tree on `748ebfb`:** P6 step 2: `TokenGaps` per-gap
+  inter-token distributions replace the span average in `ola-observe`;
+  `llama-generation` reports TTFT and inter-token percentiles on a real
+  clock; HTTP results return per-token times and the gap summary. Fixed a
+  race in the serving tests' gate.
 
 - **2026-10-16 22:31 BST — working tree on `ff89d24`:** P6 step 1: `Executor::with_clock`
   times every model invocation and stamps tokens, first token, completion,

@@ -139,7 +139,7 @@ Done when a client can submit, observe, stream, cancel, and retrieve a request w
 Design: `ola-rt/crates/ola-observe/OBSERVABILITY.md`.
 
 - [x] Retain per-token timestamps. (Stamped when the producing invocation finishes.)
-- [ ] Report real TPOT distributions instead of a terminal-span average.
+- [x] Report real TPOT distributions instead of a terminal-span average.
 - [ ] Record scheduler, admission, batching, and memory choices.
 - [ ] Record model-operation latency with documented boundaries.
 - [ ] Add automatic GPU memory telemetry.

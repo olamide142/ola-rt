@@ -1,7 +1,7 @@
 # Observability design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P6. Step 1 is implemented.
+Covers `todo.md` P6. Steps 1–2 are implemented.
 
 ## Goal
 
@@ -70,7 +70,18 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
    0.55 vs FIFO 0.32; five-seed study: FIFO 0.47 → 0.41, SJF 0.46 → 0.49).
    Latencies moved 0.5–1.5%. `SCHEDULING_BASELINES.md` records the
    correction; the other P3 findings still hold.
-2. TPOT distributions in `ola-observe`, used by experiments and HTTP timing.
+2. **Inter-token distributions.** **Done.** `ola_observe::TokenGaps`
+   (count, mean, nearest-rank p50/p90/p99, max; `pooled` never bridges
+   requests) replaces the averaged inter-token latency in
+   `RequestMeasurement`; the observer collects token times from events and
+   drops them once a request is summarized. `llama-generation` (payload 2)
+   now runs on a real clock and reports TTFT and inter-token p50/p90/max; on
+   the tiny-Llama fixture, TTFT 11.4 ms plus 23 gaps of ~10 ms accounts for
+   the 243.5 ms elapsed. Native HTTP results add `token_us` and
+   `inter_token`. An HTTP test with a 1 ms stall among 100 µs gaps checks
+   every field: the stall shows at p99 and max, not p50. Writing it exposed
+   a race in the test gate (a just-permitted caller still counted as
+   blocked); after fixing it the serving suites passed 990 runs.
 3. Iteration and batch correlation IDs; the per-request trace builder and
    JSON Lines output.
 4. Traces in the server and in executor-driven experiments.

@@ -74,11 +74,13 @@ impl Gate {
         wake.notify_all();
     }
 
-    /// Waits until the driver is blocked inside a model call.
+    /// Waits until the driver is blocked inside a model call with no permit
+    /// left to take. A caller that was just permitted but has not yet woken
+    /// does not count.
     pub fn wait_until_blocked(&self) {
         let (state, wake) = &*self.0;
         let mut state = state.lock().unwrap();
-        while state.waiting == 0 {
+        while state.waiting == 0 || state.permits != Some(0) {
             state = wake
                 .wait_timeout(state, Duration::from_millis(5))
                 .unwrap()
