@@ -529,7 +529,7 @@ ola-rt/
 │   ├── papers/
 │   └── notes/
 │
-├── IMPLEMENTATION.md
+├── IMPLEMENTATION.md   # local, untracked planning guide
 └── README.md
 ```
 
@@ -608,25 +608,27 @@ OlaRT should increasingly own:
 
 Goal: understand the stack while establishing OlaRT's architecture.
 
+Status as of 2026-10-16 (see `progress_report.md` for evidence):
+
 - [ ] micrograd-style scalar autograd exercise
 - [ ] tiny educational tensor implementation
-- [ ] understand Burn tensor/backend/device abstractions
-- [ ] implement transformer components in Burn
-- [ ] understand CubeCL
+- [x] understand Burn tensor/backend/device abstractions
+- [x] implement transformer components in Burn
+- [ ] understand CubeCL — in progress: CubeCL paged-attention extension in `ola-kernel` is not yet validated
 - [ ] CPU/SIMD experiments
-- [ ] GPU kernel experiments
+- [ ] GPU kernel experiments — in progress: see CubeCL item above
 - [ ] benchmark Burn against custom kernels
-- [ ] define OlaRT public API
-- [ ] implement request abstraction
-- [ ] model registry
-- [ ] runtime state
-- [ ] basic inference session
-- [ ] basic LLM execution
-- [ ] prefill/decode split
-- [ ] simple KV cache
-- [ ] metrics
-- [ ] FIFO scheduler
-- [ ] multi-request simulation
+- [ ] define OlaRT public API — deferred until execution-policy boundaries settle (`todo.md` P8)
+- [x] implement request abstraction
+- [x] model registry
+- [x] runtime state
+- [x] basic inference session
+- [x] basic LLM execution
+- [x] prefill/decode split
+- [x] simple KV cache — paged, with block tables
+- [x] metrics
+- [x] FIFO scheduler
+- [x] multi-request simulation
 
 End-of-phase target:
 

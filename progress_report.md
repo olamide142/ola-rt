@@ -1,23 +1,22 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-14 15:57 BST (Europe/London)
+**Last updated:** 2026-10-16 12:28 BST (Europe/London)
 
-**Source revision:** working tree based on prefill-comparison milestone
-`9403ab3` on `master`
+**Source revision:** working tree based on `15a191c` on `master`
 
-**Repository state at update:** deterministic bucketing comparison and UI
-experiment committed locally; execution-backed repeated prefill benchmark,
-versioned JSON persistence, and cost-aware adaptive prefill grouping implemented
-after that commit; measured calibration and rotating three-way comparison are
-also implemented; bounded and tensor-batched resumable Llama prefill and the
-initial `ola-kernel` paged-attention boundary are implemented in the same
-working tree; current branch commits are not pushed
+**Repository state at update:** resumable prefill and the initial
+`ola-kernel` paged-attention boundary are committed (`eb52cf6`); the working
+tree migrates the CPU backend from deprecated Burn NdArray to Burn Flex after
+the Burn 0.22 upgrade, replaces deprecated tensor readbacks, fixes a Rust 1.95
+Clippy lint, untracks `.codex/`, and refreshes documentation; current branch
+commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
-progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
-describes the long-term build plan, and `ola-rt/README.md` documents stable
-implementation semantics. This report answers the narrower question: **what
-works today, what evidence supports it, and what should be built next?**
+progress. The root `README.md` describes the project vision, the local and
+untracked `IMPLEMENTATION.md` describes the long-term build plan, and
+`ola-rt/README.md` documents stable implementation semantics. This report
+answers the narrower question: **what works today, what evidence supports it,
+and what should be built next?**
 
 ## Executive summary
 
@@ -408,10 +407,23 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **109 unit tests and 5 documentation tests passed**, with
-  formatting, workspace checks, Clippy with warnings denied, and documentation
-  generation also passing;
+- `make verify`: **114 tests passed** (unit, integration, and documentation),
+  with formatting, workspace checks, Clippy with warnings denied, and
+  documentation generation also passing, and zero compiler warnings;
   **2 external-fixture tests ignored** by default.
+- `make test-fixture` against the pinned artifact (hashes re-verified):
+  **2 passed** on the Burn Flex CPU backend, including pinned scalar-oracle
+  logits within `2e-5` and argmax `[5971, 1789, 19053]`.
+- Independent scalar oracle (`tools/llama_scalar_reference.py`): **re-run**,
+  argmax unchanged.
+- `make llama` on Flex CPU: selected `[1789, 19053]` after prompt tokens
+  `[1, 15043]`, matching the historical NdArray and WGPU selections.
+- `make check-wgpu` and `make check-cuda`: **passed** with no warnings. A fresh
+  live WGPU run was not possible because `nvidia-smi` could not communicate
+  with the NVIDIA driver; earlier GTX 1650 results below are historical.
+
+Historical evidence from earlier revisions:
+
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
 - Pinned Llama scalar-oracle conformance test: **passed manually**.
@@ -592,6 +604,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 12:28 BST — working tree on `15a191c`:** Migrated the default
+  CPU backend from deprecated Burn NdArray to Burn Flex, switched token readback
+  to dtype-casting `try_to_vec_as` so `i32` and `i64` argmax backends agree,
+  replaced deprecated tensor readbacks, fixed a Rust 1.95 Clippy lint, updated
+  a stale UI fixture assertion, untracked `.codex/`, and refreshed P0
+  documentation. Full verification, fixture conformance, and WGPU/CUDA
+  compilation passed.
 
 - **2026-10-14 11:22 BST — working tree on `9403ab3`:** Added the initial
   `ola-kernel` crate, paged-attention metadata and validated input contract,

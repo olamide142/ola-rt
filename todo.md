@@ -6,14 +6,14 @@ Last reviewed: 2026-10-16
 
 ## P0: Stabilize current work
 
-- [ ] Separate framework, benchmark, Burn, UI, and kernel changes into coherent commits.
-- [ ] Decide whether `.codex/` should be tracked or ignored.
-- [ ] Run `make verify`.
-- [ ] Run WGPU checks and available CUDA feature compilation.
-- [ ] Run tiny-Llama scalar/conformance checks.
-- [ ] Update `progress_report.md` with the current revision and verification evidence.
-- [ ] Resolve the missing `IMPLEMENTATION.md` reference.
-- [ ] Update the stale Phase 0 checklist in `README.md`.
+- [x] Separate framework, benchmark, Burn, UI, and kernel changes into coherent commits.
+- [x] Decide whether `.codex/` should be tracked or ignored. (Ignored.)
+- [x] Run `make verify`.
+- [x] Run WGPU checks and available CUDA feature compilation. (Compile only; live WGPU blocked by the NVIDIA driver.)
+- [x] Run tiny-Llama scalar/conformance checks.
+- [x] Update `progress_report.md` with the current revision and verification evidence.
+- [x] Resolve the missing `IMPLEMENTATION.md` reference.
+- [x] Update the stale Phase 0 checklist in `README.md`.
 
 ## P1: Execution-plan IR
 
