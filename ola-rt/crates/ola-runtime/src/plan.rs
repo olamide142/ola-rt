@@ -191,7 +191,7 @@ pub struct PlanEstimates {
 }
 
 /// Complete, validated description of one executor iteration.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionPlan {
     /// Executor state generation the plan was built from.
     pub generation: u64,
@@ -602,8 +602,15 @@ impl ExecutionPlan {
         for (model_id, bytes) in admitted.values() {
             *reserved.entry(model_id).or_default() += bytes;
         }
+        // Only admissions in this plan are checked: a permissive admission
+        // policy may already have committed live reservations past capacity.
+        let admitting = admitted
+            .values()
+            .map(|(model_id, _)| *model_id)
+            .collect::<BTreeSet<_>>();
         for (model_id, reserved_bytes) in reserved {
-            if let Some(&capacity_bytes) = view.model_kv_capacity.get(model_id)
+            if admitting.contains(model_id)
+                && let Some(&capacity_bytes) = view.model_kv_capacity.get(model_id)
                 && reserved_bytes > capacity_bytes
             {
                 return Err(PlanError::KvCapacity {

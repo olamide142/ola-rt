@@ -1,8 +1,9 @@
 # ExecutionPlan design proposal
 
-Status: **accepted** (2026-10-16). Covers `todo.md` P1. Step 1 (plan types
-and validation in `src/plan.rs`) is implemented; the executor does not use
-them yet.
+Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–3 are
+implemented: decodes and continued prefills run through plan → validate →
+commit and are exposed as `ExecutorIteration::execution_plan`. Admissions
+still use the interleaved path until step 4.
 
 ## Goal
 
@@ -110,7 +111,9 @@ state ──► Planner (reads state, consults policies) ──► ExecutionPlan
 - **bad release:** a predicted release is not a limit-reaching decode row in
   this plan;
 - **over capacity:** live minus predicted releases plus admissions exceeds
-  `max_active_requests`, or reservations exceed a model's KV pool.
+  `max_active_requests`, or admissions push a model's reservations past its
+  KV pool. Models without admissions are not checked, because a permissive
+  admission policy may already hold live reservations past capacity.
 
 Two checks remain the admission and batch policies' job: device-wide memory
 budgets, and whether budget deferrals are consistent with the token budget.
@@ -216,7 +219,8 @@ Each step keeps `make verify` and the fixture tests green.
    test models. **Done.**
 3. Build a planner for decodes and continued prefills, which do not depend on
    outcomes, and drive them through plan → validate → commit. Keep the
-   current admission path.
+   current admission path. **Done.** Admissions reuse the same grouping and
+   execution helpers.
 4. Add `Scheduler::rank` and move admission into the plan using the slot
    option chosen in problem 1.
 5. Record plan-versus-execution divergence (mode fallback, EOS-freed slots).

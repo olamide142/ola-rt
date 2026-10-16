@@ -458,7 +458,9 @@ fn rate(units: usize, elapsed_micros: u64) -> Option<f64> {
 mod tests {
     use ola_core::{ModelDescriptor, RequestSpec};
     use ola_model::GeneratedToken;
-    use ola_runtime::{BatchCandidate, ExecutionPhase, FifoScheduler, IterationPlan, Runtime};
+    use ola_runtime::{
+        BatchCandidate, ExecutionPhase, ExecutionPlan, FifoScheduler, IterationPlan, Runtime,
+    };
 
     use super::*;
 
@@ -508,6 +510,7 @@ mod tests {
                 phase: ExecutionPhase::Decode,
                 finished: true,
             }],
+            execution_plan: ExecutionPlan::default(),
             plan: IterationPlan {
                 scheduled: vec![BatchCandidate {
                     request_id,
@@ -541,6 +544,7 @@ mod tests {
             at: Timestamp::from_micros(170),
             events: vec![ExecutorEvent::Idle],
             plan: IterationPlan::default(),
+            execution_plan: ExecutionPlan::default(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
@@ -572,6 +576,7 @@ mod tests {
             at: Timestamp::from_micros(at),
             events: vec![ExecutorEvent::Idle],
             plan: IterationPlan::default(),
+            execution_plan: ExecutionPlan::default(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
@@ -603,6 +608,7 @@ mod tests {
             at: Timestamp::from_micros(10),
             events: Vec::new(),
             plan: IterationPlan::default(),
+            execution_plan: ExecutionPlan::default(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
                 phase: BatchPhase::Prefill,
                 request_ids: vec![RequestId::new(1), RequestId::new(2)],
@@ -647,6 +653,7 @@ mod tests {
                 finished: true,
             }],
             plan: IterationPlan::default(),
+            execution_plan: ExecutionPlan::default(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
