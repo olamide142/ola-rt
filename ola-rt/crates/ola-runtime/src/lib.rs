@@ -7,6 +7,7 @@ mod executor;
 mod kv_cache;
 mod model_registry;
 mod plan;
+mod policy;
 mod runtime;
 mod scheduler;
 mod state;
@@ -34,6 +35,7 @@ pub use plan::{
     PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillView, QueuedView,
     ReleaseReason,
 };
+pub use policy::PolicyDescriptor;
 pub use runtime::Runtime;
 pub use scheduler::{FifoScheduler, Scheduler};
 pub use state::{

@@ -40,6 +40,8 @@ Done when one iteration can be explained by a complete, validated plan before mo
 
 ## P2: Composable execution policy
 
+Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
+
 - [ ] Define an immutable workload, lifecycle, model, KV, memory, device, and measurement snapshot.
 - [ ] Define `ExecutionPolicy` as runtime state to `ExecutionPlan`.
 - [ ] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.

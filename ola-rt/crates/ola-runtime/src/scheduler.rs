@@ -1,13 +1,16 @@
 use ola_core::RequestId;
 
-use crate::RuntimeState;
+use crate::{PolicyDescriptor, RuntimeState};
 
 /// Selects the next queued request without mutating runtime state.
 pub trait Scheduler {
     /// Selects one queued request or returns `None` when no work is eligible.
     ///
     /// Returning a non-queued ID is a policy error rejected by `Runtime`.
-    fn select(&mut self, state: &RuntimeState) -> Option<RequestId>;
+    fn select(&self, state: &RuntimeState) -> Option<RequestId>;
+
+    /// Returns the scheduler's stable name and configuration.
+    fn descriptor(&self) -> PolicyDescriptor;
 
     /// Ranks up to `limit` distinct queued requests in admission order.
     ///
@@ -15,7 +18,7 @@ pub trait Scheduler {
     /// starts. The default repeatedly calls [`select`](Self::select) on a
     /// private copy of the queue with earlier selections removed; schedulers
     /// with a cheaper ordering should override it.
-    fn rank(&mut self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
+    fn rank(&self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
         let mut remaining = state.clone();
         let mut ranked = Vec::new();
         while ranked.len() < limit {
@@ -39,11 +42,15 @@ pub trait Scheduler {
 pub struct FifoScheduler;
 
 impl Scheduler for FifoScheduler {
-    fn select(&mut self, state: &RuntimeState) -> Option<RequestId> {
+    fn select(&self, state: &RuntimeState) -> Option<RequestId> {
         state.queued_ids().next()
     }
 
-    fn rank(&mut self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("fifo")
+    }
+
+    fn rank(&self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
         state.queued_ids().take(limit).collect()
     }
 }

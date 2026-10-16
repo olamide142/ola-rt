@@ -3,7 +3,7 @@ use std::fmt;
 use ola_core::{ModelId, RequestId};
 use ola_model::KvCacheProfile;
 
-use crate::MemoryState;
+use crate::{MemoryState, PolicyDescriptor};
 
 /// Read-only inputs supplied to an executor admission policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,7 +119,10 @@ pub enum AdmissionDecision {
 /// Decides whether a scheduler-selected request may start now.
 pub trait AdmissionPolicy: Send {
     /// Evaluates one queued request against current observable resources.
-    fn decide(&mut self, context: &AdmissionContext) -> AdmissionDecision;
+    fn decide(&self, context: &AdmissionContext) -> AdmissionDecision;
+
+    /// Returns the policy's stable name and configuration.
+    fn descriptor(&self) -> PolicyDescriptor;
 
     /// Whether admitted reservations never exceed a model's KV pool.
     ///
@@ -135,7 +138,11 @@ pub trait AdmissionPolicy: Send {
 pub struct UnconstrainedAdmission;
 
 impl AdmissionPolicy for UnconstrainedAdmission {
-    fn decide(&mut self, context: &AdmissionContext) -> AdmissionDecision {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("unconstrained-admission")
+    }
+
+    fn decide(&self, context: &AdmissionContext) -> AdmissionDecision {
         AdmissionDecision::Admit {
             reserved_kv_bytes: estimate_kv_bytes(context).unwrap_or(0),
         }
@@ -147,11 +154,15 @@ impl AdmissionPolicy for UnconstrainedAdmission {
 pub struct MemoryAwareAdmission;
 
 impl AdmissionPolicy for MemoryAwareAdmission {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("memory-aware-admission")
+    }
+
     fn enforces_model_kv_capacity(&self) -> bool {
         true
     }
 
-    fn decide(&mut self, context: &AdmissionContext) -> AdmissionDecision {
+    fn decide(&self, context: &AdmissionContext) -> AdmissionDecision {
         let Some(profile) = context.kv_cache else {
             return AdmissionDecision::Reject(AdmissionReason::MissingKvCacheProfile);
         };

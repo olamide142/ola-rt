@@ -2811,7 +2811,11 @@ mod tests {
         struct FirstOnly;
 
         impl crate::BatchPolicy for FirstOnly {
-            fn select(&mut self, context: &crate::BatchContext) -> Vec<RequestId> {
+            fn descriptor(&self) -> crate::PolicyDescriptor {
+                crate::PolicyDescriptor::new("first-only")
+            }
+
+            fn select(&self, context: &crate::BatchContext) -> Vec<RequestId> {
                 context
                     .candidates
                     .first()

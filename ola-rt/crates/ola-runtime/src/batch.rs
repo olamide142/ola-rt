@@ -2,6 +2,8 @@ use std::num::NonZeroUsize;
 
 use ola_core::RequestId;
 
+use crate::PolicyDescriptor;
+
 /// Model phase represented by one iteration candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BatchPhase {
@@ -49,7 +51,10 @@ impl ExecutionBatch {
 /// backed by different artifacts. Prompt lengths are always positive.
 pub trait PrefillBatcher: Send {
     /// Returns an opaque deterministic bucket key for one prompt length.
-    fn bucket(&mut self, prompt_tokens: usize) -> usize;
+    fn bucket(&self, prompt_tokens: usize) -> usize;
+
+    /// Returns the grouping rule's stable name and configuration.
+    fn descriptor(&self) -> PolicyDescriptor;
 
     /// Assigns bucket keys to one complete same-model prefill set.
     ///
@@ -57,7 +62,7 @@ pub trait PrefillBatcher: Send {
     /// policies may override this method. The executor supplies an output
     /// slice with exactly the same length, preventing malformed policies from
     /// changing the cardinality of prepared work.
-    fn buckets(&mut self, prompt_tokens: &[usize], buckets: &mut [usize]) {
+    fn buckets(&self, prompt_tokens: &[usize], buckets: &mut [usize]) {
         debug_assert_eq!(prompt_tokens.len(), buckets.len());
         for (tokens, bucket) in prompt_tokens.iter().zip(buckets) {
             *bucket = self.bucket(*tokens);
@@ -72,7 +77,11 @@ pub trait PrefillBatcher: Send {
 pub struct UnbucketedPrefillBatcher;
 
 impl PrefillBatcher for UnbucketedPrefillBatcher {
-    fn bucket(&mut self, _prompt_tokens: usize) -> usize {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("unbucketed-prefill")
+    }
+
+    fn bucket(&self, _prompt_tokens: usize) -> usize {
         0
     }
 }
@@ -86,7 +95,11 @@ impl PrefillBatcher for UnbucketedPrefillBatcher {
 pub struct PowerOfTwoPrefillBatcher;
 
 impl PrefillBatcher for PowerOfTwoPrefillBatcher {
-    fn bucket(&mut self, prompt_tokens: usize) -> usize {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("power-of-two-prefill")
+    }
+
+    fn bucket(&self, prompt_tokens: usize) -> usize {
         power_of_two_bucket(prompt_tokens)
     }
 }
@@ -203,11 +216,18 @@ impl CostAwarePrefillBatcher {
 }
 
 impl PrefillBatcher for CostAwarePrefillBatcher {
-    fn bucket(&mut self, prompt_tokens: usize) -> usize {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("cost-aware-prefill").with_config(
+            "invocation_overhead_tokens",
+            self.invocation_overhead_tokens,
+        )
+    }
+
+    fn bucket(&self, prompt_tokens: usize) -> usize {
         power_of_two_bucket(prompt_tokens)
     }
 
-    fn buckets(&mut self, prompt_tokens: &[usize], buckets: &mut [usize]) {
+    fn buckets(&self, prompt_tokens: &[usize], buckets: &mut [usize]) {
         debug_assert_eq!(prompt_tokens.len(), buckets.len());
         match self.decide(prompt_tokens).selected {
             PrefillGroupingStrategy::Unbucketed => buckets.fill(0),
@@ -262,7 +282,10 @@ pub trait BatchPolicy: Send {
     ///
     /// The executor validates membership and uniqueness before executing the
     /// result. Returning IDs in candidate order makes traces easiest to compare.
-    fn select(&mut self, context: &BatchContext) -> Vec<RequestId>;
+    fn select(&self, context: &BatchContext) -> Vec<RequestId>;
+
+    /// Returns the policy's stable name and configuration.
+    fn descriptor(&self) -> PolicyDescriptor;
 }
 
 /// Compatibility policy that selects every eligible operation.
@@ -270,7 +293,11 @@ pub trait BatchPolicy: Send {
 pub struct UnboundedBatchPolicy;
 
 impl BatchPolicy for UnboundedBatchPolicy {
-    fn select(&mut self, context: &BatchContext) -> Vec<RequestId> {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("unbounded-batch")
+    }
+
+    fn select(&self, context: &BatchContext) -> Vec<RequestId> {
         context
             .candidates
             .iter()
@@ -301,7 +328,11 @@ impl FifoTokenBudgetPolicy {
 }
 
 impl BatchPolicy for FifoTokenBudgetPolicy {
-    fn select(&mut self, context: &BatchContext) -> Vec<RequestId> {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("fifo-token-budget").with_config("max_tokens", self.max_tokens)
+    }
+
+    fn select(&self, context: &BatchContext) -> Vec<RequestId> {
         let mut used = context.scheduled_tokens();
         let mut selected = Vec::new();
         for candidate in &context.candidates {
@@ -342,7 +373,7 @@ mod tests {
 
     #[test]
     fn token_budget_selects_a_fifo_prefix_across_iteration_phases() {
-        let mut policy = FifoTokenBudgetPolicy::new(4).unwrap();
+        let policy = FifoTokenBudgetPolicy::new(4).unwrap();
         let context = BatchContext {
             scheduled: vec![candidate(1, BatchPhase::Decode, 1)],
             candidates: vec![
@@ -360,7 +391,7 @@ mod tests {
 
     #[test]
     fn oversized_prefill_runs_alone_to_preserve_progress() {
-        let mut policy = FifoTokenBudgetPolicy::new(4).unwrap();
+        let policy = FifoTokenBudgetPolicy::new(4).unwrap();
         let context = BatchContext {
             scheduled: Vec::new(),
             candidates: vec![candidate(1, BatchPhase::Prefill, 9)],
@@ -376,7 +407,7 @@ mod tests {
 
     #[test]
     fn power_of_two_prefill_buckets_group_nearby_lengths() {
-        let mut batcher = PowerOfTwoPrefillBatcher;
+        let batcher = PowerOfTwoPrefillBatcher;
 
         assert_eq!(batcher.bucket(1), 1);
         assert_eq!(batcher.bucket(5), 8);
@@ -404,7 +435,7 @@ mod tests {
     #[test]
     fn cost_aware_prefill_assigns_the_selected_workload_level_grouping() {
         let lengths = [5, 7, 9, 63];
-        let mut batcher = CostAwarePrefillBatcher::new(32);
+        let batcher = CostAwarePrefillBatcher::new(32);
 
         assert_eq!(
             batcher.decide(&lengths).selected,
