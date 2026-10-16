@@ -30,8 +30,9 @@ pub use kv_cache::{
 };
 pub use model_registry::ModelRegistry;
 pub use plan::{
-    DecodeView, ExecutionPlan, LifecycleAction, PlanError, PlanEstimates, PlannedBatch,
-    PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillView, QueuedView,
+    DecodeView, ExecutionPlan, LifecycleAction, PlanDivergence, PlanError, PlanEstimates,
+    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillView, QueuedView,
+    ReleaseReason,
 };
 pub use runtime::Runtime;
 pub use scheduler::{FifoScheduler, Scheduler};

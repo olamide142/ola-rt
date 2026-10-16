@@ -175,6 +175,43 @@ impl PlannedDeferral {
     }
 }
 
+/// Why a request left the live set without being a predicted release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseReason {
+    /// The model selected an end-of-sequence token.
+    EndOfSequence,
+    /// The request reached `max_new_tokens` in a row the planner does not
+    /// reuse slots for, such as the first prefill of a one-token request.
+    OutputLimit,
+    /// Model execution or output decoding failed.
+    Failure,
+}
+
+/// One way committed execution differed from its validated plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanDivergence {
+    /// A planned tensor invocation ran as individual invocations because the
+    /// model's declared hook returned `None`.
+    ModeFallback {
+        /// Index of the batch in [`ExecutionPlan::batches`].
+        batch_index: usize,
+    },
+    /// An admitted request could not create its session; its prefill row was
+    /// dropped from the batch.
+    SessionCreationFailed {
+        /// Request that failed instead of starting.
+        request_id: RequestId,
+    },
+    /// A planned row ended its request, freeing a slot and reservation that
+    /// the plan could not reuse this iteration.
+    UnplannedRelease {
+        /// Request that left the live set.
+        request_id: RequestId,
+        /// Observed cause.
+        reason: ReleaseReason,
+    },
+}
+
 /// Deterministic work estimates derived from a plan.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlanEstimates {

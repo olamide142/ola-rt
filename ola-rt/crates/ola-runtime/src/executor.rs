@@ -16,10 +16,10 @@ use ola_model::{
 use crate::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, BatchCandidate,
     BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, FifoScheduler, IterationPlan, LifecycleAction, PlanError, PlannedBatch,
-    PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher, PrefillView,
-    QueuedView, Runtime, RuntimeError, RuntimeState, Scheduler, UnboundedBatchPolicy,
-    UnbucketedPrefillBatcher, UnconstrainedAdmission,
+    ExecutionPlan, FifoScheduler, IterationPlan, LifecycleAction, PlanDivergence, PlanError,
+    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher,
+    PrefillView, QueuedView, ReleaseReason, Runtime, RuntimeError, RuntimeState, Scheduler,
+    UnboundedBatchPolicy, UnbucketedPrefillBatcher, UnconstrainedAdmission,
 };
 
 /// Final output retained after successful execution.
@@ -118,6 +118,10 @@ pub struct ExecutorIteration {
     pub plan: IterationPlan,
     /// Validated plan committed by this iteration.
     pub execution_plan: ExecutionPlan,
+    /// Ways execution differed from `execution_plan`: lifecycle failures,
+    /// then tensor fallbacks in batch order, then unpredicted releases in
+    /// event order. Empty when execution matched the plan exactly.
+    pub divergences: Vec<PlanDivergence>,
     /// Model invocations used to execute the selected plan.
     pub execution_batches: Vec<ExecutionBatch>,
     /// Live generation sessions after the iteration.
@@ -261,12 +265,14 @@ struct PlannedAdmission {
 struct BatchOutcome {
     indexed_events: Vec<(usize, ExecutorEvent)>,
     execution_batches: Vec<ExecutionBatch>,
+    divergences: Vec<PlanDivergence>,
 }
 
 impl BatchOutcome {
     fn extend(&mut self, other: Self) {
         self.indexed_events.extend(other.indexed_events);
         self.execution_batches.extend(other.execution_batches);
+        self.divergences.extend(other.divergences);
     }
 }
 
@@ -473,8 +479,12 @@ impl<S: Scheduler> Executor<S> {
         execution_plan
             .validate(&self.planning_view(&admissions))
             .map_err(ExecutorError::InvalidPlan)?;
-        let (mut events, execution_batches) =
-            self.commit_plan(&execution_plan, &mut admissions, at)?;
+        let committed = self.commit_plan(&execution_plan, &mut admissions, at)?;
+        let mut events = committed
+            .indexed_events
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect::<Vec<_>>();
         if events.is_empty() {
             events.push(ExecutorEvent::Idle);
         }
@@ -485,7 +495,8 @@ impl<S: Scheduler> Executor<S> {
             events,
             plan,
             execution_plan,
-            execution_batches,
+            divergences: committed.divergences,
+            execution_batches: committed.execution_batches,
             active_requests: self.live_request_count(),
             queued_requests: self.runtime.state().queued_len(),
             kv_cache_bytes: self.runtime.state().memory.kv_cache_bytes,
@@ -884,13 +895,14 @@ impl<S: Scheduler> Executor<S> {
     }
 
     /// Commits a validated plan: lifecycle actions first, then every
-    /// invocation in order. Returns events sorted by planned index.
+    /// invocation in order. Returns events sorted by planned index and every
+    /// divergence from the plan.
     fn commit_plan(
         &mut self,
         plan: &ExecutionPlan,
         admissions: &mut BTreeMap<RequestId, PlannedAdmission>,
         at: Timestamp,
-    ) -> Result<(Vec<ExecutorEvent>, Vec<ExecutionBatch>), ExecutorError> {
+    ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
         let mut admitted = BTreeMap::new();
         let admit_events = plan
@@ -933,6 +945,11 @@ impl<S: Scheduler> Executor<S> {
                             outcome
                                 .indexed_events
                                 .push((admit_events[request_id], event));
+                            outcome
+                                .divergences
+                                .push(PlanDivergence::SessionCreationFailed {
+                                    request_id: *request_id,
+                                });
                         }
                     }
                 }
@@ -1000,7 +1017,8 @@ impl<S: Scheduler> Executor<S> {
             .retain(|request_id| !planned.contains(request_id));
         self.prefill_ready
             .retain(|request_id| !planned.contains(request_id));
-        for batch in &plan.batches {
+        for (batch_index, batch) in plan.batches.iter().enumerate() {
+            let mut planned_tensor = batch.mode == BatchExecutionMode::Tensor;
             let executed = match batch.phase {
                 PlannedPhase::Decode => {
                     let members = batch
@@ -1037,7 +1055,9 @@ impl<S: Scheduler> Executor<S> {
                         continue;
                     }
                     if batch.rows.len() == 1 {
+                        // Already recorded as a session-creation failure.
                         batch.mode = BatchExecutionMode::Individual;
+                        planned_tensor = false;
                     }
                     let members = batch
                         .rows
@@ -1051,17 +1071,22 @@ impl<S: Scheduler> Executor<S> {
                     self.execute_prefill_batch(&batch, members, at)?
                 }
             };
+            if planned_tensor
+                && executed
+                    .execution_batches
+                    .iter()
+                    .all(|executed| executed.mode == BatchExecutionMode::Individual)
+            {
+                outcome
+                    .divergences
+                    .push(PlanDivergence::ModeFallback { batch_index });
+            }
             outcome.extend(executed);
         }
         outcome.indexed_events.sort_by_key(|(index, _)| *index);
-        Ok((
-            outcome
-                .indexed_events
-                .into_iter()
-                .map(|(_, event)| event)
-                .collect(),
-            outcome.execution_batches,
-        ))
+        let releases = unplanned_releases(plan, &outcome);
+        outcome.divergences.extend(releases);
+        Ok(outcome)
     }
 
     /// Groups decode rows by loaded model in first-appearance order.
@@ -1739,6 +1764,55 @@ impl<S: Scheduler> Executor<S> {
     }
 }
 
+/// Planned rows whose request left the live set without being predicted.
+fn unplanned_releases(plan: &ExecutionPlan, outcome: &BatchOutcome) -> Vec<PlanDivergence> {
+    let planned = plan
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.rows)
+        .map(|row| row.request_id)
+        .collect::<BTreeSet<_>>();
+    let excluded = plan
+        .predicted_releases
+        .iter()
+        .copied()
+        .chain(
+            outcome
+                .divergences
+                .iter()
+                .filter_map(|divergence| match divergence {
+                    PlanDivergence::SessionCreationFailed { request_id } => Some(*request_id),
+                    _ => None,
+                }),
+        )
+        .collect::<BTreeSet<_>>();
+    outcome
+        .indexed_events
+        .iter()
+        .filter_map(|(_, event)| {
+            let (request_id, reason) = match event {
+                ExecutorEvent::Token {
+                    request_id,
+                    token,
+                    finished: true,
+                    ..
+                } => (
+                    *request_id,
+                    if token.is_end_of_sequence {
+                        ReleaseReason::EndOfSequence
+                    } else {
+                        ReleaseReason::OutputLimit
+                    },
+                ),
+                ExecutorEvent::Failed { request_id, .. } => (*request_id, ReleaseReason::Failure),
+                _ => return None,
+            };
+            (planned.contains(&request_id) && !excluded.contains(&request_id))
+                .then_some(PlanDivergence::UnplannedRelease { request_id, reason })
+        })
+        .collect()
+}
+
 const fn budget_deferral(candidate: BatchCandidate, event_index: usize) -> PlannedDeferral {
     PlannedDeferral::Budget {
         request_id: candidate.request_id,
@@ -2005,6 +2079,29 @@ mod tests {
 
     fn individual_artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IndividualIncrementModel)
+    }
+
+    /// Declares every batch hook but implements none, and rejects sessions
+    /// with a non-zero temperature, so execution diverges from plans.
+    struct DivergentModel;
+
+    impl CausalModel for DivergentModel {
+        fn batch_capabilities(&self) -> BatchCapabilities {
+            BatchCapabilities::ALL
+        }
+
+        fn create_session(
+            &self,
+            generation: GenerationConfig,
+        ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
+            if generation.temperature != 0.0 {
+                return Err(ModelExecutionError::new(
+                    ExecutionStage::SessionCreation,
+                    "sampling is unsupported",
+                ));
+            }
+            Ok(Box::new(IncrementSession::default()))
+        }
     }
 
     fn profiled_artifact(capacity_bytes: u64) -> CausalLanguageModel {
@@ -2798,6 +2895,13 @@ mod tests {
             }]
         );
         assert_eq!(finished.queued_requests, 1);
+        assert_eq!(
+            finished.divergences,
+            vec![PlanDivergence::UnplannedRelease {
+                request_id: early,
+                reason: ReleaseReason::EndOfSequence,
+            }]
+        );
 
         let refilled = executor.step_iteration(Timestamp::from_micros(30)).unwrap();
         assert!(matches!(
@@ -2805,6 +2909,75 @@ mod tests {
             [ExecutorEvent::Token { request_id, phase: ExecutionPhase::Prefill, .. }]
                 if *request_id == waiting
         ));
+    }
+
+    #[test]
+    fn divergences_record_fallbacks_and_session_failures() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 3).unwrap();
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "divergent"),
+                CausalLanguageModel::new(NumericTokenizer, DivergentModel),
+            )
+            .unwrap();
+        let first = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let mut sampled = request("5", 3);
+        sampled.generation.temperature = 1.0;
+        let sampled = executor.submit(sampled, Timestamp::ZERO).unwrap();
+        let third = executor.submit(request("9", 3), Timestamp::ZERO).unwrap();
+
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(admitted.execution_plan.batches.len(), 1);
+        assert_eq!(
+            admitted.execution_plan.batches[0].mode,
+            BatchExecutionMode::Tensor
+        );
+        assert_eq!(
+            admitted.divergences,
+            vec![
+                PlanDivergence::SessionCreationFailed {
+                    request_id: sampled
+                },
+                PlanDivergence::ModeFallback { batch_index: 0 },
+            ]
+        );
+        assert_eq!(executor.active_request_count(), 2);
+        assert!(
+            admitted
+                .execution_batches
+                .iter()
+                .all(|batch| batch.mode == BatchExecutionMode::Individual)
+        );
+        assert_eq!(
+            admitted
+                .execution_batches
+                .iter()
+                .flat_map(|batch| batch.request_ids.clone())
+                .collect::<Vec<_>>(),
+            vec![first, third]
+        );
+    }
+
+    #[test]
+    fn one_token_admissions_are_unplanned_output_limit_releases() {
+        let mut executor = Executor::default();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let request_id = executor.submit(request("1", 1), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(
+            iteration.divergences,
+            vec![PlanDivergence::UnplannedRelease {
+                request_id,
+                reason: ReleaseReason::OutputLimit,
+            }]
+        );
+        let decoded = executor.step_iteration(Timestamp::from_micros(20));
+        assert!(decoded.unwrap().divergences.is_empty());
     }
 
     #[test]

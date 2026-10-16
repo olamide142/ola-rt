@@ -1,8 +1,10 @@
 # ExecutionPlan design proposal
 
-Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–4 are
+Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–5 are
 implemented: every `step_iteration` is planned, validated, and committed as
-one `ExecutionPlan`, exposed as `ExecutorIteration::execution_plan`.
+one `ExecutionPlan`, exposed as `ExecutorIteration::execution_plan`, and
+every difference between the plan and execution is listed in
+`ExecutorIteration::divergences`.
 
 ## Goal
 
@@ -224,7 +226,9 @@ Each step keeps `make verify` and the fixture tests green.
    option chosen in problem 1. **Done.** Final
    continued-prefill chunks of one-token requests are also predicted
    releases, matching the historical refill behaviour.
-5. Record plan-versus-execution divergence (mode fallback, EOS-freed slots).
+5. Record plan-versus-execution divergence (mode fallback, EOS-freed slots). **Done:**
+   `PlanDivergence::{ModeFallback, SessionCreationFailed, UnplannedRelease}`
+   with `ReleaseReason::{EndOfSequence, OutputLimit, Failure}`.
 6. Add the serialized report. Migrate `ola-observe` and the UI from
    `IterationPlan` to `ExecutionPlan` and drop the projection.
 7. Add an oracle test that compares token outputs from planned multi-request

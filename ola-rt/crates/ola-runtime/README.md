@@ -59,7 +59,11 @@ committed; `ExecutorIteration::execution_plan` exposes it. Because the plan is
 built before any model runs, a slot is reused in the same iteration only when
 its request must finish by reaching `max_new_tokens`. Slots freed by EOS or
 failure are refilled on the next iteration, and the waiting queue head is
-recorded as a `PlannedDeferral::Slots`.
+recorded as a `PlannedDeferral::Slots`. `ExecutorIteration::divergences` lists every way
+execution differed from the plan: declared tensor hooks that fell back to
+individual calls, admitted requests whose session creation failed, and planned
+rows that ended their request without being predicted (EOS, failure, or a
+one-token admission).
 
 The iteration path groups selected prefill and decode operations by loaded
 model. A model declares `CausalModel::batch_capabilities` and implements

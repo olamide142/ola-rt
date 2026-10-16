@@ -511,6 +511,7 @@ mod tests {
                 finished: true,
             }],
             execution_plan: ExecutionPlan::default(),
+            divergences: Vec::new(),
             plan: IterationPlan {
                 scheduled: vec![BatchCandidate {
                     request_id,
@@ -545,6 +546,7 @@ mod tests {
             events: vec![ExecutorEvent::Idle],
             plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
+            divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
@@ -577,6 +579,7 @@ mod tests {
             events: vec![ExecutorEvent::Idle],
             plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
+            divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
@@ -609,6 +612,7 @@ mod tests {
             events: Vec::new(),
             plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
+            divergences: Vec::new(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
                 phase: BatchPhase::Prefill,
                 request_ids: vec![RequestId::new(1), RequestId::new(2)],
@@ -654,6 +658,7 @@ mod tests {
             }],
             plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
+            divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,
             queued_requests: 0,
