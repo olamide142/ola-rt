@@ -44,7 +44,7 @@ mod tests {
 
     #[test]
     fn exposes_burn_through_the_compute_boundary() {
-        let adapter = BurnComputeBackend::new(Device::ndarray());
+        let adapter = BurnComputeBackend::new(Device::flex());
 
         assert_eq!(adapter.name(), "burn");
         let _ = adapter.device();

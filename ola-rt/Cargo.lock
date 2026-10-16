@@ -1018,6 +1018,7 @@ dependencies = [
  "burn-autodiff",
  "burn-core",
  "burn-cubecl",
+ "burn-flex",
  "burn-fusion 0.22.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "burn-std 0.22.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]

@@ -94,8 +94,8 @@ OLA_LLAMA_CONFORMANCE_DIR=/tmp/ola-rt-tiny-random-llama \
   llama::factory::tests::matches_pinned_reference_logits -- --ignored --exact
 ```
 
-Burn's F32 `NdArray` output is compared with the scalar F64 oracle using an
-absolute tolerance of `2e-5`. The tolerance covers accumulation-order and
+Burn's F32 `Flex` CPU output (NdArray before the Burn 0.22 migration) is
+compared with the scalar F64 oracle using an absolute tolerance of `2e-5`. The tolerance covers accumulation-order and
 elementary-function differences while remaining small relative to the observed
 logit magnitudes. Argmax token IDs must match exactly.
 

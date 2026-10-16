@@ -69,7 +69,7 @@ impl RequestMeasurement {
         let mean_inter_token_micros = decode_span_micros.and_then(|span| {
             let gaps = output_tokens.checked_sub(1)?;
             let gaps = u64::try_from(gaps).ok()?;
-            if gaps == 0 { None } else { Some(span / gaps) }
+            span.checked_div(gaps)
         });
 
         Some(Self {

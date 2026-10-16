@@ -50,7 +50,7 @@ pub enum LocalDevice {
 impl LocalDevice {
     const fn label(self) -> &'static str {
         match self {
-            Self::Cpu => "local / Burn NdArray<f32> / CPU",
+            Self::Cpu => "local / Burn Flex<f32> / CPU",
             Self::Wgpu => "local / Burn WGPU<f32> / GPU",
             Self::Cuda => "local / Burn CUDA<f32> / GPU",
         }
@@ -467,7 +467,7 @@ fn load_model(
     device: LocalDevice,
 ) -> Result<CausalLanguageModel, String> {
     match device {
-        LocalDevice::Cpu => LlamaFactory::new(Device::ndarray())
+        LocalDevice::Cpu => LlamaFactory::new(Device::flex())
             .load_local(directory)
             .map_err(|error| error.to_string()),
         #[cfg(feature = "wgpu")]
@@ -1250,7 +1250,7 @@ mod tests {
         assert!(chunked.contains("tensor calls 1 → 2"));
         assert!(chunked.contains("output preserved"));
         assert!(chunked.contains("fairness (1 warm-up, 3 measured, two active)"));
-        assert!(chunked.contains("p50 ms"));
+        assert!(chunked.contains("p50/p95 ms"));
 
         let paths = fs::read_dir(&results_directory)
             .unwrap()

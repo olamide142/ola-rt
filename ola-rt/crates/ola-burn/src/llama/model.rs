@@ -950,7 +950,10 @@ mod tests {
 
         let repeated = repeat_key_value(tensor, 2).into_data();
 
-        assert_eq!(repeated.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(
+            repeated.try_to_vec::<f32>().unwrap(),
+            vec![1.0, 1.0, 2.0, 2.0]
+        );
     }
 
     #[test]
@@ -1006,8 +1009,8 @@ mod tests {
     }
 
     fn assert_logits_close(left: Tensor<3>, right: Tensor<3>, tolerance: f32) {
-        let left = left.into_data().to_vec::<f32>().unwrap();
-        let right = right.into_data().to_vec::<f32>().unwrap();
+        let left = left.into_data().try_to_vec::<f32>().unwrap();
+        let right = right.into_data().try_to_vec::<f32>().unwrap();
         assert_eq!(left.len(), right.len());
         for (index, (left, right)) in left.into_iter().zip(right).enumerate() {
             let difference = (left - right).abs();

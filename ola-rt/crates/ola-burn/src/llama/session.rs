@@ -178,7 +178,7 @@ impl CausalModel for BurnLlamaModel {
         let selected = match Tensor::cat(final_rows, 0)
             .argmax(2)
             .into_data()
-            .to_vec::<i64>()
+            .try_to_vec_as::<i64>()
         {
             Ok(selected) => selected,
             Err(error) => {
@@ -316,7 +316,7 @@ impl CausalModel for BurnLlamaModel {
                 }
             }
         };
-        let selected = match logits.argmax(2).into_data().to_vec::<i64>() {
+        let selected = match logits.argmax(2).into_data().try_to_vec_as::<i64>() {
             Ok(selected) => selected,
             Err(error) => {
                 return Some(batch_error(
@@ -448,7 +448,7 @@ impl CausalModel for BurnLlamaModel {
             .slice([0..batch_size, 0..1, 0..self.config.vocab_size])
             .argmax(2)
             .into_data()
-            .to_vec::<i64>()
+            .try_to_vec_as::<i64>()
         {
             Ok(selected) => selected,
             Err(error) => {
@@ -525,7 +525,7 @@ impl LlamaSession {
             .slice([0..1, sequence_length - 1..sequence_length, 0..vocabulary])
             .argmax(2)
             .into_data()
-            .to_vec::<i64>()
+            .try_to_vec_as::<i64>()
             .map_err(|error| {
                 ModelExecutionError::new(stage, format!("failed to read selected token: {error}"))
             })?;

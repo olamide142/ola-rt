@@ -40,12 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(8);
 
     match backend.as_str() {
-        "cpu" => run(
-            Device::ndarray(),
-            artifact_directory,
-            prompt,
-            max_new_tokens,
-        ),
+        "cpu" => run(Device::flex(), artifact_directory, prompt, max_new_tokens),
         #[cfg(feature = "cuda")]
         "cuda" => run(Device::cuda(0), artifact_directory, prompt, max_new_tokens),
         #[cfg(feature = "wgpu")]

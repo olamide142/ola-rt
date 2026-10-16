@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn factory_is_registered_by_architecture_not_model_name() {
-        let factory = LlamaFactory::new(Device::ndarray());
+        let factory = LlamaFactory::new(Device::flex());
 
         assert_eq!(factory.architecture().as_str(), "llama");
     }
@@ -289,7 +289,7 @@ mod tests {
             "fixture size differs; verify the pinned SHA-256 before using expected logits"
         );
 
-        let factory = LlamaFactory::new(Device::ndarray());
+        let factory = LlamaFactory::new(Device::flex());
         let loaded = factory.load_native(&directory).unwrap();
         let device = Default::default();
         let input: Tensor<2, Int> =
@@ -299,7 +299,7 @@ mod tests {
             .clone()
             .slice([0..1, 0..3, 0..16])
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         #[rustfmt::skip]
         let expected: [f64; 48] = [
@@ -324,7 +324,7 @@ mod tests {
             );
         }
 
-        let selected = logits.argmax(2).into_data().to_vec::<i64>().unwrap();
+        let selected = logits.argmax(2).into_data().try_to_vec_as::<i64>().unwrap();
         assert_eq!(selected, vec![5_971, 1_789, 19_053]);
     }
 
@@ -337,7 +337,7 @@ mod tests {
         let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
             .map(PathBuf::from)
             .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
-        let cpu_device = Device::ndarray();
+        let cpu_device = Device::flex();
         let gpu_device = Device::wgpu(Default::default());
         let cpu = LlamaFactory::new(cpu_device.clone())
             .load_native(&directory)
@@ -354,14 +354,14 @@ mod tests {
             ))
             .slice([0..1, 0..3, 0..16])
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let gpu_logits = gpu
             .module()
             .forward(Tensor::from_data(TensorData::new(ids, [1, 3]), &gpu_device))
             .slice([0..1, 0..3, 0..16])
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         assert_eq!(cpu_logits.len(), gpu_logits.len());

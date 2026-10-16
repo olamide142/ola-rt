@@ -449,11 +449,11 @@ mod tests {
         let values = Tensor::cat(values, 2);
 
         assert_eq!(
-            keys.into_data().to_vec::<f32>().unwrap(),
+            keys.into_data().try_to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         );
         assert_eq!(
-            values.into_data().to_vec::<f32>().unwrap(),
+            values.into_data().try_to_vec::<f32>().unwrap(),
             vec![11.0, 12.0, 13.0, 14.0, 15.0, 16.0]
         );
     }

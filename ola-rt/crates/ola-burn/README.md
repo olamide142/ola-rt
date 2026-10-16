@@ -84,7 +84,7 @@ blocks. Experiments can override both values before loading an artifact:
 use burn::tensor::Device;
 use ola_burn::llama::{LlamaFactory, LlamaKvCacheConfig};
 
-let factory = LlamaFactory::new(Device::ndarray())
+let factory = LlamaFactory::new(Device::flex())
     .with_kv_cache(LlamaKvCacheConfig::new(8_192, 32));
 # let _ = factory;
 ```
@@ -148,7 +148,7 @@ cargo run -p ola-burn --example run_llama -- \
   8
 ```
 
-The default is Burn's CPU NdArray device. WGPU is an opt-in path that
+The default is Burn's pure-Rust CPU Flex device. WGPU is an opt-in path that
 uses the platform graphics API and is the simplest GPU route on a machine
 without a CUDA toolkit:
 

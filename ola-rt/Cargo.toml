@@ -21,7 +21,7 @@ rust-version = "1.95"
 [workspace.dependencies]
 # Keep the foundation adapter lean. Additional accelerator features must be
 # enabled deliberately by the model/execution work that needs them.
-burn = { version = "0.22.0", default-features = false, features = ["std", "ndarray", "extension"] }
+burn = { version = "0.22.0", default-features = false, features = ["std", "flex", "extension"] }
 burn-backend = { version = "0.22.0", default-features = false }
 burn-cubecl = { version = "0.22.0", default-features = false }
 burn-store = { version = "0.22.0", default-features = false, features = ["std", "safetensors", "pytorch"] }
