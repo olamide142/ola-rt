@@ -1,7 +1,7 @@
 # ExecutionPolicy design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–4 are implemented.
+Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–5 are implemented.
 
 ## Goal
 
@@ -192,7 +192,13 @@ Each step keeps `make verify` and `make test-fixture` green.
    replaces `schedule_next` for executor-less lifecycle probes.
 5. **`DecisionRecord`.** Add the record, `PrefillGrouping` returning
    alternatives, `CostAwarePrefillDecision` preserved, capability fallbacks,
-   and `PlanReport` v2.
+   and `PlanReport` v2. **Done.**
+   Deviation: `PrefillBatcher` keeps its name and gains `group(&self, lengths)
+   -> GroupingDecision` (buckets plus optional `CostAwarePrefillDecision`)
+   instead of being renamed `PrefillGrouping`; the rename would have churned
+   `ola-bench` signatures without changing behaviour. Admission records keep
+   the complete `AdmissionContext` and decision; selection records keep the
+   complete `BatchContext`.
 6. **Tests:**
    - determinism: the same snapshot planned twice gives equal decisions;
    - no mutation: an adversarial policy's invalid plan leaves state

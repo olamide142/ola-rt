@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use ola_core::RequestId;
 
-use crate::PolicyDescriptor;
+use crate::{GroupingDecision, PolicyDescriptor};
 
 /// Model phase represented by one iteration candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +66,20 @@ pub trait PrefillBatcher: Send {
         debug_assert_eq!(prompt_tokens.len(), buckets.len());
         for (tokens, bucket) in prompt_tokens.iter().zip(buckets) {
             *bucket = self.bucket(*tokens);
+        }
+    }
+
+    /// Groups one model's rows and reports any alternatives weighed.
+    ///
+    /// Execution policies call this so decision records keep the rule's
+    /// reasoning. The default wraps [`buckets`](Self::buckets) and reports no
+    /// alternatives.
+    fn group(&self, prompt_tokens: &[usize]) -> GroupingDecision {
+        let mut buckets = vec![0; prompt_tokens.len()];
+        self.buckets(prompt_tokens, &mut buckets);
+        GroupingDecision {
+            buckets,
+            cost_estimates: None,
         }
     }
 }
@@ -236,6 +250,16 @@ impl PrefillBatcher for CostAwarePrefillBatcher {
                     *bucket = power_of_two_bucket(*tokens);
                 }
             }
+        }
+    }
+
+    fn group(&self, prompt_tokens: &[usize]) -> GroupingDecision {
+        let decision = self.decide(prompt_tokens);
+        let mut buckets = vec![0; prompt_tokens.len()];
+        self.buckets(prompt_tokens, &mut buckets);
+        GroupingDecision {
+            buckets,
+            cost_estimates: Some(decision),
         }
     }
 }

@@ -453,7 +453,8 @@ mod tests {
     use ola_core::{ModelDescriptor, RequestSpec};
     use ola_model::GeneratedToken;
     use ola_runtime::{
-        BatchPhase, ExecutionPhase, ExecutionPlan, PlannedBatch, PlannedPhase, PlannedRow, Runtime,
+        BatchPhase, DecisionRecord, ExecutionPhase, ExecutionPlan, PlannedBatch, PlannedPhase,
+        PlannedRow, Runtime,
     };
 
     use super::*;
@@ -518,6 +519,7 @@ mod tests {
                 }],
                 ..ExecutionPlan::default()
             },
+            decision: DecisionRecord::default(),
             divergences: Vec::new(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
                 phase: BatchPhase::Decode,
@@ -544,6 +546,7 @@ mod tests {
             at: Timestamp::from_micros(170),
             events: vec![ExecutorEvent::Idle],
             execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,
@@ -576,6 +579,7 @@ mod tests {
             at: Timestamp::from_micros(at),
             events: vec![ExecutorEvent::Idle],
             execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,
@@ -608,6 +612,7 @@ mod tests {
             at: Timestamp::from_micros(10),
             events: Vec::new(),
             execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
             divergences: Vec::new(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
                 phase: BatchPhase::Prefill,
@@ -653,6 +658,7 @@ mod tests {
                 finished: true,
             }],
             execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),
             active_requests: 0,

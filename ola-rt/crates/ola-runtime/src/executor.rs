@@ -12,11 +12,11 @@ use ola_model::{
 };
 
 use crate::{
-    AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, ExecutionPolicy, ExecutorLimits, LifecycleAction, ModelSnapshot, PlanDivergence,
-    PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot, PolicyDescriptor,
-    PolicyError, PolicyMeasurements, PrefillView, QueuedRequest, ReleaseReason, Runtime,
-    RuntimeError, RuntimeState, composed::is_complete_prompt,
+    AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecisionRecord, DecodeView,
+    ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, LifecycleAction, ModelSnapshot,
+    PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot,
+    PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements, PrefillView, QueuedRequest,
+    ReleaseReason, Runtime, RuntimeError, RuntimeState, composed::is_complete_prompt,
 };
 
 /// Final output retained after successful execution.
@@ -113,6 +113,9 @@ pub struct ExecutorIteration {
     pub events: Vec<ExecutorEvent>,
     /// Validated plan committed by this iteration.
     pub execution_plan: ExecutionPlan,
+    /// Why the policy planned it: ranking, admission inputs and outcomes,
+    /// batch selections, grouping alternatives, and capability fallbacks.
+    pub decision: DecisionRecord,
     /// Ways execution differed from `execution_plan`: lifecycle failures,
     /// then tensor fallbacks in batch order, then unpredicted releases in
     /// event order. Empty when execution matched the plan exactly.
@@ -423,11 +426,10 @@ impl Executor {
         self.validate_iteration_time(at)?;
         self.prepare_queued();
         let snapshot = self.snapshot(at);
-        let execution_plan = self
-            .policy
-            .plan(&snapshot)
-            .map_err(ExecutorError::Policy)?
-            .plan;
+        let PolicyDecision {
+            plan: execution_plan,
+            record: decision,
+        } = self.policy.plan(&snapshot).map_err(ExecutorError::Policy)?;
         execution_plan
             .validate(&snapshot, self.policy.enforces_model_kv_capacity())
             .map_err(ExecutorError::InvalidPlan)?;
@@ -446,6 +448,7 @@ impl Executor {
             at,
             events,
             execution_plan,
+            decision,
             divergences: committed.divergences,
             execution_batches: committed.execution_batches,
             active_requests: self.live_request_count(),
@@ -2545,6 +2548,143 @@ mod tests {
             [ExecutorEvent::Token { request_id: id, generated_tokens: 2, .. }] if *id == request_id
         ));
         assert_eq!(observed.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn decision_records_ranking_admission_and_budget_selection() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 3)
+            .unwrap()
+            .with_policy(
+                ComposedPolicy::default().with_batch(crate::FifoTokenBudgetPolicy::new(2).unwrap()),
+            );
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("10", 3), Timestamp::ZERO).unwrap();
+        let third = executor.submit(request("20", 1), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        let decision = &iteration.decision;
+
+        assert_eq!(
+            decision.policy.to_string(),
+            "composed[fifo,unconstrained-admission,fifo-token-budget{max_tokens=2},unbucketed-prefill]"
+        );
+        assert_eq!(
+            decision.ranking,
+            crate::RankingRecord {
+                slots_available: 3,
+                limit: 4,
+                ranked: vec![first, second, third],
+            }
+        );
+        let budget = decision
+            .admissions
+            .iter()
+            .map(|record| match &record.outcome {
+                crate::AdmissionOutcome::Decided {
+                    budget_selected, ..
+                } => (record.request_id, *budget_selected),
+                other => panic!("unexpected outcome {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            budget,
+            vec![
+                (first, Some(true)),
+                (second, Some(true)),
+                (third, Some(false))
+            ]
+        );
+        let admission_selections = decision
+            .selections
+            .iter()
+            .filter(|selection| selection.stage == crate::SelectionStage::Admission)
+            .collect::<Vec<_>>();
+        assert_eq!(admission_selections.len(), 3);
+        assert_eq!(admission_selections[2].context.scheduled_tokens(), 2);
+        assert!(admission_selections[2].selected.is_empty());
+    }
+
+    #[test]
+    fn decision_records_grouping_alternatives_and_capability_fallbacks() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_policy(
+                ComposedPolicy::default().with_grouping(crate::CostAwarePrefillBatcher::new(32)),
+            );
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "individual-increment"),
+                individual_artifact(),
+            )
+            .unwrap();
+        executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        executor
+            .submit(request("1 2 3 4 5", 3), Timestamp::ZERO)
+            .unwrap();
+
+        let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        let grouping = &admitted.decision.grouping;
+        assert_eq!(grouping.len(), 1);
+        assert_eq!(grouping[0].phase, PlannedPhase::Prefill);
+        assert_eq!(grouping[0].prompt_tokens, vec![1, 5]);
+        let estimates = grouping[0].decision.cost_estimates.unwrap();
+        assert_eq!(
+            estimates.selected,
+            crate::PrefillGroupingStrategy::Unbucketed
+        );
+        assert_eq!(estimates.unbucketed.dense_input_tokens, 10);
+        assert_eq!(estimates.power_of_two.invocations, 2);
+        assert_eq!(
+            admitted.decision.capability_fallbacks,
+            vec![crate::CapabilityFallback {
+                phase: PlannedPhase::Prefill,
+                model_id: "tiny".into(),
+                rows: 2,
+                missing: crate::BatchHook::Prefill,
+            }]
+        );
+
+        let decoded = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        assert_eq!(
+            decoded.decision.capability_fallbacks[0].missing,
+            crate::BatchHook::Decode
+        );
+    }
+
+    #[test]
+    fn decision_records_the_exact_admission_context() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_policy(ComposedPolicy::default().with_admission(crate::MemoryAwareAdmission));
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                profiled_artifact(32),
+            )
+            .unwrap();
+        executor.submit(request("1", 4), Timestamp::ZERO).unwrap();
+        let deferred = executor.submit(request("10", 4), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        let record = &iteration.decision.admissions[1];
+        assert_eq!(record.request_id, deferred);
+        let crate::AdmissionOutcome::Decided {
+            context,
+            decision,
+            budget_selected,
+        } = &record.outcome
+        else {
+            panic!("admission should have run");
+        };
+        assert_eq!(context.model_reserved_kv_bytes, 32);
+        assert_eq!(context.prompt_tokens, 1);
+        assert!(matches!(decision, crate::AdmissionDecision::Defer(_)));
+        assert_eq!(*budget_selected, None);
     }
 
     #[test]

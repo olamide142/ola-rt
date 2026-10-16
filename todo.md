@@ -27,8 +27,8 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [x] Represent real input and padding positions.
 - [x] Represent request-local KV growth and release actions. (Growth as row positions, reservations on `Admit`, predicted releases; unpredicted releases in divergences.)
 - [ ] Represent model, backend/device, and kernel selections. (Model done; device and kernel wait for the kernel track.)
-- [ ] Record token, memory, padding, and invocation-cost estimates. (Tokens, padding, invocations, admitted KV bytes done; cost-aware grouping estimates not exposed by `PrefillBatcher` yet.)
-- [ ] Record deferrals and policy reasons. (Deferral reasons done; grouping-policy reasons belong with P2 decision records.)
+- [x] Record token, memory, padding, and invocation-cost estimates. (Grouping cost estimates arrive with the P2 decision record.)
+- [x] Record deferrals and policy reasons. (Policy reasons arrive with the P2 decision record.)
 - [x] Validate plans before lifecycle, session, or KV mutation.
 - [x] Preserve deterministic events when execution is regrouped.
 - [x] Add a stable serialized/report representation.
@@ -47,8 +47,8 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
 - [x] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.
 - [x] Keep individual sub-policies independently replaceable.
 - [ ] Make decisions deterministic for identical state and configuration.
-- [ ] Record decision inputs, alternatives, estimates, and reasons.
-- [ ] Add capability checks and explicit fallbacks.
+- [x] Record decision inputs, alternatives, estimates, and reasons.
+- [x] Add capability checks and explicit fallbacks.
 - [x] Prevent policies from mutating authoritative runtime state.
 - [x] Give every reportable policy a stable name and configuration.
 - [ ] Test scheduler, admission, batching, memory, and kernel-selection conflicts.

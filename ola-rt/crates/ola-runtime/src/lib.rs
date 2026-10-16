@@ -3,6 +3,7 @@
 mod admission;
 mod batch;
 mod composed;
+mod decision;
 mod error;
 mod executor;
 mod kv_cache;
@@ -25,6 +26,10 @@ pub use batch::{
     UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
 pub use composed::ComposedPolicy;
+pub use decision::{
+    AdmissionOutcome, AdmissionRecord, BatchHook, CapabilityFallback, DecisionRecord,
+    GroupingDecision, GroupingRecord, RankingRecord, SelectionRecord, SelectionStage,
+};
 pub use error::RuntimeError;
 pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,

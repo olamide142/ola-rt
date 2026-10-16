@@ -114,8 +114,11 @@ as exact token and elapsed-microsecond inputs instead of a lossy JSON float.
 `from_json` reject unsupported schema versions and structurally inconsistent
 trial indexes.
 
-`PlanReport` (schema version 1) serializes one executor iteration's validated
-`ExecutionPlan` and its divergences with stable identifiers: integer request
+`PlanReport` (schema version 2) serializes one executor iteration's validated
+`ExecutionPlan`, its divergences, and the policy's decision record (ranking,
+every admission's inputs and outcome, every batch-policy call, grouping
+alternatives and cost estimates, and capability fallbacks) with stable
+identifiers: integer request
 IDs, string model IDs, snake_case phases and modes, positions as start/end
 pairs, and admission reasons as their display text. Build one with
 `PlanReport::from_iteration`; `from_json` rejects unknown schema versions.

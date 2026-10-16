@@ -6,7 +6,7 @@ use std::{error::Error, fmt};
 
 use ola_core::RequestId;
 
-use crate::{ExecutionPlan, ExecutorIteration, PlanningSnapshot};
+use crate::{DecisionRecord, ExecutionPlan, ExecutorIteration, PlanningSnapshot};
 
 /// Turns an immutable snapshot of runtime state into an execution plan.
 ///
@@ -39,6 +39,8 @@ pub trait ExecutionPolicy: Send {
 pub struct PolicyDecision {
     /// Plan to validate and commit.
     pub plan: ExecutionPlan,
+    /// Inputs, alternatives, and outcomes behind the plan.
+    pub record: DecisionRecord,
 }
 
 /// A policy component returned a decision that cannot be planned.
@@ -81,6 +83,13 @@ pub struct PolicyDescriptor {
     pub config: Vec<(&'static str, String)>,
     /// Descriptors of composed sub-policies, in a fixed order.
     pub components: Vec<PolicyDescriptor>,
+}
+
+impl Default for PolicyDescriptor {
+    /// Placeholder for records not produced by a named policy.
+    fn default() -> Self {
+        Self::new("unspecified")
+    }
 }
 
 impl PolicyDescriptor {

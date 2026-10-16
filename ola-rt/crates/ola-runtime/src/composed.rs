@@ -7,11 +7,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use ola_core::{ModelId, RequestId};
 
 use crate::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, BatchCandidate, BatchContext,
-    BatchExecutionMode, BatchPhase, BatchPolicy, ExecutionPlan, ExecutionPolicy, FifoScheduler,
-    LifecycleAction, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningSnapshot,
-    PolicyDecision, PolicyDescriptor, PolicyError, PrefillBatcher, Scheduler, UnboundedBatchPolicy,
-    UnbucketedPrefillBatcher, UnconstrainedAdmission,
+    AdmissionContext, AdmissionDecision, AdmissionOutcome, AdmissionPolicy, AdmissionRecord,
+    BatchCandidate, BatchContext, BatchExecutionMode, BatchHook, BatchPhase, BatchPolicy,
+    CapabilityFallback, DecisionRecord, ExecutionPlan, ExecutionPolicy, FifoScheduler,
+    GroupingRecord, LifecycleAction, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow,
+    PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError, PrefillBatcher, RankingRecord,
+    Scheduler, SelectionRecord, SelectionStage, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+    UnconstrainedAdmission,
 };
 
 /// Execution policy built from a scheduler, an admission policy, a batch
@@ -97,6 +99,7 @@ impl ComposedPolicy {
         &self,
         snapshot: &PlanningSnapshot,
         scheduled: &mut Vec<BatchCandidate>,
+        record: &mut DecisionRecord,
     ) -> Result<ExecutionPlan, PolicyError> {
         let mut execution_plan = ExecutionPlan {
             generation: snapshot.generation,
@@ -113,7 +116,12 @@ impl ComposedPolicy {
             })
             .collect::<Vec<_>>();
         let decode_count = decode_candidates.len();
-        let selected = self.select_batch_candidates(scheduled, &decode_candidates)?;
+        let selected = self.select_batch_candidates(
+            scheduled,
+            &decode_candidates,
+            SelectionStage::Decode,
+            record,
+        )?;
         let mut decode_rows = Vec::new();
         for (event_index, candidate) in decode_candidates.into_iter().enumerate() {
             if !selected.contains(&candidate.request_id) {
@@ -139,7 +147,7 @@ impl ComposedPolicy {
         }
         execution_plan
             .batches
-            .extend(plan_decode_batches(snapshot, decode_rows));
+            .extend(plan_decode_batches(snapshot, decode_rows, record));
 
         let prefill_candidates = snapshot
             .prefill_order
@@ -157,7 +165,12 @@ impl ComposedPolicy {
             })
             .collect::<Vec<_>>();
         let prefill_count = prefill_candidates.len();
-        let selected = self.select_batch_candidates(scheduled, &prefill_candidates)?;
+        let selected = self.select_batch_candidates(
+            scheduled,
+            &prefill_candidates,
+            SelectionStage::ContinuedPrefill,
+            record,
+        )?;
         let mut prefill_rows = Vec::new();
         for (index, candidate) in prefill_candidates.into_iter().enumerate() {
             let event_index = decode_count.saturating_add(index);
@@ -188,6 +201,7 @@ impl ComposedPolicy {
             snapshot,
             PlannedPhase::ContinuedPrefill,
             prefill_rows,
+            record,
         ));
 
         self.plan_admissions(
@@ -195,6 +209,7 @@ impl ComposedPolicy {
             scheduled,
             &mut execution_plan,
             decode_count.saturating_add(prefill_count),
+            record,
         )?;
         Ok(execution_plan)
     }
@@ -210,6 +225,7 @@ impl ComposedPolicy {
         scheduled: &mut Vec<BatchCandidate>,
         execution_plan: &mut ExecutionPlan,
         first_event_index: usize,
+        record: &mut DecisionRecord,
     ) -> Result<(), PolicyError> {
         let mut released_total = 0_u64;
         let mut released_by_model = BTreeMap::<&ModelId, u64>::new();
@@ -233,6 +249,11 @@ impl ComposedPolicy {
             .saturating_sub(live_after)
             .min(snapshot.queued.len());
         let ranked = self.rank(snapshot, admission_count.saturating_add(1))?;
+        record.ranking = RankingRecord {
+            slots_available: admission_count,
+            limit: admission_count.saturating_add(1),
+            ranked: ranked.clone(),
+        };
         let queued = snapshot
             .queued
             .iter()
@@ -247,6 +268,10 @@ impl ComposedPolicy {
                 execution_plan
                     .deferrals
                     .push(PlannedDeferral::Slots { request_id });
+                record.admissions.push(AdmissionRecord {
+                    request_id,
+                    outcome: AdmissionOutcome::NoSlot,
+                });
                 break;
             }
             let event_index = first_event_index.saturating_add(offset);
@@ -261,6 +286,12 @@ impl ComposedPolicy {
             let prompt_tokens = match prompt_tokens {
                 Ok(tokens) => tokens,
                 Err(message) => {
+                    record.admissions.push(AdmissionRecord {
+                        request_id,
+                        outcome: AdmissionOutcome::PreparationFailed {
+                            message: message.clone(),
+                        },
+                    });
                     execution_plan.lifecycle.push(LifecycleAction::Fail {
                         request_id,
                         message,
@@ -287,9 +318,19 @@ impl ComposedPolicy {
                     .saturating_sub(model_released)
                     .saturating_add(model_pending),
             };
-            let reserved_kv_bytes = match self.admission.decide(&context) {
+            let decision = self.admission.decide(&context);
+            let decided = |budget_selected| AdmissionRecord {
+                request_id,
+                outcome: AdmissionOutcome::Decided {
+                    context: context.clone(),
+                    decision: decision.clone(),
+                    budget_selected,
+                },
+            };
+            let reserved_kv_bytes = match decision.clone() {
                 AdmissionDecision::Admit { reserved_kv_bytes } => reserved_kv_bytes,
                 AdmissionDecision::Defer(reason) => {
+                    record.admissions.push(decided(None));
                     execution_plan.deferrals.push(PlannedDeferral::Admission {
                         request_id,
                         reason,
@@ -298,6 +339,7 @@ impl ComposedPolicy {
                     break;
                 }
                 AdmissionDecision::Reject(reason) => {
+                    record.admissions.push(decided(None));
                     execution_plan.lifecycle.push(LifecycleAction::Reject {
                         request_id,
                         reason,
@@ -311,10 +353,16 @@ impl ComposedPolicy {
                 phase: BatchPhase::Prefill,
                 token_cost: snapshot.initial_prefill_chunk(model_id, prompt_tokens),
             };
-            if self
-                .select_batch_candidates(scheduled, &[candidate])?
-                .is_empty()
-            {
+            let budget_selected = !self
+                .select_batch_candidates(
+                    scheduled,
+                    &[candidate],
+                    SelectionStage::Admission,
+                    record,
+                )?
+                .is_empty();
+            record.admissions.push(decided(Some(budget_selected)));
+            if !budget_selected {
                 execution_plan
                     .deferrals
                     .push(budget_deferral(candidate, event_index));
@@ -342,6 +390,7 @@ impl ComposedPolicy {
             snapshot,
             PlannedPhase::Prefill,
             rows,
+            record,
         ));
         Ok(())
     }
@@ -356,6 +405,7 @@ impl ComposedPolicy {
         snapshot: &PlanningSnapshot,
         phase: PlannedPhase,
         rows: Vec<(ModelId, PlannedRow)>,
+        record: &mut DecisionRecord,
     ) -> Vec<PlannedBatch> {
         let mut model_positions: Vec<(ModelId, Vec<usize>)> = Vec::new();
         for (position, (model_id, _)) in rows.iter().enumerate() {
@@ -369,16 +419,21 @@ impl ComposedPolicy {
             }
         }
         let mut assigned_buckets = vec![0; rows.len()];
-        for (_, positions) in model_positions {
+        for (model_id, positions) in model_positions {
             let lengths = positions
                 .iter()
                 .map(|position| rows[*position].1.input_tokens())
                 .collect::<Vec<_>>();
-            let mut buckets = vec![0; positions.len()];
-            self.grouping.buckets(&lengths, &mut buckets);
-            for (position, bucket) in positions.into_iter().zip(buckets) {
-                assigned_buckets[position] = bucket;
+            let decision = self.grouping.group(&lengths);
+            for (position, bucket) in positions.into_iter().zip(&decision.buckets) {
+                assigned_buckets[position] = *bucket;
             }
+            record.grouping.push(GroupingRecord {
+                phase,
+                model_id,
+                prompt_tokens: lengths,
+                decision,
+            });
         }
 
         let mut groups: Vec<(usize, PlannedBatch)> = Vec::new();
@@ -403,6 +458,7 @@ impl ComposedPolicy {
         assign_batch_modes(
             snapshot,
             groups.into_iter().map(|(_, group)| group).collect(),
+            record,
         )
     }
 
@@ -410,13 +466,16 @@ impl ComposedPolicy {
         &self,
         scheduled: &[BatchCandidate],
         candidates: &[BatchCandidate],
+        stage: SelectionStage,
+        record: &mut DecisionRecord,
     ) -> Result<BTreeSet<RequestId>, PolicyError> {
         let context = BatchContext {
             scheduled: scheduled.to_vec(),
             candidates: candidates.to_vec(),
         };
+        let returned = self.batch.select(&context);
         let mut selected = BTreeSet::new();
-        for request_id in self.batch.select(&context) {
+        for &request_id in &returned {
             let is_candidate = candidates
                 .iter()
                 .any(|candidate| candidate.request_id == request_id);
@@ -424,6 +483,11 @@ impl ComposedPolicy {
                 return Err(PolicyError::InvalidBatchSelection(request_id));
             }
         }
+        record.selections.push(SelectionRecord {
+            stage,
+            context,
+            selected: returned,
+        });
         Ok(selected)
     }
 }
@@ -439,8 +503,12 @@ impl ExecutionPolicy for ComposedPolicy {
 
     fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
         let mut scheduled = Vec::new();
-        let plan = self.plan_iteration(snapshot, &mut scheduled)?;
-        Ok(PolicyDecision { plan })
+        let mut record = DecisionRecord {
+            policy: self.descriptor(),
+            ..DecisionRecord::default()
+        };
+        let plan = self.plan_iteration(snapshot, &mut scheduled, &mut record)?;
+        Ok(PolicyDecision { plan, record })
     }
 
     fn enforces_model_kv_capacity(&self) -> bool {
@@ -452,6 +520,7 @@ impl ExecutionPolicy for ComposedPolicy {
 fn plan_decode_batches(
     snapshot: &PlanningSnapshot,
     rows: Vec<(ModelId, PlannedRow)>,
+    record: &mut DecisionRecord,
 ) -> Vec<PlannedBatch> {
     let mut groups: Vec<PlannedBatch> = Vec::new();
     for (model_id, row) in rows {
@@ -466,25 +535,37 @@ fn plan_decode_batches(
             });
         }
     }
-    assign_batch_modes(snapshot, groups)
+    assign_batch_modes(snapshot, groups, record)
 }
 
 /// Marks compatible groups as tensor invocations when the model declares
 /// the matching hook, and splits the rest into one-row invocations.
-fn assign_batch_modes(snapshot: &PlanningSnapshot, groups: Vec<PlannedBatch>) -> Vec<PlannedBatch> {
+fn assign_batch_modes(
+    snapshot: &PlanningSnapshot,
+    groups: Vec<PlannedBatch>,
+    record: &mut DecisionRecord,
+) -> Vec<PlannedBatch> {
     let mut batches = Vec::with_capacity(groups.len());
     for group in groups {
         let capabilities = snapshot.model(&group.model_id).batch;
-        let supported = match group.phase {
-            PlannedPhase::Decode => capabilities.decode,
+        let (supported, hook) = match group.phase {
+            PlannedPhase::Decode => (capabilities.decode, BatchHook::Decode),
             PlannedPhase::Prefill | PlannedPhase::ContinuedPrefill => {
                 if group.rows.iter().all(is_complete_prompt) {
-                    capabilities.prefill
+                    (capabilities.prefill, BatchHook::Prefill)
                 } else {
-                    capabilities.chunked_prefill
+                    (capabilities.chunked_prefill, BatchHook::ChunkedPrefill)
                 }
             }
         };
+        if !supported && group.rows.len() > 1 {
+            record.capability_fallbacks.push(CapabilityFallback {
+                phase: group.phase,
+                model_id: group.model_id.clone(),
+                rows: group.rows.len(),
+                missing: hook,
+            });
+        }
         if supported && group.rows.len() > 1 {
             batches.push(PlannedBatch {
                 mode: BatchExecutionMode::Tensor,

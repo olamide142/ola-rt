@@ -8,13 +8,18 @@
 use std::{error::Error, fmt};
 
 use ola_runtime::{
-    BatchExecutionMode, BatchPhase, ExecutionPlan, ExecutorIteration, LifecycleAction,
-    PlanDivergence, PlanEstimates, PlannedBatch, PlannedDeferral, PlannedPhase, ReleaseReason,
+    AdmissionDecision, AdmissionOutcome, AdmissionRecord, BatchCandidate, BatchExecutionMode,
+    BatchHook, BatchPhase, CostAwarePrefillDecision, DecisionRecord, ExecutionPlan,
+    ExecutorIteration, LifecycleAction, PlanDivergence, PlanEstimates, PlannedBatch,
+    PlannedDeferral, PlannedPhase, PrefillGroupingEstimate, PrefillGroupingStrategy, ReleaseReason,
+    SelectionStage,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for serialized execution plans.
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added [`PlanReport::decision`].
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 2;
 
 /// One iteration's validated plan and observed divergences.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -37,6 +42,183 @@ pub struct PlanReport {
     pub divergences: Vec<PlanReportDivergence>,
     /// Deterministic estimates derived from the plan.
     pub estimates: PlanReportEstimates,
+    /// Why the policy planned it.
+    pub decision: PlanReportDecision,
+}
+
+/// Serialized [`DecisionRecord`].
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportDecision {
+    /// Policy descriptor, rendered as `name{config}[components]`.
+    pub policy: String,
+    /// Scheduler ranking.
+    pub ranking: PlanReportRanking,
+    /// Outcome for every ranked request.
+    pub admissions: Vec<PlanReportAdmission>,
+    /// Every batch-policy call.
+    pub selections: Vec<PlanReportSelection>,
+    /// Every prefill-grouping call.
+    pub grouping: Vec<PlanReportGrouping>,
+    /// Multi-row groups planned individually for lack of a batch hook.
+    pub capability_fallbacks: Vec<PlanReportCapabilityFallback>,
+}
+
+/// Serialized ranking record.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportRanking {
+    /// Slots free for admission after predicted releases.
+    pub slots_available: usize,
+    /// Requests asked of the scheduler.
+    pub limit: usize,
+    /// Ranked request identifiers.
+    pub ranked: Vec<u64>,
+}
+
+/// Serialized admission outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PlanReportAdmission {
+    /// No slot remained.
+    NoSlot {
+        /// Request identifier.
+        request_id: u64,
+    },
+    /// Preparation failed before admission.
+    PreparationFailed {
+        /// Request identifier.
+        request_id: u64,
+        /// Failure diagnostic.
+        message: String,
+    },
+    /// The admission policy decided.
+    Decided {
+        /// Request identifier.
+        request_id: u64,
+        /// Prompt length admission saw.
+        prompt_tokens: usize,
+        /// Output limit admission saw.
+        max_new_tokens: usize,
+        /// Device-wide reserved KV bytes admission saw.
+        reserved_kv_bytes: u64,
+        /// Model-pool reserved KV bytes admission saw.
+        model_reserved_kv_bytes: u64,
+        /// `admit`, `defer`, or `reject`.
+        decision: String,
+        /// Bytes reserved on admission.
+        granted_kv_bytes: Option<u64>,
+        /// Reason for a deferral or rejection.
+        reason: Option<String>,
+        /// Whether an admitted request's first prefill fit the budget.
+        budget_selected: Option<bool>,
+    },
+}
+
+/// Serialized [`SelectionStage`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportSelectionStage {
+    /// Live decodes.
+    Decode,
+    /// Live unfinished prompts.
+    ContinuedPrefill,
+    /// One admitted request's first prefill.
+    Admission,
+}
+
+/// Serialized batch candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportCandidate {
+    /// Request identifier.
+    pub request_id: u64,
+    /// Prefill or decode.
+    pub phase: PlanReportPhase,
+    /// Input positions the operation processes.
+    pub token_cost: usize,
+}
+
+/// Serialized batch-policy call.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportSelection {
+    /// Stage that asked.
+    pub stage: PlanReportSelectionStage,
+    /// Work already scheduled before the call.
+    pub scheduled: Vec<PlanReportCandidate>,
+    /// Candidates offered.
+    pub candidates: Vec<PlanReportCandidate>,
+    /// Requests selected.
+    pub selected: Vec<u64>,
+}
+
+/// Serialized grouping strategy cost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportGroupingCost {
+    /// Invocations required.
+    pub invocations: usize,
+    /// Real plus padded positions.
+    pub dense_input_tokens: usize,
+    /// Dense positions plus invocation overhead.
+    pub estimated_cost: usize,
+}
+
+/// Serialized cost-aware grouping alternatives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportGroupingEstimates {
+    /// `unbucketed` or `power_of_two`.
+    pub selected: PlanReportGroupingStrategy,
+    /// One-invocation estimate.
+    pub unbucketed: PlanReportGroupingCost,
+    /// Power-of-two estimate.
+    pub power_of_two: PlanReportGroupingCost,
+}
+
+/// Serialized grouping strategy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportGroupingStrategy {
+    /// One invocation.
+    Unbucketed,
+    /// Power-of-two buckets.
+    PowerOfTwo,
+}
+
+/// Serialized prefill-grouping call.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportGrouping {
+    /// Prompt phase grouped.
+    pub phase: PlanReportPhase,
+    /// Model identifier.
+    pub model: String,
+    /// Row lengths seen.
+    pub prompt_tokens: Vec<usize>,
+    /// Bucket key per row.
+    pub buckets: Vec<usize>,
+    /// Alternatives weighed, when the rule reports them.
+    pub cost_estimates: Option<PlanReportGroupingEstimates>,
+}
+
+/// Serialized [`BatchHook`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportBatchHook {
+    /// Complete-prompt batching.
+    Prefill,
+    /// Resumable-prompt batching.
+    ChunkedPrefill,
+    /// Decode batching.
+    Decode,
+}
+
+/// Serialized capability fallback.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportCapabilityFallback {
+    /// Phase of the group.
+    pub phase: PlanReportPhase,
+    /// Model identifier.
+    pub model: String,
+    /// Rows planned individually.
+    pub rows: usize,
+    /// Hook the model did not declare.
+    pub missing: PlanReportBatchHook,
 }
 
 /// Serialized [`LifecycleAction`].
@@ -214,8 +396,13 @@ pub struct PlanReportEstimates {
 }
 
 impl PlanReport {
-    /// Converts a plan and the divergences observed while committing it.
-    pub fn new(plan: &ExecutionPlan, divergences: &[PlanDivergence]) -> Self {
+    /// Converts a plan, the decision behind it, and the divergences observed
+    /// while committing it.
+    pub fn new(
+        plan: &ExecutionPlan,
+        decision: &DecisionRecord,
+        divergences: &[PlanDivergence],
+    ) -> Self {
         Self {
             schema_version: PLAN_REPORT_SCHEMA_VERSION,
             generation: plan.generation,
@@ -230,12 +417,17 @@ impl PlanReport {
                 .collect(),
             divergences: divergences.iter().map(divergence).collect(),
             estimates: estimates(plan.estimates()),
+            decision: decision_record(decision),
         }
     }
 
     /// Converts one committed executor iteration.
     pub fn from_iteration(iteration: &ExecutorIteration) -> Self {
-        Self::new(&iteration.execution_plan, &iteration.divergences)
+        Self::new(
+            &iteration.execution_plan,
+            &iteration.decision,
+            &iteration.divergences,
+        )
     }
 
     /// Encodes the report as human-readable JSON.
@@ -285,13 +477,136 @@ fn lifecycle(action: &LifecycleAction) -> PlanReportLifecycle {
     }
 }
 
+const fn planned_phase(phase: PlannedPhase) -> PlanReportPhase {
+    match phase {
+        PlannedPhase::Prefill => PlanReportPhase::Prefill,
+        PlannedPhase::ContinuedPrefill => PlanReportPhase::ContinuedPrefill,
+        PlannedPhase::Decode => PlanReportPhase::Decode,
+    }
+}
+
+const fn batch_phase(phase: BatchPhase) -> PlanReportPhase {
+    match phase {
+        BatchPhase::Prefill => PlanReportPhase::Prefill,
+        BatchPhase::Decode => PlanReportPhase::Decode,
+    }
+}
+
+fn decision_record(record: &DecisionRecord) -> PlanReportDecision {
+    let candidates = |candidates: &[BatchCandidate]| {
+        candidates
+            .iter()
+            .map(|candidate| PlanReportCandidate {
+                request_id: candidate.request_id.get(),
+                phase: batch_phase(candidate.phase),
+                token_cost: candidate.token_cost,
+            })
+            .collect()
+    };
+    PlanReportDecision {
+        policy: record.policy.to_string(),
+        ranking: PlanReportRanking {
+            slots_available: record.ranking.slots_available,
+            limit: record.ranking.limit,
+            ranked: record.ranking.ranked.iter().map(|id| id.get()).collect(),
+        },
+        admissions: record.admissions.iter().map(admission).collect(),
+        selections: record
+            .selections
+            .iter()
+            .map(|selection| PlanReportSelection {
+                stage: match selection.stage {
+                    SelectionStage::Decode => PlanReportSelectionStage::Decode,
+                    SelectionStage::ContinuedPrefill => PlanReportSelectionStage::ContinuedPrefill,
+                    SelectionStage::Admission => PlanReportSelectionStage::Admission,
+                },
+                scheduled: candidates(&selection.context.scheduled),
+                candidates: candidates(&selection.context.candidates),
+                selected: selection.selected.iter().map(|id| id.get()).collect(),
+            })
+            .collect(),
+        grouping: record
+            .grouping
+            .iter()
+            .map(|grouping| PlanReportGrouping {
+                phase: planned_phase(grouping.phase),
+                model: grouping.model_id.as_str().to_owned(),
+                prompt_tokens: grouping.prompt_tokens.clone(),
+                buckets: grouping.decision.buckets.clone(),
+                cost_estimates: grouping.decision.cost_estimates.map(grouping_estimates),
+            })
+            .collect(),
+        capability_fallbacks: record
+            .capability_fallbacks
+            .iter()
+            .map(|fallback| PlanReportCapabilityFallback {
+                phase: planned_phase(fallback.phase),
+                model: fallback.model_id.as_str().to_owned(),
+                rows: fallback.rows,
+                missing: match fallback.missing {
+                    BatchHook::Prefill => PlanReportBatchHook::Prefill,
+                    BatchHook::ChunkedPrefill => PlanReportBatchHook::ChunkedPrefill,
+                    BatchHook::Decode => PlanReportBatchHook::Decode,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn admission(record: &AdmissionRecord) -> PlanReportAdmission {
+    let request_id = record.request_id.get();
+    match &record.outcome {
+        AdmissionOutcome::NoSlot => PlanReportAdmission::NoSlot { request_id },
+        AdmissionOutcome::PreparationFailed { message } => PlanReportAdmission::PreparationFailed {
+            request_id,
+            message: message.clone(),
+        },
+        AdmissionOutcome::Decided {
+            context,
+            decision,
+            budget_selected,
+        } => {
+            let (decision, granted_kv_bytes, reason) = match decision {
+                AdmissionDecision::Admit { reserved_kv_bytes } => {
+                    ("admit", Some(*reserved_kv_bytes), None)
+                }
+                AdmissionDecision::Defer(reason) => ("defer", None, Some(reason.to_string())),
+                AdmissionDecision::Reject(reason) => ("reject", None, Some(reason.to_string())),
+            };
+            PlanReportAdmission::Decided {
+                request_id,
+                prompt_tokens: context.prompt_tokens,
+                max_new_tokens: context.max_new_tokens,
+                reserved_kv_bytes: context.reserved_kv_bytes,
+                model_reserved_kv_bytes: context.model_reserved_kv_bytes,
+                decision: decision.to_owned(),
+                granted_kv_bytes,
+                reason,
+                budget_selected: *budget_selected,
+            }
+        }
+    }
+}
+
+fn grouping_estimates(decision: CostAwarePrefillDecision) -> PlanReportGroupingEstimates {
+    let cost = |estimate: PrefillGroupingEstimate| PlanReportGroupingCost {
+        invocations: estimate.invocations,
+        dense_input_tokens: estimate.dense_input_tokens,
+        estimated_cost: estimate.estimated_cost,
+    };
+    PlanReportGroupingEstimates {
+        selected: match decision.selected {
+            PrefillGroupingStrategy::Unbucketed => PlanReportGroupingStrategy::Unbucketed,
+            PrefillGroupingStrategy::PowerOfTwo => PlanReportGroupingStrategy::PowerOfTwo,
+        },
+        unbucketed: cost(decision.unbucketed),
+        power_of_two: cost(decision.power_of_two),
+    }
+}
+
 fn batch(batch: &PlannedBatch) -> PlanReportBatch {
     PlanReportBatch {
-        phase: match batch.phase {
-            PlannedPhase::Prefill => PlanReportPhase::Prefill,
-            PlannedPhase::ContinuedPrefill => PlanReportPhase::ContinuedPrefill,
-            PlannedPhase::Decode => PlanReportPhase::Decode,
-        },
+        phase: planned_phase(batch.phase),
         model: batch.model_id.as_str().to_owned(),
         mode: match batch.mode {
             BatchExecutionMode::Tensor => PlanReportMode::Tensor,
@@ -331,10 +646,7 @@ fn deferral(deferral: &PlannedDeferral) -> PlanReportDeferral {
             event_index,
         } => PlanReportDeferral::Budget {
             request_id: request_id.get(),
-            phase: match phase {
-                BatchPhase::Prefill => PlanReportPhase::Prefill,
-                BatchPhase::Decode => PlanReportPhase::Decode,
-            },
+            phase: batch_phase(*phase),
             token_cost: *token_cost,
             event_index: *event_index,
         },
@@ -478,7 +790,25 @@ mod tests {
             request_id: RequestId::new(2),
             reason: ReleaseReason::OutputLimit,
         }];
-        let report = PlanReport::new(&plan(), &divergences);
+        let decision = DecisionRecord {
+            policy: ola_runtime::PolicyDescriptor::new("composed")
+                .with_component(ola_runtime::PolicyDescriptor::new("fifo")),
+            grouping: vec![ola_runtime::GroupingRecord {
+                phase: PlannedPhase::Prefill,
+                model_id: "tiny".into(),
+                prompt_tokens: vec![3],
+                decision: ola_runtime::GroupingDecision {
+                    buckets: vec![0],
+                    cost_estimates: Some(ola_runtime::CostAwarePrefillBatcher::new(4).decide(&[3])),
+                },
+            }],
+            admissions: vec![AdmissionRecord {
+                request_id: RequestId::new(4),
+                outcome: AdmissionOutcome::NoSlot,
+            }],
+            ..DecisionRecord::default()
+        };
+        let report = PlanReport::new(&plan(), &decision, &divergences);
 
         assert_eq!(report.schema_version, PLAN_REPORT_SCHEMA_VERSION);
         assert_eq!(report.estimates.input_tokens, 4);
@@ -490,6 +820,9 @@ mod tests {
             r#""phase": "decode""#,
             r#""kind": "slots""#,
             r#""reason": "output_limit""#,
+            r#""policy": "composed[fifo]""#,
+            r#""outcome": "no_slot""#,
+            r#""selected": "unbucketed""#,
         ] {
             assert!(json.contains(fragment), "missing {fragment} in {json}");
         }
@@ -498,7 +831,7 @@ mod tests {
 
     #[test]
     fn plan_reports_reject_unknown_schema_versions() {
-        let mut report = PlanReport::new(&plan(), &[]);
+        let mut report = PlanReport::new(&plan(), &DecisionRecord::default(), &[]);
         report.schema_version += 1;
         let json = report.to_json_pretty().unwrap();
 
