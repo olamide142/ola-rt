@@ -1,14 +1,13 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 14:46 BST (Europe/London)
+**Last updated:** 2026-10-16 16:24 BST (Europe/London)
 
-**Source revision:** working tree based on `36d4af2` on `master`
+**Source revision:** working tree based on `896b9c9` on `master`
 
-**Repository state at update:** P1 (execution-plan IR) and P2 (composable
-execution policy) are complete: every iteration is planned by a replaceable
-`ExecutionPolicy` from an immutable `PlanningSnapshot`, recorded in a
-`DecisionRecord`, validated, and committed; current branch commits are not
-pushed
+**Repository state at update:** P1 (execution-plan IR), P2 (composable
+execution policy), and P3 (scheduler and policy baselines) are complete;
+scheduling policies are compared in reproducible virtual time on seeded
+traces; current branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -150,7 +149,8 @@ performance claim.
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
 | Runtime executor | Tensor batching working | Configurable sessions, iteration planning, model-grouped tensor prefill/decode, fallback execution, stable events/results |
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
-| Scheduling | Baseline working | FIFO scheduler ranking from the planning snapshot, as one component of a composed execution policy |
+| Scheduling | Baselines working | FIFO, priority, earliest-deadline-first, and shortest-job-first (optional aging) ranking from the snapshot; admission backfill; prompt-capped and queue-adaptive token budgets |
+| Scheduling experiments | Working | Seeded traces, deterministic synthetic model, virtual-time trials with perturbations, and `compare_schedulers` (latency percentiles, throughput, KV, deferrals, slowdown and Jain fairness, starvation, deadline misses, per-class breakdowns) |
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
 | Execution policy | Working | `ExecutionPolicy` plans from an immutable snapshot through `&self`; `ComposedPolicy` combines replaceable scheduler, admission, batch, and grouping components with stable descriptors and full decision records |
 | Execution planning | Working | Each iteration is a validated `ExecutionPlan` (admissions, invocations, deferrals, predicted releases) committed atomically; divergences recorded; versioned `PlanReport` JSON |
@@ -408,16 +408,22 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 149 tests, Clippy
-  with warnings denied, and documentation) with zero compiler warnings; 3
+- `make verify`: **passed** (formatting, workspace checks, 187 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 4
   fixture tests ignored by default.
-- `make test-fixture` against the pinned artifact: **3 passed** — scalar-oracle
-  logits within `2e-5`, the UI integration (now driven by `step_iteration`),
-  and planned multi-request execution matching single-request output.
-- Policy tests plan hand-built snapshots: identical snapshots give identical
-  decisions, and head-of-line deferral, oversized prefill under a budget,
-  predicted-release memory reuse, missing batch hooks, and an admission
-  policy violating its own KV guarantee each behave as specified.
+- `make test-fixture` against the pinned artifact: **4 passed** — scalar-oracle
+  logits within `2e-5`, the UI integration, planned multi-request execution
+  matching single-request output, and every scheduling baseline reproducing
+  single-request outputs on tiny Llama with at least three distinct
+  admission orders.
+- Virtual-time scheduling comparisons (seed 3, 120 requests) are exactly
+  reproducible and pin measured effects: priority cuts urgent p95
+  completion from 159.4 ms to 23.6 ms; SJF speeds short requests and slows
+  long ones; backfill lowers p50 completion and starvation when the KV pool
+  binds; EDF reduces deadline misses only under moderate contention.
+- Isolation: cancellation (running and queued), injected failures, and
+  impossible requests leave other requests' outputs unchanged and leak no
+  slot or KV under every scheduler.
 - A live WGPU run was not repeated in this update.
 
 Historical evidence from earlier revisions:
@@ -560,6 +566,12 @@ and `TOKENS` variables.
   are rejected.
 - The serving layer has no streaming transport or HTTP implementation.
 - Benchmark probes are foundations, not publication-quality performance claims.
+- Scheduling comparisons use an illustrative cost model and a synthetic
+  model. Which budget policy helps depends on the overhead-to-token cost
+  ratio, so conclusions should be re-checked once the cost model is
+  calibrated from measured kernels (P4).
+- Scheduling summaries are in-memory; persisted, versioned scheduling
+  reports belong to P4.
 - Adaptive calibration uses a two-point linear model over p50 prefill-iteration
   time. It rejects invalid fits but does not yet use multi-shape regression or
   confidence intervals.
@@ -607,6 +619,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 16:24 BST — working tree on `896b9c9`:** Completed P3:
+  priority, earliest-deadline-first, and shortest-job-first schedulers with
+  optional aging; admission backfill; prompt-capped and queue-adaptive
+  token budgets with `BatchPressure`; a deterministic synthetic model,
+  seeded traces, and virtual-time trials with perturbations;
+  `compare_schedulers` with fairness and starvation metrics; isolation and
+  real-model equivalence tests; and a UI scheduler-comparison experiment.
 
 - **2026-10-16 14:46 BST — working tree on `36d4af2`:** Completed P2:
   immutable, named sub-policies; `PlanningSnapshot` with a one-time

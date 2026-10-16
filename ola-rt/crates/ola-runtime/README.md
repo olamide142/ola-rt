@@ -194,6 +194,33 @@ without the hook, retains the `Individual` fallback.
 The executor is synchronous by design. Full request preemption, result
 eviction, and streaming transports remain later layers.
 
+## Scheduling baselines
+
+Schedulers rank queued requests from the planning snapshot and are one
+component of a `ComposedPolicy` (see `SCHEDULING_BASELINES.md`). All of them
+break ties by arrival time and then request ID, so rankings are
+deterministic.
+
+| Scheduler | Order |
+| --- | --- |
+| `FifoScheduler` | arrival; the correctness baseline |
+| `PriorityScheduler` | highest `Priority` first; optional aging raises effective priority by one per interval waited |
+| `EarliestDeadlineFirst` | earliest deadline first; requests without one follow in arrival order |
+| `ShortestJobFirst` | smallest prompt, or prompt plus output limit; optional aging lowers effective cost by one token per interval |
+
+`HeadOfLine::Backfill { max_skipped }` lets admission skip past a request it
+defers, for example for lack of KV memory, and admit smaller work behind it.
+Skips consume no slot and are recorded in `DecisionRecord::backfill_skips`;
+the default `HeadOfLine::Block` keeps strict ranked order.
+
+`MixedTokenBudgetPolicy` serves decodes first and caps prompt tokens per
+iteration; `QueueAdaptiveTokenBudget` grows a FIFO budget with queue depth.
+Batch policies see `BatchPressure` (queued, live, and maximum sessions).
+Whether a budget helps depends on the cost of an iteration: when per-call
+overhead dominates, larger iterations win and an adaptive budget recovers
+throughput lost to a small fixed one; when per-token work dominates, capping
+prompt work keeps long prompts from stalling live decodes.
+
 ## Minimal lifecycle
 
 ```rust

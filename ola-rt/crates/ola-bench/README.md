@@ -95,6 +95,32 @@ summaries. Every strategy must preserve output tokens. These are operational
 host measurements, not a wall-clock fairness guarantee or publication-quality
 performance claim.
 
+## Scheduling comparisons
+
+Scheduling policies are compared in virtual time, so every number is exactly
+reproducible and independent of the host:
+
+- `SchedulingTrace` generates seeded traces (`mixed_short_long`,
+  `prefill_decode_competition`, `priority_classes`, `deadlines`, `overload`,
+  `impossible`) using integer-only arithmetic.
+- `run_scheduling_trial` replays a trace through a real `Executor` and
+  execution policy with a deterministic `SyntheticModel`, advancing a virtual
+  clock by a `CostModel` over each iteration's actual invocations.
+  `run_perturbed_trial` additionally cancels requests or injects invalid ones
+  mid-run.
+- `compare_schedulers` summarizes each policy against a shared baseline, each
+  request's time when run alone: queue, TTFT, and completion percentiles;
+  throughput; peak KV; deferrals and backfill skips; slowdown with Jain's
+  fairness index; starvation (waits over 10× isolated time); deadline misses;
+  and per-priority and size classes.
+
+Effects only appear under contention: with short queues, ranking rarely
+matters. Tests pin measured regimes (priority protects urgent requests, SJF
+trades long-request latency for short, backfill helps when the KV pool binds,
+EDF helps under moderate contention but not overload). The terminal
+workbench's *Scheduler comparison* experiment runs FIFO, SJF, and priority
+on two seeded traces.
+
 ## JSON reports
 
 `PrefillBenchmarkReport` converts a completed repeated comparison into a

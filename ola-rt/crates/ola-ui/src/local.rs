@@ -8,18 +8,20 @@ use std::{
 
 use burn::tensor::Device;
 use ola_bench::{
-    FixedWorkload, PrefillBenchmarkMetadata, PrefillBenchmarkReport, PrefillExecutionConfig,
-    PrefillReportError, PrefillThreeWayTrialConfig, PrefillTrialConfig, analyze_cost_aware_prefill,
-    benchmark_chunked_prefill_execution, benchmark_prefill_fairness_trials,
-    benchmark_prefill_trials, benchmark_three_way_prefill_trials,
-    calibrate_prefill_invocation_overhead, compare_prefill_batching,
+    DEFAULT_STARVATION_FACTOR, FixedWorkload, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
+    PrefillExecutionConfig, PrefillReportError, PrefillThreeWayTrialConfig, PrefillTrialConfig,
+    SchedulingSummary, SchedulingTrace, SimulationConfig, TraceParameters,
+    analyze_cost_aware_prefill, benchmark_chunked_prefill_execution,
+    benchmark_prefill_fairness_trials, benchmark_prefill_trials,
+    benchmark_three_way_prefill_trials, calibrate_prefill_invocation_overhead,
+    compare_prefill_batching, compare_schedulers,
 };
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
 use ola_runtime::{
-    ComposedPolicy, Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, MemoryAwareAdmission,
-    Runtime,
+    ComposedPolicy, ExecutionPolicy, Executor, ExecutorEvent, JobCost, KvBlockManager,
+    KvBlockMetrics, MemoryAwareAdmission, PriorityScheduler, Runtime, ShortestJobFirst,
 };
 
 use crate::{
@@ -34,6 +36,7 @@ const KV_BENCHMARK: &str = "kv-block-pressure";
 const FIFO_EXPERIMENT: &str = "fifo-workload";
 const PREFILL_BUCKET_EXPERIMENT: &str = "prefill-bucketing";
 const ADAPTIVE_PREFILL_EXPERIMENT: &str = "adaptive-prefill-cost";
+const SCHEDULER_EXPERIMENT: &str = "scheduler-comparison";
 const MAX_ACTIVITY: usize = 100;
 
 /// Compute backend selected for local model execution.
@@ -165,6 +168,13 @@ impl LocalBackend {
                     id: ADAPTIVE_PREFILL_EXPERIMENT.into(),
                     name: "Adaptive prefill cost".into(),
                     description: "Balance dense padding against invocation overhead".into(),
+                    state: RunState::Ready,
+                    last_result: None,
+                },
+                WorkItem {
+                    id: SCHEDULER_EXPERIMENT.into(),
+                    name: "Scheduler comparison".into(),
+                    description: "FIFO, SJF, and priority on seeded traces in virtual time".into(),
                     state: RunState::Ready,
                     last_result: None,
                 },
@@ -870,6 +880,14 @@ fn run_experiment(id: &str) -> WorkerEvent {
             },
             Err(message) => work_failed(WorkKind::Experiment, id, message),
         },
+        SCHEDULER_EXPERIMENT => match scheduler_comparison_probe() {
+            Ok(result) => WorkerEvent::WorkComplete {
+                kind: WorkKind::Experiment,
+                id: id.into(),
+                result,
+            },
+            Err(message) => work_failed(WorkKind::Experiment, id, message),
+        },
         _ => work_failed(WorkKind::Experiment, id, "unknown experiment ID"),
     }
 }
@@ -982,6 +1000,71 @@ fn prefill_bucketing_probe() -> Result<String, String> {
         comparison.power_of_two.padding_tokens,
         comparison.unbucketed.invocations,
         comparison.power_of_two.invocations,
+    ))
+}
+
+/// Compares scheduling baselines on seeded traces with the synthetic model
+/// and virtual time, so the result is identical on every machine.
+fn scheduler_comparison_probe() -> Result<String, String> {
+    const REQUESTS: usize = 120;
+    let millis = |micros: u64| micros as f64 / 1_000.0;
+    let fifo = || ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+    let config = SimulationConfig::default();
+
+    let overload = SchedulingTrace::overload(TraceParameters {
+        seed: 3,
+        requests: REQUESTS,
+        mean_interarrival_micros: 2_000,
+    });
+    let sizes = compare_schedulers(
+        &overload,
+        &config,
+        vec![
+            Box::new(fifo()) as Box<dyn ExecutionPolicy>,
+            Box::new(fifo().with_scheduler(ShortestJobFirst::new(JobCost::Prompt))),
+        ],
+        DEFAULT_STARVATION_FACTOR,
+    )
+    .map_err(|error| error.to_string())?;
+    let line = |label: &str, summary: &SchedulingSummary| {
+        format!(
+            "{label} p50/p95 {:.1}/{:.1} ms, fairness {:.2}, starved {}",
+            millis(summary.completion.p50_micros),
+            millis(summary.completion.p95_micros),
+            summary.slowdown.jain_fairness,
+            summary.starved,
+        )
+    };
+
+    let priorities = SchedulingTrace::priority_classes(TraceParameters {
+        seed: 3,
+        requests: REQUESTS,
+        mean_interarrival_micros: 300,
+    });
+    let urgency = compare_schedulers(
+        &priorities,
+        &config,
+        vec![
+            Box::new(fifo()) as Box<dyn ExecutionPolicy>,
+            Box::new(fifo().with_scheduler(PriorityScheduler::new())),
+        ],
+        DEFAULT_STARVATION_FACTOR,
+    )
+    .map_err(|error| error.to_string())?;
+    let urgent_p95 = |summary: &SchedulingSummary| {
+        summary
+            .classes
+            .iter()
+            .find(|class| class.class == "priority=5")
+            .map_or(0.0, |class| millis(class.completion.p95_micros))
+    };
+
+    Ok(format!(
+        "{REQUESTS} requests, virtual time · overload: {} · {} · priority classes: urgent p95 fifo {:.1} ms → priority {:.1} ms",
+        line("fifo", &sizes.summaries[0]),
+        line("shortest-job-first", &sizes.summaries[1]),
+        urgent_p95(&urgency.summaries[0]),
+        urgent_p95(&urgency.summaries[1]),
     ))
 }
 
@@ -1149,6 +1232,30 @@ mod tests {
                 .as_deref()
                 .is_some_and(|result| result.contains("padding 324 → 52"))
         );
+    }
+
+    #[test]
+    fn local_backend_runs_the_scheduler_comparison_experiment() {
+        let mut backend = LocalBackend::new(None);
+
+        backend.start_experiment(SCHEDULER_EXPERIMENT).unwrap();
+        let snapshot = wait_until(&mut backend, |snapshot| {
+            snapshot
+                .experiments
+                .iter()
+                .find(|item| item.id == SCHEDULER_EXPERIMENT)
+                .is_some_and(|item| item.state == RunState::Succeeded)
+        });
+        let result = snapshot
+            .experiments
+            .iter()
+            .find(|item| item.id == SCHEDULER_EXPERIMENT)
+            .and_then(|item| item.last_result.as_deref())
+            .unwrap();
+
+        assert!(result.contains("120 requests, virtual time"));
+        assert!(result.contains("shortest-job-first p50/p95"));
+        assert!(result.contains("urgent p95 fifo 159.4 ms → priority 23.6 ms"));
     }
 
     #[test]

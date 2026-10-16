@@ -641,4 +641,68 @@ mod tests {
         assert!(summary.rejected > 0);
         assert_eq!(summary.completed + summary.rejected, summary.requests);
     }
+
+    #[test]
+    fn adaptive_budget_recovers_throughput_when_overhead_dominates() {
+        // With the default cost model each iteration's fixed and invocation
+        // overhead dwarfs token work, so a small fixed budget forces many
+        // more iterations under load; growing the budget with the queue
+        // recovers most of the lost throughput.
+        let trace = SchedulingTrace::mixed_short_long(parameters(1_000));
+        let comparison = compare(
+            &trace,
+            &SimulationConfig::default(),
+            vec![
+                Box::new(fifo().with_batch(ola_runtime::FifoTokenBudgetPolicy::new(32).unwrap())),
+                Box::new(
+                    fifo().with_batch(
+                        ola_runtime::QueueAdaptiveTokenBudget::new(32, 256, 16).unwrap(),
+                    ),
+                ),
+            ],
+        );
+        let (fixed, adaptive) = (&comparison.summaries[0], &comparison.summaries[1]);
+
+        let throughput = |summary: &SchedulingSummary| summary.output_tokens_per_second().unwrap();
+        assert!(throughput(adaptive) > throughput(fixed) * 1.5);
+        assert!(adaptive.completion.p50_micros < fixed.completion.p50_micros);
+    }
+
+    #[test]
+    fn capping_prompt_work_helps_when_token_work_dominates() {
+        // When per-token cost dominates, an iteration carrying a long prompt
+        // stalls every live decode; capping prompt work per iteration lowers
+        // completion latency against an unbounded batch.
+        let config = SimulationConfig {
+            cost: crate::CostModel {
+                fixed_micros: 50,
+                per_invocation_micros: 50,
+                per_dense_token_micros: 40,
+            },
+            ..SimulationConfig::default()
+        };
+        for trace in [
+            SchedulingTrace::prefill_decode_competition(parameters(2_000)),
+            SchedulingTrace::mixed_short_long(parameters(1_000)),
+        ] {
+            let comparison = compare(
+                &trace,
+                &config,
+                vec![
+                    Box::new(fifo()),
+                    Box::new(
+                        fifo()
+                            .with_batch(ola_runtime::MixedTokenBudgetPolicy::new(256, 32).unwrap()),
+                    ),
+                ],
+            );
+            let (unbounded, capped) = (&comparison.summaries[0], &comparison.summaries[1]);
+
+            assert!(
+                capped.completion.p50_micros < unbounded.completion.p50_micros,
+                "{}",
+                trace.name
+            );
+        }
+    }
 }

@@ -64,8 +64,8 @@ Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 - [x] Add deadline-aware scheduling.
 - [x] Add estimated-size or shortest-job-first scheduling.
 - [x] Add a memory/cache-aware baseline. (Memory-aware admission with backfill.)
-- [x] Add configurable prefill/decode mixing. (`MixedTokenBudgetPolicy`; adaptive budget policy exists, comparison pending.)
-- [ ] Compare fixed and adaptive token budgets.
+- [x] Add configurable prefill/decode mixing. (`MixedTokenBudgetPolicy`.)
+- [x] Compare fixed and adaptive token budgets.
 - [x] Define starvation and fairness measurements.
 - [x] Test cancellation, failure, and memory-pressure isolation.
 - [x] Add mixed short/long prompt traces.
@@ -73,7 +73,7 @@ Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 - [x] Add overload and impossible-request traces.
 - [x] Compare queue latency, TTFT, completion latency, throughput, memory, fairness, and deferrals.
 
-Done when FIFO, priority, estimated-cost, and deadline-aware policies share one reproducible comparison protocol.
+Done when FIFO, priority, estimated-cost, and deadline-aware policies share one reproducible comparison protocol. **Met 2026-10-16.**
 
 ## P4: Framework-grade experiments and reports
 

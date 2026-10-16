@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–6 are
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. All seven steps are
 implemented.
 
 ## Goal
@@ -219,7 +219,15 @@ Each step keeps `make verify` and `make test-fixture` green.
    the same equivalence on tiny Llama, and asserts the policies produced at
    least three distinct admission orders.
 7. **Surface.** Add the UI experiment and README sections, and update
-   `progress_report.md`.
+   `progress_report.md`. **Done.**
+   The fixed-versus-adaptive budget comparison landed here. A load and cost
+   sweep found that budgets never lower latency under the default
+   overhead-dominated cost model (larger iterations always win, and a
+   32-token budget halves heavy-load throughput); the adaptive budget
+   recovers more than 1.5× that throughput. With a token-dominated cost
+   model (40 µs per token, 100 µs overhead), capping prompt work at 32
+   tokens per iteration lowers p50 completion on the competition and heavy
+   traces. Both regimes are pinned by tests.
 
 ## Out of scope for P3
 
