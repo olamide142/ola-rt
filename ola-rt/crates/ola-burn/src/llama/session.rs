@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use burn::tensor::{ElementConversion, Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use ola_core::GenerationConfig;
 use ola_model::{
     CausalModel, ExecutionStage, GeneratedToken, GenerationSession, ModelExecutionError,
-    SessionMetrics,
+    PrefillOutcome, SessionMetrics,
 };
 use ola_runtime::KvBlockError;
 
@@ -14,18 +14,18 @@ use super::{
 };
 
 /// Shared Burn weights exposed through OlaRT's architecture-neutral model API.
-pub(crate) struct BurnLlamaModel<B: Backend> {
-    module: Arc<LlamaForCausalLM<B>>,
+pub(crate) struct BurnLlamaModel {
+    module: Arc<LlamaForCausalLM>,
     config: Arc<LlamaConfig>,
-    device: B::Device,
-    cache_pool: Arc<Mutex<LlamaKvPool<B>>>,
+    device: burn::tensor::Device,
+    cache_pool: Arc<Mutex<LlamaKvPool>>,
 }
 
-impl<B: Backend> BurnLlamaModel<B> {
+impl BurnLlamaModel {
     pub(crate) fn with_kv_cache(
-        module: LlamaForCausalLM<B>,
+        module: LlamaForCausalLM,
         config: LlamaConfig,
-        device: B::Device,
+        device: burn::tensor::Device,
         cache_config: LlamaKvCacheConfig,
     ) -> Result<Self, KvBlockError> {
         let cache_pool = LlamaKvPool::new(&config, cache_config, device.clone())?;
@@ -38,11 +38,11 @@ impl<B: Backend> BurnLlamaModel<B> {
     }
 }
 
-impl<B> CausalModel for BurnLlamaModel<B>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
+impl CausalModel for BurnLlamaModel {
+    fn supports_chunked_prefill(&self) -> bool {
+        true
+    }
+
     fn create_session(
         &self,
         generation: GenerationConfig,
@@ -103,7 +103,7 @@ where
         }
         let mut typed = Vec::with_capacity(batch_size);
         for session in sessions {
-            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession<B>>() else {
+            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession>() else {
                 return Some(batch_error(
                     batch_size,
                     ModelExecutionError::new(
@@ -136,7 +136,7 @@ where
             token_values.extend(prompt.iter().copied().map(i64::from));
             token_values.resize(token_values.len() + padded_length - prompt.len(), 0);
         }
-        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+        let input_ids: Tensor<2, Int> = Tensor::from_data(
             TensorData::new(token_values, [batch_size, padded_length]),
             &self.device,
         );
@@ -178,7 +178,7 @@ where
         let selected = match Tensor::cat(final_rows, 0)
             .argmax(2)
             .into_data()
-            .to_vec::<B::IntElem>()
+            .to_vec::<i64>()
         {
             Ok(selected) => selected,
             Err(error) => {
@@ -230,6 +230,148 @@ where
         )
     }
 
+    fn prefill_chunk_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_chunks: &[&[u32]],
+        is_final: &[bool],
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+        let batch_size = sessions.len();
+        if prompt_chunks.len() != batch_size || is_final.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Prefill,
+                    format!(
+                        "chunk batch has {batch_size} sessions, {} chunks, and {} final flags",
+                        prompt_chunks.len(),
+                        is_final.len()
+                    ),
+                ),
+            ));
+        }
+        if batch_size == 0 {
+            return Some(Vec::new());
+        }
+        let mut typed = Vec::with_capacity(batch_size);
+        for session in sessions {
+            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession>() else {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        "chunked batch session was not created by this Llama backend",
+                    ),
+                ));
+            };
+            typed.push(session);
+        }
+        for (index, (session, chunk)) in typed.iter().zip(prompt_chunks).enumerate() {
+            if let Err(error) = session.validate_prefill_chunk(chunk) {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        format!("chunk batch request at index {index} is invalid: {error}"),
+                    ),
+                ));
+            }
+        }
+
+        let sequence_lengths = prompt_chunks
+            .iter()
+            .map(|chunk| chunk.len())
+            .collect::<Vec<_>>();
+        let padded_length = sequence_lengths.iter().copied().max().unwrap_or(0);
+        let mut token_values = Vec::with_capacity(batch_size * padded_length);
+        for chunk in prompt_chunks {
+            token_values.extend(chunk.iter().copied().map(i64::from));
+            token_values.resize(token_values.len() + padded_length - chunk.len(), 0);
+        }
+        let input_ids: Tensor<2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [batch_size, padded_length]),
+            &self.device,
+        );
+        let logits = {
+            let mut caches = typed
+                .iter_mut()
+                .map(|session| {
+                    session
+                        .cache
+                        .as_mut()
+                        .expect("Llama sessions allocate a cache at creation")
+                })
+                .collect::<Vec<_>>();
+            match self.module.prefill_chunk_batch(
+                input_ids,
+                caches.as_mut_slice(),
+                &sequence_lengths,
+            ) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    return Some(batch_error(
+                        batch_size,
+                        cache_error(ExecutionStage::Prefill, error),
+                    ));
+                }
+            }
+        };
+        let selected = match logits.argmax(2).into_data().to_vec::<i64>() {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Some(batch_error(
+                    batch_size,
+                    ModelExecutionError::new(
+                        ExecutionStage::Prefill,
+                        format!("failed to read chunked batch token selections: {error}"),
+                    ),
+                ));
+            }
+        };
+        if selected.len() != batch_size {
+            return Some(batch_error(
+                batch_size,
+                ModelExecutionError::new(
+                    ExecutionStage::Prefill,
+                    format!(
+                        "backend returned {} chunk selections for batch size {batch_size}",
+                        selected.len()
+                    ),
+                ),
+            ));
+        }
+
+        Some(
+            typed
+                .into_iter()
+                .zip(prompt_chunks.iter().copied())
+                .zip(is_final.iter().copied())
+                .zip(selected)
+                .map(|(((session, chunk), is_final), selected)| {
+                    session.tokens.extend_from_slice(chunk);
+                    session.metrics.prompt_tokens = session.tokens.len();
+                    session.metrics.kv_cache_bytes = session
+                        .cache
+                        .as_ref()
+                        .expect("a live Llama session owns a cache")
+                        .bytes();
+                    if is_final {
+                        let selected = selected.elem::<i64>();
+                        let id = u32::try_from(selected).map_err(|_| {
+                            ModelExecutionError::new(
+                                ExecutionStage::Prefill,
+                                "backend returned a token ID outside the u32 range",
+                            )
+                        })?;
+                        Ok(PrefillOutcome::Token(session.record_selected_token(id)))
+                    } else {
+                        Ok(PrefillOutcome::Pending)
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn decode_batch(
         &self,
         sessions: &mut [&mut dyn GenerationSession],
@@ -250,7 +392,7 @@ where
         }
         let mut typed = Vec::with_capacity(batch_size);
         for session in sessions {
-            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession<B>>() else {
+            let Some(session) = session.as_any_mut().downcast_mut::<LlamaSession>() else {
                 return Some(batch_error(
                     batch_size,
                     ModelExecutionError::new(
@@ -280,7 +422,7 @@ where
             .copied()
             .map(i64::from)
             .collect::<Vec<_>>();
-        let input_ids: Tensor<B, 2, Int> =
+        let input_ids: Tensor<2, Int> =
             Tensor::from_data(TensorData::new(token_values, [batch_size, 1]), &self.device);
         let logits = {
             let mut caches = typed
@@ -306,7 +448,7 @@ where
             .slice([0..batch_size, 0..1, 0..self.config.vocab_size])
             .argmax(2)
             .into_data()
-            .to_vec::<B::IntElem>()
+            .to_vec::<i64>()
         {
             Ok(selected) => selected,
             Err(error) => {
@@ -359,26 +501,22 @@ where
 }
 
 /// Request-local state for correctness-first cached Llama decoding.
-struct LlamaSession<B: Backend> {
-    module: Arc<LlamaForCausalLM<B>>,
+struct LlamaSession {
+    module: Arc<LlamaForCausalLM>,
     config: Arc<LlamaConfig>,
-    device: B::Device,
+    device: burn::tensor::Device,
     generation: GenerationConfig,
     tokens: Vec<u32>,
-    cache: Option<LlamaKvCache<B>>,
+    cache: Option<LlamaKvCache>,
     last_generated: Option<u32>,
     metrics: SessionMetrics,
     terminal: bool,
 }
 
-impl<B> LlamaSession<B>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
+impl LlamaSession {
     fn select_token(
         &mut self,
-        logits: Tensor<B, 3>,
+        logits: Tensor<3>,
         stage: ExecutionStage,
     ) -> Result<GeneratedToken, ModelExecutionError> {
         let sequence_length = logits.dims()[1];
@@ -387,7 +525,7 @@ where
             .slice([0..1, sequence_length - 1..sequence_length, 0..vocabulary])
             .argmax(2)
             .into_data()
-            .to_vec::<B::IntElem>()
+            .to_vec::<i64>()
             .map_err(|error| {
                 ModelExecutionError::new(stage, format!("failed to read selected token: {error}"))
             })?;
@@ -483,17 +621,35 @@ where
         }
         self.validate_context_length(prompt_tokens.len(), ExecutionStage::Prefill)
     }
+
+    fn validate_prefill_chunk(&self, prompt_tokens: &[u32]) -> Result<(), ModelExecutionError> {
+        if self.last_generated.is_some() || self.terminal {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prefill cannot continue after the first token was generated",
+            ));
+        }
+        if prompt_tokens.is_empty() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "prefill chunk must contain at least one token",
+            ));
+        }
+        for &token in prompt_tokens {
+            self.validate_token(token, ExecutionStage::Prefill)?;
+        }
+        self.validate_context_length(
+            self.tokens.len().saturating_add(prompt_tokens.len()),
+            ExecutionStage::Prefill,
+        )
+    }
 }
 
-impl<B> GenerationSession for LlamaSession<B>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
+impl GenerationSession for LlamaSession {
     fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<GeneratedToken, ModelExecutionError> {
         self.validate_prefill_input(prompt_tokens)?;
         let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
-        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+        let input_ids: Tensor<2, Int> = Tensor::from_data(
             TensorData::new(token_values, [1, prompt_tokens.len()]),
             &self.device,
         );
@@ -511,9 +667,39 @@ where
         self.select_token(logits, ExecutionStage::Prefill)
     }
 
+    fn prefill_chunk(
+        &mut self,
+        prompt_tokens: &[u32],
+        is_final: bool,
+    ) -> Result<PrefillOutcome, ModelExecutionError> {
+        self.validate_prefill_chunk(prompt_tokens)?;
+        let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
+        let input_ids: Tensor<2, Int> = Tensor::from_data(
+            TensorData::new(token_values, [1, prompt_tokens.len()]),
+            &self.device,
+        );
+        let cache = self
+            .cache
+            .as_mut()
+            .expect("sessions allocate a cache at creation");
+        let logits = self
+            .module
+            .prefill_chunk(input_ids, cache)
+            .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
+        self.metrics.kv_cache_bytes = cache.bytes();
+        self.tokens.extend_from_slice(prompt_tokens);
+        self.metrics.prompt_tokens = self.tokens.len();
+        if is_final {
+            self.select_token(logits, ExecutionStage::Prefill)
+                .map(PrefillOutcome::Token)
+        } else {
+            Ok(PrefillOutcome::Pending)
+        }
+    }
+
     fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
         self.validate_decode_input(input_token)?;
-        let input_ids: Tensor<B, 2, Int> = Tensor::from_data(
+        let input_ids: Tensor<2, Int> = Tensor::from_data(
             TensorData::new(vec![i64::from(input_token)], [1, 1]),
             &self.device,
         );
@@ -545,23 +731,20 @@ fn cache_error(stage: ExecutionStage, error: KvBlockError) -> ModelExecutionErro
     ModelExecutionError::new(stage, format!("KV cache: {error}"))
 }
 
-fn batch_error(
+fn batch_error<T>(
     batch_size: usize,
     error: ModelExecutionError,
-) -> Vec<Result<GeneratedToken, ModelExecutionError>> {
+) -> Vec<Result<T, ModelExecutionError>> {
     (0..batch_size).map(|_| Err(error.clone())).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
     use ola_core::{ModelDescriptor, RequestSpec, Timestamp};
     use ola_model::{CausalLanguageModel, Tokenizer};
     use ola_runtime::{BatchExecutionMode, BatchPhase, ExecutionBatch, Executor, Runtime};
 
     use super::*;
-
-    type TestBackend = NdArray<f32>;
 
     #[derive(Clone, Copy)]
     struct NumericTokenizer;
@@ -597,8 +780,8 @@ mod tests {
         }
     }
 
-    fn tiny_model() -> BurnLlamaModel<TestBackend> {
-        let config = LlamaConfig {
+    fn tiny_model_config() -> LlamaConfig {
+        LlamaConfig {
             model_type: "llama".into(),
             vocab_size: 16,
             hidden_size: 8,
@@ -617,9 +800,12 @@ mod tests {
             rope_scaling: None,
             bos_token_id: Some(1),
             eos_token_id: Vec::new(),
-        };
+        }
+    }
+
+    fn tiny_model() -> BurnLlamaModel {
+        let config = tiny_model_config();
         let device = Default::default();
-        TestBackend::seed(&device, 11);
         let module = LlamaForCausalLM::init(&config, &device);
         BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(64, 16))
             .unwrap()
@@ -652,6 +838,117 @@ mod tests {
                 kv_cache_bytes: 512,
             }
         );
+    }
+
+    #[test]
+    fn chunked_prefill_matches_complete_prefill_and_cached_decode() {
+        let model = tiny_model();
+        let mut complete = model.create_session(greedy(3)).unwrap();
+        let mut chunked = model.create_session(greedy(3)).unwrap();
+        let prompt = [1, 4, 5, 7, 3];
+
+        let expected = complete.prefill(&prompt).unwrap();
+        assert_eq!(
+            chunked.prefill_chunk(&prompt[..2], false).unwrap(),
+            PrefillOutcome::Pending
+        );
+        assert_eq!(
+            chunked.metrics(),
+            SessionMetrics {
+                prompt_tokens: 2,
+                generated_tokens: 0,
+                kv_cache_bytes: 512,
+            }
+        );
+        let actual = chunked.prefill_chunk(&prompt[2..], true).unwrap();
+
+        assert_eq!(actual, PrefillOutcome::Token(expected));
+        assert_eq!(chunked.metrics(), complete.metrics());
+        assert_eq!(
+            chunked.decode(expected.id).unwrap(),
+            complete.decode(expected.id).unwrap()
+        );
+    }
+
+    #[test]
+    fn batched_chunks_match_complete_prefill_at_unequal_positions() {
+        let model = tiny_model();
+        let first_prompt = [1, 4, 5, 7, 3];
+        let second_prompt = [1, 6, 8];
+        let mut first = model.create_session(greedy(2)).unwrap();
+        let mut second = model.create_session(greedy(2)).unwrap();
+        let mut first_oracle = model.create_session(greedy(2)).unwrap();
+        let mut second_oracle = model.create_session(greedy(2)).unwrap();
+        let expected = [
+            first_oracle.prefill(&first_prompt).unwrap(),
+            second_oracle.prefill(&second_prompt).unwrap(),
+        ];
+        assert_eq!(
+            first.prefill_chunk(&first_prompt[..2], false).unwrap(),
+            PrefillOutcome::Pending
+        );
+        assert_eq!(
+            second.prefill_chunk(&second_prompt[..1], false).unwrap(),
+            PrefillOutcome::Pending
+        );
+
+        let outcomes = {
+            let mut sessions: Vec<&mut dyn GenerationSession> =
+                vec![first.as_mut(), second.as_mut()];
+            model
+                .prefill_chunk_batch(
+                    &mut sessions,
+                    &[&first_prompt[2..], &second_prompt[1..]],
+                    &[true, true],
+                )
+                .expect("Burn Llama implements tensor-batched resumable prefill")
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        assert_eq!(outcomes, expected.map(PrefillOutcome::Token).to_vec());
+        assert_eq!(first.metrics(), first_oracle.metrics());
+        assert_eq!(second.metrics(), second_oracle.metrics());
+        assert_eq!(
+            first.decode(expected[0].id).unwrap(),
+            first_oracle.decode(expected[0].id).unwrap()
+        );
+        assert_eq!(
+            second.decode(expected[1].id).unwrap(),
+            second_oracle.decode(expected[1].id).unwrap()
+        );
+    }
+
+    #[test]
+    fn chunk_reservation_failure_does_not_advance_the_session_cursor() {
+        let mut config = tiny_model_config();
+        config.max_position_embeddings = 8;
+        let device = Default::default();
+        let module = LlamaForCausalLM::init(&config, &device);
+        let model =
+            BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(2, 1))
+                .unwrap();
+        let mut session = model.create_session(greedy(2)).unwrap();
+        assert_eq!(
+            session.prefill_chunk(&[1], false).unwrap(),
+            PrefillOutcome::Pending
+        );
+        let before = session.metrics();
+
+        let error = session.prefill_chunk(&[4, 5], true).unwrap_err();
+
+        assert!(error.message().contains("KV cache"));
+        assert_eq!(session.metrics(), before);
+        assert!(matches!(
+            session.prefill_chunk(&[4], true).unwrap(),
+            PrefillOutcome::Token(GeneratedToken {
+                is_end_of_sequence: false,
+                ..
+            })
+        ));
+        assert_eq!(session.metrics().prompt_tokens, 2);
+        assert_eq!(session.metrics().generated_tokens, 1);
     }
 
     #[test]

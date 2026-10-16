@@ -1,43 +1,33 @@
 #![doc = include_str!("../README.md")]
 
-use std::{any::type_name, marker::PhantomData};
-
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 use ola_core::ComputeBackend;
 
 pub mod llama;
 
 /// Associates a Burn backend and device with the backend-neutral runtime.
 #[derive(Clone, Debug)]
-pub struct BurnComputeBackend<B: Backend> {
-    device: B::Device,
-    backend: PhantomData<fn() -> B>,
+pub struct BurnComputeBackend {
+    device: Device,
 }
 
-impl<B: Backend> BurnComputeBackend<B> {
+impl BurnComputeBackend {
     /// Creates an adapter that owns the selected Burn device.
-    pub const fn new(device: B::Device) -> Self {
-        Self {
-            device,
-            backend: PhantomData,
-        }
+    pub const fn new(device: Device) -> Self {
+        Self { device }
     }
 
     /// Returns the native Burn device for backend-specific model setup.
-    pub fn burn_device(&self) -> &B::Device {
+    pub fn burn_device(&self) -> &Device {
         &self.device
     }
 }
 
-impl<B> ComputeBackend for BurnComputeBackend<B>
-where
-    B: Backend + 'static,
-    B::Device: Clone + std::fmt::Debug + Send + Sync + 'static,
-{
-    type Device = B::Device;
+impl ComputeBackend for BurnComputeBackend {
+    type Device = Device;
 
     fn name(&self) -> &'static str {
-        type_name::<B>()
+        "burn"
     }
 
     fn device(&self) -> &Self::Device {
@@ -47,16 +37,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
+    use burn::tensor::Device;
     use ola_core::ComputeBackend;
 
     use super::BurnComputeBackend;
 
     #[test]
     fn exposes_burn_through_the_compute_boundary() {
-        let adapter = BurnComputeBackend::<NdArray>::new(Default::default());
+        let adapter = BurnComputeBackend::new(Device::ndarray());
 
-        assert!(adapter.name().contains("NdArray"));
+        assert_eq!(adapter.name(), "burn");
         let _ = adapter.device();
     }
 }

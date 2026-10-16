@@ -47,6 +47,7 @@ CausalLanguageModel
                   ↓
             GenerationSession   one per request, mutable
               ├── prefill()
+              ├── prefill_chunk() → Pending | Token
               ├── decode()
               └── metrics()
 ```
@@ -68,6 +69,14 @@ implementation-selected entropy.
 `SessionMetrics` exposes the minimum state needed by later scheduling and
 observability work: prompt tokens, generated tokens, and KV-cache bytes. It is a
 snapshot, not a promise about a particular cache layout.
+
+Models explicitly advertise resumable prefill support. The compatibility
+default accepts only a final segment and delegates to complete-prompt
+`prefill`; this prevents a runtime policy from silently splitting prompts for
+an architecture whose session state cannot resume safely. A pending segment
+updates accepted prompt/KV metrics but cannot emit or count an output token.
+An optional model-level chunk-batch hook accepts different chunk lengths,
+absolute positions, and final-segment flags while retaining isolated sessions.
 
 An architecture may also attach a `KvCacheProfile` to the loaded model. Unlike
 live metrics, this describes physical planning facts known before a session

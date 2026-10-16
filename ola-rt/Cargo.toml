@@ -16,13 +16,15 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.94"
+rust-version = "1.95"
 
 [workspace.dependencies]
 # Keep the foundation adapter lean. Additional accelerator features must be
 # enabled deliberately by the model/execution work that needs them.
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray"] }
-burn-store = { version = "0.21.0", default-features = false, features = ["std", "safetensors"] }
+burn = { version = "0.22.0", default-features = false, features = ["std", "ndarray", "extension"] }
+burn-backend = { version = "0.22.0", default-features = false }
+burn-cubecl = { version = "0.22.0", default-features = false }
+burn-store = { version = "0.22.0", default-features = false, features = ["std", "safetensors", "pytorch"] }
 crossterm = "0.29"
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
@@ -37,6 +39,11 @@ ratatui = "0.30.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokenizers = { version = "0.22.1", default-features = false, features = ["onig"] }
+
+# Burn 0.22.0's optional Fusion dependency references burn-remote 0.22.0,
+# which was not published to crates.io with the rest of that release.
+[patch.crates-io]
+burn-remote = { git = "https://github.com/tracel-ai/burn", tag = "v0.22.0" }
 
 [workspace.lints.rust]
 missing_docs = "warn"

@@ -142,7 +142,13 @@ Implemented:
   starvation-safe FIFO input-token budget;
 - model-grouped prefill and decode execution with explicit tensor/individual
   records and real Burn Llama variable-length tensor paths;
-- replaceable prompt-length bucketing with explicit dense-padding accounting;
+- bounded resumable Llama prefill with request-local cursors, shared
+  prefill/decode token budgets, progress events, atomic segment reservation,
+  and cancellation-safe KV release;
+- tensor-batched resumable chunks with variable lengths and unequal absolute
+  positions;
+- replaceable prompt-length bucketing with explicit dense-padding accounting
+  and a workload-aware cost policy balancing padding against invocation count;
 - backend-neutral observation of iteration work, interval rates, cumulative
   counters, and terminal request latency boundaries;
 - a transport-neutral generation service;
@@ -151,6 +157,15 @@ Implemented:
 - deterministic fixed-workload generation and replay;
 - deterministic prefill-grouping comparison with padding and invocation
   summaries;
+- execution-backed prefill-strategy comparison against a loaded model with
+  output-equivalence, warm-ups, alternating paired trials, retained samples,
+  latency percentiles, throughput, and peak-KV measurements;
+- measured invocation-cost calibration and fresh order-rotated three-way
+  comparison of unbucketed, power-of-two, and adaptive grouping;
+- execution-backed complete-versus-chunked prefill comparison with output
+  equivalence and scheduler-work measurements;
+- versioned JSON benchmark reports with exact workload/protocol metadata, raw
+  paired samples, integer timing data, summaries, and create-new persistence;
 - basic latency summaries;
 - a Burn device adapter;
 - a first replaceable kernel contract with validated paged-attention inputs,

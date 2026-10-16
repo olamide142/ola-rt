@@ -2,10 +2,11 @@ use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     tensor::{
-        Int, Tensor, activation::silu, backend::Backend, module::attention,
-        ops::AttentionModuleOptions,
+        Device, Int, Tensor, activation::silu, module::attention, ops::AttentionModuleOptions,
     },
 };
+#[cfg(any(feature = "wgpu", feature = "cuda"))]
+use ola_kernel::CubePagedAttention;
 use ola_kernel::{
     PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvPage,
     PortablePagedAttention,
@@ -21,14 +22,14 @@ use super::{LlamaConfig, kv_cache::LlamaKvCache};
 /// can then handle linear transposition and normalization naming while the
 /// checkpoint remains recognizable to researchers inspecting it.
 #[derive(Module, Debug)]
-pub struct LlamaForCausalLM<B: Backend> {
-    model: LlamaModel<B>,
-    lm_head: Linear<B>,
+pub struct LlamaForCausalLM {
+    model: LlamaModel,
+    lm_head: Linear,
 }
 
-impl<B: Backend> LlamaForCausalLM<B> {
+impl LlamaForCausalLM {
     /// Initializes the module structure before checkpoint parameters are loaded.
-    pub fn init(config: &LlamaConfig, device: &B::Device) -> Self {
+    pub fn init(config: &LlamaConfig, device: &Device) -> Self {
         Self {
             model: LlamaModel::init(config, device),
             lm_head: linear(config.hidden_size, config.vocab_size, device),
@@ -41,18 +42,29 @@ impl<B: Backend> LlamaForCausalLM<B> {
     /// `[batch, sequence, vocabulary]`. The first implementation uses this
     /// full-sequence method for both prefill and decode so correctness can be
     /// established before introducing cache mutation.
-    pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+    pub fn forward(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
         self.lm_head.forward(self.model.forward(input_ids))
     }
 
     /// Processes a complete prompt and returns logits plus its populated cache.
     pub(crate) fn prefill(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        cache: &mut LlamaKvCache<B>,
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
         let hidden_states = self.model.prefill(input_ids, cache)?;
         Ok(self.lm_head.forward(hidden_states))
+    }
+
+    /// Processes a resumable prompt segment against the existing cache.
+    pub(crate) fn prefill_chunk(
+        &self,
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
+        Ok(self
+            .lm_head
+            .forward(self.model.prefill_chunk(input_ids, cache)?))
     }
 
     /// Processes right-padded prompts in one tensor invocation.
@@ -61,31 +73,45 @@ impl<B: Backend> LlamaForCausalLM<B> {
     /// causal mask prevents the padded suffix from influencing real tokens.
     pub(crate) fn prefill_batch(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        caches: &mut [&mut LlamaKvCache<B>],
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
         sequence_lengths: &[usize],
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+    ) -> Result<Tensor<3>, KvBlockError> {
         Ok(self.lm_head.forward(
             self.model
                 .prefill_batch(input_ids, caches, sequence_lengths)?,
         ))
     }
 
+    /// Processes variable-length resumable segments in one tensor path.
+    pub(crate) fn prefill_chunk_batch(
+        &self,
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
+        sequence_lengths: &[usize],
+    ) -> Result<Tensor<3>, KvBlockError> {
+        Ok(self.lm_head.forward(self.model.prefill_chunk_batch(
+            input_ids,
+            caches,
+            sequence_lengths,
+        )?))
+    }
+
     /// Processes one new token using and extending an existing request cache.
     pub(crate) fn decode(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        cache: &mut LlamaKvCache<B>,
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
         Ok(self.lm_head.forward(self.model.decode(input_ids, cache)?))
     }
 
     /// Processes one token for each request while preserving isolated caches.
     pub(crate) fn decode_batch(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        caches: &mut [&mut LlamaKvCache<B>],
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
+    ) -> Result<Tensor<3>, KvBlockError> {
         Ok(self
             .lm_head
             .forward(self.model.decode_batch(input_ids, caches)?))
@@ -93,14 +119,14 @@ impl<B: Backend> LlamaForCausalLM<B> {
 }
 
 #[derive(Module, Debug)]
-struct LlamaModel<B: Backend> {
-    embed_tokens: Embedding<B>,
-    layers: Vec<LlamaDecoderLayer<B>>,
-    norm: RmsNorm<B>,
+struct LlamaModel {
+    embed_tokens: Embedding,
+    layers: Vec<LlamaDecoderLayer>,
+    norm: RmsNorm,
 }
 
-impl<B: Backend> LlamaModel<B> {
-    fn init(config: &LlamaConfig, device: &B::Device) -> Self {
+impl LlamaModel {
+    fn init(config: &LlamaConfig, device: &Device) -> Self {
         Self {
             embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
             layers: (0..config.num_hidden_layers)
@@ -112,7 +138,7 @@ impl<B: Backend> LlamaModel<B> {
         }
     }
 
-    fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+    fn forward(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
         for layer in &self.layers {
             hidden_states = layer.forward(hidden_states);
@@ -122,9 +148,9 @@ impl<B: Backend> LlamaModel<B> {
 
     fn prefill(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        cache: &mut LlamaKvCache<B>,
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
         let sequence_length = input_ids.dims()[1];
         cache.reserve(sequence_length)?;
         let mut hidden_states = self.embed_tokens.forward(input_ids);
@@ -136,10 +162,10 @@ impl<B: Backend> LlamaModel<B> {
 
     fn prefill_batch(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        caches: &mut [&mut LlamaKvCache<B>],
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
         sequence_lengths: &[usize],
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+    ) -> Result<Tensor<3>, KvBlockError> {
         let [batch_size, padded_length] = input_ids.dims();
         debug_assert_eq!(batch_size, caches.len());
         debug_assert_eq!(batch_size, sequence_lengths.len());
@@ -158,11 +184,119 @@ impl<B: Backend> LlamaModel<B> {
         Ok(self.norm.forward(hidden_states))
     }
 
+    fn prefill_chunk(
+        &self,
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
+        let [batch_size, sequence_length] = input_ids.dims();
+        debug_assert_eq!(batch_size, 1);
+        let start_position = cache.tokens();
+
+        // Reserve the complete segment before writing any layer data. A pool
+        // capacity failure therefore leaves both block ownership and the
+        // request's accepted-token cursor unchanged.
+        cache.reserve(sequence_length)?;
+        let mut outputs = Vec::with_capacity(sequence_length);
+        for offset in 0..sequence_length {
+            let position = start_position + offset;
+            let token = input_ids.clone().slice([0..1, offset..offset + 1]);
+            let mut hidden_states = self.embed_tokens.forward(token);
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                hidden_states = layer.prefill_chunk(hidden_states, cache, layer_index, position);
+            }
+            outputs.push(self.norm.forward(hidden_states));
+        }
+        Ok(Tensor::cat(outputs, 1))
+    }
+
+    fn prefill_chunk_batch(
+        &self,
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
+        sequence_lengths: &[usize],
+    ) -> Result<Tensor<3>, KvBlockError> {
+        let [batch_size, padded_length] = input_ids.dims();
+        debug_assert_eq!(batch_size, caches.len());
+        debug_assert_eq!(batch_size, sequence_lengths.len());
+        debug_assert!(sequence_lengths.iter().all(|length| *length > 0));
+        debug_assert!(
+            sequence_lengths
+                .iter()
+                .all(|length| *length <= padded_length)
+        );
+        let start_positions = caches
+            .iter()
+            .map(|cache| cache.tokens())
+            .collect::<Vec<_>>();
+
+        // Reserve every segment in one allocator transaction before any
+        // request writes K/V state.
+        LlamaKvCache::reserve_batch_lengths(caches, sequence_lengths)?;
+        let mut final_hidden = (0..batch_size).map(|_| None).collect::<Vec<_>>();
+        for offset in 0..padded_length {
+            let active_indices = sequence_lengths
+                .iter()
+                .enumerate()
+                .filter_map(|(index, length)| (offset < *length).then_some(index))
+                .collect::<Vec<_>>();
+            if active_indices.is_empty() {
+                break;
+            }
+            let token_rows = active_indices
+                .iter()
+                .map(|index| {
+                    input_ids
+                        .clone()
+                        .slice([*index..*index + 1, offset..offset + 1])
+                })
+                .collect::<Vec<_>>();
+            let token_ids = Tensor::cat(token_rows, 0);
+            let positions = active_indices
+                .iter()
+                .map(|index| start_positions[*index] + offset)
+                .collect::<Vec<_>>();
+            let active_caches = caches
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, cache)| {
+                    active_indices.contains(&index).then_some(&mut **cache)
+                })
+                .collect::<Vec<_>>();
+            let mut hidden_states = self.embed_tokens.forward(token_ids);
+            for (layer_index, layer) in self.layers.iter().enumerate() {
+                hidden_states = layer.prefill_chunk_batch(
+                    hidden_states,
+                    active_caches.as_slice(),
+                    layer_index,
+                    positions.as_slice(),
+                );
+            }
+            let hidden_states = self.norm.forward(hidden_states);
+            for (row, index) in active_indices.into_iter().enumerate() {
+                if offset + 1 == sequence_lengths[index] {
+                    final_hidden[index] = Some(hidden_states.clone().slice([
+                        row..row + 1,
+                        0..1,
+                        0..hidden_states.dims()[2],
+                    ]));
+                }
+            }
+        }
+        Ok(Tensor::cat(
+            final_hidden
+                .into_iter()
+                .map(|row| row.expect("every non-empty chunk has a final hidden row"))
+                .collect(),
+            0,
+        ))
+    }
+
     fn decode(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        cache: &mut LlamaKvCache<B>,
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        cache: &mut LlamaKvCache,
+    ) -> Result<Tensor<3>, KvBlockError> {
         debug_assert_eq!(input_ids.dims()[1], 1);
         let position = cache.tokens();
         cache.reserve(1)?;
@@ -175,9 +309,9 @@ impl<B: Backend> LlamaModel<B> {
 
     fn decode_batch(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        caches: &mut [&mut LlamaKvCache<B>],
-    ) -> Result<Tensor<B, 3>, KvBlockError> {
+        input_ids: Tensor<2, Int>,
+        caches: &mut [&mut LlamaKvCache],
+    ) -> Result<Tensor<3>, KvBlockError> {
         let [batch_size, sequence_length] = input_ids.dims();
         debug_assert_eq!(sequence_length, 1);
         debug_assert_eq!(batch_size, caches.len());
@@ -196,15 +330,15 @@ impl<B: Backend> LlamaModel<B> {
 }
 
 #[derive(Module, Debug)]
-struct LlamaDecoderLayer<B: Backend> {
-    self_attn: LlamaAttention<B>,
-    mlp: LlamaMlp<B>,
-    input_layernorm: RmsNorm<B>,
-    post_attention_layernorm: RmsNorm<B>,
+struct LlamaDecoderLayer {
+    self_attn: LlamaAttention,
+    mlp: LlamaMlp,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
 }
 
-impl<B: Backend> LlamaDecoderLayer<B> {
-    fn init(config: &LlamaConfig, device: &B::Device) -> Self {
+impl LlamaDecoderLayer {
+    fn init(config: &LlamaConfig, device: &Device) -> Self {
         let norm = || {
             RmsNormConfig::new(config.hidden_size)
                 .with_epsilon(config.rms_norm_eps)
@@ -218,7 +352,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
         }
     }
 
-    fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = residual
             + self
@@ -231,12 +365,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
                 .forward(self.post_attention_layernorm.forward(hidden_states))
     }
 
-    fn prefill(
-        &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &LlamaKvCache<B>,
-        layer: usize,
-    ) -> Tensor<B, 3> {
+    fn prefill(&self, hidden_states: Tensor<3>, cache: &LlamaKvCache, layer: usize) -> Tensor<3> {
         let residual = hidden_states.clone();
         let attention =
             self.self_attn
@@ -251,11 +380,11 @@ impl<B: Backend> LlamaDecoderLayer<B> {
 
     fn prefill_batch(
         &self,
-        hidden_states: Tensor<B, 3>,
-        caches: &[&mut LlamaKvCache<B>],
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
         layer: usize,
         sequence_lengths: &[usize],
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = residual
             + self.self_attn.prefill_batch(
@@ -271,13 +400,57 @@ impl<B: Backend> LlamaDecoderLayer<B> {
                 .forward(self.post_attention_layernorm.forward(hidden_states))
     }
 
-    fn decode(
+    fn prefill_chunk(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &LlamaKvCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &LlamaKvCache,
         layer: usize,
         position: usize,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
+        let residual = hidden_states.clone();
+        let hidden_states = residual
+            + self.self_attn.prefill_chunk(
+                self.input_layernorm.forward(hidden_states),
+                cache,
+                layer,
+                position,
+            );
+        let residual = hidden_states.clone();
+        residual
+            + self
+                .mlp
+                .forward(self.post_attention_layernorm.forward(hidden_states))
+    }
+
+    fn prefill_chunk_batch(
+        &self,
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
+        layer: usize,
+        positions: &[usize],
+    ) -> Tensor<3> {
+        let residual = hidden_states.clone();
+        let hidden_states = residual
+            + self.self_attn.prefill_chunk_batch(
+                self.input_layernorm.forward(hidden_states),
+                caches,
+                layer,
+                positions,
+            );
+        let residual = hidden_states.clone();
+        residual
+            + self
+                .mlp
+                .forward(self.post_attention_layernorm.forward(hidden_states))
+    }
+
+    fn decode(
+        &self,
+        hidden_states: Tensor<3>,
+        cache: &LlamaKvCache,
+        layer: usize,
+        position: usize,
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = residual
             + self.self_attn.decode(
@@ -295,11 +468,11 @@ impl<B: Backend> LlamaDecoderLayer<B> {
 
     fn decode_batch(
         &self,
-        hidden_states: Tensor<B, 3>,
-        caches: &[&mut LlamaKvCache<B>],
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
         layer: usize,
         positions: &[usize],
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = residual
             + self.self_attn.decode_batch(
@@ -317,19 +490,20 @@ impl<B: Backend> LlamaDecoderLayer<B> {
 }
 
 #[derive(Module, Debug)]
-struct LlamaAttention<B: Backend> {
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
+struct LlamaAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    #[module(skip)]
     rotary_embedding: LlamaRotaryEmbedding,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
 }
 
-impl<B: Backend> LlamaAttention<B> {
-    fn init(config: &LlamaConfig, device: &B::Device) -> Self {
+impl LlamaAttention {
+    fn init(config: &LlamaConfig, device: &Device) -> Self {
         let head_dim = config.attention_head_dim();
         let query_width = config.num_attention_heads * head_dim;
         let key_value_width = config.num_key_value_heads * head_dim;
@@ -348,19 +522,14 @@ impl<B: Backend> LlamaAttention<B> {
         }
     }
 
-    fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let query = self.rotary_embedding.forward(query, 0);
         let key = self.rotary_embedding.forward(key, 0);
         self.attend(query, key, value, true)
     }
 
-    fn prefill(
-        &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &LlamaKvCache<B>,
-        layer: usize,
-    ) -> Tensor<B, 3> {
+    fn prefill(&self, hidden_states: Tensor<3>, cache: &LlamaKvCache, layer: usize) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let query = self.rotary_embedding.forward(query, 0);
         let key = self.rotary_embedding.forward(key, 0);
@@ -371,11 +540,11 @@ impl<B: Backend> LlamaAttention<B> {
 
     fn prefill_batch(
         &self,
-        hidden_states: Tensor<B, 3>,
-        caches: &[&mut LlamaKvCache<B>],
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
         layer: usize,
         sequence_lengths: &[usize],
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let query = self.rotary_embedding.forward(query, 0);
         let key = self.rotary_embedding.forward(key, 0);
@@ -402,11 +571,11 @@ impl<B: Backend> LlamaAttention<B> {
 
     fn decode(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &LlamaKvCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &LlamaKvCache,
         layer: usize,
         position: usize,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let query = self.rotary_embedding.forward(query, position);
         let key = self.rotary_embedding.forward(key, position);
@@ -414,13 +583,69 @@ impl<B: Backend> LlamaAttention<B> {
         self.attend_paged_decode(query, cache.read_layer_pages(layer))
     }
 
-    fn decode_batch(
+    fn prefill_chunk(
         &self,
-        hidden_states: Tensor<B, 3>,
-        caches: &[&mut LlamaKvCache<B>],
+        hidden_states: Tensor<3>,
+        cache: &LlamaKvCache,
+        layer: usize,
+        position: usize,
+    ) -> Tensor<3> {
+        let (query, key, value) = self.project(hidden_states);
+        let query = self.rotary_embedding.forward(query, position);
+        let key = self.rotary_embedding.forward(key, position);
+        cache.write_layer(layer, position, key, value);
+        self.attend_paged_decode(query, cache.read_layer_pages_prefix(layer, position + 1))
+    }
+
+    fn prefill_chunk_batch(
+        &self,
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
         layer: usize,
         positions: &[usize],
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
+        let (query, key, value) = self.project(hidden_states);
+        let batch_size = query.dims()[0];
+        debug_assert_eq!(batch_size, caches.len());
+        debug_assert_eq!(batch_size, positions.len());
+        let mut contexts = Vec::with_capacity(batch_size);
+        for index in 0..batch_size {
+            let query = query.clone().slice([
+                index..index + 1,
+                0..self.num_attention_heads,
+                0..1,
+                0..self.head_dim,
+            ]);
+            let key = key.clone().slice([
+                index..index + 1,
+                0..self.num_key_value_heads,
+                0..1,
+                0..self.head_dim,
+            ]);
+            let value = value.clone().slice([
+                index..index + 1,
+                0..self.num_key_value_heads,
+                0..1,
+                0..self.head_dim,
+            ]);
+            let query = self.rotary_embedding.forward(query, positions[index]);
+            let key = self.rotary_embedding.forward(key, positions[index]);
+            caches[index].write_layer(layer, positions[index], key, value);
+            contexts.push(self.attend_paged_decode_context(
+                query,
+                caches[index].read_layer_pages_prefix(layer, positions[index] + 1),
+            ));
+        }
+        self.project_attention_output(Tensor::cat(contexts, 0))
+    }
+
+    fn decode_batch(
+        &self,
+        hidden_states: Tensor<3>,
+        caches: &[&mut LlamaKvCache],
+        layer: usize,
+        positions: &[usize],
+    ) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let batch_size = query.dims()[0];
         debug_assert_eq!(batch_size, caches.len());
@@ -455,7 +680,7 @@ impl<B: Backend> LlamaAttention<B> {
         self.project_attention_output(Tensor::cat(contexts, 0))
     }
 
-    fn project(&self, hidden_states: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+    fn project(&self, hidden_states: Tensor<3>) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let [batch_size, sequence_length, _] = hidden_states.dims();
         let query = self
             .q_proj
@@ -492,11 +717,11 @@ impl<B: Backend> LlamaAttention<B> {
 
     fn attend(
         &self,
-        query: Tensor<B, 4>,
-        key: Tensor<B, 4>,
-        value: Tensor<B, 4>,
+        query: Tensor<4>,
+        key: Tensor<4>,
+        value: Tensor<4>,
         is_causal: bool,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let groups = self.num_attention_heads / self.num_key_value_heads;
         let key = repeat_key_value(key, groups);
         let value = repeat_key_value(value, groups);
@@ -520,17 +745,17 @@ impl<B: Backend> LlamaAttention<B> {
     /// pages are never concatenated into a sequence-sized temporary.
     fn attend_paged_decode(
         &self,
-        query: Tensor<B, 4>,
-        pages: Vec<(Tensor<B, 4>, Tensor<B, 4>)>,
-    ) -> Tensor<B, 3> {
+        query: Tensor<4>,
+        pages: Vec<(Tensor<4>, Tensor<4>)>,
+    ) -> Tensor<3> {
         self.project_attention_output(self.attend_paged_decode_context(query, pages))
     }
 
     fn attend_paged_decode_context(
         &self,
-        query: Tensor<B, 4>,
-        pages: Vec<(Tensor<B, 4>, Tensor<B, 4>)>,
-    ) -> Tensor<B, 4> {
+        query: Tensor<4>,
+        pages: Vec<(Tensor<4>, Tensor<4>)>,
+    ) -> Tensor<4> {
         let config = PagedAttentionConfig::new(
             self.num_attention_heads,
             self.num_key_value_heads,
@@ -543,12 +768,32 @@ impl<B: Backend> LlamaAttention<B> {
             .collect();
         let input = PagedAttentionInput::new(query, pages, config)
             .expect("Llama cache pages must satisfy the paged-attention contract");
+        #[cfg(feature = "wgpu")]
+        {
+            let kernel = CubePagedAttention::new(ola_kernel::KernelTarget::Wgpu)
+                .expect("WGPU is a supported CubeCL target");
+            if kernel.supports(&input) {
+                return kernel
+                    .execute(input)
+                    .expect("CubeCL paged attention must execute validated input");
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let kernel = CubePagedAttention::new(ola_kernel::KernelTarget::Cuda)
+                .expect("CUDA is a supported CubeCL target");
+            if kernel.supports(&input) {
+                return kernel
+                    .execute(input)
+                    .expect("CubeCL paged attention must execute validated input");
+            }
+        }
         PortablePagedAttention::new()
             .execute(input)
             .expect("portable paged attention must execute validated input")
     }
 
-    fn project_attention_output(&self, context: Tensor<B, 4>) -> Tensor<B, 3> {
+    fn project_attention_output(&self, context: Tensor<4>) -> Tensor<3> {
         let [batch_size, _, sequence_length, _] = context.dims();
         let context = context.swap_dims(1, 2).reshape([
             batch_size,
@@ -564,7 +809,7 @@ impl<B: Backend> LlamaAttention<B> {
 /// Repeating a rank-four tensor directly would tile all heads (`0,1,0,1`).
 /// Inserting a group dimension first produces the GQA order expected by Llama
 /// (`0,0,1,1`).
-fn repeat_key_value<B: Backend>(tensor: Tensor<B, 4>, groups: usize) -> Tensor<B, 4> {
+fn repeat_key_value(tensor: Tensor<4>, groups: usize) -> Tensor<4> {
     if groups == 1 {
         return tensor;
     }
@@ -587,17 +832,17 @@ impl LlamaRotaryEmbedding {
     /// Burn's general `RotaryEncoding` rotates adjacent pairs. Llama instead
     /// pairs the first half of each head with the second half, so substituting
     /// the generic module would preserve shapes while producing wrong logits.
-    fn forward<B: Backend>(&self, tensor: Tensor<B, 4>, position_offset: usize) -> Tensor<B, 4> {
+    fn forward(&self, tensor: Tensor<4>, position_offset: usize) -> Tensor<4> {
         let [batch, heads, sequence, head_dim] = tensor.dims();
         debug_assert_eq!(head_dim, self.head_dim);
         let device = tensor.device();
         let half = head_dim / 2;
 
-        let exponent = Tensor::<B, 1, Int>::arange_step(0..head_dim as i64, 2, &device)
+        let exponent = Tensor::<1, Int>::arange_step(0..head_dim as i64, 2, &device)
             .float()
             .div_scalar(head_dim as f32);
         let inverse_frequency = exponent.mul_scalar(self.theta.ln() as f32).exp().recip();
-        let positions = Tensor::<B, 1, Int>::arange(
+        let positions = Tensor::<1, Int>::arange(
             position_offset as i64..(position_offset + sequence) as i64,
             &device,
         )
@@ -623,14 +868,14 @@ impl LlamaRotaryEmbedding {
 }
 
 #[derive(Module, Debug)]
-struct LlamaMlp<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+struct LlamaMlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
 }
 
-impl<B: Backend> LlamaMlp<B> {
-    fn init(config: &LlamaConfig, device: &B::Device) -> Self {
+impl LlamaMlp {
+    fn init(config: &LlamaConfig, device: &Device) -> Self {
         Self {
             gate_proj: linear(config.hidden_size, config.intermediate_size, device),
             up_proj: linear(config.hidden_size, config.intermediate_size, device),
@@ -638,14 +883,14 @@ impl<B: Backend> LlamaMlp<B> {
         }
     }
 
-    fn forward(&self, hidden_states: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
         let gated = silu(self.gate_proj.forward(hidden_states.clone()));
         self.down_proj
             .forward(gated * self.up_proj.forward(hidden_states))
     }
 }
 
-fn linear<B: Backend>(input: usize, output: usize, device: &B::Device) -> Linear<B> {
+fn linear(input: usize, output: usize, device: &Device) -> Linear {
     LinearConfig::new(input, output)
         .with_bias(false)
         .init(device)
@@ -655,15 +900,13 @@ fn linear<B: Backend>(input: usize, output: usize, device: &B::Device) -> Linear
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use burn::{backend::NdArray, tensor::TensorData};
+    use burn::tensor::TensorData;
 
     use super::*;
     use crate::llama::{
         LlamaKvCacheConfig,
         kv_cache::{LlamaKvCache, LlamaKvPool},
     };
-
-    type TestBackend = NdArray<f32>;
 
     fn tiny_config() -> LlamaConfig {
         LlamaConfig {
@@ -691,8 +934,7 @@ mod tests {
     #[test]
     fn forward_preserves_batch_and_sequence_and_projects_to_vocabulary() {
         let device = Default::default();
-        TestBackend::seed(&device, 7);
-        let model = LlamaForCausalLM::<TestBackend>::init(&tiny_config(), &device);
+        let model = LlamaForCausalLM::init(&tiny_config(), &device);
         let input = Tensor::from_data(TensorData::new(vec![1_i64, 5, 9], [1, 3]), &device);
 
         let logits = model.forward(input);
@@ -703,10 +945,8 @@ mod tests {
     #[test]
     fn grouped_query_expansion_repeats_each_head_contiguously() {
         let device = Default::default();
-        let tensor = Tensor::<TestBackend, 4>::from_data(
-            TensorData::new(vec![1.0_f32, 2.0], [1, 2, 1, 1]),
-            &device,
-        );
+        let tensor =
+            Tensor::<4>::from_data(TensorData::new(vec![1.0_f32, 2.0], [1, 2, 1, 1]), &device);
 
         let repeated = repeat_key_value(tensor, 2).into_data();
 
@@ -716,14 +956,13 @@ mod tests {
     #[test]
     fn paged_decode_matches_full_sequence_logits_across_page_sizes() {
         let device = Default::default();
-        TestBackend::seed(&device, 13);
         let config = tiny_config();
-        let model = LlamaForCausalLM::<TestBackend>::init(&config, &device);
+        let model = LlamaForCausalLM::init(&config, &device);
         for tokens_per_block in [1, 2, 4, 16] {
             let pool = LlamaKvPool::new(
                 &config,
                 LlamaKvCacheConfig::new(config.max_position_embeddings, tokens_per_block),
-                device,
+                device.clone(),
             )
             .unwrap();
             let mut cache = LlamaKvCache::allocate(Arc::new(Mutex::new(pool))).unwrap();
@@ -766,11 +1005,7 @@ mod tests {
         }
     }
 
-    fn assert_logits_close(
-        left: Tensor<TestBackend, 3>,
-        right: Tensor<TestBackend, 3>,
-        tolerance: f32,
-    ) {
+    fn assert_logits_close(left: Tensor<3>, right: Tensor<3>, tolerance: f32) {
         let left = left.into_data().to_vec::<f32>().unwrap();
         let right = right.into_data().to_vec::<f32>().unwrap();
         assert_eq!(left.len(), right.len());

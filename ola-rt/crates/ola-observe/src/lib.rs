@@ -315,7 +315,9 @@ impl ExecutionObserver {
                     terminal.push(*request_id);
                 }
                 ExecutorEvent::Deferred { .. } => measurement.admission_deferrals += 1,
-                ExecutorEvent::Idle | ExecutorEvent::BatchDeferred { .. } => {}
+                ExecutorEvent::Idle
+                | ExecutorEvent::PrefillProgress { .. }
+                | ExecutorEvent::BatchDeferred { .. } => {}
             }
         }
         let mut terminal_measurements = Vec::with_capacity(terminal.len());

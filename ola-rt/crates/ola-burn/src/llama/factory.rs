@@ -1,11 +1,10 @@
 use std::{
     error::Error,
     fmt,
-    marker::PhantomData,
     path::{Path, PathBuf},
 };
 
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use ola_core::ArchitectureId;
 use ola_model::{
@@ -22,11 +21,10 @@ use super::{
 /// The factory is registered under an architecture ID (normally `llama`). Model
 /// IDs and paths remain catalog data, so the same factory can load TinyLlama or
 /// another compatible untied, unscaled Llama checkpoint.
-pub struct LlamaFactory<B: Backend> {
+pub struct LlamaFactory {
     architecture: ArchitectureId,
-    device: B::Device,
+    device: Device,
     kv_cache: Option<LlamaKvCacheConfig>,
-    backend: PhantomData<fn() -> B>,
 }
 
 /// Native Burn Llama module paired with the configuration that shaped it.
@@ -35,36 +33,35 @@ pub struct LlamaFactory<B: Backend> {
 /// [`CausalLanguageModel`] interface. This representation exists for research
 /// probes that need logits or hidden tensor outputs without widening the core
 /// runtime API to include backend-specific tensors.
-pub struct LoadedLlama<B: Backend> {
+pub struct LoadedLlama {
     config: LlamaConfig,
-    module: LlamaForCausalLM<B>,
+    module: LlamaForCausalLM,
 }
 
-impl<B: Backend> LoadedLlama<B> {
+impl LoadedLlama {
     /// Returns the validated Hugging Face configuration.
     pub const fn config(&self) -> &LlamaConfig {
         &self.config
     }
 
     /// Returns the native Burn module for explicit research measurements.
-    pub const fn module(&self) -> &LlamaForCausalLM<B> {
+    pub const fn module(&self) -> &LlamaForCausalLM {
         &self.module
     }
 
     /// Consumes the wrapper into configuration and module parts.
-    pub fn into_parts(self) -> (LlamaConfig, LlamaForCausalLM<B>) {
+    pub fn into_parts(self) -> (LlamaConfig, LlamaForCausalLM) {
         (self.config, self.module)
     }
 }
 
-impl<B: Backend> LlamaFactory<B> {
+impl LlamaFactory {
     /// Creates a factory registered as the canonical `llama` architecture.
-    pub fn new(device: B::Device) -> Self {
+    pub fn new(device: Device) -> Self {
         Self {
             architecture: "llama".into(),
             device,
             kv_cache: None,
-            backend: PhantomData,
         }
     }
 
@@ -72,12 +69,11 @@ impl<B: Backend> LlamaFactory<B> {
     ///
     /// Aliases are useful when experiments intentionally compare two Llama
     /// implementations through the same registry.
-    pub fn with_architecture(device: B::Device, architecture: impl Into<ArchitectureId>) -> Self {
+    pub fn with_architecture(device: Device, architecture: impl Into<ArchitectureId>) -> Self {
         Self {
             architecture: architecture.into(),
             device,
             kv_cache: None,
-            backend: PhantomData,
         }
     }
 
@@ -94,11 +90,7 @@ impl<B: Backend> LlamaFactory<B> {
     pub fn load_local(
         &self,
         directory: impl AsRef<Path>,
-    ) -> Result<CausalLanguageModel, LlamaLoadError>
-    where
-        B: 'static,
-        B::Device: Send + Sync,
-    {
+    ) -> Result<CausalLanguageModel, LlamaLoadError> {
         let directory = directory.as_ref();
         if !directory.is_dir() {
             return Err(LlamaLoadError::NotDirectory(directory.to_path_buf()));
@@ -111,7 +103,7 @@ impl<B: Backend> LlamaFactory<B> {
             .kv_cache
             .unwrap_or_else(|| LlamaKvCacheConfig::for_model(&config));
         let cache_profile = cache_config
-            .profile::<B>(&config)
+            .profile(&config)
             .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
         let model =
             BurnLlamaModel::with_kv_cache(module, config, self.device.clone(), cache_config)
@@ -124,17 +116,14 @@ impl<B: Backend> LlamaFactory<B> {
     /// This is the narrow escape hatch used by logit-conformance tests. It
     /// preserves the native Burn type without making backend tensors part of
     /// `ola-model` or `ola-runtime`.
-    pub fn load_native(&self, directory: impl AsRef<Path>) -> Result<LoadedLlama<B>, LlamaLoadError>
-    where
-        B: 'static,
-    {
+    pub fn load_native(&self, directory: impl AsRef<Path>) -> Result<LoadedLlama, LlamaLoadError> {
         let directory = directory.as_ref();
         if !directory.is_dir() {
             return Err(LlamaLoadError::NotDirectory(directory.to_path_buf()));
         }
         let config = LlamaConfig::from_file(directory.join("config.json"))?;
         let weights = find_single_safetensors_file(directory)?;
-        let mut module = LlamaForCausalLM::<B>::init(&config, &self.device);
+        let mut module = LlamaForCausalLM::init(&config, &self.device);
         // Burn stores RMSNorm scale as `gamma`, while Hugging Face Llama uses
         // `weight`. The general PyTorch adapter cannot infer these nested
         // architecture-specific containers, so keep the mapping explicit and
@@ -150,11 +139,7 @@ impl<B: Backend> LlamaFactory<B> {
     }
 }
 
-impl<B> ArchitectureFactory<CausalLanguageModel> for LlamaFactory<B>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
+impl ArchitectureFactory<CausalLanguageModel> for LlamaFactory {
     fn architecture(&self) -> &ArchitectureId {
         &self.architecture
     }
@@ -272,12 +257,7 @@ impl From<LlamaConfigError> for LlamaLoadError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "wgpu")]
-    use burn::backend::{Wgpu, wgpu::WgpuDevice};
-    use burn::{
-        backend::NdArray,
-        tensor::{Int, Tensor, TensorData},
-    };
+    use burn::tensor::{Device, Int, Tensor, TensorData};
 
     use super::*;
     #[cfg(feature = "wgpu")]
@@ -287,7 +267,7 @@ mod tests {
 
     #[test]
     fn factory_is_registered_by_architecture_not_model_name() {
-        let factory = LlamaFactory::<NdArray>::new(Default::default());
+        let factory = LlamaFactory::new(Device::ndarray());
 
         assert_eq!(factory.architecture().as_str(), "llama");
     }
@@ -309,10 +289,10 @@ mod tests {
             "fixture size differs; verify the pinned SHA-256 before using expected logits"
         );
 
-        let factory = LlamaFactory::<NdArray<f32>>::new(Default::default());
+        let factory = LlamaFactory::new(Device::ndarray());
         let loaded = factory.load_native(&directory).unwrap();
         let device = Default::default();
-        let input: Tensor<NdArray<f32>, 2, Int> =
+        let input: Tensor<2, Int> =
             Tensor::from_data(TensorData::new(vec![1_i64, 15_043, 1_789], [1, 3]), &device);
         let logits = loaded.module().forward(input);
         let actual = logits
@@ -357,12 +337,12 @@ mod tests {
         let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
             .map(PathBuf::from)
             .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
-        let cpu_device = Default::default();
-        let gpu_device = WgpuDevice::default();
-        let cpu = LlamaFactory::<NdArray<f32>>::new(cpu_device)
+        let cpu_device = Device::ndarray();
+        let gpu_device = Device::wgpu(Default::default());
+        let cpu = LlamaFactory::new(cpu_device.clone())
             .load_native(&directory)
             .unwrap();
-        let gpu = LlamaFactory::<Wgpu<f32, i32>>::new(gpu_device.clone())
+        let gpu = LlamaFactory::new(gpu_device.clone())
             .load_native(&directory)
             .unwrap();
         let ids = vec![1_i64, 15_043, 1_789];
@@ -402,7 +382,7 @@ mod tests {
         let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
             .map(PathBuf::from)
             .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
-        let artifact = LlamaFactory::<Wgpu<f32, i32>>::new(WgpuDevice::default())
+        let artifact = LlamaFactory::new(Device::wgpu(Default::default()))
             .load_local(directory)
             .unwrap();
         let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();

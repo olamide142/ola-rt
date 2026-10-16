@@ -50,6 +50,19 @@ impl ExecutionBatch {
 pub trait PrefillBatcher: Send {
     /// Returns an opaque deterministic bucket key for one prompt length.
     fn bucket(&mut self, prompt_tokens: usize) -> usize;
+
+    /// Assigns bucket keys to one complete same-model prefill set.
+    ///
+    /// The default preserves the original per-prompt behavior. Workload-aware
+    /// policies may override this method. The executor supplies an output
+    /// slice with exactly the same length, preventing malformed policies from
+    /// changing the cardinality of prepared work.
+    fn buckets(&mut self, prompt_tokens: &[usize], buckets: &mut [usize]) {
+        debug_assert_eq!(prompt_tokens.len(), buckets.len());
+        for (tokens, bucket) in prompt_tokens.iter().zip(buckets) {
+            *bucket = self.bucket(*tokens);
+        }
+    }
 }
 
 /// Compatibility rule that places every prompt length in one bucket.
@@ -74,10 +87,143 @@ pub struct PowerOfTwoPrefillBatcher;
 
 impl PrefillBatcher for PowerOfTwoPrefillBatcher {
     fn bucket(&mut self, prompt_tokens: usize) -> usize {
-        prompt_tokens
-            .checked_next_power_of_two()
-            .unwrap_or(usize::MAX)
+        power_of_two_bucket(prompt_tokens)
     }
+}
+
+/// Grouping alternatives considered by [`CostAwarePrefillBatcher`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefillGroupingStrategy {
+    /// One invocation containing every compatible prompt.
+    Unbucketed,
+    /// One invocation per populated next-power-of-two length bucket.
+    PowerOfTwo,
+}
+
+/// Estimated work for one candidate prefill grouping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrefillGroupingEstimate {
+    /// Model invocations required by the grouping.
+    pub invocations: usize,
+    /// Real plus padded token positions processed by dense tensors.
+    pub dense_input_tokens: usize,
+    /// Dense positions plus configured token-equivalent invocation overhead.
+    pub estimated_cost: usize,
+}
+
+/// Auditable choice made for one same-model prefill set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostAwarePrefillDecision {
+    /// Strategy with the lower estimated cost; ties prefer one invocation.
+    pub selected: PrefillGroupingStrategy,
+    /// Estimate for placing every prompt in one tensor.
+    pub unbucketed: PrefillGroupingEstimate,
+    /// Estimate for next-power-of-two length grouping.
+    pub power_of_two: PrefillGroupingEstimate,
+}
+
+/// Chooses a prefill grouping using dense work plus invocation overhead.
+///
+/// `invocation_overhead_tokens` expresses one model invocation's fixed cost in
+/// token-equivalent units. A value of zero optimizes only dense tensor
+/// positions; larger values increasingly favor fewer, wider invocations. The
+/// estimate is deliberately simple and deterministic so experiments can
+/// calibrate it per model/backend without embedding timing reads in policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CostAwarePrefillBatcher {
+    invocation_overhead_tokens: usize,
+}
+
+impl CostAwarePrefillBatcher {
+    /// Creates a workload-aware grouper with an explicit invocation estimate.
+    pub const fn new(invocation_overhead_tokens: usize) -> Self {
+        Self {
+            invocation_overhead_tokens,
+        }
+    }
+
+    /// Returns the fixed token-equivalent cost charged per model invocation.
+    pub const fn invocation_overhead_tokens(self) -> usize {
+        self.invocation_overhead_tokens
+    }
+
+    /// Estimates both alternatives and returns the selected strategy.
+    pub fn decide(self, prompt_tokens: &[usize]) -> CostAwarePrefillDecision {
+        let input_tokens = prompt_tokens
+            .iter()
+            .fold(0_usize, |total, tokens| total.saturating_add(*tokens));
+        let unbucketed_dense = prompt_tokens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_mul(prompt_tokens.len());
+        let unbucketed_invocations = usize::from(!prompt_tokens.is_empty());
+        let unbucketed = PrefillGroupingEstimate {
+            invocations: unbucketed_invocations,
+            dense_input_tokens: unbucketed_dense,
+            estimated_cost: unbucketed_dense.saturating_add(
+                unbucketed_invocations.saturating_mul(self.invocation_overhead_tokens),
+            ),
+        };
+
+        let mut groups: Vec<(usize, usize, usize)> = Vec::new();
+        for &tokens in prompt_tokens {
+            let bucket = power_of_two_bucket(tokens);
+            if let Some((_, maximum, rows)) = groups.iter_mut().find(|(key, _, _)| *key == bucket) {
+                *maximum = (*maximum).max(tokens);
+                *rows += 1;
+            } else {
+                groups.push((bucket, tokens, 1));
+            }
+        }
+        let power_of_two_dense = groups.iter().fold(0_usize, |total, (_, maximum, rows)| {
+            total.saturating_add(maximum.saturating_mul(*rows))
+        });
+        debug_assert!(power_of_two_dense >= input_tokens);
+        let power_of_two_invocations = groups.len();
+        let power_of_two = PrefillGroupingEstimate {
+            invocations: power_of_two_invocations,
+            dense_input_tokens: power_of_two_dense,
+            estimated_cost: power_of_two_dense.saturating_add(
+                power_of_two_invocations.saturating_mul(self.invocation_overhead_tokens),
+            ),
+        };
+        let selected = if power_of_two.estimated_cost < unbucketed.estimated_cost {
+            PrefillGroupingStrategy::PowerOfTwo
+        } else {
+            PrefillGroupingStrategy::Unbucketed
+        };
+        CostAwarePrefillDecision {
+            selected,
+            unbucketed,
+            power_of_two,
+        }
+    }
+}
+
+impl PrefillBatcher for CostAwarePrefillBatcher {
+    fn bucket(&mut self, prompt_tokens: usize) -> usize {
+        power_of_two_bucket(prompt_tokens)
+    }
+
+    fn buckets(&mut self, prompt_tokens: &[usize], buckets: &mut [usize]) {
+        debug_assert_eq!(prompt_tokens.len(), buckets.len());
+        match self.decide(prompt_tokens).selected {
+            PrefillGroupingStrategy::Unbucketed => buckets.fill(0),
+            PrefillGroupingStrategy::PowerOfTwo => {
+                for (tokens, bucket) in prompt_tokens.iter().zip(buckets) {
+                    *bucket = power_of_two_bucket(*tokens);
+                }
+            }
+        }
+    }
+}
+
+fn power_of_two_bucket(prompt_tokens: usize) -> usize {
+    prompt_tokens
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
 }
 
 /// One unit of model work eligible for the current iteration.
@@ -256,6 +402,44 @@ mod tests {
         assert_eq!(batcher.bucket(7), 8);
         assert_eq!(batcher.bucket(8), 8);
         assert_eq!(batcher.bucket(9), 16);
+    }
+
+    #[test]
+    fn cost_aware_prefill_balances_padding_against_extra_invocations() {
+        let lengths = [5, 7, 9];
+        let low_overhead = CostAwarePrefillBatcher::new(3).decide(&lengths);
+        let break_even = CostAwarePrefillBatcher::new(4).decide(&lengths);
+
+        assert_eq!(low_overhead.unbucketed.dense_input_tokens, 27);
+        assert_eq!(low_overhead.power_of_two.dense_input_tokens, 23);
+        assert_eq!(low_overhead.unbucketed.estimated_cost, 30);
+        assert_eq!(low_overhead.power_of_two.estimated_cost, 29);
+        assert_eq!(low_overhead.selected, PrefillGroupingStrategy::PowerOfTwo);
+        assert_eq!(break_even.unbucketed.estimated_cost, 31);
+        assert_eq!(break_even.power_of_two.estimated_cost, 31);
+        assert_eq!(break_even.selected, PrefillGroupingStrategy::Unbucketed);
+    }
+
+    #[test]
+    fn cost_aware_prefill_assigns_the_selected_workload_level_grouping() {
+        let lengths = [5, 7, 9, 63];
+        let mut batcher = CostAwarePrefillBatcher::new(32);
+
+        assert_eq!(
+            batcher.decide(&lengths).selected,
+            PrefillGroupingStrategy::PowerOfTwo
+        );
+        let mut buckets = [0; 4];
+        batcher.buckets(&lengths, &mut buckets);
+        assert_eq!(buckets, [8, 8, 16, 64]);
+
+        let clustered = [5, 6, 7, 8];
+        assert_eq!(
+            batcher.decide(&clustered).selected,
+            PrefillGroupingStrategy::Unbucketed
+        );
+        batcher.buckets(&clustered, &mut buckets);
+        assert_eq!(buckets, [0, 0, 0, 0]);
     }
 
     #[test]

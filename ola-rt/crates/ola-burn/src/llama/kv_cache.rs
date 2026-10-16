@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::Tensor;
 use ola_model::KvCacheProfile;
 use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
 
@@ -42,10 +42,7 @@ impl LlamaKvCacheConfig {
         self.tokens_per_block
     }
 
-    pub(crate) fn profile<B: Backend>(
-        self,
-        model: &LlamaConfig,
-    ) -> Result<KvCacheProfile, KvBlockError> {
+    pub(crate) fn profile(self, model: &LlamaConfig) -> Result<KvCacheProfile, KvBlockError> {
         if self.capacity_tokens == 0 {
             return Err(KvBlockError::InvalidConfiguration(
                 "capacity_tokens must be greater than zero",
@@ -56,7 +53,7 @@ impl LlamaKvCacheConfig {
                 "tokens_per_block must be greater than zero",
             ));
         }
-        let element_bytes = std::mem::size_of::<B::FloatElem>() as u64;
+        let element_bytes = std::mem::size_of::<f32>() as u64;
         let bytes_per_token = checked_product(&[
             model.num_hidden_layers as u64,
             2,
@@ -76,14 +73,14 @@ impl LlamaKvCacheConfig {
     }
 }
 
-pub(crate) struct LlamaKvCache<B: Backend> {
-    pool: Arc<Mutex<LlamaKvPool<B>>>,
+pub(crate) struct LlamaKvCache {
+    pool: Arc<Mutex<LlamaKvPool>>,
     sequence: KvSequenceId,
     tokens: usize,
 }
 
-impl<B: Backend> LlamaKvCache<B> {
-    pub(crate) fn allocate(pool: Arc<Mutex<LlamaKvPool<B>>>) -> Result<Self, KvBlockError> {
+impl LlamaKvCache {
+    pub(crate) fn allocate(pool: Arc<Mutex<LlamaKvPool>>) -> Result<Self, KvBlockError> {
         let sequence = lock_pool(&pool).manager.allocate()?;
         Ok(Self {
             pool,
@@ -158,14 +155,23 @@ impl<B: Backend> LlamaKvCache<B> {
         &self,
         layer: usize,
         token_offset: usize,
-        key: Tensor<B, 4>,
-        value: Tensor<B, 4>,
+        key: Tensor<4>,
+        value: Tensor<4>,
     ) {
         lock_pool(&self.pool).write_layer(self.sequence, layer, token_offset, key, value);
     }
 
-    pub(crate) fn read_layer_pages(&self, layer: usize) -> Vec<(Tensor<B, 4>, Tensor<B, 4>)> {
+    pub(crate) fn read_layer_pages(&self, layer: usize) -> Vec<(Tensor<4>, Tensor<4>)> {
         lock_pool(&self.pool).read_layer_pages(self.sequence, layer)
+    }
+
+    /// Reads only the populated prefix of an atomically pre-reserved segment.
+    pub(crate) fn read_layer_pages_prefix(
+        &self,
+        layer: usize,
+        token_count: usize,
+    ) -> Vec<(Tensor<4>, Tensor<4>)> {
+        lock_pool(&self.pool).read_layer_pages_prefix(self.sequence, layer, token_count)
     }
 
     /// Returns physical page bytes attributed to this sequence.
@@ -191,33 +197,33 @@ impl<B: Backend> LlamaKvCache<B> {
     }
 }
 
-impl<B: Backend> Drop for LlamaKvCache<B> {
+impl Drop for LlamaKvCache {
     fn drop(&mut self) {
         let result = lock_pool(&self.pool).manager.free(self.sequence);
         debug_assert!(result.is_ok(), "a live cache sequence must be releasable");
     }
 }
 
-pub(crate) struct LlamaKvPool<B: Backend> {
+pub(crate) struct LlamaKvPool {
     manager: KvBlockManager,
-    layers: Vec<LlamaLayerPages<B>>,
+    layers: Vec<LlamaLayerPages>,
     num_key_value_heads: usize,
     head_dim: usize,
-    device: B::Device,
+    device: burn::tensor::Device,
 }
 
-struct LlamaLayerPages<B: Backend> {
-    keys: Vec<Option<Tensor<B, 4>>>,
-    values: Vec<Option<Tensor<B, 4>>>,
+struct LlamaLayerPages {
+    keys: Vec<Option<Tensor<4>>>,
+    values: Vec<Option<Tensor<4>>>,
 }
 
-impl<B: Backend> LlamaKvPool<B> {
+impl LlamaKvPool {
     pub(crate) fn new(
         model: &LlamaConfig,
         config: LlamaKvCacheConfig,
-        device: B::Device,
+        device: burn::tensor::Device,
     ) -> Result<Self, KvBlockError> {
-        let profile = config.profile::<B>(model)?;
+        let profile = config.profile(model)?;
         let manager = KvBlockManager::new(
             profile.capacity_bytes(),
             profile.tokens_per_block(),
@@ -244,8 +250,8 @@ impl<B: Backend> LlamaKvPool<B> {
         sequence: KvSequenceId,
         layer: usize,
         token_offset: usize,
-        key: Tensor<B, 4>,
-        value: Tensor<B, 4>,
+        key: Tensor<4>,
+        value: Tensor<4>,
     ) {
         let [batch, heads, token_count, head_dim] = key.dims();
         debug_assert_eq!(value.dims(), key.dims());
@@ -316,11 +322,25 @@ impl<B: Backend> LlamaKvPool<B> {
         &self,
         sequence: KvSequenceId,
         layer: usize,
-    ) -> Vec<(Tensor<B, 4>, Tensor<B, 4>)> {
+    ) -> Vec<(Tensor<4>, Tensor<4>)> {
         let token_count = self
             .manager
             .cached_tokens(sequence)
             .expect("a live cache owns token accounting");
+        self.read_layer_pages_prefix(sequence, layer, token_count)
+    }
+
+    fn read_layer_pages_prefix(
+        &self,
+        sequence: KvSequenceId,
+        layer: usize,
+        token_count: usize,
+    ) -> Vec<(Tensor<4>, Tensor<4>)> {
+        let reserved_tokens = self
+            .manager
+            .cached_tokens(sequence)
+            .expect("a live cache owns token accounting");
+        debug_assert!(token_count <= reserved_tokens);
         debug_assert!(token_count > 0);
         let tokens_per_block = self.manager.tokens_per_block();
         let layer = self
@@ -362,18 +382,16 @@ fn checked_product(values: &[u64]) -> Result<u64, KvBlockError> {
     })
 }
 
-fn lock_pool<B: Backend>(pool: &Mutex<LlamaKvPool<B>>) -> MutexGuard<'_, LlamaKvPool<B>> {
+fn lock_pool(pool: &Mutex<LlamaKvPool>) -> MutexGuard<'_, LlamaKvPool> {
     pool.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use burn::{backend::NdArray, tensor::TensorData};
+    use burn::tensor::TensorData;
 
     use super::*;
-
-    type TestBackend = NdArray<f32>;
 
     fn tiny_config() -> LlamaConfig {
         LlamaConfig {
@@ -400,13 +418,13 @@ mod tests {
 
     #[test]
     fn writes_and_reads_across_non_contiguous_physical_pages() {
-        let pool = LlamaKvPool::<TestBackend>::new(
+        let pool = LlamaKvPool::new(
             &tiny_config(),
             LlamaKvCacheConfig::new(6, 2),
             Default::default(),
         )
         .unwrap();
-        let device = pool.device;
+        let device = pool.device.clone();
         let pool = Arc::new(Mutex::new(pool));
         let mut first = LlamaKvCache::allocate(pool.clone()).unwrap();
         let mut second = LlamaKvCache::allocate(pool).unwrap();
@@ -442,7 +460,7 @@ mod tests {
 
     #[test]
     fn released_pages_are_reused_and_capacity_failure_is_atomic() {
-        let pool = LlamaKvPool::<TestBackend>::new(
+        let pool = LlamaKvPool::new(
             &tiny_config(),
             LlamaKvCacheConfig::new(4, 2),
             Default::default(),
@@ -467,7 +485,7 @@ mod tests {
 
     #[test]
     fn variable_length_batch_reservation_is_atomic() {
-        let pool = LlamaKvPool::<TestBackend>::new(
+        let pool = LlamaKvPool::new(
             &tiny_config(),
             LlamaKvCacheConfig::new(8, 2),
             Default::default(),

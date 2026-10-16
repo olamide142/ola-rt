@@ -7,8 +7,8 @@ rust-version.workspace = true
 
 [features]
 default = []
-cuda = ["burn/cuda"]
-wgpu = ["burn/wgpu"]
+cuda = ["burn/cuda", "ola-kernel/cuda"]
+wgpu = ["burn/wgpu", "ola-kernel/wgpu"]
 
 [dependencies]
 burn.workspace = true

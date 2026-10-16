@@ -2,11 +2,13 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
+    num::NonZeroUsize,
 };
 
 use ola_core::{Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp};
 use ola_model::{
-    CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, SessionMetrics,
+    CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, PrefillOutcome,
+    SessionMetrics,
 };
 
 use crate::{
@@ -43,6 +45,17 @@ pub enum ExecutionPhase {
 pub enum ExecutorEvent {
     /// Neither queued nor active work was available.
     Idle,
+    /// One resumable prompt segment completed without generating a token.
+    PrefillProgress {
+        /// Request whose prompt cursor advanced.
+        request_id: RequestId,
+        /// Prompt tokens accepted by the session so far.
+        processed_tokens: usize,
+        /// Total tokens in the tokenized prompt.
+        total_tokens: usize,
+        /// Physical KV bytes currently attributed to the request.
+        kv_cache_bytes: u64,
+    },
     /// One token was emitted by prefill or decode.
     Token {
         /// Request that produced the token.
@@ -129,6 +142,8 @@ pub enum ExecutorError {
     DuplicateExecutableModel(ModelId),
     /// A multi-request executor requires at least one active slot.
     InvalidActiveRequestLimit(usize),
+    /// A resumable prefill segment must contain at least one token.
+    InvalidPrefillChunkSize(usize),
     /// A batch policy selected an unknown request or selected one twice.
     InvalidBatchSelection(RequestId),
 }
@@ -154,6 +169,9 @@ impl fmt::Display for ExecutorError {
                     formatter,
                     "active request limit must be positive, got {limit}"
                 )
+            }
+            Self::InvalidPrefillChunkSize(size) => {
+                write!(formatter, "prefill chunk size must be positive, got {size}")
             }
             Self::InvalidBatchSelection(request) => {
                 write!(
@@ -198,7 +216,9 @@ struct PendingPrefill {
     model: CausalLanguageModel,
     session: Box<dyn GenerationSession>,
     prompt_tokens: Vec<u32>,
+    cursor: usize,
     max_new_tokens: usize,
+    last_step_at: Timestamp,
     reserved_kv_bytes: u64,
 }
 
@@ -232,7 +252,10 @@ pub struct Executor<S = FifoScheduler> {
     models: BTreeMap<ModelId, CausalLanguageModel>,
     active: BTreeMap<RequestId, ActiveGeneration>,
     ready: VecDeque<RequestId>,
+    prefilling: BTreeMap<RequestId, PendingPrefill>,
+    prefill_ready: VecDeque<RequestId>,
     max_active_requests: usize,
+    prefill_chunk_size: Option<NonZeroUsize>,
     admission: Box<dyn AdmissionPolicy>,
     batch_policy: Box<dyn BatchPolicy>,
     prefill_batcher: Box<dyn PrefillBatcher>,
@@ -253,7 +276,10 @@ impl<S: Scheduler> Executor<S> {
             models: BTreeMap::new(),
             active: BTreeMap::new(),
             ready: VecDeque::new(),
+            prefilling: BTreeMap::new(),
+            prefill_ready: VecDeque::new(),
             max_active_requests: 1,
+            prefill_chunk_size: None,
             admission: Box::new(UnconstrainedAdmission),
             batch_policy: Box::new(UnboundedBatchPolicy),
             prefill_batcher: Box::new(UnbucketedPrefillBatcher),
@@ -309,6 +335,17 @@ impl<S: Scheduler> Executor<S> {
         self
     }
 
+    /// Bounds resumable prompt work performed for one request per iteration.
+    ///
+    /// Architectures that do not advertise chunk support remain on the
+    /// complete-prompt compatibility path. Admission still reserves the
+    /// request's worst-case KV demand before its first chunk executes.
+    pub fn with_prefill_chunk_size(mut self, tokens: usize) -> Result<Self, ExecutorError> {
+        self.prefill_chunk_size =
+            Some(NonZeroUsize::new(tokens).ok_or(ExecutorError::InvalidPrefillChunkSize(tokens))?);
+        Ok(self)
+    }
+
     /// Registers runtime metadata and its corresponding executable atomically.
     pub fn register_model(
         &mut self,
@@ -359,14 +396,20 @@ impl<S: Scheduler> Executor<S> {
         if self.active.remove(&request_id).is_some() {
             self.ready.retain(|ready| *ready != request_id);
             self.refresh_kv_memory();
+        } else if self.prefilling.remove(&request_id).is_some() {
+            self.prefill_ready.retain(|ready| *ready != request_id);
+            self.refresh_kv_memory();
         }
         Ok(())
     }
 
     /// Performs one prefill or decode operation at the supplied timestamp.
     pub fn step(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
-        let can_admit =
-            self.active.len() < self.max_active_requests && self.runtime.state().queued_len() > 0;
+        if !self.prefill_ready.is_empty() {
+            return self.prefill_next(at);
+        }
+        let can_admit = self.live_request_count() < self.max_active_requests
+            && self.runtime.state().queued_len() > 0;
         if can_admit || self.ready.is_empty() {
             self.start_next(at)
         } else {
@@ -429,7 +472,56 @@ impl<S: Scheduler> Executor<S> {
         events.extend(indexed_events.into_iter().map(|(_, event)| event));
         execution_batches.extend(decode_batches);
 
-        let available_slots = self.max_active_requests.saturating_sub(self.active.len());
+        let prefill_candidates = self
+            .prefill_ready
+            .iter()
+            .map(|request_id| {
+                let pending = self
+                    .prefilling
+                    .get(request_id)
+                    .expect("ready prefill requests retain their session");
+                BatchCandidate {
+                    request_id: *request_id,
+                    phase: BatchPhase::Prefill,
+                    token_cost: self.next_prefill_chunk_len(pending),
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = self.select_batch_candidates(&plan, &prefill_candidates)?;
+        let mut selected_prefills = Vec::new();
+        let mut retained_prefills = VecDeque::new();
+        let mut continued_events = Vec::new();
+        for (index, candidate) in prefill_candidates.into_iter().enumerate() {
+            if selected.contains(&candidate.request_id) {
+                plan.scheduled.push(candidate);
+                let pending = self
+                    .prefilling
+                    .remove(&candidate.request_id)
+                    .expect("selected prefill requests retain their session");
+                selected_prefills.push((index, pending));
+            } else {
+                plan.deferred.push(candidate);
+                retained_prefills.push_back(candidate.request_id);
+                continued_events.push((
+                    index,
+                    ExecutorEvent::BatchDeferred {
+                        request_id: candidate.request_id,
+                        phase: ExecutionPhase::Prefill,
+                        token_cost: candidate.token_cost,
+                    },
+                ));
+            }
+        }
+        self.prefill_ready = retained_prefills;
+        let continued_prefill = self.prefill_selected_batch(selected_prefills, at)?;
+        continued_events.extend(continued_prefill.indexed_events);
+        continued_events.sort_by_key(|(index, _)| *index);
+        events.extend(continued_events.into_iter().map(|(_, event)| event));
+        execution_batches.extend(continued_prefill.execution_batches);
+
+        let available_slots = self
+            .max_active_requests
+            .saturating_sub(self.live_request_count());
         let admission_count = available_slots.min(self.runtime.state().queued_len());
         let mut pending = Vec::with_capacity(admission_count);
         let mut admission_events = Vec::new();
@@ -477,7 +569,7 @@ impl<S: Scheduler> Executor<S> {
             events,
             plan,
             execution_batches,
-            active_requests: self.active.len(),
+            active_requests: self.live_request_count(),
             queued_requests: self.runtime.state().queued_len(),
             kv_cache_bytes: self.runtime.state().memory.kv_cache_bytes,
             reserved_kv_bytes: self.reserved_kv_bytes(),
@@ -496,12 +588,12 @@ impl<S: Scheduler> Executor<S> {
 
     /// Returns whether one request currently owns a generation session.
     pub fn has_active_request(&self) -> bool {
-        !self.active.is_empty()
+        self.live_request_count() > 0
     }
 
     /// Returns the number of request-local generation sessions currently live.
     pub fn active_request_count(&self) -> usize {
-        self.active.len()
+        self.live_request_count()
     }
 
     /// Returns the configured upper bound on concurrently live sessions.
@@ -514,6 +606,11 @@ impl<S: Scheduler> Executor<S> {
         self.active
             .values()
             .map(|active| active.reserved_kv_bytes)
+            .chain(
+                self.prefilling
+                    .values()
+                    .map(|pending| pending.reserved_kv_bytes),
+            )
             .sum()
     }
 
@@ -596,7 +693,7 @@ impl<S: Scheduler> Executor<S> {
         let candidate = BatchCandidate {
             request_id,
             phase: BatchPhase::Prefill,
-            token_cost: prompt_tokens.len(),
+            token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
         };
         let selected = self.select_batch_candidates(plan, &[candidate])?;
         if selected.is_empty() {
@@ -623,7 +720,9 @@ impl<S: Scheduler> Executor<S> {
             model,
             session,
             prompt_tokens,
+            cursor: 0,
             max_new_tokens: request.spec.generation.max_new_tokens,
+            last_step_at: at,
             reserved_kv_bytes,
         }))
     }
@@ -635,9 +734,32 @@ impl<S: Scheduler> Executor<S> {
         prepared: Vec<(usize, PendingPrefill)>,
         at: Timestamp,
     ) -> Result<PrefillBatchOutcome, ExecutorError> {
+        let mut model_positions: Vec<(ModelId, Vec<usize>)> = Vec::new();
+        for (position, (_, pending)) in prepared.iter().enumerate() {
+            if let Some((_, positions)) = model_positions
+                .iter_mut()
+                .find(|(model_id, _)| model_id == &pending.model_id)
+            {
+                positions.push(position);
+            } else {
+                model_positions.push((pending.model_id.clone(), vec![position]));
+            }
+        }
+        let mut assigned_buckets = vec![0; prepared.len()];
+        for (_, positions) in model_positions {
+            let lengths = positions
+                .iter()
+                .map(|position| self.next_prefill_chunk_len(&prepared[*position].1))
+                .collect::<Vec<_>>();
+            let mut buckets = vec![0; positions.len()];
+            self.prefill_batcher.buckets(&lengths, &mut buckets);
+            for (position, bucket) in positions.into_iter().zip(buckets) {
+                assigned_buckets[position] = bucket;
+            }
+        }
+
         let mut groups: Vec<PrefillGroup> = Vec::new();
-        for (index, pending) in prepared {
-            let bucket = self.prefill_batcher.bucket(pending.prompt_tokens.len());
+        for ((index, pending), bucket) in prepared.into_iter().zip(assigned_buckets) {
             if let Some(group) = groups
                 .iter_mut()
                 .find(|group| group.model_id == pending.model_id && group.bucket == bucket)
@@ -659,16 +781,43 @@ impl<S: Scheduler> Executor<S> {
             let model = members[0].1.model.clone();
             let prompts = members
                 .iter()
-                .map(|(_, pending)| pending.prompt_tokens.clone())
+                .map(|(_, pending)| {
+                    let end = pending
+                        .cursor
+                        .saturating_add(self.next_prefill_chunk_len(pending));
+                    pending.prompt_tokens[pending.cursor..end].to_vec()
+                })
                 .collect::<Vec<_>>();
             let prompt_slices = prompts.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let all_complete_prompts = members.iter().all(|(_, pending)| {
+                pending.cursor == 0
+                    && self.next_prefill_chunk_len(pending) == pending.prompt_tokens.len()
+            });
+            let final_chunks = members
+                .iter()
+                .zip(&prompts)
+                .map(|((_, pending), prompt)| {
+                    pending.cursor.saturating_add(prompt.len()) == pending.prompt_tokens.len()
+                })
+                .collect::<Vec<_>>();
             let batched = if members.len() > 1 {
                 let mut sessions: Vec<&mut dyn GenerationSession> =
                     Vec::with_capacity(members.len());
                 for (_, pending) in &mut members {
                     sessions.push(pending.session.as_mut());
                 }
-                model.prefill_batch(&mut sessions, &prompt_slices)
+                if all_complete_prompts {
+                    model
+                        .prefill_batch(&mut sessions, &prompt_slices)
+                        .map(|results| {
+                            results
+                                .into_iter()
+                                .map(|result| result.map(PrefillOutcome::Token))
+                                .collect()
+                        })
+                } else {
+                    model.prefill_chunk_batch(&mut sessions, &prompt_slices, &final_chunks)
+                }
             } else {
                 None
             };
@@ -705,20 +854,26 @@ impl<S: Scheduler> Executor<S> {
                         .saturating_mul(prompts.len())
                         .saturating_sub(prompts.iter().map(Vec::len).sum()),
                 });
-                for ((index, pending), result) in members.into_iter().zip(results) {
+                for (((index, mut pending), prompt), result) in
+                    members.into_iter().zip(prompts).zip(results)
+                {
+                    if result.is_ok() {
+                        pending.cursor = pending.cursor.saturating_add(prompt.len());
+                    }
                     let event = self.finish_prefill(pending, result, at)?;
                     indexed_events.push((index, event));
                 }
             } else {
                 for (index, mut pending) in members {
+                    let chunk_len = self.next_prefill_chunk_len(&pending);
                     execution_batches.push(ExecutionBatch {
                         phase: BatchPhase::Prefill,
                         request_ids: vec![pending.request_id],
                         mode: BatchExecutionMode::Individual,
-                        input_tokens: pending.prompt_tokens.len(),
+                        input_tokens: chunk_len,
                         padding_tokens: 0,
                     });
-                    let result = pending.session.prefill(&pending.prompt_tokens);
+                    let result = execute_prefill_segment(&mut pending, chunk_len);
                     let event = self.finish_prefill(pending, result, at)?;
                     indexed_events.push((index, event));
                 }
@@ -732,16 +887,49 @@ impl<S: Scheduler> Executor<S> {
 
     fn finish_prefill(
         &mut self,
-        pending: PendingPrefill,
-        result: Result<GeneratedToken, ModelExecutionError>,
+        mut pending: PendingPrefill,
+        result: Result<PrefillOutcome, ModelExecutionError>,
         at: Timestamp,
     ) -> Result<ExecutorEvent, ExecutorError> {
-        let token = match result {
-            Ok(token) => token,
+        let outcome = match result {
+            Ok(outcome) => outcome,
             Err(error) => {
                 return self.fail_started(pending.request_id, error.to_string(), at);
             }
         };
+        if let PrefillOutcome::Pending = outcome {
+            if pending.cursor >= pending.prompt_tokens.len() {
+                return self.fail_started(
+                    pending.request_id,
+                    "model left a completed prompt pending without selecting a token".into(),
+                    at,
+                );
+            }
+            pending.last_step_at = at;
+            let request_id = pending.request_id;
+            let metrics = pending.session.metrics();
+            pending.reserved_kv_bytes = pending.reserved_kv_bytes.max(metrics.kv_cache_bytes);
+            let event = ExecutorEvent::PrefillProgress {
+                request_id,
+                processed_tokens: pending.cursor,
+                total_tokens: pending.prompt_tokens.len(),
+                kv_cache_bytes: metrics.kv_cache_bytes,
+            };
+            self.prefilling.insert(request_id, pending);
+            self.prefill_ready.push_back(request_id);
+            self.refresh_kv_memory();
+            return Ok(event);
+        }
+        let PrefillOutcome::Token(token) = outcome else {
+            unreachable!()
+        };
+        if pending.cursor != pending.prompt_tokens.len() {
+            return self.fail_started(
+                pending.request_id,
+                "model selected a token before consuming the complete prompt".into(),
+                at,
+            );
+        }
         self.runtime.mark_first_token(pending.request_id, at)?;
         let active = ActiveGeneration {
             request_id: pending.request_id,
@@ -817,7 +1005,7 @@ impl<S: Scheduler> Executor<S> {
             let candidate = BatchCandidate {
                 request_id,
                 phase: BatchPhase::Prefill,
-                token_cost: prompt_tokens.len(),
+                token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
             };
             let selected = self.select_batch_candidates(plan, &[candidate])?;
             if selected.is_empty() {
@@ -831,27 +1019,49 @@ impl<S: Scheduler> Executor<S> {
             plan.scheduled.push(candidate);
         }
         let lease = self.runtime.start_selected(request_id, at)?;
-        let mut session = match model.create_session(request.spec.generation.clone()) {
+        let session = match model.create_session(request.spec.generation.clone()) {
             Ok(session) => session,
             Err(error) => return self.fail_started(lease.request_id, error.to_string(), at),
         };
-        let token = match session.prefill(&prompt_tokens) {
-            Ok(token) => token,
-            Err(error) => return self.fail_started(lease.request_id, error.to_string(), at),
-        };
-        self.runtime.mark_first_token(lease.request_id, at)?;
-        let active = ActiveGeneration {
+        let mut pending = PendingPrefill {
             request_id: lease.request_id,
             model_id,
             model,
             session,
-            generated: vec![token.id],
-            last_token: token,
+            prompt_tokens,
+            cursor: 0,
             max_new_tokens: request.spec.generation.max_new_tokens,
             last_step_at: at,
             reserved_kv_bytes,
         };
-        self.observe_token(active, ExecutionPhase::Prefill, at)
+        let chunk_len = self.next_prefill_chunk_len(&pending);
+        let result = execute_prefill_segment(&mut pending, chunk_len);
+        self.finish_prefill(pending, result, at)
+    }
+
+    fn prefill_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
+        let Some(request_id) = self.prefill_ready.pop_front() else {
+            return Ok(ExecutorEvent::Idle);
+        };
+        let mut pending = self
+            .prefilling
+            .remove(&request_id)
+            .expect("ready prefill requests retain their session");
+        if at < pending.last_step_at {
+            let previous = pending.last_step_at;
+            self.prefilling.insert(request_id, pending);
+            self.prefill_ready.push_front(request_id);
+            return Err(RuntimeError::TimestampRegression {
+                request: request_id,
+                event: "executor prefill step",
+                previous,
+                observed: at,
+            }
+            .into());
+        }
+        let chunk_len = self.next_prefill_chunk_len(&pending);
+        let result = execute_prefill_segment(&mut pending, chunk_len);
+        self.finish_prefill(pending, result, at)
     }
 
     fn decode_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
@@ -1099,6 +1309,11 @@ impl<S: Scheduler> Executor<S> {
             .active
             .values()
             .map(|active| active.session.metrics().kv_cache_bytes)
+            .chain(
+                self.prefilling
+                    .values()
+                    .map(|pending| pending.session.metrics().kv_cache_bytes),
+            )
             .sum();
     }
 
@@ -1112,6 +1327,19 @@ impl<S: Scheduler> Executor<S> {
             }
             .into());
         }
+        if let Some(pending) = self
+            .prefilling
+            .values()
+            .find(|pending| at < pending.last_step_at)
+        {
+            return Err(RuntimeError::TimestampRegression {
+                request: pending.request_id,
+                event: "executor prefill step",
+                previous: pending.last_step_at,
+                observed: at,
+            }
+            .into());
+        }
         Ok(())
     }
 
@@ -1120,8 +1348,59 @@ impl<S: Scheduler> Executor<S> {
             .values()
             .filter(|active| &active.model_id == model_id)
             .map(|active| active.reserved_kv_bytes)
+            .chain(
+                self.prefilling
+                    .values()
+                    .filter(|pending| &pending.model_id == model_id)
+                    .map(|pending| pending.reserved_kv_bytes),
+            )
             .sum()
     }
+
+    fn live_request_count(&self) -> usize {
+        self.active.len().saturating_add(self.prefilling.len())
+    }
+
+    fn initial_prefill_chunk_len(
+        &self,
+        model: &CausalLanguageModel,
+        prompt_tokens: usize,
+    ) -> usize {
+        if model.supports_chunked_prefill() {
+            self.prefill_chunk_size
+                .map_or(prompt_tokens, |chunk| prompt_tokens.min(chunk.get()))
+        } else {
+            prompt_tokens
+        }
+    }
+
+    fn next_prefill_chunk_len(&self, pending: &PendingPrefill) -> usize {
+        let remaining = pending.prompt_tokens.len().saturating_sub(pending.cursor);
+        self.initial_prefill_chunk_len(&pending.model, remaining)
+    }
+}
+
+fn execute_prefill_segment(
+    pending: &mut PendingPrefill,
+    chunk_len: usize,
+) -> Result<PrefillOutcome, ModelExecutionError> {
+    debug_assert!(chunk_len > 0);
+    let end = pending.cursor.saturating_add(chunk_len);
+    debug_assert!(end <= pending.prompt_tokens.len());
+    let is_final = end == pending.prompt_tokens.len();
+    let prompt_chunk = pending.prompt_tokens[pending.cursor..end].to_vec();
+    let result = if pending.cursor == 0 && is_final {
+        pending
+            .session
+            .prefill(&prompt_chunk)
+            .map(PrefillOutcome::Token)
+    } else {
+        pending.session.prefill_chunk(&prompt_chunk, is_final)
+    };
+    if result.is_ok() {
+        pending.cursor = end;
+    }
+    result
 }
 
 fn prepare_prompt(
@@ -1191,6 +1470,10 @@ mod tests {
     struct IncrementModel;
 
     impl CausalModel for IncrementModel {
+        fn supports_chunked_prefill(&self) -> bool {
+            true
+        }
+
         fn create_session(
             &self,
             _generation: GenerationConfig,
@@ -1208,6 +1491,22 @@ mod tests {
                     .iter_mut()
                     .zip(prompt_tokens.iter().copied())
                     .map(|(session, prompt)| session.prefill(prompt))
+                    .collect(),
+            )
+        }
+
+        fn prefill_chunk_batch(
+            &self,
+            sessions: &mut [&mut dyn GenerationSession],
+            prompt_chunks: &[&[u32]],
+            is_final: &[bool],
+        ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+            Some(
+                sessions
+                    .iter_mut()
+                    .zip(prompt_chunks.iter().copied())
+                    .zip(is_final.iter().copied())
+                    .map(|((session, chunk), is_final)| session.prefill_chunk(chunk, is_final))
                     .collect(),
             )
         }
@@ -1260,6 +1559,34 @@ mod tests {
                 id: last + 1,
                 is_end_of_sequence: false,
             })
+        }
+
+        fn prefill_chunk(
+            &mut self,
+            prompt_tokens: &[u32],
+            is_final: bool,
+        ) -> Result<PrefillOutcome, ModelExecutionError> {
+            let last = prompt_tokens.last().copied().ok_or_else(|| {
+                ModelExecutionError::new(ExecutionStage::Prefill, "chunk cannot be empty")
+            })?;
+            if self.ready {
+                return Err(ModelExecutionError::new(
+                    ExecutionStage::Prefill,
+                    "prefill already completed",
+                ));
+            }
+            self.metrics.prompt_tokens += prompt_tokens.len();
+            self.metrics.kv_cache_bytes += prompt_tokens.len() as u64 * 8;
+            if is_final {
+                self.ready = true;
+                self.metrics.generated_tokens = 1;
+                Ok(PrefillOutcome::Token(GeneratedToken {
+                    id: last + 1,
+                    is_end_of_sequence: false,
+                }))
+            } else {
+                Ok(PrefillOutcome::Pending)
+            }
         }
 
         fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
@@ -1367,6 +1694,201 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn chunked_prefill_advances_a_bounded_cursor_before_emitting_a_token() {
+        let mut executor = Executor::default().with_prefill_chunk_size(2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let id = executor
+            .submit(request("1 2 3 4 5", 1), Timestamp::ZERO)
+            .unwrap();
+
+        let first = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+        assert_eq!(first.plan.scheduled[0].token_cost, 2);
+        assert!(matches!(
+            first.events.as_slice(),
+            [ExecutorEvent::PrefillProgress {
+                request_id,
+                processed_tokens: 2,
+                total_tokens: 5,
+                kv_cache_bytes: 16,
+            }] if *request_id == id
+        ));
+        assert_eq!(first.execution_batches[0].input_tokens, 2);
+        assert_eq!(first.active_requests, 1);
+        assert_eq!(executor.state().memory.kv_cache_bytes, 16);
+
+        let second = executor.step_iteration(Timestamp::from_micros(2)).unwrap();
+        assert!(matches!(
+            second.events.as_slice(),
+            [ExecutorEvent::PrefillProgress {
+                processed_tokens: 4,
+                total_tokens: 5,
+                ..
+            }]
+        ));
+
+        let third = executor.step_iteration(Timestamp::from_micros(3)).unwrap();
+        assert_eq!(third.plan.scheduled[0].token_cost, 1);
+        assert!(matches!(
+            third.events.as_slice(),
+            [ExecutorEvent::Token {
+                token: GeneratedToken { id: 6, .. },
+                generated_tokens: 1,
+                finished: true,
+                phase: ExecutionPhase::Prefill,
+                ..
+            }]
+        ));
+        assert_eq!(executor.result(id).unwrap().metrics.prompt_tokens, 5);
+        assert_eq!(executor.state().memory.kv_cache_bytes, 0);
+    }
+
+    #[test]
+    fn chunked_prefill_and_decode_share_an_iteration_budget() {
+        let policy = crate::FifoTokenBudgetPolicy::new(3).unwrap();
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_batch_policy(policy)
+            .with_prefill_chunk_size(2)
+            .unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let short = executor.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let long = executor
+            .submit(request("1 2 3 4", 1), Timestamp::ZERO)
+            .unwrap();
+
+        let first = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+        assert!(
+            matches!(first.events[0], ExecutorEvent::Token { request_id, .. } if request_id == short)
+        );
+        assert!(
+            matches!(first.events[1], ExecutorEvent::PrefillProgress { request_id, .. } if request_id == long)
+        );
+
+        let second = executor.step_iteration(Timestamp::from_micros(2)).unwrap();
+        assert_eq!(
+            second
+                .plan
+                .scheduled
+                .iter()
+                .map(|candidate| (candidate.request_id, candidate.token_cost))
+                .collect::<Vec<_>>(),
+            vec![(short, 1), (long, 2)]
+        );
+        assert!(
+            matches!(second.events[0], ExecutorEvent::Token { request_id, .. } if request_id == short)
+        );
+        assert!(
+            matches!(second.events[1], ExecutorEvent::Token { request_id, finished: true, .. } if request_id == long)
+        );
+    }
+
+    #[test]
+    fn resumable_chunks_tensor_batch_at_unequal_absolute_positions() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_prefill_chunk_size(2)
+            .unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let first = executor
+            .submit(request("1 2 3 4 5", 1), Timestamp::ZERO)
+            .unwrap();
+        executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+        let second = executor
+            .submit(request("5 6 7 8 9", 1), Timestamp::from_micros(1))
+            .unwrap();
+        executor.step_iteration(Timestamp::from_micros(2)).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(3)).unwrap();
+
+        assert_eq!(iteration.execution_batches.len(), 1);
+        assert_eq!(
+            iteration.execution_batches[0],
+            ExecutionBatch {
+                phase: BatchPhase::Prefill,
+                request_ids: vec![first, second],
+                mode: BatchExecutionMode::Tensor,
+                input_tokens: 3,
+                padding_tokens: 1,
+            }
+        );
+        assert!(matches!(
+            iteration.events[0],
+            ExecutorEvent::Token {
+                request_id,
+                finished: true,
+                ..
+            } if request_id == first
+        ));
+        assert!(matches!(
+            iteration.events[1],
+            ExecutorEvent::PrefillProgress {
+                request_id,
+                processed_tokens: 4,
+                ..
+            } if request_id == second
+        ));
+    }
+
+    #[test]
+    fn cancelling_chunked_prefill_releases_its_live_session_memory() {
+        let mut executor = Executor::default().with_prefill_chunk_size(2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let id = executor
+            .submit(request("1 2 3 4", 2), Timestamp::ZERO)
+            .unwrap();
+        executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+        assert_eq!(executor.state().memory.kv_cache_bytes, 16);
+
+        executor.cancel(id, Timestamp::from_micros(2)).unwrap();
+
+        assert_eq!(executor.state().memory.kv_cache_bytes, 0);
+        assert_eq!(executor.active_request_count(), 0);
+        assert_eq!(
+            executor.state().request(id).unwrap().status,
+            RequestStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn models_without_resumable_prefill_keep_the_complete_prompt_path() {
+        let mut executor = Executor::default().with_prefill_chunk_size(2).unwrap();
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                individual_artifact(),
+            )
+            .unwrap();
+        executor
+            .submit(request("1 2 3 4", 1), Timestamp::ZERO)
+            .unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+
+        assert_eq!(iteration.plan.scheduled[0].token_cost, 4);
+        assert_eq!(iteration.execution_batches[0].input_tokens, 4);
+        assert!(matches!(
+            iteration.events.as_slice(),
+            [ExecutorEvent::Token { finished: true, .. }]
+        ));
+    }
+
+    #[test]
+    fn rejects_a_zero_prefill_chunk_size() {
+        assert!(matches!(
+            Executor::default().with_prefill_chunk_size(0),
+            Err(ExecutorError::InvalidPrefillChunkSize(0))
+        ));
     }
 
     #[test]
@@ -1768,6 +2290,49 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(
+            iteration
+                .execution_batches
+                .iter()
+                .map(|batch| batch.padding_tokens)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    #[test]
+    fn cost_aware_prefill_applies_one_workload_level_decision() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 4)
+            .unwrap()
+            .with_prefill_batcher(crate::CostAwarePrefillBatcher::new(32));
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let mut ids = Vec::new();
+        for length in [5, 7, 9, 63] {
+            let mut spec = request("1", 1);
+            spec.inputs = vec![Input::Tokens(vec![1; length])];
+            ids.push(executor.submit(spec, Timestamp::ZERO).unwrap());
+        }
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        assert_eq!(
+            iteration
+                .events
+                .iter()
+                .filter(|event| matches!(event, ExecutorEvent::Token { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(iteration.execution_batches.len(), 3);
+        assert_eq!(
+            iteration.execution_batches[0].request_ids,
+            vec![ids[0], ids[1]]
+        );
+        assert_eq!(iteration.execution_batches[0].padding_tokens, 2);
+        assert_eq!(iteration.execution_batches[1].request_ids, vec![ids[2]]);
+        assert_eq!(iteration.execution_batches[2].request_ids, vec![ids[3]]);
         assert_eq!(
             iteration
                 .execution_batches

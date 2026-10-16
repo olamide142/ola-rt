@@ -19,9 +19,11 @@ artifact-directory/
 └── model.safetensors
 ```
 
-`LlamaFactory<B>` implements
-`ArchitectureFactory<CausalLanguageModel>` for any compatible Burn backend
-`B`. Registering that factory under `llama` does not register a particular
+`LlamaFactory` implements
+`ArchitectureFactory<CausalLanguageModel>` for a runtime-selected Burn device.
+Burn 0.22 dispatches tensors using `Device`, so the same model type can run on
+CPU, WGPU, or CUDA without a backend type parameter. Registering that factory
+under `llama` does not register a particular
 model. A `ModelDefinition` separately selects the artifact directory, allowing
 TinyLlama and other compatible Llama checkpoints to share the implementation.
 
@@ -53,6 +55,8 @@ The baseline is intentionally simple and easy to inspect:
   one-token decode operations;
 - only greedy decoding (`temperature = 0`) is accepted;
 - prefill writes compact keys and values into fixed-size per-layer pages;
+- resumable prefill atomically reserves each bounded segment, advances its
+  request-local cursor, and selects a token only after the final segment;
 - runtime block tables map each sequence's logical blocks to physical pages;
 - decode processes only the newest token and writes into its assigned page;
 - request metrics report physical page bytes attributed to the sequence,
@@ -77,10 +81,10 @@ The default page pool has capacity for one full model context and uses 16-token
 blocks. Experiments can override both values before loading an artifact:
 
 ```rust,no_run
-use burn::backend::NdArray;
+use burn::tensor::Device;
 use ola_burn::llama::{LlamaFactory, LlamaKvCacheConfig};
 
-let factory = LlamaFactory::<NdArray<f32>>::new(Default::default())
+let factory = LlamaFactory::new(Device::ndarray())
     .with_kv_cache(LlamaKvCacheConfig::new(8_192, 32));
 # let _ = factory;
 ```
@@ -118,6 +122,21 @@ different lengths and decode at different positions. Executor integration
 tests verify that compatible Llama requests report real `Tensor` batches for
 both phases. The individual paths remain numerical and lifecycle oracles.
 
+## Resumable prefill
+
+Llama sessions accept bounded prompt segments through the architecture-neutral
+`prefill_chunk` contract. A segment reserves all of its pages before writing
+any layer data. Attention then advances one prompt position at a time over the
+populated page prefix, preserving exact causal position and allowing the
+runtime to yield between segments. Capacity failure leaves the accepted-token
+cursor and session metrics unchanged. Tests compare final tokens, metrics, and
+the following cached decode against complete-prompt prefill.
+
+Compatible sessions can share this path at unequal absolute positions and with
+different segment lengths. The implementation atomically reserves all rows,
+then tensor-batches the active row subset at each segment offset while each row
+attends only through its newly populated absolute position.
+
 ## Running a local artifact
 
 From the implementation workspace:
@@ -129,7 +148,7 @@ cargo run -p ola-burn --example run_llama -- \
   8
 ```
 
-The default is Burn's CPU `NdArray<f32>` backend. WGPU is an opt-in path that
+The default is Burn's CPU NdArray device. WGPU is an opt-in path that
 uses the platform graphics API and is the simplest GPU route on a machine
 without a CUDA toolkit:
 
@@ -148,7 +167,7 @@ cargo run -p ola-burn --features cuda --example run_llama -- \
 
 The example selects the `llama` factory through `ArchitectureRegistry`,
 tokenizes the prompt, performs greedy prefill and decode, and prints token IDs,
-session metrics, the concrete backend type, and decoded text. A random test
+session metrics, and decoded text. A random test
 checkpoint validates mechanics but produces meaningless text; a trained
 checkpoint such as TinyLlama is required for meaningful output and needs enough
 memory for its full-precision representation.
@@ -158,6 +177,12 @@ fixture: its selected tokens match CPU exactly, and sampled logits remain
 within the documented accelerator tolerance. This is correctness evidence, not
 a throughput claim; first-run compilation and shader warm-up must be separated
 from steady-state measurements.
+
+With `--features wgpu` or `--features cuda`, single-token decode attempts the
+CubeCL paged-attention implementation through Burn's CubeCL/Fusion extension.
+It falls back to portable Burn attention on other devices and unsupported
+dtypes. The current CubeCL kernel is a bring-up implementation, not a tuned
+FlashAttention kernel; benchmark it before treating it as a performance win.
 
 ## Evidence expectations
 

@@ -5,8 +5,17 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+cuda = ["cubecl", "burn/cuda", "burn-cubecl/cuda"]
+cubecl = ["dep:burn-backend", "dep:burn-cubecl", "burn/fusion"]
+cubecl-cpu = ["cubecl", "burn/cpu", "burn-cubecl/cpu"]
+wgpu = ["cubecl", "burn/wgpu", "burn-cubecl/wgpu"]
+
 [dependencies]
 burn.workspace = true
+burn-backend = { workspace = true, optional = true, features = ["cubecl"] }
+burn-cubecl = { workspace = true, optional = true }
 
 [lints]
 workspace = true

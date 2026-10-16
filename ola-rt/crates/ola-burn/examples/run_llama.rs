@@ -6,11 +6,7 @@
 
 use std::{env, error::Error, io};
 
-#[cfg(feature = "cuda")]
-use burn::backend::Cuda;
-#[cfg(feature = "wgpu")]
-use burn::backend::Wgpu;
-use burn::{backend::NdArray, tensor::backend::Backend};
+use burn::tensor::Device;
 use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor};
 use ola_model::{ArchitectureRegistry, CausalLanguageModel, ModelDefinition};
@@ -44,22 +40,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or(8);
 
     match backend.as_str() {
-        "cpu" => run::<NdArray<f32>>(
-            Default::default(),
+        "cpu" => run(
+            Device::ndarray(),
             artifact_directory,
             prompt,
             max_new_tokens,
         ),
         #[cfg(feature = "cuda")]
-        "cuda" => run::<Cuda<f32, i32>>(
-            Default::default(),
-            artifact_directory,
-            prompt,
-            max_new_tokens,
-        ),
+        "cuda" => run(Device::cuda(0), artifact_directory, prompt, max_new_tokens),
         #[cfg(feature = "wgpu")]
-        "wgpu" => run::<Wgpu<f32, i32>>(
-            Default::default(),
+        "wgpu" => run(
+            Device::wgpu(Default::default()),
             artifact_directory,
             prompt,
             max_new_tokens,
@@ -84,22 +75,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run<B>(
-    device: B::Device,
+fn run(
+    device: Device,
     artifact_directory: String,
     prompt: String,
     max_new_tokens: usize,
-) -> Result<(), Box<dyn Error>>
-where
-    B: Backend + 'static,
-    B::Device: Send + Sync,
-{
+) -> Result<(), Box<dyn Error>> {
     let definition = ModelDefinition::local(
         ModelDescriptor::language("selected-llama", "llama"),
         artifact_directory,
     );
     let mut architectures = ArchitectureRegistry::<CausalLanguageModel>::default();
-    architectures.register(LlamaFactory::<B>::new(device))?;
+    architectures.register(LlamaFactory::new(device))?;
     let loaded = architectures.load(&definition)?;
 
     let prompt_tokens = loaded.inner().tokenizer().encode(&prompt, true)?;
@@ -124,7 +111,6 @@ where
     println!("prompt_tokens={prompt_tokens:?}");
     println!("generated_tokens={generated:?}");
     println!("metrics={:?}", session.metrics());
-    println!("backend={}", std::any::type_name::<B>());
     println!("text={text:?}");
     Ok(())
 }

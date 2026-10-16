@@ -15,9 +15,10 @@ pub use admission::{
     UnconstrainedAdmission,
 };
 pub use batch::{
-    BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, ExecutionBatch,
-    FifoTokenBudgetPolicy, IterationPlan, PowerOfTwoPrefillBatcher, PrefillBatcher,
-    UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+    BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy,
+    CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutionBatch, FifoTokenBudgetPolicy,
+    IterationPlan, PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate,
+    PrefillGroupingStrategy, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
 pub use error::RuntimeError;
 pub use executor::{

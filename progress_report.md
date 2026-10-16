@@ -1,14 +1,17 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-13 14:09 BST (Europe/London)
+**Last updated:** 2026-10-14 15:57 BST (Europe/London)
 
-**Source revision:** working tree based on continuous-batching milestone
-`c788f1a` on `master`
+**Source revision:** working tree based on prefill-comparison milestone
+`9403ab3` on `master`
 
-**Repository state at update:** batching, Makefile, observability,
-variable-length Llama prefill/decode, and prompt bucketing committed locally;
-deterministic bucketing comparison and UI experiment implemented after that
-commit; not yet committed or pushed
+**Repository state at update:** deterministic bucketing comparison and UI
+experiment committed locally; execution-backed repeated prefill benchmark,
+versioned JSON persistence, and cost-aware adaptive prefill grouping implemented
+after that commit; measured calibration and rotating three-way comparison are
+also implemented; bounded and tensor-batched resumable Llama prefill and the
+initial `ola-kernel` paged-attention boundary are implemented in the same
+working tree; current branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, `IMPLEMENTATION.md`
@@ -90,11 +93,60 @@ invocation-count tradeoff without presenting deterministic shape arithmetic as
 elapsed performance. The comparison is runnable from the terminal workbench's
 Experiments screen without loading a model.
 
+The working tree adds the next measurement layer: identical tokenized requests
+are executed against a loaded model under both grouping strategies. The runner
+rejects output divergence and reports real executor invocations, padding,
+emitted-token throughput, prefill-iteration and total host wall time, and peak
+observed/reserved KV bytes. A repeated protocol discards explicit warm-up
+pairs, retains raw measured pairs, alternates which strategy runs first, and
+derives nearest-rank latency summaries. The UI exposes four measured pairs
+after one warm-up pair. Documentation explicitly distinguishes
+prefill-iteration wall time from TTFT and treats results as operational probes
+rather than publication-quality performance claims.
+
+Benchmark results can now cross process boundaries. A versioned JSON schema
+records the full tokenized workload, repetition protocol, model/device/build
+metadata, paired execution order, every raw measurement, exact aggregate
+token/time inputs, latency summaries, and KV peaks. File creation refuses to
+overwrite existing results, and readers reject unknown schema versions or
+inconsistent trial indexes. UI persistence is opt-in through
+`--results-dir`/`OLA_BENCH_RESULTS_DIR`, so ordinary interactive use remains
+side-effect free.
+
+The runtime now has its first workload-aware grouping policy.
+`CostAwarePrefillBatcher` evaluates the complete same-model prefill set and
+chooses either one wide tensor invocation or next-power-of-two buckets. Its
+explicit token-equivalent invocation overhead balances fixed launch cost
+against dense padding work; both candidate estimates and the selected strategy
+are auditable. Decisions contain no timing reads, preserve lifecycle order, and
+can be calibrated independently per model/backend. A model-independent UI
+experiment demonstrates that the same policy selects bucketing for a diverse
+trace and one wide batch for a clustered trace.
+
+The adaptive cost can now be derived from execution instead of chosen only by
+hand. The benchmark fits unbucketed and power-of-two p50 prefill measurements to
+`time = dense_tokens * a + invocations * b`, rejects invalid/non-positive fits,
+and uses the rounded `b/a` token-equivalent overhead in a fresh three-strategy
+comparison. Unbucketed, power-of-two, and adaptive order rotates across three
+measured trials, outputs must remain identical, and schema-v2 reports retain
+the full order, calibrated overhead, and every adaptive sample. The complete
+flow passed against the real CPU tiny-Llama fixture.
+
+The latest working-tree addition exercises chunking under mixed arrivals and
+decode competition. A repeated fairness sweep compares complete prefill with
+selected chunk sizes while limiting active requests, rotates strategy order,
+discards warm-ups, validates output equality, and retains each request's TTFT
+and completion host latency alongside scheduler iterations. The UI probe runs
+four differently sized prompts with two active slots, chunk sizes 2/4/8, one
+warm-up, and three measured runs. Per-request p50/p95 summaries are operational
+host observations, not a wall-clock fairness guarantee or publication-quality
+performance claim.
+
 ## Current delivery status
 
 | Area | Status | Current capability |
 | --- | --- | --- |
-| Workspace architecture | Working | Eight crates with explicit dependency boundaries |
+| Workspace architecture | Working | Nine crates with explicit dependency boundaries |
 | Core request model | Working | IDs, timestamps, multimodal inputs, generation controls, validation |
 | Model selection | Working | Catalog, model definitions, architecture registry, factories |
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
@@ -102,9 +154,10 @@ Experiments screen without loading a model.
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
-| Batch composition | Token-budget and bucketing baseline | Replaceable selection policy, auditable plans, FIFO token budget, optional power-of-two prefill buckets |
+| Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
 | Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
-| Workloads and metrics | Foundation working | Fixed trace replay, nearest-rank latency summaries, deterministic prefill grouping comparisons |
+| Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
+| Kernel abstraction | First vertical slice | Validated paged-attention contract, stable metadata, and portable Burn reference used by Llama decode |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -113,7 +166,7 @@ Experiments screen without loading a model.
 | KV block manager | Working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
 | Serving | Foundation working | Transport-neutral request/service boundary |
 | Terminal UI | Working foundation | Overview, chat, benchmarks, experiments, background local adapter |
-| Local UI integrations | Working | Executor-backed Llama chat/generation, KV/FIFO probes, and prefill-bucketing comparison |
+| Local UI integrations | Working | Llama chat/generation, KV/FIFO probes, fixed/adaptive shape experiments, real-model prefill benchmarks, and repeated mixed-workload chunk fairness sweep |
 | GPU execution | Working WGPU path | Llama generation runs through WGPU on the GTX 1650; native CUDA compiles but needs toolkit/NVRTC locally |
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
@@ -138,6 +191,9 @@ Experiments screen without loading a model.
 - Shared tokenizer and model weights with isolated request sessions.
 - Backend-neutral individual and optional batched prefill/decode contracts plus
   session metrics.
+- Explicit resumable-prefill capability negotiation and typed pending/token
+  segment outcomes.
+- Optional tensor-batched chunk contract carrying per-row final-segment flags.
 - Backend-neutral physical KV resource profiles for pre-session planning.
 - Explicit distinction between catalog availability and runtime residency.
 
@@ -175,9 +231,19 @@ Experiments screen without loading a model.
   - explicit prefill/decode candidates with input-token costs;
   - auditable selected/deferred iteration plans and batch-deferral events;
   - FIFO token-budget enforcement with oversized-prefill progress;
+  - bounded resumable prefill with request-local cursors and progress events;
+  - shared token-budget composition for decode and continued prefill work;
+  - cancellation-safe partial-session cleanup and architecture fallback to
+    complete-prompt execution;
+  - model-grouped tensor execution for resumable chunks with unequal cursors
+    and segment lengths;
   - model-compatible grouping of selected prefill and decode work;
   - replaceable prefill-length grouping with unbucketed compatibility and
     power-of-two strategies;
+  - complete same-model workload grouping hooks for policies that require more
+    than one prompt length at a time;
+  - cost-aware adaptive selection balancing dense positions against an explicit
+    token-equivalent invocation overhead, with auditable candidate estimates;
   - optional phase-specific tensor-batch hooks with transparent individual
     fallback;
   - explicit tensor/individual execution records with request-row order, real
@@ -210,6 +276,12 @@ Experiments screen without loading a model.
     runtime admission.
 - Atomic multi-sequence KV growth for tensor decode.
 - Atomic request-specific KV growth for variable-length tensor prefill.
+- Atomic per-segment reservation for resumable prefill, with accepted-token
+  state unchanged on capacity failure.
+- Request-local chunk attention over the populated page prefix, with final
+  token and subsequent decode agreement against complete-prompt execution.
+- Atomic variable-length chunk reservation and per-offset active-row tensor
+  batching across sessions at unequal absolute positions.
 - Tensor-batched variable-length prefill:
   - right-padded dense transformer computation with causal isolation;
   - per-row final real-token selection;
@@ -235,6 +307,20 @@ Experiments screen without loading a model.
   - backend-generic token selection across differing integer element types;
   - CPU/WGPU fixture-logit comparison with an explicit tolerance.
 
+### `ola-kernel`
+
+- Fine-grained `PagedAttentionKernel<B>` contract without scheduler, model, or
+  allocation ownership.
+- Validated single-sequence decode inputs with explicit GQA dimensions and
+  populated logical KV pages.
+- Stable operation, implementation, and hardware-target metadata for future
+  diagnostics and benchmark reports.
+- Portable Burn online-softmax implementation extracted from the Llama model
+  and retained as the numerical baseline.
+- Direct use by Llama cached decode and resumable-prefill attention.
+- Documented handoff for adding a second implementation, capability checks,
+  provider selection, fallback, conformance, and benchmarking.
+
 ### `ola-bench`
 
 - Deterministic timestamped workload representation.
@@ -245,6 +331,25 @@ Experiments screen without loading a model.
   inputs, padding inputs, and efficiency.
 - Side-by-side unbucketed versus power-of-two comparison with explicit padding
   savings and no implied wall-clock claim.
+- Execution-backed comparison against one loaded model with output-equivalence
+  validation, invocation/padding counts, host wall time, output throughput, and
+  peak observed/reserved KV bytes.
+- Warm-up-aware repeated comparisons with alternating paired order, retained
+  raw samples, nearest-rank prefill/total latency summaries, and aggregate
+  throughput.
+- Two-term invocation-cost calibration with explicit validity checks and a
+  fresh order-rotated three-way unbucketed/power-of-two/adaptive benchmark.
+- Complete-versus-chunked execution comparison with output equivalence,
+  segment invocation/iteration counts, timing, and KV peaks.
+- Repeated mixed-workload fairness sweep comparing complete prefill with
+  configured chunk sizes under an active-request limit, rotating strategy
+  order, discarding warm-ups, retaining per-request TTFT/completion host latency
+  and scheduler iterations, and deriving nearest-rank distributions.
+- Versioned JSON report schema with exact protocol, metadata, raw paired
+  or three-way samples, integer microsecond timing, full execution order,
+  adaptive calibration, derived summaries, and non-overwriting persistence.
+- Deterministic cost-aware policy analysis exposing candidate estimates,
+  selected strategy, and resulting invocation/padding shape.
 
 ### `ola-observe`
 
@@ -280,10 +385,22 @@ Experiments screen without loading a model.
 - Explicit CPU/WGPU/CUDA selection using `--backend` or `OLA_BACKEND`.
 - Real cached chat generation through the runtime executor.
 - Llama generation latency/throughput probe.
+- Loaded-model prefill-strategy benchmark with execution timing, padding,
+  invocation, throughput, peak-KV, warm-up, calibrated adaptive cost, and
+  rotating three-way p50 results.
+- Loaded-model chunked-prefill benchmark comparing complete execution with
+  three-token resumable segments and verifying identical generated output.
+- Repeated mixed-workload chunk fairness probe with four unequal prompts, two
+  active slots, chunk sizes 2/4/8, per-request first-token/completion latency
+  and iteration summaries, and output-equivalence checks.
+- Opt-in report persistence using `--results-dir` or
+  `OLA_BENCH_RESULTS_DIR`, with optional device/build identity overrides.
 - Real KV block-pressure benchmark.
 - Real fixed-workload FIFO experiment.
 - Model-independent prefill-bucketing experiment showing padding, invocation,
   and efficiency tradeoffs.
+- Model-independent adaptive-prefill experiment comparing clustered and diverse
+  prompt traces under an explicit invocation-cost assumption.
 - Completed-job KV usage is reported as an observation, not falsely retained as
   live allocated memory.
 
@@ -291,7 +408,9 @@ Experiments screen without loading a model.
 
 At the working tree recorded above:
 
-- `cargo test --workspace`: **77 unit tests and 5 documentation tests passed**;
+- `make verify`: **109 unit tests and 5 documentation tests passed**, with
+  formatting, workspace checks, Clippy with warnings denied, and documentation
+  generation also passing;
   **2 external-fixture tests ignored** by default.
 - `OLA_LLAMA_CONFORMANCE_DIR=... cargo test --workspace -- --ignored`:
   **2 passed** against the pinned artifact.
@@ -300,6 +419,19 @@ At the working tree recorded above:
 - WGPU UI-to-executor generation integration test: **passed manually**.
 - Strict-admission CPU UI-to-executor generation integration test: **passed
   manually** against the pinned fixture.
+- Repeated execution-backed prefill comparison through the CPU UI adapter:
+  **passed manually** against the pinned fixture, including one discarded
+  calibration warm-up, four calibration pairs, one three-way warm-up, three
+  order-rotated measured trials, output-equivalence validation, calibrated cost
+  rendering, schema-v2 JSON persistence, and validated adaptive readback.
+- Complete-versus-chunked Llama prefill through the CPU UI adapter: **passed
+  manually** against the pinned fixture with a three-token segment limit,
+  three resumable calls for 7/5-token prompts, tensor execution for the first
+  two calls, and identical output.
+- Mixed-workload chunk fairness sweep through the CPU tiny-Llama UI fixture:
+  **passed manually** with four unequal prompts, two active slots, chunk sizes
+  2/4/8, per-request first-token/completion iteration reporting, and identical
+  generated outputs.
 - Strict-admission WGPU UI-to-executor generation integration test: **passed
   manually** on the GTX 1650 against the pinned fixture.
 - WGPU fixture logits versus CPU fixture logits: **passed manually** with a
@@ -328,8 +460,11 @@ At the working tree recorded above:
   transparent fallback, and execution-mode records.
 - Prefill-bucketing tests cover power-of-two boundaries, padding accounting,
   nearby-length grouping, distant-length splitting, and FIFO event restoration.
-- Benchmark/UI tests cover invalid traces and the reproducible bucketing
-  comparison surfaced through the workbench.
+- Adaptive-prefill tests cover candidate cost arithmetic, break-even tie
+  behavior, workload-level assignment, real executor grouping, and UI routing.
+- Benchmark/UI tests cover invalid traces, reproducible bucketing shape
+  comparison, execution-backed grouping and output equivalence, and workbench
+  availability without a loaded model.
 - Observation tests cover every documented latency boundary, interval rates,
   dense padding efficiency, cumulative counts, regressive timestamps,
   single-token inter-token handling, and failure atomicity.
@@ -391,8 +526,10 @@ and `TOKENS` variables.
 - There is no cache eviction, preemption, swapping, prefix reuse, or
   quantization.
 - Variable-length prefill uses right padding to the longest prompt in its
-  execution group. Power-of-two bucketing is available but not yet selected
-  adaptively; chunked prefill is not implemented. Generation remains greedy.
+  execution group. Cost-aware grouping can choose power-of-two buckets.
+  Resumable Llama chunks currently advance one prompt position at a time. Each
+  offset tensor-batches its active rows, but there is not yet a fused
+  multi-position ragged chunk kernel. Generation remains greedy.
 - Decode batches still traverse each request's physical pages independently;
   page attention is not yet a fused ragged multi-request kernel.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
@@ -408,13 +545,20 @@ and `TOKENS` variables.
   are rejected.
 - The serving layer has no streaming transport or HTTP implementation.
 - Benchmark probes are foundations, not publication-quality performance claims.
+- Adaptive calibration uses a two-point linear model over p50 prefill-iteration
+  time. It rejects invalid fits but does not yet use multi-shape regression or
+  confidence intervals.
 
 ## Recommended next milestones
 
 1. **Optimize continuous tensor batching**
-   - execute the grouping comparison against a loaded model to measure latency
-     and throughput alongside deterministic shape costs;
-   - add chunked prefill or an adaptive padding/throughput strategy;
+   - fuse multi-position ragged chunk execution where accelerator backends
+     permit it;
+   - benchmark chunk-size/fairness tradeoffs under mixed decode and long-prompt
+     traces;
+   - expand adaptive calibration to multiple prompt shapes and confidence
+     intervals before considering it as the default policy;
+   - add report-to-report comparisons across models, devices, and revisions;
    - optimize the request-local portion of tensor-batched paged attention;
    - keep per-request block tables, lifecycle, cancellation, and outputs
      isolated;
@@ -448,6 +592,47 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-14 11:22 BST — working tree on `9403ab3`:** Added the initial
+  `ola-kernel` crate, paged-attention metadata and validated input contract,
+  portable Burn reference implementation, direct Llama integration, focused
+  tests, extension guidance, and full-workspace verification.
+
+- **2026-10-14 15:24 BST — working tree on `9403ab3`:** Added tensor-batched
+  resumable Llama chunks across unequal request cursors and segment lengths,
+  atomically reserved KV rows, mixed-length chunk benchmarking, and UI output
+  reporting tensor versus individual calls. CPU fixture output equivalence,
+  full verification, and WGPU/CUDA feature compilation passed.
+
+- **2026-10-14 11:13 BST — working tree on `9403ab3`:** Added bounded
+  resumable Llama prefill, scheduler-visible prompt progress, shared
+  prefill/decode token budgeting, cancellation-safe partial sessions, atomic
+  segment reservation, complete-versus-chunked benchmarking, and a UI entry.
+
+- **2026-10-14 10:47 BST — working tree on `9403ab3`:** Added measured
+  invocation-cost calibration, fresh rotating three-way execution trials,
+  adaptive output-equivalence checks, schema-v2 adaptive report persistence,
+  UI summaries, and real-fixture validation.
+
+- **2026-10-13 20:18 BST — working tree on `9403ab3`:** Added complete-workload
+  prefill grouping and an auditable cost-aware policy that balances dense
+  padding against token-equivalent invocation overhead, with executor, analysis,
+  documentation, and UI experiment coverage.
+
+- **2026-10-13 19:57 BST — working tree on `9403ab3`:** Added schema-versioned
+  JSON benchmark reports with exact protocol/metadata, raw paired samples,
+  integer timings, summaries, create-new persistence, UI/Makefile configuration,
+  and real-fixture write/read validation.
+
+- **2026-10-13 19:04 BST — working tree on `9403ab3`:** Upgraded the loaded-model
+  prefill comparison to warm-up-aware alternating paired trials with retained
+  raw samples, nearest-rank latency distributions, aggregate throughput, UI
+  percentile reporting, and real-fixture validation.
+
+- **2026-10-13 14:42 BST — working tree on `9403ab3`:** Added a reusable
+  execution-backed prefill-strategy comparison with output-equivalence checks,
+  timing, throughput, invocation, padding, and peak-KV metrics; exposed it as a
+  model-dependent UI benchmark and documented measurement limits.
 
 - **2026-10-13 14:09 BST — working tree on `c788f1a`:** Added deterministic
   unbucketed-versus-power-of-two prefill comparison, padding/invocation/

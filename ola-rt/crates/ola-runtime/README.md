@@ -126,18 +126,24 @@ Prefill tensor grouping has a separate `PrefillBatcher` boundary. The
 compatibility `UnbucketedPrefillBatcher` puts all same-model prompts together.
 `PowerOfTwoPrefillBatcher` groups lengths by their next power of two, bounding
 padding within a group while retaining batches for nearby prompt lengths.
+`CostAwarePrefillBatcher` examines the complete same-model prefill set and
+chooses between those alternatives. Its explicit invocation-overhead parameter
+expresses fixed launch cost in token-equivalent units; it selects the lower sum
+of dense tensor positions and invocation overhead, preferring one invocation on
+ties. `decide` exposes both estimates for experiments and audit logs.
 Grouping may change backend invocation order, but lifecycle events are restored
 to scheduler order.
 
 ```rust,no_run
 use ola_runtime::{
-    Executor, FifoTokenBudgetPolicy, PowerOfTwoPrefillBatcher, Runtime,
+    CostAwarePrefillBatcher, Executor, FifoTokenBudgetPolicy, Runtime,
 };
 
 let policy = FifoTokenBudgetPolicy::new(256).expect("the budget is positive");
 let executor = Executor::with_max_active_requests(Runtime::default(), 8)?
     .with_batch_policy(policy)
-    .with_prefill_batcher(PowerOfTwoPrefillBatcher);
+    .with_prefill_batcher(CostAwarePrefillBatcher::new(32))
+    .with_prefill_chunk_size(64)?;
 
 # Ok::<(), ola_runtime::ExecutorError>(())
 ```
@@ -148,8 +154,22 @@ This policy controls iteration-level composition only. The compatibility
 attached model supports it; selection and execution mechanism remain
 separately observable.
 
-The executor is synchronous by design. Preemption, result eviction, and
-streaming transports remain later layers.
+`with_prefill_chunk_size` adds interruption points to architectures that
+advertise resumable prefill. A long prompt retains its session, token cursor,
+worst-case admission reservation, and KV pages between iterations. Each
+segment is a normal `BatchCandidate`, so decode and continued prefill share the
+same token budget. `PrefillProgress` exposes accepted versus total prompt
+tokens without pretending that a first output token exists. Cancellation drops
+the partial session and its pages. Architectures without support execute the
+complete prompt unchanged.
+
+Compatible resumable chunks share the optional model tensor hook even when
+their request cursors and remaining lengths differ. The execution record keeps
+real and padded chunk positions visible. A single selected request, or a model
+without the hook, retains the `Individual` fallback.
+
+The executor is synchronous by design. Full request preemption, result
+eviction, and streaming transports remain later layers.
 
 ## Minimal lifecycle
 

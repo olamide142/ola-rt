@@ -1,4 +1,4 @@
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{DType, Tensor};
 
 use crate::{KernelDescriptor, KernelError, KernelOperation, KernelTarget};
 
@@ -59,53 +59,55 @@ impl PagedAttentionConfig {
         self.head_dim
     }
 
-    const fn groups(self) -> usize {
+    pub(crate) const fn groups(self) -> usize {
         self.query_heads / self.key_value_heads
     }
 }
 
 /// One populated logical KV-cache page.
-pub struct PagedKvPage<B: Backend> {
-    key: Tensor<B, 4>,
-    value: Tensor<B, 4>,
+#[derive(Clone)]
+pub struct PagedKvPage {
+    key: Tensor<4>,
+    value: Tensor<4>,
 }
 
-impl<B: Backend> PagedKvPage<B> {
+impl PagedKvPage {
     /// Pairs key and value tensors for one logical page.
     ///
     /// Shape validation occurs when pages are assembled into
     /// [`PagedAttentionInput`].
-    pub const fn new(key: Tensor<B, 4>, value: Tensor<B, 4>) -> Self {
+    pub const fn new(key: Tensor<4>, value: Tensor<4>) -> Self {
         Self { key, value }
     }
 
     /// Returns the key tensor.
-    pub const fn key(&self) -> &Tensor<B, 4> {
+    pub const fn key(&self) -> &Tensor<4> {
         &self.key
     }
 
     /// Returns the value tensor.
-    pub const fn value(&self) -> &Tensor<B, 4> {
+    pub const fn value(&self) -> &Tensor<4> {
         &self.value
     }
 
-    fn into_parts(self) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    pub(crate) fn into_parts(self) -> (Tensor<4>, Tensor<4>) {
         (self.key, self.value)
     }
 }
 
 /// Validated input to single-sequence paged decode attention.
-pub struct PagedAttentionInput<B: Backend> {
-    query: Tensor<B, 4>,
-    pages: Vec<PagedKvPage<B>>,
+#[derive(Clone)]
+pub struct PagedAttentionInput {
+    query: Tensor<4>,
+    pages: Vec<PagedKvPage>,
     config: PagedAttentionConfig,
 }
 
-impl<B: Backend> PagedAttentionInput<B> {
+impl PagedAttentionInput {
     /// Validates and constructs an operator input.
     pub fn new(
-        query: Tensor<B, 4>,
-        pages: Vec<PagedKvPage<B>>,
+        query: Tensor<4>,
+        pages: Vec<PagedKvPage>,
         config: PagedAttentionConfig,
     ) -> Result<Self, KernelError> {
         let expected_query = [1, config.query_heads, 1, config.head_dim];
@@ -120,6 +122,8 @@ impl<B: Backend> PagedAttentionInput<B> {
                 "paged decode attention requires at least one populated KV page",
             ));
         }
+        let query_device = query.device();
+        let query_dtype = query.dtype();
         for (index, page) in pages.iter().enumerate() {
             let key = page.key.dims();
             let value = page.value.dims();
@@ -138,6 +142,16 @@ impl<B: Backend> PagedAttentionInput<B> {
                     config.key_value_heads, config.head_dim
                 )));
             }
+            if page.key.device() != query_device || page.value.device() != query_device {
+                return Err(KernelError::new(format!(
+                    "KV page {index} and query must live on the same device"
+                )));
+            }
+            if page.key.dtype() != query_dtype || page.value.dtype() != query_dtype {
+                return Err(KernelError::new(format!(
+                    "KV page {index} and query must use the same dtype"
+                )));
+            }
         }
         Ok(Self {
             query,
@@ -147,12 +161,12 @@ impl<B: Backend> PagedAttentionInput<B> {
     }
 
     /// Returns the query tensor.
-    pub const fn query(&self) -> &Tensor<B, 4> {
+    pub const fn query(&self) -> &Tensor<4> {
         &self.query
     }
 
     /// Returns logical KV pages in sequence order.
-    pub fn pages(&self) -> &[PagedKvPage<B>] {
+    pub fn pages(&self) -> &[PagedKvPage] {
         &self.pages
     }
 
@@ -161,18 +175,23 @@ impl<B: Backend> PagedAttentionInput<B> {
         self.config
     }
 
-    fn into_parts(self) -> (Tensor<B, 4>, Vec<PagedKvPage<B>>, PagedAttentionConfig) {
+    /// Returns the common floating-point dtype validated for query and pages.
+    pub fn dtype(&self) -> DType {
+        self.query.dtype()
+    }
+
+    pub(crate) fn into_parts(self) -> (Tensor<4>, Vec<PagedKvPage>, PagedAttentionConfig) {
         (self.query, self.pages, self.config)
     }
 }
 
 /// Replaceable implementation of single-sequence paged decode attention.
-pub trait PagedAttentionKernel<B: Backend>: Send + Sync {
+pub trait PagedAttentionKernel: Send + Sync {
     /// Returns stable metadata for diagnostics and benchmark reports.
     fn descriptor(&self) -> KernelDescriptor;
 
     /// Produces an attention context with shape `[1, query_heads, 1, head_dim]`.
-    fn execute(&self, input: PagedAttentionInput<B>) -> Result<Tensor<B, 4>, KernelError>;
+    fn execute(&self, input: PagedAttentionInput) -> Result<Tensor<4>, KernelError>;
 }
 
 /// Reference implementation composed from portable Burn tensor operations.
@@ -186,7 +205,7 @@ impl PortablePagedAttention {
     }
 }
 
-impl<B: Backend> PagedAttentionKernel<B> for PortablePagedAttention {
+impl PagedAttentionKernel for PortablePagedAttention {
     fn descriptor(&self) -> KernelDescriptor {
         KernelDescriptor::new(
             "portable-burn-paged-attention",
@@ -195,7 +214,7 @@ impl<B: Backend> PagedAttentionKernel<B> for PortablePagedAttention {
         )
     }
 
-    fn execute(&self, input: PagedAttentionInput<B>) -> Result<Tensor<B, 4>, KernelError> {
+    fn execute(&self, input: PagedAttentionInput) -> Result<Tensor<4>, KernelError> {
         let (query, pages, config) = input.into_parts();
         let scale = (config.head_dim as f32).sqrt();
         let mut pages = pages.into_iter();
@@ -233,7 +252,7 @@ impl<B: Backend> PagedAttentionKernel<B> for PortablePagedAttention {
 }
 
 /// Repeats each key/value head contiguously into its query-head group.
-fn repeat_key_value<B: Backend>(tensor: Tensor<B, 4>, groups: usize) -> Tensor<B, 4> {
+fn repeat_key_value(tensor: Tensor<4>, groups: usize) -> Tensor<4> {
     if groups == 1 {
         return tensor;
     }
@@ -246,11 +265,9 @@ fn repeat_key_value<B: Backend>(tensor: Tensor<B, 4>, groups: usize) -> Tensor<B
 
 #[cfg(test)]
 mod tests {
-    use burn::{backend::NdArray, tensor::TensorData};
+    use burn::tensor::TensorData;
 
     use super::*;
-
-    type TestBackend = NdArray<f32>;
 
     #[test]
     fn rejects_invalid_grouped_query_attention() {
@@ -262,7 +279,7 @@ mod tests {
     #[test]
     fn rejects_empty_page_input() {
         let device = Default::default();
-        let query = Tensor::<TestBackend, 4>::zeros([1, 1, 1, 1], &device);
+        let query = Tensor::<4>::zeros([1, 1, 1, 1], &device);
         let config = PagedAttentionConfig::new(1, 1, 1).unwrap();
 
         let error = PagedAttentionInput::new(query, Vec::new(), config)
@@ -275,10 +292,7 @@ mod tests {
     #[test]
     fn online_softmax_combines_pages_without_concatenation() {
         let device = Default::default();
-        let query = Tensor::<TestBackend, 4>::from_data(
-            TensorData::new(vec![1.0_f32], [1, 1, 1, 1]),
-            &device,
-        );
+        let query = Tensor::<4>::from_data(TensorData::new(vec![1.0_f32], [1, 1, 1, 1]), &device);
         let first = PagedKvPage::new(
             Tensor::from_data(TensorData::new(vec![0.0_f32], [1, 1, 1, 1]), &device),
             Tensor::from_data(TensorData::new(vec![10.0_f32], [1, 1, 1, 1]), &device),
@@ -291,7 +305,7 @@ mod tests {
         let input = PagedAttentionInput::new(query, vec![first, second], config).unwrap();
 
         let output = PortablePagedAttention::new().execute(input).unwrap();
-        let values = output.into_data().to_vec::<f32>().unwrap();
+        let values = output.into_data().try_to_vec::<f32>().unwrap();
 
         assert!((values[0] - 17.5).abs() < 1e-5);
     }
@@ -299,7 +313,7 @@ mod tests {
     #[test]
     fn grouped_query_heads_share_their_corresponding_kv_head() {
         let device = Default::default();
-        let query = Tensor::<TestBackend, 4>::zeros([1, 4, 1, 1], &device);
+        let query = Tensor::<4>::zeros([1, 4, 1, 1], &device);
         let page = PagedKvPage::new(
             Tensor::zeros([1, 2, 1, 1], &device),
             Tensor::from_data(TensorData::new(vec![10.0_f32, 20.0], [1, 2, 1, 1]), &device),
@@ -310,16 +324,14 @@ mod tests {
         let output = PortablePagedAttention::new().execute(input).unwrap();
 
         assert_eq!(
-            output.into_data().to_vec::<f32>().unwrap(),
+            output.into_data().try_to_vec::<f32>().unwrap(),
             vec![10.0, 10.0, 20.0, 20.0]
         );
     }
 
     #[test]
     fn portable_descriptor_is_stable() {
-        let descriptor = <PortablePagedAttention as PagedAttentionKernel<TestBackend>>::descriptor(
-            &PortablePagedAttention::new(),
-        );
+        let descriptor = PortablePagedAttention::new().descriptor();
 
         assert_eq!(descriptor.name(), "portable-burn-paged-attention");
         assert_eq!(

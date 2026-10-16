@@ -94,6 +94,15 @@ pub trait CausalModel: Send + Sync {
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError>;
 
+    /// Returns whether sessions created by this model can resume prefill.
+    ///
+    /// The runtime only divides prompts when this returns true. The default
+    /// keeps existing architecture implementations on the complete-prompt
+    /// compatibility path.
+    fn supports_chunked_prefill(&self) -> bool {
+        false
+    }
+
     /// Attempts one tensor-batched prefill across compatible sessions.
     ///
     /// `prompt_tokens` contains one complete, non-empty prompt per session.
@@ -108,6 +117,22 @@ pub trait CausalModel: Send + Sync {
         _sessions: &mut [&mut dyn GenerationSession],
         _prompt_tokens: &[&[u32]],
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        None
+    }
+
+    /// Attempts one tensor-batched resumable prefill across compatible sessions.
+    ///
+    /// Each non-empty chunk continues its corresponding session at that
+    /// session's current absolute position. `is_final` identifies chunks that
+    /// end their complete prompts. Returning `None` requests the individual
+    /// [`GenerationSession::prefill_chunk`] fallback. Implementations must
+    /// validate and reserve the complete batch before mutating any session.
+    fn prefill_chunk_batch(
+        &self,
+        _sessions: &mut [&mut dyn GenerationSession],
+        _prompt_chunks: &[&[u32]],
+        _is_final: &[bool],
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
         None
     }
 
@@ -134,6 +159,15 @@ pub struct GeneratedToken {
     pub id: u32,
     /// Whether this token is an end-of-sequence token for the loaded artifact.
     pub is_end_of_sequence: bool,
+}
+
+/// Result of processing one resumable prompt segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefillOutcome {
+    /// More prompt tokens remain, so no output token is available yet.
+    Pending,
+    /// The final prompt segment selected the request's first output token.
+    Token(GeneratedToken),
 }
 
 /// Observable snapshot of request-local model state.
@@ -211,6 +245,27 @@ pub trait GenerationSession: Send {
     /// chat-template application happen before this boundary.
     fn prefill(&mut self, prompt_tokens: &[u32]) -> Result<GeneratedToken, ModelExecutionError>;
 
+    /// Processes one non-empty prompt segment and optionally finishes prefill.
+    ///
+    /// `is_final` identifies the segment containing the end of the prompt.
+    /// Implementations supporting resumable prefill must retain KV state after
+    /// [`PrefillOutcome::Pending`] and must not sample or increment generated
+    /// token metrics until the final segment. The compatibility default only
+    /// accepts a final segment and delegates to [`Self::prefill`].
+    fn prefill_chunk(
+        &mut self,
+        prompt_tokens: &[u32],
+        is_final: bool,
+    ) -> Result<PrefillOutcome, ModelExecutionError> {
+        if !is_final {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "this model does not support resumable prefill",
+            ));
+        }
+        self.prefill(prompt_tokens).map(PrefillOutcome::Token)
+    }
+
     /// Consumes the previously generated token and returns the next token.
     ///
     /// The caller passes `input_token` explicitly so execution traces can
@@ -274,6 +329,11 @@ impl CausalLanguageModel {
         self.kv_cache_profile
     }
 
+    /// Returns whether request sessions can process prompts incrementally.
+    pub fn supports_chunked_prefill(&self) -> bool {
+        self.model.supports_chunked_prefill()
+    }
+
     /// Returns the artifact-compatible tokenizer.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()
@@ -299,6 +359,17 @@ impl CausalLanguageModel {
         prompt_tokens: &[&[u32]],
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
         self.model.prefill_batch(sessions, prompt_tokens)
+    }
+
+    /// Attempts a model-specific tensor-batched resumable prefill.
+    pub fn prefill_chunk_batch(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_chunks: &[&[u32]],
+        is_final: &[bool],
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+        self.model
+            .prefill_chunk_batch(sessions, prompt_chunks, is_final)
     }
 
     /// Attempts a model-specific tensor-batched decode.

@@ -5,6 +5,7 @@ MANIFEST := ola-rt/Cargo.toml
 MODEL ?=
 PROMPT ?= Hello
 TOKENS ?= 8
+RESULTS_DIR ?=
 
 .DEFAULT_GOAL := help
 
@@ -13,7 +14,7 @@ TOKENS ?= 8
 	test-fixture test-gpu-fixture require-model
 
 help: ## Show available commands and configurable variables.
-	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8"}' Makefile
+	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results"}' Makefile
 
 fmt: ## Format every Rust crate.
 	$(CARGO) fmt --manifest-path $(MANIFEST) --all
@@ -44,11 +45,11 @@ check-cuda: ## Compile native-CUDA model and UI targets (execution needs NVRTC).
 gpu-info: ## Print the NVIDIA adapter, memory, driver, and compute capability.
 	nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version,compute_cap --format=csv
 
-ui: ## Open the terminal workbench on CPU; optionally pass MODEL=... .
-	$(CARGO) run --manifest-path $(MANIFEST) -p ola-ui -- $(if $(MODEL),--model "$(MODEL)",)
+ui: ## Open the CPU workbench; MODEL and RESULTS_DIR are optional.
+	$(CARGO) run --manifest-path $(MANIFEST) -p ola-ui -- $(if $(MODEL),--model "$(MODEL)",) $(if $(RESULTS_DIR),--results-dir "$(RESULTS_DIR)",)
 
-ui-wgpu: require-model ## Open local-model UI generation through WGPU (MODEL required).
-	$(CARGO) run --manifest-path $(MANIFEST) -p ola-ui --features wgpu -- --backend wgpu --model "$(MODEL)"
+ui-wgpu: require-model ## Open WGPU workbench; MODEL required, RESULTS_DIR optional.
+	$(CARGO) run --manifest-path $(MANIFEST) -p ola-ui --features wgpu -- --backend wgpu --model "$(MODEL)" $(if $(RESULTS_DIR),--results-dir "$(RESULTS_DIR)",)
 
 llama: require-model ## Generate on CPU (MODEL required; PROMPT and TOKENS optional).
 	$(CARGO) run --manifest-path $(MANIFEST) -p ola-burn --example run_llama -- "$(MODEL)" "$(PROMPT)" "$(TOKENS)"
