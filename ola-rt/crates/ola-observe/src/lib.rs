@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, error::Error, fmt};
 
 use ola_core::{RequestId, Timestamp};
 use ola_runtime::{
-    BatchExecutionMode, BatchPhase, ExecutorEvent, ExecutorIteration, RequestRecord, RequestStatus,
+    BatchExecutionMode, ExecutorEvent, ExecutorIteration, RequestRecord, RequestStatus,
     RuntimeState,
 };
 
@@ -104,6 +104,8 @@ pub struct IterationMeasurement {
     pub scheduled_decodes: usize,
     /// Operations left for a later iteration by batch policy.
     pub batch_deferred_operations: usize,
+    /// Ways execution differed from the iteration's validated plan.
+    pub plan_divergences: usize,
     /// Model invocations that packed more than one request into tensors.
     pub tensor_batches: usize,
     /// Request operations executed through tensor batches.
@@ -232,23 +234,15 @@ impl ExecutionObserver {
         let elapsed_micros = self
             .previous_iteration_at
             .map(|previous| elapsed(iteration.at, previous));
+        let planned = iteration.execution_plan.estimates();
         let mut measurement = IterationMeasurement {
             at: iteration.at,
             elapsed_micros,
-            scheduled_input_tokens: iteration.plan.scheduled_tokens(),
-            scheduled_prefills: iteration
-                .plan
-                .scheduled
-                .iter()
-                .filter(|candidate| candidate.phase == BatchPhase::Prefill)
-                .count(),
-            scheduled_decodes: iteration
-                .plan
-                .scheduled
-                .iter()
-                .filter(|candidate| candidate.phase == BatchPhase::Decode)
-                .count(),
-            batch_deferred_operations: iteration.plan.deferred.len(),
+            scheduled_input_tokens: planned.input_tokens,
+            scheduled_prefills: planned.prefill_rows,
+            scheduled_decodes: planned.decode_rows,
+            batch_deferred_operations: planned.budget_deferrals,
+            plan_divergences: iteration.divergences.len(),
             tensor_batches: iteration
                 .execution_batches
                 .iter()
@@ -459,7 +453,8 @@ mod tests {
     use ola_core::{ModelDescriptor, RequestSpec};
     use ola_model::GeneratedToken;
     use ola_runtime::{
-        BatchCandidate, ExecutionPhase, ExecutionPlan, FifoScheduler, IterationPlan, Runtime,
+        BatchPhase, ExecutionPhase, ExecutionPlan, FifoScheduler, PlannedBatch, PlannedPhase,
+        PlannedRow, Runtime,
     };
 
     use super::*;
@@ -510,16 +505,21 @@ mod tests {
                 phase: ExecutionPhase::Decode,
                 finished: true,
             }],
-            execution_plan: ExecutionPlan::default(),
-            divergences: Vec::new(),
-            plan: IterationPlan {
-                scheduled: vec![BatchCandidate {
-                    request_id,
-                    phase: BatchPhase::Decode,
-                    token_cost: 1,
+            execution_plan: ExecutionPlan {
+                batches: vec![PlannedBatch {
+                    phase: PlannedPhase::Decode,
+                    model_id: "tiny".into(),
+                    mode: BatchExecutionMode::Individual,
+                    rows: vec![PlannedRow {
+                        request_id,
+                        event_index: 0,
+                        positions: 2..3,
+                        final_prompt_chunk: false,
+                    }],
                 }],
-                deferred: Vec::new(),
+                ..ExecutionPlan::default()
             },
+            divergences: Vec::new(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
                 phase: BatchPhase::Decode,
                 request_ids: vec![request_id],
@@ -544,7 +544,6 @@ mod tests {
         let later = ExecutorIteration {
             at: Timestamp::from_micros(170),
             events: vec![ExecutorEvent::Idle],
-            plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),
@@ -577,7 +576,6 @@ mod tests {
         let iteration = |at| ExecutorIteration {
             at: Timestamp::from_micros(at),
             events: vec![ExecutorEvent::Idle],
-            plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),
@@ -610,7 +608,6 @@ mod tests {
         let iteration = ExecutorIteration {
             at: Timestamp::from_micros(10),
             events: Vec::new(),
-            plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
             divergences: Vec::new(),
             execution_batches: vec![ola_runtime::ExecutionBatch {
@@ -656,7 +653,6 @@ mod tests {
                 phase: ExecutionPhase::Decode,
                 finished: true,
             }],
-            plan: IterationPlan::default(),
             execution_plan: ExecutionPlan::default(),
             divergences: Vec::new(),
             execution_batches: Vec::new(),

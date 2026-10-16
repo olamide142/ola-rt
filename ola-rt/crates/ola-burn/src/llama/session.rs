@@ -1068,7 +1068,7 @@ mod tests {
             }]
         );
         assert_eq!(decoded.active_requests, 2);
-        assert_eq!(decoded.plan.scheduled_tokens(), 2);
+        assert_eq!(decoded.execution_plan.estimates().input_tokens, 2);
     }
 
     #[test]

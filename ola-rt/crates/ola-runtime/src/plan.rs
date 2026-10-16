@@ -221,6 +221,12 @@ pub struct PlanEstimates {
     pub padding_tokens: usize,
     /// Planned model invocations.
     pub invocations: usize,
+    /// Rows performing first or continued prompt work.
+    pub prefill_rows: usize,
+    /// Rows performing one decode step.
+    pub decode_rows: usize,
+    /// Operations left out by the batch policy's token budget.
+    pub budget_deferrals: usize,
     /// KV bytes newly reserved by admitted requests.
     pub admitted_kv_bytes: u64,
     /// Requests whose final token is known to be produced by this plan.
@@ -387,6 +393,41 @@ pub enum PlanError {
     },
 }
 
+impl fmt::Display for ExecutionPlan {
+    /// Writes a one-line summary such as
+    /// `gen 7: 1 admitted, 3 invocations (1 tensor), 8+0 tokens, 1 deferred, 1 predicted release`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let estimates = self.estimates();
+        let admitted = self
+            .lifecycle
+            .iter()
+            .filter(|action| matches!(action, LifecycleAction::Admit { .. }))
+            .count();
+        let tensor = self
+            .batches
+            .iter()
+            .filter(|batch| batch.mode == BatchExecutionMode::Tensor)
+            .count();
+        write!(
+            formatter,
+            "gen {}: {admitted} admitted, {} terminated, {} invocations ({tensor} tensor), \
+             {}+{} tokens, {} deferred, {} predicted release{}",
+            self.generation,
+            self.lifecycle.len().saturating_sub(admitted),
+            estimates.invocations,
+            estimates.input_tokens,
+            estimates.padding_tokens,
+            self.deferrals.len(),
+            estimates.predicted_releases,
+            if estimates.predicted_releases == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    }
+}
+
 impl fmt::Display for PlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -460,6 +501,13 @@ impl ExecutionPlan {
             input_tokens: self.batches.iter().map(PlannedBatch::input_tokens).sum(),
             padding_tokens: self.batches.iter().map(PlannedBatch::padding_tokens).sum(),
             invocations: self.batches.len(),
+            prefill_rows: self.rows_in(|phase| phase != PlannedPhase::Decode),
+            decode_rows: self.rows_in(|phase| phase == PlannedPhase::Decode),
+            budget_deferrals: self
+                .deferrals
+                .iter()
+                .filter(|deferral| matches!(deferral, PlannedDeferral::Budget { .. }))
+                .count(),
             admitted_kv_bytes: self
                 .lifecycle
                 .iter()
@@ -472,6 +520,14 @@ impl ExecutionPlan {
                 .sum(),
             predicted_releases: self.predicted_releases.len(),
         }
+    }
+
+    fn rows_in(&self, phase: impl Fn(PlannedPhase) -> bool) -> usize {
+        self.batches
+            .iter()
+            .filter(|batch| phase(batch.phase))
+            .map(|batch| batch.rows.len())
+            .sum()
     }
 
     /// Checks that the plan can be committed against `view` without partial
@@ -860,9 +916,17 @@ mod tests {
                 input_tokens: 8,
                 padding_tokens: 0,
                 invocations: 3,
+                prefill_rows: 2,
+                decode_rows: 2,
+                budget_deferrals: 0,
                 admitted_kv_bytes: 100,
                 predicted_releases: 1,
             }
+        );
+        assert_eq!(
+            plan.to_string(),
+            "gen 7: 1 admitted, 0 terminated, 3 invocations (1 tensor), 8+0 tokens, \
+             0 deferred, 1 predicted release"
         );
     }
 

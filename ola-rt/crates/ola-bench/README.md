@@ -113,3 +113,9 @@ as exact token and elapsed-microsecond inputs instead of a lossy JSON float.
 `write_json_new` refuses to replace an existing path, while `read_json` and
 `from_json` reject unsupported schema versions and structurally inconsistent
 trial indexes.
+
+`PlanReport` (schema version 1) serializes one executor iteration's validated
+`ExecutionPlan` and its divergences with stable identifiers: integer request
+IDs, string model IDs, snake_case phases and modes, positions as start/end
+pairs, and admission reasons as their display text. Build one with
+`PlanReport::from_iteration`; `from_json` rejects unknown schema versions.

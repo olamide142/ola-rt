@@ -33,8 +33,10 @@ observed.
 
 `ExecutionObserver::observe_iteration` records:
 
-- selected prefill/decode operations and input-token cost from `IterationPlan`;
-- batch-policy deferrals from the plan;
+- selected prefill/decode rows and input-token cost from the iteration's
+  `ExecutionPlan` estimates;
+- batch-policy (budget) deferrals from the plan;
+- the number of plan divergences observed while committing it;
 - actual tensor-batch and individual-invocation counts from execution records;
 - meaningful model-input positions, right-padding positions, and input-token
   efficiency from execution records;

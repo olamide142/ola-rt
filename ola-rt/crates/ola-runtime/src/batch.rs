@@ -328,25 +328,6 @@ impl BatchPolicy for FifoTokenBudgetPolicy {
     }
 }
 
-/// Auditable work selected and deferred during one executor iteration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct IterationPlan {
-    /// Operations selected for execution, in execution order.
-    pub scheduled: Vec<BatchCandidate>,
-    /// Eligible operations left for a later iteration by batch policy.
-    pub deferred: Vec<BatchCandidate>,
-}
-
-impl IterationPlan {
-    /// Returns the total input token positions selected for execution.
-    pub fn scheduled_tokens(&self) -> usize {
-        self.scheduled
-            .iter()
-            .map(|candidate| candidate.token_cost)
-            .sum()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

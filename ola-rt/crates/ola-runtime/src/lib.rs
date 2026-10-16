@@ -18,8 +18,8 @@ pub use admission::{
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy,
     CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutionBatch, FifoTokenBudgetPolicy,
-    IterationPlan, PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate,
-    PrefillGroupingStrategy, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+    PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate, PrefillGroupingStrategy,
+    UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
 pub use error::RuntimeError;
 pub use executor::{

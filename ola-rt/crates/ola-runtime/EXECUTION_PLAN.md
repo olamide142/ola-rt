@@ -1,6 +1,6 @@
 # ExecutionPlan design proposal
 
-Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–5 are
+Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–6 are
 implemented: every `step_iteration` is planned, validated, and committed as
 one `ExecutionPlan`, exposed as `ExecutorIteration::execution_plan`, and
 every difference between the plan and execution is listed in
@@ -79,10 +79,10 @@ Padding and `PlanEstimates` are computed from the rows rather than stored, so
 they cannot contradict them. A `KernelSelection` field is added when the
 kernel track needs it.
 
-`IterationPlan` becomes a projection of this type (`plan.iteration_view()`) so
-`ola-observe`, the UI, and benchmarks keep working while they migrate.
-`ExecutionBatch` stays as the record of what *actually* ran.
-`ExecutorIteration` gains `execution_plan: ExecutionPlan`.
+`ExecutorIteration::execution_plan` replaces the former `IterationPlan`
+record; `ola-observe` derives its scheduled and deferred counts from
+`PlanEstimates`. `ExecutionBatch` stays as the record of what *actually* ran,
+and `ExecutorIteration::divergences` explains any difference.
 
 ## Lifecycle: plan → validate → commit
 
@@ -202,13 +202,12 @@ functions of a snapshot.
 
 ## Report representation
 
-`ola-runtime` and `ola-core` do not depend on serde today; only `ola-bench`
-and `ola-burn` do. To keep the runtime free of serialization concerns,
-`ola-bench` owns a versioned `PlanReport` with `schema_version`, converted
-from `&ExecutionPlan` in the same way as the schema-v2 benchmark reports.
-Adding an optional `serde` feature to `ola-core` and `ola-runtime` would also
-work if direct derives turn out simpler. The UI gets a short human-readable
-`Display` form.
+`ola-runtime` and `ola-core` do not depend on serde; only `ola-bench` and
+`ola-burn` do. To keep the runtime free of serialization concerns, `ola-bench`
+owns a versioned `PlanReport` (schema version 1), converted from an
+`ExecutorIteration` in the same way as the schema-v2 benchmark reports.
+`ExecutionPlan` also implements `Display` as a one-line summary for logs and
+interfaces.
 
 ## Implementation steps
 
@@ -230,7 +229,8 @@ Each step keeps `make verify` and the fixture tests green.
    `PlanDivergence::{ModeFallback, SessionCreationFailed, UnplannedRelease}`
    with `ReleaseReason::{EndOfSequence, OutputLimit, Failure}`.
 6. Add the serialized report. Migrate `ola-observe` and the UI from
-   `IterationPlan` to `ExecutionPlan` and drop the projection.
+   `IterationPlan` to `ExecutionPlan` and drop the projection. **Done.** The UI has no
+   direct iteration consumer, so it needed no migration.
 7. Add an oracle test that compares token outputs from planned multi-request
    execution against the single-request path on the pinned fixture.
 

@@ -16,9 +16,9 @@ use ola_model::{
 use crate::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, BatchCandidate,
     BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, FifoScheduler, IterationPlan, LifecycleAction, PlanDivergence, PlanError,
-    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher,
-    PrefillView, QueuedView, ReleaseReason, Runtime, RuntimeError, RuntimeState, Scheduler,
+    ExecutionPlan, FifoScheduler, LifecycleAction, PlanDivergence, PlanError, PlannedBatch,
+    PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher, PrefillView,
+    QueuedView, ReleaseReason, Runtime, RuntimeError, RuntimeState, Scheduler,
     UnboundedBatchPolicy, UnbucketedPrefillBatcher, UnconstrainedAdmission,
 };
 
@@ -114,8 +114,6 @@ pub struct ExecutorIteration {
     pub at: Timestamp,
     /// Per-request outcomes in deterministic execution order.
     pub events: Vec<ExecutorEvent>,
-    /// Auditable batch-policy decision for this iteration.
-    pub plan: IterationPlan,
     /// Validated plan committed by this iteration.
     pub execution_plan: ExecutionPlan,
     /// Ways execution differed from `execution_plan`: lifecycle failures,
@@ -474,8 +472,8 @@ impl<S: Scheduler> Executor<S> {
     /// same iteration.
     pub fn step_iteration(&mut self, at: Timestamp) -> Result<ExecutorIteration, ExecutorError> {
         self.validate_iteration_time(at)?;
-        let mut plan = IterationPlan::default();
-        let (execution_plan, mut admissions) = self.plan_iteration(at, &mut plan)?;
+        let mut scheduled = Vec::new();
+        let (execution_plan, mut admissions) = self.plan_iteration(at, &mut scheduled)?;
         execution_plan
             .validate(&self.planning_view(&admissions))
             .map_err(ExecutorError::InvalidPlan)?;
@@ -493,7 +491,6 @@ impl<S: Scheduler> Executor<S> {
         Ok(ExecutorIteration {
             at,
             events,
-            plan,
             execution_plan,
             divergences: committed.divergences,
             execution_batches: committed.execution_batches,
@@ -564,7 +561,7 @@ impl<S: Scheduler> Executor<S> {
     fn plan_iteration(
         &mut self,
         at: Timestamp,
-        plan: &mut IterationPlan,
+        scheduled: &mut Vec<BatchCandidate>,
     ) -> Result<(ExecutionPlan, BTreeMap<RequestId, PlannedAdmission>), ExecutorError> {
         let mut execution_plan = ExecutionPlan {
             generation: self.generation,
@@ -582,17 +579,16 @@ impl<S: Scheduler> Executor<S> {
             })
             .collect::<Vec<_>>();
         let decode_count = decode_candidates.len();
-        let selected = self.select_batch_candidates(plan, &decode_candidates)?;
+        let selected = self.select_batch_candidates(scheduled, &decode_candidates)?;
         let mut decode_rows = Vec::new();
         for (event_index, candidate) in decode_candidates.into_iter().enumerate() {
             if !selected.contains(&candidate.request_id) {
-                plan.deferred.push(candidate);
                 execution_plan
                     .deferrals
                     .push(budget_deferral(candidate, event_index));
                 continue;
             }
-            plan.scheduled.push(candidate);
+            scheduled.push(candidate);
             let active = self
                 .active
                 .get(&candidate.request_id)
@@ -631,18 +627,17 @@ impl<S: Scheduler> Executor<S> {
             })
             .collect::<Vec<_>>();
         let prefill_candidates_len = prefill_candidates.len();
-        let selected = self.select_batch_candidates(plan, &prefill_candidates)?;
+        let selected = self.select_batch_candidates(scheduled, &prefill_candidates)?;
         let mut prefill_rows = Vec::new();
         for (index, candidate) in prefill_candidates.into_iter().enumerate() {
             let event_index = decode_count.saturating_add(index);
             if !selected.contains(&candidate.request_id) {
-                plan.deferred.push(candidate);
                 execution_plan
                     .deferrals
                     .push(budget_deferral(candidate, event_index));
                 continue;
             }
-            plan.scheduled.push(candidate);
+            scheduled.push(candidate);
             let pending = self
                 .prefilling
                 .get(&candidate.request_id)
@@ -668,7 +663,7 @@ impl<S: Scheduler> Executor<S> {
             .extend(self.plan_prefill_batches(PlannedPhase::ContinuedPrefill, prefill_rows));
 
         let admissions = self.plan_admissions(
-            plan,
+            scheduled,
             &mut execution_plan,
             decode_count.saturating_add(prefill_count),
         )?;
@@ -682,7 +677,7 @@ impl<S: Scheduler> Executor<S> {
     /// admission or budget deferral, preserving FIFO head-of-line semantics.
     fn plan_admissions(
         &mut self,
-        plan: &mut IterationPlan,
+        scheduled: &mut Vec<BatchCandidate>,
         execution_plan: &mut ExecutionPlan,
         first_event_index: usize,
     ) -> Result<BTreeMap<RequestId, PlannedAdmission>, ExecutorError> {
@@ -788,14 +783,16 @@ impl<S: Scheduler> Executor<S> {
                 phase: BatchPhase::Prefill,
                 token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
             };
-            if self.select_batch_candidates(plan, &[candidate])?.is_empty() {
-                plan.deferred.push(candidate);
+            if self
+                .select_batch_candidates(scheduled, &[candidate])?
+                .is_empty()
+            {
                 execution_plan
                     .deferrals
                     .push(budget_deferral(candidate, event_index));
                 break;
             }
-            plan.scheduled.push(candidate);
+            scheduled.push(candidate);
             pending_total = pending_total.saturating_add(reserved_kv_bytes);
             *pending_by_model.entry(model_id.clone()).or_default() += reserved_kv_bytes;
             execution_plan.lifecycle.push(LifecycleAction::Admit {
@@ -1359,14 +1356,6 @@ impl<S: Scheduler> Executor<S> {
     }
 
     fn start_next(&mut self, at: Timestamp) -> Result<ExecutorEvent, ExecutorError> {
-        self.start_next_with_plan(at, None)
-    }
-
-    fn start_next_with_plan(
-        &mut self,
-        at: Timestamp,
-        plan: Option<&mut IterationPlan>,
-    ) -> Result<ExecutorEvent, ExecutorError> {
         let Some(request_id) = self.runtime.select_next()? else {
             return Ok(ExecutorEvent::Idle);
         };
@@ -1414,23 +1403,6 @@ impl<S: Scheduler> Executor<S> {
                 return Ok(ExecutorEvent::Rejected { request_id, reason });
             }
         };
-        if let Some(plan) = plan {
-            let candidate = BatchCandidate {
-                request_id,
-                phase: BatchPhase::Prefill,
-                token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
-            };
-            let selected = self.select_batch_candidates(plan, &[candidate])?;
-            if selected.is_empty() {
-                plan.deferred.push(candidate);
-                return Ok(ExecutorEvent::BatchDeferred {
-                    request_id,
-                    phase: ExecutionPhase::Prefill,
-                    token_cost: candidate.token_cost,
-                });
-            }
-            plan.scheduled.push(candidate);
-        }
         let lease = self.runtime.start_selected(request_id, at)?;
         let session = match model.create_session(request.spec.generation.clone()) {
             Ok(session) => session,
@@ -1606,11 +1578,11 @@ impl<S: Scheduler> Executor<S> {
 
     fn select_batch_candidates(
         &mut self,
-        plan: &IterationPlan,
+        scheduled: &[BatchCandidate],
         candidates: &[BatchCandidate],
     ) -> Result<BTreeSet<RequestId>, ExecutorError> {
         let context = BatchContext {
-            scheduled: plan.scheduled.clone(),
+            scheduled: scheduled.to_vec(),
             candidates: candidates.to_vec(),
         };
         let mut selected = BTreeSet::new();
@@ -2109,6 +2081,28 @@ mod tests {
         artifact().with_kv_cache_profile(profile)
     }
 
+    /// Scheduled rows as `(request, phase, input tokens)` in event order.
+    fn scheduled(plan: &ExecutionPlan) -> Vec<(RequestId, PlannedPhase, usize)> {
+        let mut rows = plan
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                batch.rows.iter().map(move |row| {
+                    (
+                        row.event_index,
+                        row.request_id,
+                        batch.phase,
+                        row.input_tokens(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|row| row.0);
+        rows.into_iter()
+            .map(|(_, request_id, phase, tokens)| (request_id, phase, tokens))
+            .collect()
+    }
+
     fn request(prompt: &str, max_new_tokens: usize) -> RequestSpec {
         let mut request = RequestSpec::text("tiny", prompt);
         request.generation = GenerationConfig {
@@ -2190,7 +2184,7 @@ mod tests {
             .unwrap();
 
         let first = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
-        assert_eq!(first.plan.scheduled[0].token_cost, 2);
+        assert_eq!(scheduled(&first.execution_plan)[0].2, 2);
         assert!(matches!(
             first.events.as_slice(),
             [ExecutorEvent::PrefillProgress {
@@ -2215,7 +2209,7 @@ mod tests {
         ));
 
         let third = executor.step_iteration(Timestamp::from_micros(3)).unwrap();
-        assert_eq!(third.plan.scheduled[0].token_cost, 1);
+        assert_eq!(scheduled(&third.execution_plan)[0].2, 1);
         assert!(matches!(
             third.events.as_slice(),
             [ExecutorEvent::Token {
@@ -2256,11 +2250,9 @@ mod tests {
 
         let second = executor.step_iteration(Timestamp::from_micros(2)).unwrap();
         assert_eq!(
-            second
-                .plan
-                .scheduled
-                .iter()
-                .map(|candidate| (candidate.request_id, candidate.token_cost))
+            scheduled(&second.execution_plan)
+                .into_iter()
+                .map(|(request_id, _, tokens)| (request_id, tokens))
                 .collect::<Vec<_>>(),
             vec![(short, 1), (long, 2)]
         );
@@ -2358,7 +2350,7 @@ mod tests {
 
         let iteration = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
 
-        assert_eq!(iteration.plan.scheduled[0].token_cost, 4);
+        assert_eq!(scheduled(&iteration.execution_plan)[0].2, 4);
         assert_eq!(iteration.execution_batches[0].input_tokens, 4);
         assert!(matches!(
             iteration.events.as_slice(),
@@ -2674,28 +2666,21 @@ mod tests {
 
         let admitted = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
 
-        assert_eq!(admitted.plan.scheduled_tokens(), 2);
+        assert_eq!(admitted.execution_plan.estimates().input_tokens, 2);
         assert_eq!(
-            admitted.plan.scheduled,
+            scheduled(&admitted.execution_plan),
             vec![
-                BatchCandidate {
-                    request_id: first,
-                    phase: BatchPhase::Prefill,
-                    token_cost: 1,
-                },
-                BatchCandidate {
-                    request_id: second,
-                    phase: BatchPhase::Prefill,
-                    token_cost: 1,
-                },
+                (first, PlannedPhase::Prefill, 1),
+                (second, PlannedPhase::Prefill, 1),
             ]
         );
         assert_eq!(
-            admitted.plan.deferred,
-            vec![BatchCandidate {
+            admitted.execution_plan.deferrals,
+            vec![PlannedDeferral::Budget {
                 request_id: third,
                 phase: BatchPhase::Prefill,
                 token_cost: 1,
+                event_index: 2,
             }]
         );
         assert!(matches!(
@@ -2710,15 +2695,13 @@ mod tests {
         assert_eq!(admitted.queued_requests, 1);
 
         let decoded = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
-        assert_eq!(decoded.plan.scheduled_tokens(), 2);
+        assert_eq!(decoded.execution_plan.estimates().input_tokens, 2);
         assert!(
-            decoded
-                .plan
-                .scheduled
+            scheduled(&decoded.execution_plan)
                 .iter()
-                .all(|candidate| candidate.phase == BatchPhase::Decode)
+                .all(|(_, phase, _)| *phase == PlannedPhase::Decode)
         );
-        assert_eq!(decoded.plan.deferred[0].request_id, third);
+        assert_eq!(decoded.execution_plan.deferrals[0].request_id(), third);
         assert_eq!(
             decoded.execution_batches,
             vec![ExecutionBatch {
@@ -3135,16 +3118,12 @@ mod tests {
 
         let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
 
-        assert_eq!(iteration.plan.scheduled_tokens(), 3);
+        assert_eq!(iteration.execution_plan.estimates().input_tokens, 3);
         assert_eq!(
-            iteration.plan.scheduled,
-            vec![BatchCandidate {
-                request_id: request,
-                phase: BatchPhase::Prefill,
-                token_cost: 3,
-            }]
+            scheduled(&iteration.execution_plan),
+            vec![(request, PlannedPhase::Prefill, 3)]
         );
-        assert!(iteration.plan.deferred.is_empty());
+        assert!(iteration.execution_plan.deferrals.is_empty());
         assert_eq!(executor.state().queued_len(), 0);
         assert!(executor.result(request).is_some());
     }

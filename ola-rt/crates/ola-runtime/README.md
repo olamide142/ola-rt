@@ -124,8 +124,9 @@ tokenized prompt length.
 
 The configured `BatchPolicy` chooses work without mutating lifecycle state.
 The executor validates that every returned request is an eligible, unique
-candidate before doing model work. `ExecutorIteration::plan` then records the
-selected and policy-deferred candidates in deterministic order, while
+candidate before doing model work. Selected work becomes rows of
+`ExecutorIteration::execution_plan`, and policy-deferred work becomes
+`PlannedDeferral::Budget` entries, both in deterministic event order, while
 `BatchDeferred` events explain individual deferrals to observers.
 
 `UnboundedBatchPolicy` is the compatibility default and preserves the earlier

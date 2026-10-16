@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod plan_report;
 mod report;
 
 use std::{
@@ -19,6 +20,11 @@ use ola_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use plan_report::{
+    PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportBatch, PlanReportDeferral,
+    PlanReportDivergence, PlanReportError, PlanReportEstimates, PlanReportLifecycle,
+    PlanReportMode, PlanReportPhase, PlanReportReleaseReason, PlanReportRow,
+};
 pub use report::{
     PREFILL_REPORT_SCHEMA_VERSION, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
     PrefillReportError, PrefillReportProtocol, PrefillReportSample, PrefillReportStrategySummary,

@@ -31,7 +31,7 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [ ] Record deferrals and policy reasons.
 - [x] Validate plans before lifecycle, session, or KV mutation.
 - [x] Preserve deterministic events when execution is regrouped.
-- [ ] Add a stable serialized/report representation.
+- [x] Add a stable serialized/report representation.
 - [x] Test duplicate, stale, invalid, and over-capacity plans.
 - [ ] Compare planned execution against the single-request correctness path.
 
