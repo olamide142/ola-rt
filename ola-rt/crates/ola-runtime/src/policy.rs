@@ -34,6 +34,24 @@ pub trait ExecutionPolicy: Send {
     fn observe(&mut self, _iteration: &ExecutorIteration) {}
 }
 
+impl<P: ExecutionPolicy + ?Sized> ExecutionPolicy for Box<P> {
+    fn descriptor(&self) -> PolicyDescriptor {
+        (**self).descriptor()
+    }
+
+    fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
+        (**self).plan(snapshot)
+    }
+
+    fn enforces_model_kv_capacity(&self) -> bool {
+        (**self).enforces_model_kv_capacity()
+    }
+
+    fn observe(&mut self, iteration: &ExecutorIteration) {
+        (**self).observe(iteration);
+    }
+}
+
 /// Output of one planning pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyDecision {

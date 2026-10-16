@@ -2,6 +2,7 @@
 
 mod plan_report;
 mod report;
+mod scheduling_summary;
 mod simulation;
 mod synthetic;
 mod trace;
@@ -36,6 +37,10 @@ pub use report::{
     PREFILL_REPORT_SCHEMA_VERSION, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
     PrefillReportError, PrefillReportProtocol, PrefillReportSample, PrefillReportStrategySummary,
     PrefillReportTrial,
+};
+pub use scheduling_summary::{
+    ClassSummary, DEFAULT_STARVATION_FACTOR, LONG_PROMPT_TOKENS, SchedulingComparison,
+    SchedulingSummary, SlowdownSummary, compare_schedulers, isolated_end_to_end, summarize_run,
 };
 pub use simulation::{
     CostModel, SchedulingRun, SimulationConfig, SimulationError, TrialIteration, TrialOutcome,

@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–4 are
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–5 are
 implemented.
 
 ## Goal
@@ -105,7 +105,7 @@ limit, priority, optional deadline, and optional early-EOS step.
 | `mixed_short_long` | SJF against FIFO; head-of-line blocking by long prompts |
 | `prefill_decode_competition` | long prompts arriving while many decodes are live; mixing and budgets |
 | `priority_classes` | a minority of high-priority requests in a normal stream |
-| `deadlines` | mixed slack, some infeasible |
+| `deadlines` | slack of 1–4× an estimated solo time (caller supplies the per-iteration cost), 10% infeasible |
 | `overload` | arrival rate above capacity; queue growth and starvation |
 | `impossible` | requests exceeding the KV pool mixed with normal ones |
 
@@ -192,7 +192,22 @@ Each step keeps `make verify` and `make test-fixture` green.
    `overload` trace.
 5. **Metrics and comparison.** Add `SchedulingSummary` (latencies,
    throughput, memory, deferrals, slowdown, Jain fairness, starvation,
-   deadline misses), `compare_schedulers`, and the reproducibility test.
+   deadline misses), `compare_schedulers`, and the reproducibility test. **Done** in
+   `ola-bench/src/scheduling_summary.rs`. A probe sweep before writing
+   tests changed two things and pinned the regimes the tests assert:
+   - the `deadlines` trace originally set slack from the arrival gap, which
+     made every deadline infeasible (120/120 missed under every policy); it
+     now scales slack to an estimated solo time;
+   - with the default 1024-token pool memory never binds, so backfill never
+     triggers; the backfill comparison uses a 512-token pool.
+
+   Measured effects (seed 3, 120 requests): priority cuts urgent p95
+   completion more than 4× with no urgent starvation; SJF speeds short
+   requests and slows long ones, lowering fairness; backfill lowers p50
+   completion and starvation under a binding pool; EDF misses fewer
+   deadlines only under moderate contention (2 slots, 6 ms mean gap) and
+   misses more than FIFO under overload, the known EDF domino effect.
+   Empty classes are omitted from summaries.
 6. **Isolation and equivalence.** Add the isolation matrix, synthetic output
    equivalence, and the fixture equivalence test.
 7. **Surface.** Add the UI experiment and README sections, and update

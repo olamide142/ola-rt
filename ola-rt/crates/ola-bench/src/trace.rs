@@ -86,16 +86,24 @@ impl SchedulingTrace {
         })
     }
 
-    /// Medium requests with deadlines of 2 to 40 mean gaps after arrival;
-    /// one in ten has a 1 µs deadline and cannot be met.
-    pub fn deadlines(parameters: TraceParameters) -> Self {
-        let gap = parameters.mean_interarrival_micros.max(1);
+    /// Medium requests whose deadlines allow 1× to 4× an estimate of their
+    /// time running alone; one in ten has a 1 µs deadline and cannot be met.
+    ///
+    /// The estimate is `(output limit + 1) × iteration_micros`: one
+    /// iteration per generated token plus one for the prompt. Pass the
+    /// cost model's approximate single-request iteration time, so deadlines
+    /// are feasible without load and become hard under it.
+    pub fn deadlines(parameters: TraceParameters, iteration_micros: u64) -> Self {
         Self::generate("deadlines", parameters, |random, _| {
             let mut request = shaped(random, 8..=64, 8..=32);
+            let solo = u64::try_from(request.max_new_tokens.saturating_add(1))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(iteration_micros.max(1));
             let slack = if random.chance(10) {
                 1
             } else {
-                gap.saturating_mul(random.between_u64(2, 40))
+                // 2..=8 halves: 1× to 4× the solo estimate.
+                solo.saturating_mul(random.between_u64(2, 8)) / 2
             };
             // Arrival is filled in by `generate`; store the slack for now.
             request.deadline_micros = Some(slack);
@@ -239,7 +247,7 @@ mod tests {
             SchedulingTrace::mixed_short_long(PARAMETERS),
             SchedulingTrace::prefill_decode_competition(PARAMETERS),
             SchedulingTrace::priority_classes(PARAMETERS),
-            SchedulingTrace::deadlines(PARAMETERS),
+            SchedulingTrace::deadlines(PARAMETERS, 500),
             SchedulingTrace::overload(PARAMETERS),
             SchedulingTrace::impossible(PARAMETERS, 1_024),
         ]
@@ -297,7 +305,7 @@ mod tests {
                 .any(|request| request.priority == 5)
         );
 
-        let deadlines = SchedulingTrace::deadlines(PARAMETERS);
+        let deadlines = SchedulingTrace::deadlines(PARAMETERS, 500);
         assert!(deadlines.requests.iter().all(|request| {
             request
                 .deadline_micros
