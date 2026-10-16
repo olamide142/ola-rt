@@ -145,6 +145,10 @@ pub struct PlanReportSelection {
     pub stage: PlanReportSelectionStage,
     /// Work already scheduled before the call.
     pub scheduled: Vec<PlanReportCandidate>,
+    /// Queued requests at the iteration boundary.
+    pub queued_requests: usize,
+    /// Live sessions at the iteration boundary.
+    pub live_requests: usize,
     /// Candidates offered.
     pub candidates: Vec<PlanReportCandidate>,
     /// Requests selected.
@@ -524,6 +528,8 @@ fn decision_record(record: &DecisionRecord) -> PlanReportDecision {
                     SelectionStage::Admission => PlanReportSelectionStage::Admission,
                 },
                 scheduled: candidates(&selection.context.scheduled),
+                queued_requests: selection.context.pressure.queued_requests,
+                live_requests: selection.context.pressure.live_requests,
                 candidates: candidates(&selection.context.candidates),
                 selected: selection.selected.iter().map(|id| id.get()).collect(),
             })

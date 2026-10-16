@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use ola_core::{ModelId, Priority, RequestId, Timestamp};
 use ola_model::{BatchCapabilities, KvCacheProfile};
 
-use crate::{DecodeView, MemoryState, PrefillView};
+use crate::{BatchPressure, DecodeView, MemoryState, PrefillView};
 
 /// Executor configuration that bounds every plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +118,15 @@ impl PlanningSnapshot {
     /// Returns the number of live sessions.
     pub fn live_requests(&self) -> usize {
         self.prefilling.len().saturating_add(self.decoding.len())
+    }
+
+    /// Returns the load batch policies may adapt to.
+    pub fn pressure(&self) -> BatchPressure {
+        BatchPressure {
+            queued_requests: self.queued.len(),
+            live_requests: self.live_requests(),
+            max_active_requests: self.limits.max_active_requests,
+        }
     }
 
     /// Returns the model snapshot, treating unknown models as detached.

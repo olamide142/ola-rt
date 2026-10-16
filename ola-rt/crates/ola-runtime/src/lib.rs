@@ -20,10 +20,11 @@ pub use admission::{
     UnconstrainedAdmission,
 };
 pub use batch::{
-    BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy,
+    BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,
     CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutionBatch, FifoTokenBudgetPolicy,
-    PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate, PrefillGroupingStrategy,
-    UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+    MixedTokenBudgetPolicy, PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate,
+    PrefillGroupingStrategy, QueueAdaptiveTokenBudget, UnboundedBatchPolicy,
+    UnbucketedPrefillBatcher,
 };
 pub use composed::{ComposedPolicy, HeadOfLine};
 pub use decision::{

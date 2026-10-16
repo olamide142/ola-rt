@@ -150,6 +150,7 @@ impl ComposedPolicy {
             .collect::<Vec<_>>();
         let decode_count = decode_candidates.len();
         let selected = self.select_batch_candidates(
+            snapshot,
             scheduled,
             &decode_candidates,
             SelectionStage::Decode,
@@ -199,6 +200,7 @@ impl ComposedPolicy {
             .collect::<Vec<_>>();
         let prefill_count = prefill_candidates.len();
         let selected = self.select_batch_candidates(
+            snapshot,
             scheduled,
             &prefill_candidates,
             SelectionStage::ContinuedPrefill,
@@ -404,6 +406,7 @@ impl ComposedPolicy {
             };
             let budget_selected = !self
                 .select_batch_candidates(
+                    snapshot,
                     scheduled,
                     &[candidate],
                     SelectionStage::Admission,
@@ -514,6 +517,7 @@ impl ComposedPolicy {
 
     fn select_batch_candidates(
         &self,
+        snapshot: &PlanningSnapshot,
         scheduled: &[BatchCandidate],
         candidates: &[BatchCandidate],
         stage: SelectionStage,
@@ -522,6 +526,7 @@ impl ComposedPolicy {
         let context = BatchContext {
             scheduled: scheduled.to_vec(),
             candidates: candidates.to_vec(),
+            pressure: snapshot.pressure(),
         };
         let returned = self.batch.select(&context);
         let mut selected = BTreeSet::new();

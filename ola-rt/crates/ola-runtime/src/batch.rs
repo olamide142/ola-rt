@@ -288,6 +288,19 @@ pub struct BatchContext {
     pub scheduled: Vec<BatchCandidate>,
     /// Eligible work in deterministic executor order.
     pub candidates: Vec<BatchCandidate>,
+    /// Load at the iteration boundary, for budgets that adapt to it.
+    pub pressure: BatchPressure,
+}
+
+/// Load visible to batch policies, taken from the planning snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BatchPressure {
+    /// Requests waiting for admission.
+    pub queued_requests: usize,
+    /// Live sessions.
+    pub live_requests: usize,
+    /// Configured live-session limit.
+    pub max_active_requests: usize,
 }
 
 impl BatchContext {
@@ -295,6 +308,15 @@ impl BatchContext {
     pub fn scheduled_tokens(&self) -> usize {
         self.scheduled
             .iter()
+            .map(|candidate| candidate.token_cost)
+            .sum()
+    }
+
+    /// Returns prompt token positions already committed this iteration.
+    pub fn scheduled_prefill_tokens(&self) -> usize {
+        self.scheduled
+            .iter()
+            .filter(|candidate| candidate.phase == BatchPhase::Prefill)
             .map(|candidate| candidate.token_cost)
             .sum()
     }
@@ -357,30 +379,151 @@ impl BatchPolicy for FifoTokenBudgetPolicy {
     }
 
     fn select(&self, context: &BatchContext) -> Vec<RequestId> {
-        let mut used = context.scheduled_tokens();
-        let mut selected = Vec::new();
-        for candidate in &context.candidates {
-            let Some(next) = used.checked_add(candidate.token_cost) else {
-                break;
-            };
-            if next <= self.max_tokens.get() {
-                used = next;
-                selected.push(candidate.request_id);
-                continue;
-            }
-
-            // A prompt larger than the budget must still be able to make
-            // progress. Run it alone and record its actual cost in the plan.
-            if context.scheduled.is_empty()
-                && selected.is_empty()
-                && candidate.phase == BatchPhase::Prefill
-            {
-                selected.push(candidate.request_id);
-            }
-            break;
-        }
-        selected
+        select_within_budget(context, self.max_tokens.get(), None)
     }
+}
+
+/// Token budget that serves decodes first and caps prompt work per
+/// iteration, so long prompts cannot crowd out live decodes.
+///
+/// The first prompt in an iteration may exceed the prompt cap when it fits
+/// the total budget; otherwise an unchunked prompt longer than the cap could
+/// never run while decodes are live. A prompt larger than the whole budget
+/// still runs alone when nothing else is scheduled. With
+/// `max_prefill_tokens == max_tokens` this is exactly
+/// [`FifoTokenBudgetPolicy`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MixedTokenBudgetPolicy {
+    max_tokens: NonZeroUsize,
+    max_prefill_tokens: NonZeroUsize,
+}
+
+impl MixedTokenBudgetPolicy {
+    /// Creates a budget; `None` unless `0 < max_prefill_tokens <= max_tokens`.
+    pub const fn new(max_tokens: usize, max_prefill_tokens: usize) -> Option<Self> {
+        if max_prefill_tokens > max_tokens {
+            return None;
+        }
+        match (
+            NonZeroUsize::new(max_tokens),
+            NonZeroUsize::new(max_prefill_tokens),
+        ) {
+            (Some(max_tokens), Some(max_prefill_tokens)) => Some(Self {
+                max_tokens,
+                max_prefill_tokens,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl BatchPolicy for MixedTokenBudgetPolicy {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("mixed-token-budget")
+            .with_config("max_tokens", self.max_tokens)
+            .with_config("max_prefill_tokens", self.max_prefill_tokens)
+    }
+
+    fn select(&self, context: &BatchContext) -> Vec<RequestId> {
+        select_within_budget(
+            context,
+            self.max_tokens.get(),
+            Some(self.max_prefill_tokens.get()),
+        )
+    }
+}
+
+/// FIFO token budget that grows with queue depth: small when idle for low
+/// latency, larger under load for throughput.
+///
+/// The budget is `min_tokens + tokens_per_queued × queued_requests`, clamped
+/// to `max_tokens`. It is computed from [`BatchPressure`] alone, so equal
+/// snapshots give equal budgets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueueAdaptiveTokenBudget {
+    min_tokens: NonZeroUsize,
+    max_tokens: NonZeroUsize,
+    tokens_per_queued: usize,
+}
+
+impl QueueAdaptiveTokenBudget {
+    /// Creates an adaptive budget; `None` unless `0 < min_tokens <= max_tokens`.
+    pub const fn new(
+        min_tokens: usize,
+        max_tokens: usize,
+        tokens_per_queued: usize,
+    ) -> Option<Self> {
+        if min_tokens > max_tokens {
+            return None;
+        }
+        match (NonZeroUsize::new(min_tokens), NonZeroUsize::new(max_tokens)) {
+            (Some(min_tokens), Some(max_tokens)) => Some(Self {
+                min_tokens,
+                max_tokens,
+                tokens_per_queued,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Returns the budget for a given load.
+    pub fn budget(self, pressure: BatchPressure) -> usize {
+        self.tokens_per_queued
+            .saturating_mul(pressure.queued_requests)
+            .saturating_add(self.min_tokens.get())
+            .min(self.max_tokens.get())
+    }
+}
+
+impl BatchPolicy for QueueAdaptiveTokenBudget {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("queue-adaptive-token-budget")
+            .with_config("min_tokens", self.min_tokens)
+            .with_config("max_tokens", self.max_tokens)
+            .with_config("tokens_per_queued", self.tokens_per_queued)
+    }
+
+    fn select(&self, context: &BatchContext) -> Vec<RequestId> {
+        select_within_budget(context, self.budget(context.pressure), None)
+    }
+}
+
+/// Selects the FIFO prefix of candidates that fits `max_tokens`, and
+/// `max_prefill_tokens` for prompt work when given.
+fn select_within_budget(
+    context: &BatchContext,
+    max_tokens: usize,
+    max_prefill_tokens: Option<usize>,
+) -> Vec<RequestId> {
+    let mut used = context.scheduled_tokens();
+    let mut prefill_used = context.scheduled_prefill_tokens();
+    let mut selected = Vec::new();
+    for candidate in &context.candidates {
+        let Some(next) = used.checked_add(candidate.token_cost) else {
+            break;
+        };
+        let prefill = candidate.phase == BatchPhase::Prefill;
+        let within_prefill_cap = !prefill
+            || prefill_used == 0
+            || max_prefill_tokens
+                .is_none_or(|cap| prefill_used.saturating_add(candidate.token_cost) <= cap);
+        if next <= max_tokens && within_prefill_cap {
+            used = next;
+            if prefill {
+                prefill_used = prefill_used.saturating_add(candidate.token_cost);
+            }
+            selected.push(candidate.request_id);
+            continue;
+        }
+
+        // A prompt larger than the budget must still be able to make
+        // progress. Run it alone and record its actual cost in the plan.
+        if context.scheduled.is_empty() && selected.is_empty() && prefill {
+            selected.push(candidate.request_id);
+        }
+        break;
+    }
+    selected
 }
 
 #[cfg(test)]
@@ -399,6 +542,7 @@ mod tests {
     fn token_budget_selects_a_fifo_prefix_across_iteration_phases() {
         let policy = FifoTokenBudgetPolicy::new(4).unwrap();
         let context = BatchContext {
+            pressure: BatchPressure::default(),
             scheduled: vec![candidate(1, BatchPhase::Decode, 1)],
             candidates: vec![
                 candidate(2, BatchPhase::Decode, 1),
@@ -417,6 +561,7 @@ mod tests {
     fn oversized_prefill_runs_alone_to_preserve_progress() {
         let policy = FifoTokenBudgetPolicy::new(4).unwrap();
         let context = BatchContext {
+            pressure: BatchPressure::default(),
             scheduled: Vec::new(),
             candidates: vec![candidate(1, BatchPhase::Prefill, 9)],
         };
@@ -489,5 +634,142 @@ mod tests {
         };
 
         assert_eq!(batch.dense_input_tokens(), 16);
+    }
+
+    fn context(
+        scheduled: Vec<BatchCandidate>,
+        candidates: Vec<BatchCandidate>,
+        queued_requests: usize,
+    ) -> BatchContext {
+        BatchContext {
+            scheduled,
+            candidates,
+            pressure: BatchPressure {
+                queued_requests,
+                live_requests: 0,
+                max_active_requests: 8,
+            },
+        }
+    }
+
+    fn ids(selected: Vec<RequestId>) -> Vec<u64> {
+        selected.into_iter().map(RequestId::get).collect()
+    }
+
+    #[test]
+    fn mixed_budget_with_an_uncapped_prompt_share_matches_fifo_budget() {
+        let decode = |id| candidate(id, BatchPhase::Decode, 1);
+        let prefill = |id, cost| candidate(id, BatchPhase::Prefill, cost);
+        let cases = [
+            context(
+                vec![decode(1)],
+                vec![decode(2), prefill(3, 3), prefill(4, 4)],
+                0,
+            ),
+            context(Vec::new(), vec![prefill(1, 20), prefill(2, 1)], 0),
+            context(vec![decode(1), decode(2)], vec![prefill(3, 9)], 0),
+            context(
+                Vec::new(),
+                vec![prefill(1, 5), prefill(2, 5), prefill(3, 1)],
+                0,
+            ),
+        ];
+        let fifo = FifoTokenBudgetPolicy::new(10).unwrap();
+        let mixed = MixedTokenBudgetPolicy::new(10, 10).unwrap();
+
+        for case in &cases {
+            assert_eq!(mixed.select(case), fifo.select(case));
+        }
+    }
+
+    #[test]
+    fn mixed_budget_caps_prompt_work_behind_live_decodes() {
+        let context = context(
+            vec![
+                candidate(1, BatchPhase::Decode, 1),
+                candidate(2, BatchPhase::Decode, 1),
+            ],
+            vec![
+                candidate(3, BatchPhase::Prefill, 3),
+                candidate(4, BatchPhase::Prefill, 3),
+            ],
+            0,
+        );
+
+        assert_eq!(
+            ids(FifoTokenBudgetPolicy::new(10).unwrap().select(&context)),
+            [3, 4]
+        );
+        assert_eq!(
+            ids(MixedTokenBudgetPolicy::new(10, 4).unwrap().select(&context)),
+            [3]
+        );
+    }
+
+    #[test]
+    fn mixed_budget_lets_the_first_prompt_exceed_the_cap_and_oversized_prompts_run_alone() {
+        let over_cap = context(
+            vec![candidate(1, BatchPhase::Decode, 1)],
+            vec![candidate(2, BatchPhase::Prefill, 6)],
+            0,
+        );
+        let oversized = context(Vec::new(), vec![candidate(1, BatchPhase::Prefill, 20)], 0);
+        let policy = MixedTokenBudgetPolicy::new(10, 4).unwrap();
+
+        assert_eq!(ids(policy.select(&over_cap)), [2]);
+        assert_eq!(ids(policy.select(&oversized)), [1]);
+    }
+
+    #[test]
+    fn adaptive_budget_grows_with_queue_depth_up_to_its_maximum() {
+        let policy = QueueAdaptiveTokenBudget::new(2, 6, 1).unwrap();
+        let prompts = || {
+            vec![
+                candidate(1, BatchPhase::Prefill, 2),
+                candidate(2, BatchPhase::Prefill, 2),
+                candidate(3, BatchPhase::Prefill, 2),
+                candidate(4, BatchPhase::Prefill, 2),
+            ]
+        };
+
+        assert_eq!(
+            policy.budget(context(Vec::new(), Vec::new(), 0).pressure),
+            2
+        );
+        assert_eq!(
+            policy.budget(context(Vec::new(), Vec::new(), 3).pressure),
+            5
+        );
+        assert_eq!(
+            policy.budget(context(Vec::new(), Vec::new(), 50).pressure),
+            6
+        );
+        assert_eq!(ids(policy.select(&context(Vec::new(), prompts(), 0))), [1]);
+        assert_eq!(
+            ids(policy.select(&context(Vec::new(), prompts(), 4))),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn budget_policies_reject_invalid_configuration_and_have_stable_names() {
+        assert!(MixedTokenBudgetPolicy::new(4, 5).is_none());
+        assert!(MixedTokenBudgetPolicy::new(4, 0).is_none());
+        assert!(QueueAdaptiveTokenBudget::new(6, 2, 1).is_none());
+        assert!(QueueAdaptiveTokenBudget::new(0, 2, 1).is_none());
+        assert_eq!(
+            MixedTokenBudgetPolicy::new(16, 8)
+                .unwrap()
+                .descriptor()
+                .to_string(),
+            "mixed-token-budget{max_tokens=16,max_prefill_tokens=8}"
+        );
+        assert_eq!(
+            QueueAdaptiveTokenBudget::new(4, 64, 2)
+                .unwrap()
+                .descriptor()
+                .to_string(),
+            "queue-adaptive-token-budget{min_tokens=4,max_tokens=64,tokens_per_queued=2}"
+        );
     }
 }

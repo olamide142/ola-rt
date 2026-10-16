@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–2 are
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–3 are
 implemented.
 
 ## Goal
@@ -177,7 +177,12 @@ Each step keeps `make verify` and `make test-fixture` green.
    was added to `PlanReport` schema 2 in place, since that version had not
    been published.
 3. **Budgets.** Add `BatchPressure`, `MixedTokenBudgetPolicy`, and
-   `QueueAdaptiveTokenBudget`, with tests.
+   `QueueAdaptiveTokenBudget`, with tests. **Done.**
+   `MixedTokenBudgetPolicy` lets the first prompt of an iteration exceed the
+   prompt cap when it fits the total budget, so an unchunked prompt longer
+   than the cap is not starved by live decodes; with the cap equal to the
+   budget it matches `FifoTokenBudgetPolicy` exactly (tested). Selection
+   records in `PlanReport` carry queue and live counts.
 4. **Simulation harness.** Add `SyntheticModel`, the virtual-clock cost
    model, seeded trace generators, and `run_scheduling_trial`.
 5. **Metrics and comparison.** Add `SchedulingSummary` (latencies,
