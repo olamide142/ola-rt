@@ -95,9 +95,9 @@ OLA_LLAMA_CONFORMANCE_DIR=/tmp/ola-rt-tiny-random-llama \
 ```
 
 Burn's F32 `Flex` CPU output (NdArray before the Burn 0.22 migration) is
-compared with the scalar F64 oracle using an absolute tolerance of `2e-5`. The tolerance covers accumulation-order and
-elementary-function differences while remaining small relative to the observed
-logit magnitudes. Argmax token IDs must match exactly.
+compared with the scalar F64 oracle using an absolute tolerance of `2e-5`.
+The tolerance covers accumulation-order and elementary-function differences
+while remaining small relative to the observed logit magnitudes. Argmax token IDs must match exactly.
 
 ## Change-control rule
 
@@ -113,3 +113,14 @@ tolerance change. Any accepted update must record:
 KV-cache work must additionally compare cached one-token decode logits with
 this full-sequence baseline at every generated position. Matching only final
 text is insufficient because argmax can hide significant logit drift.
+
+## Planned multi-request execution
+
+`llama::factory::tests::planned_multi_request_execution_matches_single_request_oracle`
+runs five prompts of different lengths and output limits through one planned
+executor with three slots, two-token prefill chunks, power-of-two grouping,
+and a four-token iteration budget. Every request's generated token IDs must
+equal those it produces when run alone. The test also asserts that it
+exercised tensor invocations, continued prefill, budget deferral, and
+predicted slot reuse, and that Llama never fell back from a declared tensor
+hook. It runs with the other fixture tests (`make test-fixture`).

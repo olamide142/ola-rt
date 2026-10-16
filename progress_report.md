@@ -1,15 +1,14 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 12:28 BST (Europe/London)
+**Last updated:** 2026-10-16 13:21 BST (Europe/London)
 
-**Source revision:** working tree based on `15a191c` on `master`
+**Source revision:** working tree based on `a88bf75` on `master`
 
-**Repository state at update:** resumable prefill and the initial
-`ola-kernel` paged-attention boundary are committed (`eb52cf6`); the working
-tree migrates the CPU backend from deprecated Burn NdArray to Burn Flex after
-the Burn 0.22 upgrade, replaces deprecated tensor readbacks, fixes a Rust 1.95
-Clippy lint, untracks `.codex/`, and refreshes documentation; current branch
-commits are not pushed
+**Repository state at update:** the P1 execution-plan IR is complete: every
+`step_iteration` is planned, validated, and committed as one `ExecutionPlan`
+(`7c8af6e`..`a88bf75`), and the working tree adds the planned-versus-single-
+request oracle test on the pinned fixture; current branch commits are not
+pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -153,6 +152,7 @@ performance claim.
 | Live memory accounting | Baseline working | Active session KV bytes propagated into `RuntimeState::memory` |
 | Scheduling | Baseline working | Replaceable scheduler trait with deterministic FIFO |
 | Admission | Memory-aware baseline | Typed admit/defer/reject decisions using page-rounded model-pool and optional device budgets |
+| Execution planning | Working | Each iteration is a validated `ExecutionPlan` (admissions, invocations, deferrals, predicted releases) committed atomically; divergences recorded; versioned `PlanReport` JSON |
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
 | Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
@@ -407,20 +407,19 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **114 tests passed** (unit, integration, and documentation),
-  with formatting, workspace checks, Clippy with warnings denied, and
-  documentation generation also passing, and zero compiler warnings;
-  **2 external-fixture tests ignored** by default.
-- `make test-fixture` against the pinned artifact (hashes re-verified):
-  **2 passed** on the Burn Flex CPU backend, including pinned scalar-oracle
-  logits within `2e-5` and argmax `[5971, 1789, 19053]`.
-- Independent scalar oracle (`tools/llama_scalar_reference.py`): **re-run**,
-  argmax unchanged.
-- `make llama` on Flex CPU: selected `[1789, 19053]` after prompt tokens
-  `[1, 15043]`, matching the historical NdArray and WGPU selections.
-- `make check-wgpu` and `make check-cuda`: **passed** with no warnings. A fresh
-  live WGPU run was not possible because `nvidia-smi` could not communicate
-  with the NVIDIA driver; earlier GTX 1650 results below are historical.
+- `make verify`: **passed** (formatting, workspace checks, all tests, Clippy
+  with warnings denied, and documentation), with zero compiler warnings;
+  fixture tests ignored by default.
+- `make test-fixture` against the pinned artifact: **3 passed** — scalar-oracle
+  logits within `2e-5`, the UI integration, and the new planned multi-request
+  execution matching each request's single-request output while exercising
+  tensor invocations, continued prefill, budget deferral, and predicted slot
+  reuse.
+- Plan validation is unit-tested for stale, duplicate, invalid-status,
+  inconsistent, bad-release, and over-capacity plans; executor tests cover
+  planned admissions, preparation failures, EOS-freed slots, tensor fallback,
+  and session-creation divergence.
+- A live WGPU run was not repeated in this update.
 
 Historical evidence from earlier revisions:
 
@@ -548,6 +547,11 @@ and `TOKENS` variables.
   reclaim part of a reservation as a sequence approaches completion.
 - Device-wide admission is enforced only when a caller supplies a capacity and
   non-KV accounting; automatic GPU-memory telemetry is not wired in yet.
+- Slots freed by EOS or failure are refilled on the next iteration because
+  plans are built before execution; only limit-reaching completions are reused
+  in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
+- Execution plans record the model but not backend/device or kernel choices,
+  and do not yet carry the cost-aware grouping policy's estimates or reasons.
 - Inter-token latency currently uses the terminal decode span divided by token
   gaps; individual token timestamps are not retained yet.
 - Executor results are retained in memory and there is no result eviction or
@@ -604,6 +608,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 13:21 BST — working tree on `a88bf75`:** Completed the P1
+  execution-plan IR: plan types and validation, declared model batch
+  capabilities, planned live work and admissions (slots reused in the same
+  iteration only for limit-reaching completions; EOS-freed slots refill next
+  iteration), plan-versus-execution divergences, `PlanReport` JSON, removal of
+  `IterationPlan`, and a fixture oracle test for planned multi-request output.
 
 - **2026-10-16 12:28 BST — working tree on `15a191c`:** Migrated the default
   CPU backend from deprecated Burn NdArray to Burn Flex, switched token readback

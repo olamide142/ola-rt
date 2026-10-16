@@ -1,6 +1,6 @@
 # ExecutionPlan design proposal
 
-Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–6 are
+Status: **accepted** (2026-10-16). Covers `todo.md` P1. All seven steps are
 implemented: every `step_iteration` is planned, validated, and committed as
 one `ExecutionPlan`, exposed as `ExecutorIteration::execution_plan`, and
 every difference between the plan and execution is listed in
@@ -232,7 +232,8 @@ Each step keeps `make verify` and the fixture tests green.
    `IterationPlan` to `ExecutionPlan` and drop the projection. **Done.** The UI has no
    direct iteration consumer, so it needed no migration.
 7. Add an oracle test that compares token outputs from planned multi-request
-   execution against the single-request path on the pinned fixture.
+   execution against the single-request path on the pinned fixture. **Done:**
+   `ola-burn` `planned_multi_request_execution_matches_single_request_oracle`.
 
 ## Out of scope for P1
 

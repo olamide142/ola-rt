@@ -328,6 +328,135 @@ mod tests {
         assert_eq!(selected, vec![5_971, 1_789, 19_053]);
     }
 
+    /// Planned multi-request execution must emit exactly the tokens each
+    /// request produces when run alone. The planned run exercises slot
+    /// refill, chunked and continued prefill, power-of-two grouping, budget
+    /// deferrals, and tensor-batched decode on real Llama weights.
+    #[test]
+    #[ignore = "requires the pinned external Hugging Face conformance fixture"]
+    fn planned_multi_request_execution_matches_single_request_oracle() {
+        use ola_core::{GenerationConfig, ModelDescriptor, RequestId, RequestSpec, Timestamp};
+        use ola_runtime::{
+            BatchExecutionMode, Executor, FifoTokenBudgetPolicy, PlanDivergence, PlannedPhase,
+            PowerOfTwoPrefillBatcher, Runtime,
+        };
+
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
+        let artifact = LlamaFactory::new(Device::flex())
+            .load_local(directory)
+            .unwrap();
+        let workload = [
+            ("Hello", 3),
+            ("Hello world", 5),
+            ("The quick brown fox jumps", 2),
+            ("a", 4),
+            ("Once upon a time there was", 6),
+        ];
+        let request = |prompt: &str, max_new_tokens: usize| {
+            let mut request = RequestSpec::text("tiny", prompt);
+            request.generation = GenerationConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_p: 1.0,
+                seed: Some(0),
+            };
+            request
+        };
+        let run_to_completion = |executor: &mut Executor, ids: &[RequestId]| {
+            let mut iterations = Vec::new();
+            for step in 1..=500 {
+                if ids.iter().all(|id| executor.result(*id).is_some()) {
+                    return iterations;
+                }
+                iterations.push(
+                    executor
+                        .step_iteration(Timestamp::from_micros(step))
+                        .unwrap(),
+                );
+            }
+            panic!("workload did not complete within 500 iterations");
+        };
+
+        let oracle = workload
+            .iter()
+            .map(|(prompt, max_new_tokens)| {
+                let mut executor = Executor::default();
+                executor
+                    .register_model(ModelDescriptor::language("tiny", "llama"), artifact.clone())
+                    .unwrap();
+                let id = executor
+                    .submit(request(prompt, *max_new_tokens), Timestamp::ZERO)
+                    .unwrap();
+                run_to_completion(&mut executor, &[id]);
+                executor.result(id).unwrap().token_ids.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 3)
+            .unwrap()
+            .with_prefill_chunk_size(2)
+            .unwrap()
+            .with_prefill_batcher(PowerOfTwoPrefillBatcher)
+            .with_batch_policy(FifoTokenBudgetPolicy::new(4).unwrap());
+        executor
+            .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
+            .unwrap();
+        let ids = workload
+            .iter()
+            .map(|(prompt, max_new_tokens)| {
+                executor
+                    .submit(request(prompt, *max_new_tokens), Timestamp::ZERO)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let iterations = run_to_completion(&mut executor, &ids);
+
+        for ((id, expected), (prompt, _)) in ids.iter().zip(&oracle).zip(&workload) {
+            assert_eq!(
+                &executor.result(*id).unwrap().token_ids,
+                expected,
+                "planned output diverged from the single-request oracle for {prompt:?}"
+            );
+        }
+        assert!(
+            iterations
+                .iter()
+                .flat_map(|iteration| &iteration.execution_batches)
+                .any(|batch| batch.mode == BatchExecutionMode::Tensor),
+            "the workload should exercise at least one tensor invocation"
+        );
+        let plans = iterations
+            .iter()
+            .map(|iteration| &iteration.execution_plan)
+            .collect::<Vec<_>>();
+        assert!(
+            plans
+                .iter()
+                .flat_map(|plan| &plan.batches)
+                .any(|batch| batch.phase == PlannedPhase::ContinuedPrefill),
+            "the workload should exercise continued prefill"
+        );
+        assert!(
+            plans
+                .iter()
+                .any(|plan| plan.estimates().budget_deferrals > 0),
+            "the workload should exercise token-budget deferral"
+        );
+        assert!(
+            plans.iter().any(|plan| !plan.predicted_releases.is_empty()),
+            "the workload should exercise predicted slot reuse"
+        );
+        assert!(
+            iterations
+                .iter()
+                .flat_map(|iteration| &iteration.divergences)
+                .all(|divergence| !matches!(divergence, PlanDivergence::ModeFallback { .. })),
+            "Llama declares every batch hook and must not fall back"
+        );
+    }
+
     /// Validates the opt-in GPU backend against the CPU reference on identical
     /// checkpoint weights and input IDs.
     #[cfg(feature = "wgpu")]

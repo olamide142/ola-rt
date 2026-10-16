@@ -25,17 +25,17 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [x] Represent prefill, continued-prefill, and decode phases.
 - [x] Represent tensor groups and individual fallbacks.
 - [x] Represent real input and padding positions.
-- [ ] Represent request-local KV growth and release actions.
-- [ ] Represent model, backend/device, and kernel selections.
-- [ ] Record token, memory, padding, and invocation-cost estimates.
-- [ ] Record deferrals and policy reasons.
+- [x] Represent request-local KV growth and release actions. (Growth as row positions, reservations on `Admit`, predicted releases; unpredicted releases in divergences.)
+- [ ] Represent model, backend/device, and kernel selections. (Model done; device and kernel wait for the kernel track.)
+- [ ] Record token, memory, padding, and invocation-cost estimates. (Tokens, padding, invocations, admitted KV bytes done; cost-aware grouping estimates not exposed by `PrefillBatcher` yet.)
+- [ ] Record deferrals and policy reasons. (Deferral reasons done; grouping-policy reasons belong with P2 decision records.)
 - [x] Validate plans before lifecycle, session, or KV mutation.
 - [x] Preserve deterministic events when execution is regrouped.
 - [x] Add a stable serialized/report representation.
 - [x] Test duplicate, stale, invalid, and over-capacity plans.
-- [ ] Compare planned execution against the single-request correctness path.
+- [x] Compare planned execution against the single-request correctness path.
 
-Done when one iteration can be explained by a complete, validated plan before model execution begins.
+Done when one iteration can be explained by a complete, validated plan before model execution begins. **Met 2026-10-16;** the three open items above carry into P2 and the kernel track.
 
 
 ## P2: Composable execution policy
