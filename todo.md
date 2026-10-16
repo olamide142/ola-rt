@@ -77,12 +77,14 @@ Done when FIFO, priority, estimated-cost, and deadline-aware policies share one 
 
 ## P4: Framework-grade experiments and reports
 
+Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
+
 - [ ] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
-- [ ] Retain raw measurements alongside derived summaries.
+- [x] Retain raw measurements alongside derived summaries.
 - [ ] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity.
 - [ ] Generalize versioned persistence beyond prefill reports.
-- [ ] Keep report creation non-overwriting by default.
-- [ ] Validate schema versions and sample consistency.
+- [x] Keep report creation non-overwriting by default.
+- [x] Validate schema versions and sample consistency.
 - [ ] Compare reports across models, devices, policies, kernels, and revisions.
 - [ ] Report regressions and uncertainty rather than relying on one run.
 - [ ] Expand calibration to multiple shapes and confidence intervals.

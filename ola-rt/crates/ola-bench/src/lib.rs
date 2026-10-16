@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod experiment;
 mod plan_report;
 mod report;
 mod scheduling_summary;
@@ -24,6 +25,11 @@ use ola_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use experiment::{
+    BuildInfo, Direction, EXPERIMENT_SCHEMA, Estimate, ExperimentIdentity, ExperimentKind,
+    ExperimentReport, Interval, MetricSpec, Protocol, ReportError, ReportParts, RunMetadata,
+    Sample, TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity, content_digest,
+};
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,
     PlanReportBatchHook, PlanReportCandidate, PlanReportCapabilityFallback, PlanReportDecision,
