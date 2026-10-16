@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let session = runtime
-        .schedule_next(Timestamp::from_micros(20))?
+        .start_queue_head(Timestamp::from_micros(20))?
         .expect("the submitted request should be queued");
     runtime.mark_first_token(session.request_id, Timestamp::from_micros(30))?;
     runtime.complete(session.request_id, Timestamp::from_micros(100))?;

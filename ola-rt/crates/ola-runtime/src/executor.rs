@@ -13,10 +13,10 @@ use ola_model::{
 
 use crate::{
     AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, ExecutionPolicy, ExecutorLimits, FifoScheduler, LifecycleAction, ModelSnapshot,
-    PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot,
-    PolicyDescriptor, PolicyError, PolicyMeasurements, PrefillView, QueuedRequest, ReleaseReason,
-    Runtime, RuntimeError, RuntimeState, Scheduler, composed::is_complete_prompt,
+    ExecutionPlan, ExecutionPolicy, ExecutorLimits, LifecycleAction, ModelSnapshot, PlanDivergence,
+    PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot, PolicyDescriptor,
+    PolicyError, PolicyMeasurements, PrefillView, QueuedRequest, ReleaseReason, Runtime,
+    RuntimeError, RuntimeState, composed::is_complete_prompt,
 };
 
 /// Final output retained after successful execution.
@@ -265,8 +265,8 @@ impl BatchOutcome {
 /// Compatible prefill and decode operations may share tensor invocations;
 /// models without a matching batch hook retain the individual correctness
 /// path.
-pub struct Executor<S = FifoScheduler> {
-    runtime: Runtime<S>,
+pub struct Executor {
+    runtime: Runtime,
     models: BTreeMap<ModelId, CausalLanguageModel>,
     active: BTreeMap<RequestId, ActiveGeneration>,
     ready: VecDeque<RequestId>,
@@ -280,15 +280,15 @@ pub struct Executor<S = FifoScheduler> {
     generation: u64,
 }
 
-impl Default for Executor<FifoScheduler> {
+impl Default for Executor {
     fn default() -> Self {
         Self::new(Runtime::default())
     }
 }
 
-impl<S: Scheduler> Executor<S> {
+impl Executor {
     /// Wraps a runtime with no attached executable models.
-    pub fn new(runtime: Runtime<S>) -> Self {
+    pub fn new(runtime: Runtime) -> Self {
         Self {
             runtime,
             models: BTreeMap::new(),
@@ -307,7 +307,7 @@ impl<S: Scheduler> Executor<S> {
 
     /// Wraps a runtime with a bounded number of concurrently live sessions.
     pub fn with_max_active_requests(
-        runtime: Runtime<S>,
+        runtime: Runtime,
         max_active_requests: usize,
     ) -> Result<Self, ExecutorError> {
         if max_active_requests == 0 {
@@ -504,7 +504,7 @@ impl<S: Scheduler> Executor<S> {
     }
 
     /// Borrows the underlying runtime for read-only inspection.
-    pub const fn runtime(&self) -> &Runtime<S> {
+    pub const fn runtime(&self) -> &Runtime {
         &self.runtime
     }
 

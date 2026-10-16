@@ -1,14 +1,12 @@
 use ola_core::RequestId;
 
-use crate::{PlanningSnapshot, PolicyDescriptor, RuntimeState};
+use crate::{PlanningSnapshot, PolicyDescriptor};
 
-/// Selects the next queued request without mutating runtime state.
+/// Orders queued requests for admission without mutating runtime state.
+///
+/// A scheduler is a component of an execution policy such as
+/// `ComposedPolicy`; it never starts requests itself.
 pub trait Scheduler {
-    /// Selects one queued request or returns `None` when no work is eligible.
-    ///
-    /// Returning a non-queued ID is a policy error rejected by `Runtime`.
-    fn select(&self, state: &RuntimeState) -> Option<RequestId>;
-
     /// Returns the scheduler's stable name and configuration.
     fn descriptor(&self) -> PolicyDescriptor;
 
@@ -26,10 +24,6 @@ pub trait Scheduler {
 pub struct FifoScheduler;
 
 impl Scheduler for FifoScheduler {
-    fn select(&self, state: &RuntimeState) -> Option<RequestId> {
-        state.queued_ids().next()
-    }
-
     fn descriptor(&self) -> PolicyDescriptor {
         PolicyDescriptor::new("fifo")
     }

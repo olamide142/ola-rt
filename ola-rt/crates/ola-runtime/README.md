@@ -8,13 +8,18 @@ admission. This differs from `ola_model::ModelCatalog`, which describes models
 that could be selected and loaded. Keeping availability separate from residency
 will later allow explicit load, unload, placement, and memory policies.
 
-A `Scheduler` receives an immutable view of `RuntimeState` and selects a queued
-request ID. The runtime validates that decision before transitioning the
-request. This is a deliberate research boundary: schedulers can be compared or
-replaced without allowing experimental code to mutate runtime bookkeeping.
+`Runtime` makes no ordering decisions. A `Scheduler` is a component of an
+execution policy: it ranks queued requests from an immutable
+`PlanningSnapshot`, which carries each request's prompt length, output limit,
+priority, deadline, and arrival time. The policy validates the ranking and the
+executor validates the resulting plan before any request transitions. This is
+a deliberate research boundary: schedulers can be compared or replaced
+without allowing experimental code to mutate runtime bookkeeping.
+`Runtime::start_queue_head` remains as a policy-free lifecycle convenience for
+probes that run without an executor.
 
-The current scheduler is FIFO. The trait is already sufficient for priority,
-deadline, estimated-size, and memory-aware baselines. The executor now exposes
+The current scheduler is FIFO. The snapshot already carries what priority,
+deadline, estimated-size, and memory-aware baselines need. The executor now exposes
 an iteration-level boundary over several live sessions; richer admission and
 batch-composition policy can build on that boundary without owning lifecycle
 state.
@@ -46,11 +51,11 @@ same allocation and scheduling experiments.
 
 ## Synchronous multi-request executor
 
-`Executor` connects lifecycle scheduling to executable `ola-model` artifacts.
-`step` intentionally performs at most one model operation: either a queued
-request's prefill or one active request's decode. `step_iteration` is the first
-continuous-batching control-plane boundary: it advances every request that was
-active at iteration entry once, then fills free slots from the scheduler. Each
+`Executor` connects lifecycle state to executable `ola-model` artifacts.
+`step_iteration` is its only way forward and the continuous-batching
+control-plane boundary: it advances every request that was active at
+iteration entry once, then fills free slots in the order the policy's
+scheduler ranks them. Each
 token event identifies whether prefill or decode produced it.
 
 Every iteration is first described by an `ExecutionPlan` (see
@@ -203,7 +208,7 @@ let request = runtime.submit(
     Timestamp::from_micros(10),
 )?;
 let session = runtime
-    .schedule_next(Timestamp::from_micros(20))?
+    .start_queue_head(Timestamp::from_micros(20))?
     .expect("the request is queued");
 
 assert_eq!(session.request_id, request);

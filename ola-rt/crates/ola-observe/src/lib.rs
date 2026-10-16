@@ -453,8 +453,7 @@ mod tests {
     use ola_core::{ModelDescriptor, RequestSpec};
     use ola_model::GeneratedToken;
     use ola_runtime::{
-        BatchPhase, ExecutionPhase, ExecutionPlan, FifoScheduler, PlannedBatch, PlannedPhase,
-        PlannedRow, Runtime,
+        BatchPhase, ExecutionPhase, ExecutionPlan, PlannedBatch, PlannedPhase, PlannedRow, Runtime,
     };
 
     use super::*;
@@ -571,7 +570,7 @@ mod tests {
 
     #[test]
     fn rejects_regressive_observation_time_without_updating_totals() {
-        let runtime = Runtime::<FifoScheduler>::default();
+        let runtime = Runtime::default();
         let mut observer = ExecutionObserver::default();
         let iteration = |at| ExecutorIteration {
             at: Timestamp::from_micros(at),
@@ -604,7 +603,7 @@ mod tests {
 
     #[test]
     fn observes_dense_prefill_padding_and_efficiency() {
-        let runtime = Runtime::<FifoScheduler>::default();
+        let runtime = Runtime::default();
         let iteration = ExecutorIteration {
             at: Timestamp::from_micros(10),
             events: Vec::new(),
@@ -638,7 +637,7 @@ mod tests {
 
     #[test]
     fn invalid_terminal_event_does_not_partially_update_observer_state() {
-        let runtime = Runtime::<FifoScheduler>::default();
+        let runtime = Runtime::default();
         let request_id = RequestId::new(99);
         let iteration = ExecutorIteration {
             at: Timestamp::from_micros(10),
@@ -673,7 +672,7 @@ mod tests {
         assert!(observer.terminal_requests.is_empty());
     }
 
-    fn completed_runtime() -> (Runtime<FifoScheduler>, RequestId) {
+    fn completed_runtime() -> (Runtime, RequestId) {
         let mut runtime = Runtime::default();
         runtime
             .register_model(ModelDescriptor::language("tiny", "test"))
@@ -684,7 +683,9 @@ mod tests {
                 Timestamp::from_micros(10),
             )
             .unwrap();
-        runtime.schedule_next(Timestamp::from_micros(20)).unwrap();
+        runtime
+            .start_queue_head(Timestamp::from_micros(20))
+            .unwrap();
         runtime
             .mark_first_token(request_id, Timestamp::from_micros(30))
             .unwrap();

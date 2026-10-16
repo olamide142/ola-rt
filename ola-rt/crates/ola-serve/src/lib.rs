@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use ola_core::{
     GenerationConfig, Input, ModelDescriptor, ModelId, Priority, RequestId, RequestSpec, Timestamp,
 };
-use ola_runtime::{Runtime, RuntimeError, Scheduler};
+use ola_runtime::{Runtime, RuntimeError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Coarse service readiness reported to a future health endpoint.
@@ -47,13 +47,13 @@ impl GenerateRequest {
 
 #[derive(Debug)]
 /// Application facade owning one configured runtime.
-pub struct InferenceService<S> {
-    runtime: Runtime<S>,
+pub struct InferenceService {
+    runtime: Runtime,
 }
 
-impl<S: Scheduler> InferenceService<S> {
+impl InferenceService {
     /// Wraps a configured runtime.
-    pub const fn new(runtime: Runtime<S>) -> Self {
+    pub const fn new(runtime: Runtime) -> Self {
         Self { runtime }
     }
 
@@ -87,17 +87,17 @@ impl<S: Scheduler> InferenceService<S> {
     }
 
     /// Borrows the underlying runtime for observation.
-    pub const fn runtime(&self) -> &Runtime<S> {
+    pub const fn runtime(&self) -> &Runtime {
         &self.runtime
     }
 
     /// Mutably borrows the runtime for executor-loop lifecycle operations.
-    pub const fn runtime_mut(&mut self) -> &mut Runtime<S> {
+    pub const fn runtime_mut(&mut self) -> &mut Runtime {
         &mut self.runtime
     }
 
     /// Consumes the facade and returns its runtime.
-    pub fn into_runtime(self) -> Runtime<S> {
+    pub fn into_runtime(self) -> Runtime {
         self.runtime
     }
 }

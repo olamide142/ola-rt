@@ -16,7 +16,7 @@ use ola_model::CausalLanguageModel;
 use ola_runtime::{
     BatchExecutionMode, BatchPhase, ComposedPolicy, CostAwarePrefillBatcher,
     CostAwarePrefillDecision, Executor, ExecutorError, ExecutorEvent, PowerOfTwoPrefillBatcher,
-    PrefillBatcher, Runtime, RuntimeError, Scheduler, UnbucketedPrefillBatcher,
+    PrefillBatcher, Runtime, RuntimeError, UnbucketedPrefillBatcher,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,10 +64,7 @@ impl Workload {
     ///
     /// Replay performs admission only; the experiment remains responsible for
     /// advancing scheduling and execution.
-    pub fn replay<S: Scheduler>(
-        &self,
-        runtime: &mut Runtime<S>,
-    ) -> Result<Vec<RequestId>, RuntimeError> {
+    pub fn replay(&self, runtime: &mut Runtime) -> Result<Vec<RequestId>, RuntimeError> {
         self.events
             .iter()
             .map(|event| runtime.submit(event.request.clone(), event.at))

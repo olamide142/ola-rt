@@ -1,33 +1,32 @@
 use ola_core::{ModelDescriptor, Request, RequestId, RequestSpec, Timestamp};
 
 use crate::{
-    FifoScheduler, InferenceSession, RequestRecord, RequestStatus, RequestTiming, RuntimeError,
-    RuntimeState, Scheduler,
+    InferenceSession, RequestRecord, RequestStatus, RequestTiming, RuntimeError, RuntimeState,
 };
 
 #[derive(Debug)]
-/// Owns model registration, request identity, lifecycle state, and a scheduler.
+/// Owns model registration, request identity, and lifecycle state.
 ///
-/// `Runtime` is intentionally synchronous in the foundation release. Async
+/// `Runtime` makes no ordering decisions: which queued request runs next is
+/// an execution-policy decision (see `Scheduler` and `ExecutionPolicy`).
+/// It is intentionally synchronous in the foundation release. Async
 /// transport and device execution can wrap it without changing state semantics.
-pub struct Runtime<S = FifoScheduler> {
+pub struct Runtime {
     state: RuntimeState,
-    scheduler: S,
     next_request_id: u64,
 }
 
-impl Default for Runtime<FifoScheduler> {
+impl Default for Runtime {
     fn default() -> Self {
-        Self::new(FifoScheduler)
+        Self::new()
     }
 }
 
-impl<S: Scheduler> Runtime<S> {
-    /// Creates an empty runtime using the supplied scheduler implementation.
-    pub fn new(scheduler: S) -> Self {
+impl Runtime {
+    /// Creates an empty runtime.
+    pub fn new() -> Self {
         Self {
             state: RuntimeState::default(),
-            scheduler,
             next_request_id: 1,
         }
     }
@@ -96,44 +95,22 @@ impl<S: Scheduler> Runtime<S> {
         Ok(id)
     }
 
-    /// Asks the scheduler for one request and atomically moves it to running.
+    /// Starts the oldest queued request, if any.
     ///
-    /// `Ok(None)` means no work is currently queued.
-    pub fn schedule_next(
+    /// This is a lifecycle convenience for probes and tests that run without
+    /// an executor. It applies no scheduling policy; executors start requests
+    /// chosen by their `ExecutionPolicy` through `start_selected`.
+    pub fn start_queue_head(
         &mut self,
         started_at: Timestamp,
     ) -> Result<Option<InferenceSession>, RuntimeError> {
-        let Some(id) = self.select_next()? else {
+        let Some(id) = self.state.queue.front().copied() else {
             return Ok(None);
         };
-
         self.start_selected(id, started_at).map(Some)
     }
 
-    /// Asks the scheduler for the next queued request without transitioning it.
-    ///
-    /// This two-stage form lets an executor apply admission policy to the
-    /// scheduler's candidate while leaving deferred work queued.
-    pub fn select_next(&mut self) -> Result<Option<RequestId>, RuntimeError> {
-        let Some(id) = self.scheduler.select(&self.state) else {
-            return Ok(None);
-        };
-
-        if !self.state.queue.contains(&id) {
-            return Err(RuntimeError::InvalidSchedule(id));
-        }
-        let record = self
-            .state
-            .requests
-            .get(&id)
-            .ok_or(RuntimeError::InvalidSchedule(id))?;
-        if record.status != RequestStatus::Queued {
-            return Err(RuntimeError::InvalidSchedule(id));
-        }
-        Ok(Some(id))
-    }
-
-    /// Starts a scheduler-selected queued request after external admission.
+    /// Starts a policy-selected queued request after admission.
     pub fn start_selected(
         &mut self,
         id: RequestId,
@@ -353,7 +330,7 @@ mod tests {
             .unwrap();
 
         let session = runtime
-            .schedule_next(Timestamp::from_micros(20))
+            .start_queue_head(Timestamp::from_micros(20))
             .unwrap()
             .unwrap();
         assert_eq!(session.request_id, first);
@@ -422,7 +399,7 @@ mod tests {
             )
             .unwrap();
 
-        let result = runtime.schedule_next(Timestamp::from_micros(9));
+        let result = runtime.start_queue_head(Timestamp::from_micros(9));
 
         assert_eq!(
             result,

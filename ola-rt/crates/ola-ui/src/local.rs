@@ -940,7 +940,7 @@ fn fifo_workload_probe() -> Result<String, String> {
     for index in 0..REQUESTS {
         let base = 20_000 + index as u64 * 3;
         let session = runtime
-            .schedule_next(Timestamp::from_micros(base))
+            .start_queue_head(Timestamp::from_micros(base))
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "FIFO returned no request while work remained".to_owned())?;
         observed.push(session.request_id);
