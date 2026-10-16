@@ -72,7 +72,8 @@ The types are in `src/plan.rs`. In summary:
   where `positions` is the absolute range processed and therefore also the KV
   growth;
 - `PlannedDeferral::{Admission, Budget, Slots}`;
-- `PlanningView`, the read-only snapshot (queued, prefilling, decoding, slot
+- `PlanningSnapshot` (see `EXECUTION_POLICY.md`; it replaced the original
+  `PlanningView`), the read-only snapshot (queued, prefilling, decoding, slot
   limit, and model KV capacities) that `validate` checks against.
 
 Padding and `PlanEstimates` are computed from the rows rather than stored, so

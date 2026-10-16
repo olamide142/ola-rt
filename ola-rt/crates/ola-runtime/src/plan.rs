@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use ola_core::{ModelId, RequestId, Timestamp};
 
-use crate::{AdmissionReason, BatchExecutionMode, BatchPhase};
+use crate::{AdmissionReason, BatchExecutionMode, BatchPhase, PlanningSnapshot};
 
 /// Model work performed by one planned invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,15 +253,6 @@ pub struct ExecutionPlan {
     pub predicted_releases: Vec<RequestId>,
 }
 
-/// Queued request as seen by the planner.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueuedView {
-    /// Model requested by the caller.
-    pub model_id: ModelId,
-    /// Tokenized prompt length, or `None` when preparation failed.
-    pub prompt_tokens: Option<usize>,
-}
-
 /// Live request with an unfinished prompt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrefillView {
@@ -299,38 +290,56 @@ impl DecodeView {
     }
 }
 
-/// Read-only snapshot a plan is validated against.
-///
-/// Every live request must appear in exactly one of `prefilling` or
-/// `decoding`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PlanningView {
-    /// Executor state generation.
-    pub generation: u64,
-    /// Configured live-session limit.
-    pub max_active_requests: usize,
-    /// Requests waiting for admission.
-    pub queued: BTreeMap<RequestId, QueuedView>,
-    /// Live requests with unfinished prompts.
-    pub prefilling: BTreeMap<RequestId, PrefillView>,
-    /// Live requests ready to decode.
-    pub decoding: BTreeMap<RequestId, DecodeView>,
-    /// Physical KV pool capacity for models that publish one.
-    pub model_kv_capacity: BTreeMap<ModelId, u64>,
+/// Lookup tables built from a [`PlanningSnapshot`] for validation.
+struct ValidationView<'a> {
+    generation: u64,
+    max_active_requests: usize,
+    queued: BTreeMap<RequestId, QueuedView<'a>>,
+    prefilling: &'a BTreeMap<RequestId, PrefillView>,
+    decoding: &'a BTreeMap<RequestId, DecodeView>,
+    model_kv_capacity: BTreeMap<&'a ModelId, u64>,
 }
 
-impl PlanningView {
-    /// Returns the number of live sessions.
-    pub fn live_requests(&self) -> usize {
-        self.prefilling.len().saturating_add(self.decoding.len())
+struct QueuedView<'a> {
+    model_id: &'a ModelId,
+    prompt_tokens: Option<usize>,
+}
+
+impl<'a> ValidationView<'a> {
+    fn new(snapshot: &'a PlanningSnapshot, enforce_model_kv_capacity: bool) -> Self {
+        Self {
+            generation: snapshot.generation,
+            max_active_requests: snapshot.limits.max_active_requests,
+            queued: snapshot
+                .queued
+                .iter()
+                .map(|request| {
+                    (
+                        request.request_id,
+                        QueuedView {
+                            model_id: &request.model_id,
+                            prompt_tokens: request.prompt_tokens.as_ref().ok().copied(),
+                        },
+                    )
+                })
+                .collect(),
+            prefilling: &snapshot.prefilling,
+            decoding: &snapshot.decoding,
+            model_kv_capacity: snapshot
+                .models
+                .iter()
+                .filter(|_| enforce_model_kv_capacity)
+                .filter_map(|(model_id, model)| {
+                    model
+                        .kv_cache
+                        .map(|profile| (model_id, profile.capacity_bytes()))
+                })
+                .collect(),
+        }
     }
 
-    fn model_of(&self, request_id: RequestId) -> Option<&ModelId> {
-        self.queued
-            .get(&request_id)
-            .map(|view| &view.model_id)
-            .or_else(|| self.prefilling.get(&request_id).map(|view| &view.model_id))
-            .or_else(|| self.decoding.get(&request_id).map(|view| &view.model_id))
+    fn live_requests(&self) -> usize {
+        self.prefilling.len().saturating_add(self.decoding.len())
     }
 }
 
@@ -530,13 +539,22 @@ impl ExecutionPlan {
             .sum()
     }
 
-    /// Checks that the plan can be committed against `view` without partial
-    /// mutation.
+    /// Checks that the plan can be committed against `snapshot` without
+    /// partial mutation.
+    ///
+    /// `enforce_model_kv_capacity` rejects admissions that push a model past
+    /// its KV pool; pass the admission policy's own guarantee, since
+    /// permissive policies leave allocation failures to execution.
     ///
     /// # Errors
     ///
     /// Returns the first violated rule; see [`PlanError`].
-    pub fn validate(&self, view: &PlanningView) -> Result<(), PlanError> {
+    pub fn validate(
+        &self,
+        snapshot: &PlanningSnapshot,
+        enforce_model_kv_capacity: bool,
+    ) -> Result<(), PlanError> {
+        let view = &ValidationView::new(snapshot, enforce_model_kv_capacity);
         if self.generation != view.generation {
             return Err(PlanError::Stale {
                 planned: self.generation,
@@ -576,7 +594,7 @@ impl ExecutionPlan {
                     {
                         return Err(PlanError::DuplicateRequest(request_id));
                     }
-                    if model_id != &queued.model_id {
+                    if model_id != queued.model_id {
                         return Err(PlanError::ModelMismatch {
                             request_id,
                             expected: queued.model_id.clone(),
@@ -719,7 +737,7 @@ impl ExecutionPlan {
             .collect::<BTreeSet<_>>();
         for (model_id, reserved_bytes) in reserved {
             if admitting.contains(model_id)
-                && let Some(&capacity_bytes) = view.model_kv_capacity.get(model_id)
+                && let Some(&capacity_bytes) = view.model_kv_capacity.get(&model_id)
                 && reserved_bytes > capacity_bytes
             {
                 return Err(PlanError::KvCapacity {
@@ -734,7 +752,7 @@ impl ExecutionPlan {
 }
 
 fn validate_row(
-    view: &PlanningView,
+    view: &ValidationView<'_>,
     batch: &PlannedBatch,
     row: &PlannedRow,
 ) -> Result<(), PlanError> {
@@ -751,7 +769,7 @@ fn validate_row(
             let prompt = queued
                 .prompt_tokens
                 .ok_or(PlanError::InvalidPositions(request_id))?;
-            (&queued.model_id, Some((0, prompt)))
+            (queued.model_id, Some((0, prompt)))
         }
         PlannedPhase::ContinuedPrefill => {
             let pending = view
@@ -798,13 +816,16 @@ fn validate_row(
             return Err(PlanError::InvalidPositions(request_id));
         }
     }
-    debug_assert_eq!(view.model_of(request_id), Some(expected));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use ola_core::Priority;
+    use ola_model::{BatchCapabilities, KvCacheProfile};
+
     use super::*;
+    use crate::{ExecutorLimits, MemoryState, ModelSnapshot, PolicyMeasurements, QueuedRequest};
 
     fn id(value: u64) -> RequestId {
         RequestId::new(value)
@@ -815,18 +836,25 @@ mod tests {
     }
 
     /// One queued request (1), one prefilling request (2), and two decoding
-    /// requests (3 reaches its limit, 4 does not), with two free slots.
-    fn view() -> PlanningView {
-        PlanningView {
+    /// requests (3 reaches its limit, 4 does not), with two free slots and a
+    /// 400-byte KV pool.
+    fn view() -> PlanningSnapshot {
+        PlanningSnapshot {
+            at: Timestamp::from_micros(10),
             generation: 7,
-            max_active_requests: 4,
-            queued: BTreeMap::from([(
-                id(1),
-                QueuedView {
-                    model_id: model(),
-                    prompt_tokens: Some(5),
-                },
-            )]),
+            limits: ExecutorLimits {
+                max_active_requests: 4,
+                prefill_chunk_size: None,
+            },
+            queued: vec![QueuedRequest {
+                request_id: id(1),
+                model_id: model(),
+                prompt_tokens: Ok(5),
+                max_new_tokens: 4,
+                priority: Priority::default(),
+                deadline: None,
+                queued_at: Timestamp::ZERO,
+            }],
             prefilling: BTreeMap::from([(
                 id(2),
                 PrefillView {
@@ -859,7 +887,20 @@ mod tests {
                     },
                 ),
             ]),
-            model_kv_capacity: BTreeMap::from([(model(), 400)]),
+            decode_order: vec![id(3), id(4)],
+            prefill_order: vec![id(2)],
+            models: BTreeMap::from([(
+                model(),
+                ModelSnapshot {
+                    attached: true,
+                    batch: BatchCapabilities::ALL,
+                    chunked_prefill: true,
+                    kv_cache: KvCacheProfile::new(1, 1, 400),
+                },
+            )]),
+            memory: MemoryState::default(),
+            device: None,
+            measurements: PolicyMeasurements::default(),
         }
     }
 
@@ -909,7 +950,7 @@ mod tests {
     #[test]
     fn accepts_a_consistent_plan_and_derives_estimates() {
         let plan = plan();
-        assert_eq!(plan.validate(&view()), Ok(()));
+        assert_eq!(plan.validate(&view(), true), Ok(()));
         assert_eq!(
             plan.estimates(),
             PlanEstimates {
@@ -947,7 +988,7 @@ mod tests {
         let mut view = view();
         view.generation = 8;
         assert_eq!(
-            plan().validate(&view),
+            plan().validate(&view, true),
             Err(PlanError::Stale {
                 planned: 7,
                 current: 8
@@ -960,7 +1001,7 @@ mod tests {
         let mut duplicate_row = plan();
         duplicate_row.batches[0].rows[1].request_id = id(3);
         assert_eq!(
-            duplicate_row.validate(&view()),
+            duplicate_row.validate(&view(), true),
             Err(PlanError::DuplicateRequest(id(3)))
         );
 
@@ -974,7 +1015,7 @@ mod tests {
                 event_index: 4,
             });
         assert_eq!(
-            executed_and_deferred.validate(&view()),
+            executed_and_deferred.validate(&view(), true),
             Err(PlanError::DuplicateRequest(id(4)))
         );
     }
@@ -984,14 +1025,14 @@ mod tests {
         let mut wrong_cursor = plan();
         wrong_cursor.batches[1].rows[0].positions = 2..7;
         assert_eq!(
-            wrong_cursor.validate(&view()),
+            wrong_cursor.validate(&view(), true),
             Err(PlanError::InvalidPositions(id(2)))
         );
 
         let mut wrong_final_flag = plan();
         wrong_final_flag.batches[1].rows[0].final_prompt_chunk = false;
         assert_eq!(
-            wrong_final_flag.validate(&view()),
+            wrong_final_flag.validate(&view(), true),
             Err(PlanError::InvalidPositions(id(2)))
         );
 
@@ -1000,7 +1041,7 @@ mod tests {
         decode_of_queued.batches.truncate(2);
         decode_of_queued.batches[0].rows[1].request_id = id(1);
         assert_eq!(
-            decode_of_queued.validate(&view()),
+            decode_of_queued.validate(&view(), true),
             Err(PlanError::InvalidStatus {
                 request_id: id(1),
                 expected: "decoding"
@@ -1010,7 +1051,7 @@ mod tests {
         let mut wrong_model = plan();
         wrong_model.batches[1].model_id = "other".into();
         assert!(matches!(
-            wrong_model.validate(&view()),
+            wrong_model.validate(&view(), true),
             Err(PlanError::ModelMismatch { .. })
         ));
     }
@@ -1020,7 +1061,7 @@ mod tests {
         let mut wide_individual = plan();
         wide_individual.batches[0].mode = BatchExecutionMode::Individual;
         assert_eq!(
-            wide_individual.validate(&view()),
+            wide_individual.validate(&view(), true),
             Err(PlanError::IndividualBatchWidth(0))
         );
 
@@ -1031,13 +1072,13 @@ mod tests {
             mode: BatchExecutionMode::Tensor,
             rows: Vec::new(),
         });
-        assert_eq!(empty.validate(&view()), Err(PlanError::EmptyBatch(3)));
+        assert_eq!(empty.validate(&view(), true), Err(PlanError::EmptyBatch(3)));
 
         let mut unpaired = plan();
         unpaired.batches.pop();
         unpaired.batches[1].rows[0].event_index = 2;
         assert_eq!(
-            unpaired.validate(&view()),
+            unpaired.validate(&view(), true),
             Err(PlanError::UnpairedAdmission(id(1)))
         );
     }
@@ -1046,7 +1087,10 @@ mod tests {
     fn rejects_gapped_or_repeated_event_indices() {
         let mut gapped = plan();
         gapped.batches[2].rows[0].event_index = 5;
-        assert_eq!(gapped.validate(&view()), Err(PlanError::InvalidEventOrder));
+        assert_eq!(
+            gapped.validate(&view(), true),
+            Err(PlanError::InvalidEventOrder)
+        );
     }
 
     #[test]
@@ -1054,16 +1098,16 @@ mod tests {
         let mut no_release = plan();
         no_release.predicted_releases.clear();
         let mut tight = view();
-        tight.max_active_requests = 3;
+        tight.limits.max_active_requests = 3;
         assert_eq!(
-            no_release.validate(&tight),
+            no_release.validate(&tight, true),
             Err(PlanError::SlotCapacity {
                 live_after: 4,
                 max_active_requests: 3
             })
         );
         // Predicting request 3's limit-reached completion frees its slot.
-        assert_eq!(plan().validate(&tight), Ok(()));
+        assert_eq!(plan().validate(&tight, true), Ok(()));
 
         let mut large = plan();
         large.lifecycle[0] = LifecycleAction::Admit {
@@ -1072,7 +1116,7 @@ mod tests {
             reserved_kv_bytes: 201,
         };
         assert_eq!(
-            large.validate(&view()),
+            large.validate(&view(), true),
             Err(PlanError::KvCapacity {
                 model_id: model(),
                 reserved_bytes: 401,
@@ -1086,7 +1130,7 @@ mod tests {
         let mut early = plan();
         early.predicted_releases = vec![id(4)];
         assert_eq!(
-            early.validate(&view()),
+            early.validate(&view(), true),
             Err(PlanError::InvalidRelease(id(4)))
         );
 
@@ -1096,7 +1140,7 @@ mod tests {
         not_executed.batches[1].rows[0].event_index = 1;
         not_executed.batches[2].rows[0].event_index = 2;
         assert_eq!(
-            not_executed.validate(&view()),
+            not_executed.validate(&view(), true),
             Err(PlanError::InvalidRelease(id(3)))
         );
     }
@@ -1106,13 +1150,13 @@ mod tests {
         let mut plan = plan();
         plan.predicted_releases.push(id(2));
         assert_eq!(
-            plan.validate(&view()),
+            plan.validate(&view(), true),
             Err(PlanError::InvalidRelease(id(2)))
         );
 
         let mut one_token = view();
         one_token.prefilling.get_mut(&id(2)).unwrap().max_new_tokens = 1;
-        assert_eq!(plan.validate(&one_token), Ok(()));
+        assert_eq!(plan.validate(&one_token, true), Ok(()));
     }
 
     #[test]
@@ -1124,7 +1168,7 @@ mod tests {
             .deferrals
             .push(PlannedDeferral::Slots { request_id: id(2) });
         assert_eq!(
-            deferred_live.validate(&view()),
+            deferred_live.validate(&view(), true),
             Err(PlanError::DuplicateRequest(id(2)))
         );
 
@@ -1134,6 +1178,6 @@ mod tests {
         queued_waits
             .deferrals
             .push(PlannedDeferral::Slots { request_id: id(1) });
-        assert_eq!(queued_waits.validate(&view()), Ok(()));
+        assert_eq!(queued_waits.validate(&view(), true), Ok(()));
     }
 }

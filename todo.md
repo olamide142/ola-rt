@@ -42,7 +42,7 @@ Done when one iteration can be explained by a complete, validated plan before mo
 
 Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
 
-- [ ] Define an immutable workload, lifecycle, model, KV, memory, device, and measurement snapshot.
+- [x] Define an immutable workload, lifecycle, model, KV, memory, device, and measurement snapshot. (Device and measurement fields exist but stay empty until P6/P4.)
 - [ ] Define `ExecutionPolicy` as runtime state to `ExecutionPlan`.
 - [ ] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.
 - [ ] Keep individual sub-policies independently replaceable.

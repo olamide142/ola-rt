@@ -1,7 +1,7 @@
 # ExecutionPolicy design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Step 1 is implemented.
+Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–2 are implemented.
 
 ## Goal
 
@@ -43,35 +43,19 @@ unchanged.
 ### Snapshot
 
 ```rust
-pub struct PlanningSnapshot<'a> {
+pub struct PlanningSnapshot {
     pub at: Timestamp,
     pub generation: u64,
     pub limits: ExecutorLimits,          // max_active_requests, prefill_chunk_size
     pub queued: Vec<QueuedRequest>,      // queue order
     pub prefilling: BTreeMap<RequestId, PrefillView>,
     pub decoding: BTreeMap<RequestId, DecodeView>,
+    pub decode_order: Vec<RequestId>,    // round-robin order
+    pub prefill_order: Vec<RequestId>,   // round-robin order
     pub models: BTreeMap<ModelId, ModelSnapshot>,
     pub memory: MemoryState,
-    pub reserved_kv_bytes: BTreeMap<ModelId, u64>,
     pub device: Option<DeviceSnapshot>,          // None until P6 telemetry
-    pub measurements: &'a PolicyMeasurements,    // calibration inputs; empty today
-}
-
-pub struct QueuedRequest {
-    pub request_id: RequestId,
-    pub model_id: ModelId,
-    pub prompt_tokens: Result<usize, String>,    // prepared by the executor
-    pub max_new_tokens: usize,
-    pub priority: Priority,
-    pub deadline: Option<Timestamp>,
-    pub queued_at: Timestamp,
-}
-
-pub struct ModelSnapshot {
-    pub attached: bool,
-    pub batch: BatchCapabilities,
-    pub chunked_prefill: bool,
-    pub kv_cache: Option<KvCacheProfile>,
+    pub measurements: PolicyMeasurements,        // calibration inputs; empty today
 }
 ```
 
@@ -81,7 +65,13 @@ pub struct ModelSnapshot {
   lengths or errors. This also removes the per-iteration re-tokenization of
   deferred requests.
 - **`PlanningSnapshot` replaces `PlanningView`.** `ExecutionPlan::validate`
-  checks plans against the same snapshot the policy saw.
+  checks plans against the same snapshot the policy saw. Whether KV capacity
+  is enforced is passed separately, because it is the admission policy's
+  guarantee, not a property of the state.
+- The snapshot is owned rather than borrowed, so it can be stored or
+  compared. Live KV reservations are derived from the views
+  (`reserved_kv_bytes()`, `model_reserved_kv_bytes()`), and the round-robin
+  order of live work is explicit (`decode_order`, `prefill_order`).
 - `priority`, `deadline`, and `queued_at` are included now so P3 schedulers
   need no snapshot change.
 
@@ -189,7 +179,7 @@ Each step keeps `make verify` and `make test-fixture` green.
 1. **Sub-policies to `&self` plus descriptors.** No behaviour change. **Done.**
 2. **Snapshot.** Add `PlanningSnapshot`, `ModelSnapshot`, and the
    prepared-prompt cache; validate against the snapshot; drop
-   `PlanningView`.
+   `PlanningView`. **Done.**
 3. **`ExecutionPolicy` and `ComposedPolicy`.** Move the planning code out of
    `Executor`, add `with_policy`, and migrate the `with_*` call sites.
 4. **Scheduler and `step()`.** Make `Runtime` non-generic, retire `step()`,

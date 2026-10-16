@@ -5,21 +5,20 @@ use std::{
     num::NonZeroUsize,
 };
 
-use ola_core::{
-    GenerationConfig, Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp,
-};
+use ola_core::{Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp};
 use ola_model::{
-    BatchCapabilities, CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError,
-    PrefillOutcome, SessionMetrics,
+    CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, PrefillOutcome,
+    SessionMetrics,
 };
 
 use crate::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, BatchCandidate,
     BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, FifoScheduler, LifecycleAction, PlanDivergence, PlanError, PlannedBatch,
-    PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher, PrefillView,
-    QueuedView, ReleaseReason, Runtime, RuntimeError, RuntimeState, Scheduler,
-    UnboundedBatchPolicy, UnbucketedPrefillBatcher, UnconstrainedAdmission,
+    ExecutionPlan, ExecutorLimits, FifoScheduler, LifecycleAction, ModelSnapshot, PlanDivergence,
+    PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningSnapshot,
+    PolicyMeasurements, PrefillBatcher, PrefillView, QueuedRequest, ReleaseReason, Runtime,
+    RuntimeError, RuntimeState, Scheduler, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+    UnconstrainedAdmission,
 };
 
 /// Final output retained after successful execution.
@@ -232,11 +231,6 @@ impl ActiveGeneration {
             .saturating_add(self.generated.len())
             .saturating_sub(1)
     }
-
-    /// Whether the next decode must finish by reaching `max_new_tokens`.
-    fn reaches_limit(&self) -> bool {
-        self.generated.len().saturating_add(1) >= self.max_new_tokens
-    }
 }
 
 struct PendingPrefill {
@@ -249,14 +243,6 @@ struct PendingPrefill {
     max_new_tokens: usize,
     last_step_at: Timestamp,
     reserved_kv_bytes: u64,
-}
-
-/// Inputs prepared while planning an admission and consumed at commit.
-struct PlannedAdmission {
-    model: CausalLanguageModel,
-    prompt_tokens: Vec<u32>,
-    generation: GenerationConfig,
-    max_new_tokens: usize,
 }
 
 #[derive(Default)]
@@ -296,6 +282,7 @@ pub struct Executor<S = FifoScheduler> {
     batch_policy: Box<dyn BatchPolicy>,
     prefill_batcher: Box<dyn PrefillBatcher>,
     results: BTreeMap<RequestId, ExecutionResult>,
+    prepared: BTreeMap<RequestId, Result<Vec<u32>, String>>,
     generation: u64,
 }
 
@@ -321,6 +308,7 @@ impl<S: Scheduler> Executor<S> {
             batch_policy: Box::new(UnboundedBatchPolicy),
             prefill_batcher: Box::new(UnbucketedPrefillBatcher),
             results: BTreeMap::new(),
+            prepared: BTreeMap::new(),
             generation: 0,
         }
     }
@@ -435,6 +423,7 @@ impl<S: Scheduler> Executor<S> {
         cancelled_at: Timestamp,
     ) -> Result<(), ExecutorError> {
         self.runtime.cancel(request_id, cancelled_at)?;
+        self.prepared.remove(&request_id);
         self.bump_generation();
         if self.active.remove(&request_id).is_some() {
             self.ready.retain(|ready| *ready != request_id);
@@ -472,12 +461,14 @@ impl<S: Scheduler> Executor<S> {
     /// same iteration.
     pub fn step_iteration(&mut self, at: Timestamp) -> Result<ExecutorIteration, ExecutorError> {
         self.validate_iteration_time(at)?;
+        self.prepare_queued();
+        let snapshot = self.snapshot(at);
         let mut scheduled = Vec::new();
-        let (execution_plan, mut admissions) = self.plan_iteration(at, &mut scheduled)?;
+        let execution_plan = self.plan_iteration(&snapshot, &mut scheduled)?;
         execution_plan
-            .validate(&self.planning_view(&admissions))
+            .validate(&snapshot, self.admission.enforces_model_kv_capacity())
             .map_err(ExecutorError::InvalidPlan)?;
-        let committed = self.commit_plan(&execution_plan, &mut admissions, at)?;
+        let committed = self.commit_plan(&execution_plan, at)?;
         let mut events = committed
             .indexed_events
             .into_iter()
@@ -552,28 +543,27 @@ impl<S: Scheduler> Executor<S> {
         &self.runtime
     }
 
-    /// Plans one complete iteration before anything executes.
+    /// Plans one complete iteration from an immutable snapshot.
     ///
     /// Event indices follow the historical order: decodes, continued
     /// prefills, then admissions. Slots and reservations of requests that
     /// must finish by reaching their output limit are reused for admission;
     /// slots freed by EOS or failure are refilled next iteration.
     fn plan_iteration(
-        &mut self,
-        at: Timestamp,
+        &self,
+        snapshot: &PlanningSnapshot,
         scheduled: &mut Vec<BatchCandidate>,
-    ) -> Result<(ExecutionPlan, BTreeMap<RequestId, PlannedAdmission>), ExecutorError> {
+    ) -> Result<ExecutionPlan, ExecutorError> {
         let mut execution_plan = ExecutionPlan {
-            generation: self.generation,
-            at,
+            generation: snapshot.generation,
+            at: snapshot.at,
             ..ExecutionPlan::default()
         };
-        let decode_candidates = self
-            .ready
+        let decode_candidates = snapshot
+            .decode_order
             .iter()
-            .copied()
             .map(|request_id| BatchCandidate {
-                request_id,
+                request_id: *request_id,
                 phase: BatchPhase::Decode,
                 token_cost: 1,
             })
@@ -589,44 +579,40 @@ impl<S: Scheduler> Executor<S> {
                 continue;
             }
             scheduled.push(candidate);
-            let active = self
-                .active
-                .get(&candidate.request_id)
-                .expect("ready requests always retain an active generation session");
-            if active.reaches_limit() {
+            let decode = &snapshot.decoding[&candidate.request_id];
+            if decode.reaches_limit() {
                 execution_plan.predicted_releases.push(candidate.request_id);
             }
-            let position = active.next_position();
             decode_rows.push((
-                active.model_id.clone(),
+                decode.model_id.clone(),
                 PlannedRow {
                     request_id: candidate.request_id,
                     event_index,
-                    positions: position..position.saturating_add(1),
+                    positions: decode.position..decode.position.saturating_add(1),
                     final_prompt_chunk: false,
                 },
             ));
         }
         execution_plan
             .batches
-            .extend(self.plan_decode_batches(decode_rows));
+            .extend(plan_decode_batches(snapshot, decode_rows));
 
-        let prefill_candidates = self
-            .prefill_ready
+        let prefill_candidates = snapshot
+            .prefill_order
             .iter()
             .map(|request_id| {
-                let pending = self
-                    .prefilling
-                    .get(request_id)
-                    .expect("ready prefill requests retain their session");
+                let pending = &snapshot.prefilling[request_id];
                 BatchCandidate {
                     request_id: *request_id,
                     phase: BatchPhase::Prefill,
-                    token_cost: self.next_prefill_chunk_len(pending),
+                    token_cost: snapshot.initial_prefill_chunk(
+                        &pending.model_id,
+                        pending.prompt_tokens.saturating_sub(pending.cursor),
+                    ),
                 }
             })
             .collect::<Vec<_>>();
-        let prefill_candidates_len = prefill_candidates.len();
+        let prefill_count = prefill_candidates.len();
         let selected = self.select_batch_candidates(scheduled, &prefill_candidates)?;
         let mut prefill_rows = Vec::new();
         for (index, candidate) in prefill_candidates.into_iter().enumerate() {
@@ -638,12 +624,9 @@ impl<S: Scheduler> Executor<S> {
                 continue;
             }
             scheduled.push(candidate);
-            let pending = self
-                .prefilling
-                .get(&candidate.request_id)
-                .expect("ready prefill requests retain their session");
+            let pending = &snapshot.prefilling[&candidate.request_id];
             let end = pending.cursor.saturating_add(candidate.token_cost);
-            let final_prompt_chunk = end == pending.prompt_tokens.len();
+            let final_prompt_chunk = end == pending.prompt_tokens;
             if final_prompt_chunk && pending.max_new_tokens <= 1 {
                 execution_plan.predicted_releases.push(candidate.request_id);
             }
@@ -657,17 +640,19 @@ impl<S: Scheduler> Executor<S> {
                 },
             ));
         }
-        let prefill_count = prefill_candidates_len;
-        execution_plan
-            .batches
-            .extend(self.plan_prefill_batches(PlannedPhase::ContinuedPrefill, prefill_rows));
+        execution_plan.batches.extend(self.plan_prefill_batches(
+            snapshot,
+            PlannedPhase::ContinuedPrefill,
+            prefill_rows,
+        ));
 
-        let admissions = self.plan_admissions(
+        self.plan_admissions(
+            snapshot,
             scheduled,
             &mut execution_plan,
             decode_count.saturating_add(prefill_count),
         )?;
-        Ok((execution_plan, admissions))
+        Ok(execution_plan)
     }
 
     /// Ranks queued work and plans admissions into the remaining slots.
@@ -676,36 +661,43 @@ impl<S: Scheduler> Executor<S> {
     /// admitted, rejected, or fails preparation. Planning stops at the first
     /// admission or budget deferral, preserving FIFO head-of-line semantics.
     fn plan_admissions(
-        &mut self,
+        &self,
+        snapshot: &PlanningSnapshot,
         scheduled: &mut Vec<BatchCandidate>,
         execution_plan: &mut ExecutionPlan,
         first_event_index: usize,
-    ) -> Result<BTreeMap<RequestId, PlannedAdmission>, ExecutorError> {
+    ) -> Result<(), ExecutorError> {
         let mut released_total = 0_u64;
-        let mut released_by_model = BTreeMap::<ModelId, u64>::new();
+        let mut released_by_model = BTreeMap::<&ModelId, u64>::new();
         for request_id in &execution_plan.predicted_releases {
-            let (model_id, bytes) = if let Some(active) = self.active.get(request_id) {
-                (&active.model_id, active.reserved_kv_bytes)
-            } else {
-                let pending = &self.prefilling[request_id];
-                (&pending.model_id, pending.reserved_kv_bytes)
+            let (model_id, bytes) = match snapshot.decoding.get(request_id) {
+                Some(decode) => (&decode.model_id, decode.reserved_kv_bytes),
+                None => {
+                    let pending = &snapshot.prefilling[request_id];
+                    (&pending.model_id, pending.reserved_kv_bytes)
+                }
             };
             released_total = released_total.saturating_add(bytes);
-            *released_by_model.entry(model_id.clone()).or_default() += bytes;
+            *released_by_model.entry(model_id).or_default() += bytes;
         }
-        let live_after = self
-            .live_request_count()
+        let live_after = snapshot
+            .live_requests()
             .saturating_sub(execution_plan.predicted_releases.len());
-        let admission_count = self
+        let admission_count = snapshot
+            .limits
             .max_active_requests
             .saturating_sub(live_after)
-            .min(self.runtime.state().queued_len());
+            .min(snapshot.queued.len());
         let ranked = self.runtime.rank_next(admission_count.saturating_add(1))?;
+        let queued = snapshot
+            .queued
+            .iter()
+            .map(|request| (request.request_id, request))
+            .collect::<BTreeMap<_, _>>();
 
-        let mut admissions = BTreeMap::new();
         let mut rows = Vec::new();
         let mut pending_total = 0_u64;
-        let mut pending_by_model = BTreeMap::<ModelId, u64>::new();
+        let mut pending_by_model = BTreeMap::<&ModelId, u64>::new();
         for (offset, request_id) in ranked.into_iter().enumerate() {
             if offset == admission_count {
                 execution_plan
@@ -714,48 +706,40 @@ impl<S: Scheduler> Executor<S> {
                 break;
             }
             let event_index = first_event_index.saturating_add(offset);
-            let request = self
-                .runtime
-                .state()
-                .request(request_id)
-                .expect("a ranked request retains its runtime record")
-                .request
-                .clone();
-            let model_id = request.spec.model.clone();
-            let Some(model) = self.models.get(&model_id).cloned() else {
-                execution_plan.lifecycle.push(LifecycleAction::Fail {
-                    request_id,
-                    message: format!("model `{model_id}` has no executable attached"),
-                    event_index,
-                });
-                continue;
+            let request = queued[&request_id];
+            let model_id = &request.model_id;
+            let model = snapshot.model(model_id);
+            let prompt_tokens = match (&request.prompt_tokens, model.attached) {
+                (_, false) => Err(format!("model `{model_id}` has no executable attached")),
+                (Ok(tokens), true) => Ok(*tokens),
+                (Err(message), true) => Err(message.clone()),
             };
-            let prompt_tokens = match prepare_prompt(&model, &request) {
+            let prompt_tokens = match prompt_tokens {
                 Ok(tokens) => tokens,
-                Err(error) => {
+                Err(message) => {
                     execution_plan.lifecycle.push(LifecycleAction::Fail {
                         request_id,
-                        message: error.to_string(),
+                        message,
                         event_index,
                     });
                     continue;
                 }
             };
-            let model_released = released_by_model.get(&model_id).copied().unwrap_or(0);
-            let model_pending = pending_by_model.get(&model_id).copied().unwrap_or(0);
+            let model_released = released_by_model.get(model_id).copied().unwrap_or(0);
+            let model_pending = pending_by_model.get(model_id).copied().unwrap_or(0);
             let context = AdmissionContext {
                 request_id,
                 model_id: model_id.clone(),
-                prompt_tokens: prompt_tokens.len(),
-                max_new_tokens: request.spec.generation.max_new_tokens,
-                kv_cache: model.kv_cache_profile(),
-                memory: self.runtime.state().memory,
-                reserved_kv_bytes: self
+                prompt_tokens,
+                max_new_tokens: request.max_new_tokens,
+                kv_cache: model.kv_cache,
+                memory: snapshot.memory,
+                reserved_kv_bytes: snapshot
                     .reserved_kv_bytes()
                     .saturating_sub(released_total)
                     .saturating_add(pending_total),
-                model_reserved_kv_bytes: self
-                    .reserved_kv_bytes_for_model(&model_id)
+                model_reserved_kv_bytes: snapshot
+                    .model_reserved_kv_bytes(model_id)
                     .saturating_sub(model_released)
                     .saturating_add(model_pending),
             };
@@ -781,7 +765,7 @@ impl<S: Scheduler> Executor<S> {
             let candidate = BatchCandidate {
                 request_id,
                 phase: BatchPhase::Prefill,
-                token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
+                token_cost: snapshot.initial_prefill_chunk(model_id, prompt_tokens),
             };
             if self
                 .select_batch_candidates(scheduled, &[candidate])?
@@ -794,56 +778,81 @@ impl<S: Scheduler> Executor<S> {
             }
             scheduled.push(candidate);
             pending_total = pending_total.saturating_add(reserved_kv_bytes);
-            *pending_by_model.entry(model_id.clone()).or_default() += reserved_kv_bytes;
+            *pending_by_model.entry(model_id).or_default() += reserved_kv_bytes;
             execution_plan.lifecycle.push(LifecycleAction::Admit {
                 request_id,
                 model_id: model_id.clone(),
                 reserved_kv_bytes,
             });
             rows.push((
-                model_id,
+                model_id.clone(),
                 PlannedRow {
                     request_id,
                     event_index,
                     positions: 0..candidate.token_cost,
-                    final_prompt_chunk: candidate.token_cost == prompt_tokens.len(),
+                    final_prompt_chunk: candidate.token_cost == prompt_tokens,
                 },
             ));
-            admissions.insert(
-                request_id,
-                PlannedAdmission {
-                    model,
-                    prompt_tokens,
-                    max_new_tokens: request.spec.generation.max_new_tokens,
-                    generation: request.spec.generation,
-                },
-            );
         }
-        execution_plan
-            .batches
-            .extend(self.plan_prefill_batches(PlannedPhase::Prefill, rows));
-        Ok(admissions)
+        execution_plan.batches.extend(self.plan_prefill_batches(
+            snapshot,
+            PlannedPhase::Prefill,
+            rows,
+        ));
+        Ok(())
     }
 
-    /// Snapshot of live work that plans are validated against.
-    fn planning_view(&self, admissions: &BTreeMap<RequestId, PlannedAdmission>) -> PlanningView {
+    /// Tokenizes queued requests for attached models once, caching the
+    /// result until the request starts, fails, or is cancelled.
+    fn prepare_queued(&mut self) {
         let state = self.runtime.state();
-        PlanningView {
+        for request_id in state.queued_ids() {
+            if self.prepared.contains_key(&request_id) {
+                continue;
+            }
+            let request = &state
+                .request(request_id)
+                .expect("queued requests retain their runtime record")
+                .request;
+            if let Some(model) = self.models.get(&request.spec.model) {
+                let prompt = prepare_prompt(model, request).map_err(|error| error.to_string());
+                self.prepared.insert(request_id, prompt);
+            }
+        }
+    }
+
+    /// Builds the immutable input for one planning pass.
+    fn snapshot(&self, at: Timestamp) -> PlanningSnapshot {
+        let state = self.runtime.state();
+        PlanningSnapshot {
+            at,
             generation: self.generation,
-            max_active_requests: self.max_active_requests,
+            limits: ExecutorLimits {
+                max_active_requests: self.max_active_requests,
+                prefill_chunk_size: self.prefill_chunk_size.map(NonZeroUsize::get),
+            },
             queued: state
                 .queued_ids()
-                .filter_map(|request_id| {
-                    let record = state.request(request_id)?;
-                    Some((
+                .map(|request_id| {
+                    let record = state
+                        .request(request_id)
+                        .expect("queued requests retain their runtime record");
+                    let spec = &record.request.spec;
+                    QueuedRequest {
                         request_id,
-                        QueuedView {
-                            model_id: record.request.spec.model.clone(),
-                            prompt_tokens: admissions
-                                .get(&request_id)
-                                .map(|admission| admission.prompt_tokens.len()),
+                        model_id: spec.model.clone(),
+                        prompt_tokens: match self.prepared.get(&request_id) {
+                            Some(Ok(tokens)) => Ok(tokens.len()),
+                            Some(Err(message)) => Err(message.clone()),
+                            None => {
+                                Err(format!("model `{}` has no executable attached", spec.model))
+                            }
                         },
-                    ))
+                        max_new_tokens: spec.generation.max_new_tokens,
+                        priority: spec.priority,
+                        deadline: spec.deadline,
+                        queued_at: record.timing.queued_at,
+                    }
                 })
                 .collect(),
             prefilling: self
@@ -878,16 +887,27 @@ impl<S: Scheduler> Executor<S> {
                     )
                 })
                 .collect(),
-            model_kv_capacity: self
-                .models
+            decode_order: self.ready.iter().copied().collect(),
+            prefill_order: self.prefill_ready.iter().copied().collect(),
+            models: state
+                .models()
                 .iter()
-                .filter(|_| self.admission.enforces_model_kv_capacity())
-                .filter_map(|(model_id, model)| {
-                    model
-                        .kv_cache_profile()
-                        .map(|profile| (model_id.clone(), profile.capacity_bytes()))
+                .map(|descriptor| {
+                    let snapshot =
+                        self.models
+                            .get(&descriptor.id)
+                            .map_or(ModelSnapshot::DETACHED, |model| ModelSnapshot {
+                                attached: true,
+                                batch: model.batch_capabilities(),
+                                chunked_prefill: model.supports_chunked_prefill(),
+                                kv_cache: model.kv_cache_profile(),
+                            });
+                    (descriptor.id.clone(), snapshot)
                 })
                 .collect(),
+            memory: state.memory,
+            device: None,
+            measurements: PolicyMeasurements::default(),
         }
     }
 
@@ -897,7 +917,6 @@ impl<S: Scheduler> Executor<S> {
     fn commit_plan(
         &mut self,
         plan: &ExecutionPlan,
-        admissions: &mut BTreeMap<RequestId, PlannedAdmission>,
         at: Timestamp,
     ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
@@ -916,22 +935,35 @@ impl<S: Scheduler> Executor<S> {
                     model_id,
                     reserved_kv_bytes,
                 } => {
-                    let admission = admissions
+                    let model = self.models[model_id].clone();
+                    let prompt_tokens = self
+                        .prepared
                         .remove(request_id)
-                        .expect("planned admissions retain their prepared inputs");
+                        .and_then(Result::ok)
+                        .expect("planned admissions have prepared prompts");
+                    let generation = self
+                        .runtime
+                        .state()
+                        .request(*request_id)
+                        .expect("admitted requests retain their runtime record")
+                        .request
+                        .spec
+                        .generation
+                        .clone();
+                    let max_new_tokens = generation.max_new_tokens;
                     let lease = self.runtime.start_selected(*request_id, at)?;
-                    match admission.model.create_session(admission.generation) {
+                    match model.create_session(generation) {
                         Ok(session) => {
                             admitted.insert(
                                 *request_id,
                                 PendingPrefill {
                                     request_id: lease.request_id,
                                     model_id: model_id.clone(),
-                                    model: admission.model,
+                                    model,
                                     session,
-                                    prompt_tokens: admission.prompt_tokens,
+                                    prompt_tokens,
                                     cursor: 0,
-                                    max_new_tokens: admission.max_new_tokens,
+                                    max_new_tokens,
                                     last_step_at: at,
                                     reserved_kv_bytes: *reserved_kv_bytes,
                                 },
@@ -955,6 +987,7 @@ impl<S: Scheduler> Executor<S> {
                     reason,
                     event_index,
                 } => {
+                    self.prepared.remove(request_id);
                     self.runtime.reject(*request_id, reason.to_string(), at)?;
                     outcome.indexed_events.push((
                         *event_index,
@@ -969,6 +1002,7 @@ impl<S: Scheduler> Executor<S> {
                     message,
                     event_index,
                 } => {
+                    self.prepared.remove(request_id);
                     self.runtime.start_selected(*request_id, at)?;
                     let event = self.fail_started(*request_id, message.clone(), at)?;
                     outcome.indexed_events.push((*event_index, event));
@@ -1086,31 +1120,14 @@ impl<S: Scheduler> Executor<S> {
         Ok(outcome)
     }
 
-    /// Groups decode rows by loaded model in first-appearance order.
-    fn plan_decode_batches(&self, rows: Vec<(ModelId, PlannedRow)>) -> Vec<PlannedBatch> {
-        let mut groups: Vec<PlannedBatch> = Vec::new();
-        for (model_id, row) in rows {
-            if let Some(group) = groups.iter_mut().find(|group| group.model_id == model_id) {
-                group.rows.push(row);
-            } else {
-                groups.push(PlannedBatch {
-                    phase: PlannedPhase::Decode,
-                    model_id,
-                    mode: BatchExecutionMode::Individual,
-                    rows: vec![row],
-                });
-            }
-        }
-        self.assign_batch_modes(groups)
-    }
-
     /// Groups prompt rows by loaded model and prefill-batcher bucket.
     ///
     /// The batcher sees each model's complete row set, so workload-aware
     /// policies make one decision per model. Groups keep first-appearance
     /// order, so bucketing never reorders events.
     fn plan_prefill_batches(
-        &mut self,
+        &self,
+        snapshot: &PlanningSnapshot,
         phase: PlannedPhase,
         rows: Vec<(ModelId, PlannedRow)>,
     ) -> Vec<PlannedBatch> {
@@ -1157,49 +1174,10 @@ impl<S: Scheduler> Executor<S> {
                 ));
             }
         }
-        self.assign_batch_modes(groups.into_iter().map(|(_, group)| group).collect())
-    }
-
-    /// Marks compatible groups as tensor invocations when the model declares
-    /// the matching hook, and splits the rest into one-row invocations.
-    fn assign_batch_modes(&self, groups: Vec<PlannedBatch>) -> Vec<PlannedBatch> {
-        let mut batches = Vec::with_capacity(groups.len());
-        for group in groups {
-            let capabilities = self.models.get(&group.model_id).map_or(
-                BatchCapabilities::NONE,
-                CausalLanguageModel::batch_capabilities,
-            );
-            let supported = match group.phase {
-                PlannedPhase::Decode => capabilities.decode,
-                PlannedPhase::Prefill | PlannedPhase::ContinuedPrefill => {
-                    if group.rows.iter().all(is_complete_prompt) {
-                        capabilities.prefill
-                    } else {
-                        capabilities.chunked_prefill
-                    }
-                }
-            };
-            if supported && group.rows.len() > 1 {
-                batches.push(PlannedBatch {
-                    mode: BatchExecutionMode::Tensor,
-                    ..group
-                });
-                continue;
-            }
-            let PlannedBatch {
-                phase,
-                model_id,
-                rows,
-                ..
-            } = group;
-            batches.extend(rows.into_iter().map(|row| PlannedBatch {
-                phase,
-                model_id: model_id.clone(),
-                mode: BatchExecutionMode::Individual,
-                rows: vec![row],
-            }));
-        }
-        batches
+        assign_batch_modes(
+            snapshot,
+            groups.into_iter().map(|(_, group)| group).collect(),
+        )
     }
 
     /// Executes one planned prompt invocation. A declared tensor hook that
@@ -1359,6 +1337,7 @@ impl<S: Scheduler> Executor<S> {
         let Some(request_id) = self.runtime.select_next()? else {
             return Ok(ExecutorEvent::Idle);
         };
+        self.prepared.remove(&request_id);
         let request = self
             .runtime
             .state()
@@ -1577,7 +1556,7 @@ impl<S: Scheduler> Executor<S> {
     }
 
     fn select_batch_candidates(
-        &mut self,
+        &self,
         scheduled: &[BatchCandidate],
         candidates: &[BatchCandidate],
     ) -> Result<BTreeSet<RequestId>, ExecutorError> {
@@ -1734,6 +1713,66 @@ impl<S: Scheduler> Executor<S> {
         let remaining = pending.prompt_tokens.len().saturating_sub(pending.cursor);
         self.initial_prefill_chunk_len(&pending.model, remaining)
     }
+}
+
+/// Groups decode rows by loaded model in first-appearance order.
+fn plan_decode_batches(
+    snapshot: &PlanningSnapshot,
+    rows: Vec<(ModelId, PlannedRow)>,
+) -> Vec<PlannedBatch> {
+    let mut groups: Vec<PlannedBatch> = Vec::new();
+    for (model_id, row) in rows {
+        if let Some(group) = groups.iter_mut().find(|group| group.model_id == model_id) {
+            group.rows.push(row);
+        } else {
+            groups.push(PlannedBatch {
+                phase: PlannedPhase::Decode,
+                model_id,
+                mode: BatchExecutionMode::Individual,
+                rows: vec![row],
+            });
+        }
+    }
+    assign_batch_modes(snapshot, groups)
+}
+
+/// Marks compatible groups as tensor invocations when the model declares
+/// the matching hook, and splits the rest into one-row invocations.
+fn assign_batch_modes(snapshot: &PlanningSnapshot, groups: Vec<PlannedBatch>) -> Vec<PlannedBatch> {
+    let mut batches = Vec::with_capacity(groups.len());
+    for group in groups {
+        let capabilities = snapshot.model(&group.model_id).batch;
+        let supported = match group.phase {
+            PlannedPhase::Decode => capabilities.decode,
+            PlannedPhase::Prefill | PlannedPhase::ContinuedPrefill => {
+                if group.rows.iter().all(is_complete_prompt) {
+                    capabilities.prefill
+                } else {
+                    capabilities.chunked_prefill
+                }
+            }
+        };
+        if supported && group.rows.len() > 1 {
+            batches.push(PlannedBatch {
+                mode: BatchExecutionMode::Tensor,
+                ..group
+            });
+            continue;
+        }
+        let PlannedBatch {
+            phase,
+            model_id,
+            rows,
+            ..
+        } = group;
+        batches.extend(rows.into_iter().map(|row| PlannedBatch {
+            phase,
+            model_id: model_id.clone(),
+            mode: BatchExecutionMode::Individual,
+            rows: vec![row],
+        }));
+    }
+    batches
 }
 
 /// Planned rows whose request left the live set without being predicted.
@@ -2965,6 +3004,69 @@ mod tests {
         );
         let decoded = executor.step_iteration(Timestamp::from_micros(20));
         assert!(decoded.unwrap().divergences.is_empty());
+    }
+
+    #[test]
+    fn waiting_requests_are_tokenized_once() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountingTokenizer(Arc<AtomicUsize>);
+
+        impl Tokenizer for CountingTokenizer {
+            fn encode(
+                &self,
+                text: &str,
+                add_special_tokens: bool,
+            ) -> Result<Vec<u32>, ModelExecutionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                NumericTokenizer.encode(text, add_special_tokens)
+            }
+
+            fn decode(
+                &self,
+                token_ids: &[u32],
+                skip_special_tokens: bool,
+            ) -> Result<String, ModelExecutionError> {
+                NumericTokenizer.decode(token_ids, skip_special_tokens)
+            }
+        }
+
+        // The first request fills the 32-byte pool, so admission defers the
+        // second on every iteration until the first finishes.
+        let encodes = Arc::new(AtomicUsize::new(0));
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_admission_policy(crate::MemoryAwareAdmission);
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                CausalLanguageModel::new(CountingTokenizer(encodes.clone()), IncrementModel)
+                    .with_kv_cache_profile(KvCacheProfile::new(8, 4, 32).unwrap()),
+            )
+            .unwrap();
+        executor.submit(request("1", 4), Timestamp::ZERO).unwrap();
+        let waiting = executor.submit(request("10", 4), Timestamp::ZERO).unwrap();
+
+        for step in 1..=3 {
+            let iteration = executor
+                .step_iteration(Timestamp::from_micros(step * 10))
+                .unwrap();
+            assert!(
+                iteration
+                    .execution_plan
+                    .deferrals
+                    .iter()
+                    .any(|deferral| matches!(
+                        deferral,
+                        PlannedDeferral::Admission { request_id, .. } if *request_id == waiting
+                    ))
+            );
+        }
+
+        assert_eq!(encodes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

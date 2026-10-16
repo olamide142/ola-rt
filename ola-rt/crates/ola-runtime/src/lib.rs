@@ -10,6 +10,7 @@ mod plan;
 mod policy;
 mod runtime;
 mod scheduler;
+mod snapshot;
 mod state;
 
 pub use admission::{
@@ -32,12 +33,15 @@ pub use kv_cache::{
 pub use model_registry::ModelRegistry;
 pub use plan::{
     DecodeView, ExecutionPlan, LifecycleAction, PlanDivergence, PlanError, PlanEstimates,
-    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillView, QueuedView,
-    ReleaseReason,
+    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PrefillView, ReleaseReason,
 };
 pub use policy::PolicyDescriptor;
 pub use runtime::Runtime;
 pub use scheduler::{FifoScheduler, Scheduler};
+pub use snapshot::{
+    DeviceSnapshot, ExecutorLimits, ModelSnapshot, PlanningSnapshot, PolicyMeasurements,
+    QueuedRequest,
+};
 pub use state::{
     InferenceSession, MemoryState, RequestRecord, RequestStatus, RequestTiming, RuntimeState,
 };

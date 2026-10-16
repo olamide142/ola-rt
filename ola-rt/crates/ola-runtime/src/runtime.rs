@@ -134,7 +134,7 @@ impl<S: Scheduler> Runtime<S> {
     }
 
     /// Ranks up to `limit` queued requests without changing lifecycle state.
-    pub fn rank_next(&mut self, limit: usize) -> Result<Vec<RequestId>, RuntimeError> {
+    pub fn rank_next(&self, limit: usize) -> Result<Vec<RequestId>, RuntimeError> {
         let ranked = self.scheduler.rank(&self.state, limit);
         let mut seen = std::collections::BTreeSet::new();
         for id in &ranked {
