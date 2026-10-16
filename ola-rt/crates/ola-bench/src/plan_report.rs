@@ -55,6 +55,8 @@ pub struct PlanReportDecision {
     pub ranking: PlanReportRanking,
     /// Outcome for every ranked request.
     pub admissions: Vec<PlanReportAdmission>,
+    /// Admission-deferred requests that backfill skipped past.
+    pub backfill_skips: Vec<u64>,
     /// Every batch-policy call.
     pub selections: Vec<PlanReportSelection>,
     /// Every prefill-grouping call.
@@ -511,6 +513,7 @@ fn decision_record(record: &DecisionRecord) -> PlanReportDecision {
             ranked: record.ranking.ranked.iter().map(|id| id.get()).collect(),
         },
         admissions: record.admissions.iter().map(admission).collect(),
+        backfill_skips: record.backfill_skips.iter().map(|id| id.get()).collect(),
         selections: record
             .selections
             .iter()

@@ -26,6 +26,31 @@ pub struct ComposedPolicy {
     admission: Box<dyn AdmissionPolicy>,
     batch: Box<dyn BatchPolicy>,
     grouping: Box<dyn PrefillBatcher>,
+    head_of_line: HeadOfLine,
+}
+
+/// What admission does when the policy defers a ranked request.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HeadOfLine {
+    /// Stop admitting for this iteration, so ranked order is never bypassed.
+    #[default]
+    Block,
+    /// Skip a deferred request and try the next ranked one, up to
+    /// `max_skipped` times per iteration. Skipped requests keep their queue
+    /// position but can starve if smaller work keeps arriving.
+    Backfill {
+        /// Admission deferrals tolerated before admission stops.
+        max_skipped: usize,
+    },
+}
+
+impl HeadOfLine {
+    const fn max_skipped(self) -> usize {
+        match self {
+            Self::Block => 0,
+            Self::Backfill { max_skipped } => max_skipped,
+        }
+    }
 }
 
 impl Default for ComposedPolicy {
@@ -35,6 +60,7 @@ impl Default for ComposedPolicy {
             admission: Box::new(UnconstrainedAdmission),
             batch: Box::new(UnboundedBatchPolicy),
             grouping: Box::new(UnbucketedPrefillBatcher),
+            head_of_line: HeadOfLine::Block,
         }
     }
 }
@@ -66,6 +92,13 @@ impl ComposedPolicy {
     #[must_use]
     pub fn with_grouping(mut self, grouping: impl PrefillBatcher + 'static) -> Self {
         self.grouping = Box::new(grouping);
+        self
+    }
+
+    /// Replaces what admission does after a deferral.
+    #[must_use]
+    pub const fn with_head_of_line(mut self, head_of_line: HeadOfLine) -> Self {
+        self.head_of_line = head_of_line;
         self
     }
 
@@ -248,10 +281,17 @@ impl ComposedPolicy {
             .max_active_requests
             .saturating_sub(live_after)
             .min(snapshot.queued.len());
-        let ranked = self.rank(snapshot, admission_count.saturating_add(1))?;
+        // Skipped requests consume no slot, so rank enough to fill every
+        // slot after the maximum number of skips, plus one to record the
+        // first request left waiting for a slot.
+        let max_skipped = self.head_of_line.max_skipped();
+        let limit = admission_count
+            .saturating_add(max_skipped)
+            .saturating_add(1);
+        let ranked = self.rank(snapshot, limit)?;
         record.ranking = RankingRecord {
             slots_available: admission_count,
-            limit: admission_count.saturating_add(1),
+            limit,
             ranked: ranked.clone(),
         };
         let queued = snapshot
@@ -263,8 +303,11 @@ impl ComposedPolicy {
         let mut rows = Vec::new();
         let mut pending_total = 0_u64;
         let mut pending_by_model = BTreeMap::<&ModelId, u64>::new();
+        // Admissions, rejections, and preparation failures each consume one
+        // attempt; backfill skips do not.
+        let mut attempts = 0;
         for (offset, request_id) in ranked.into_iter().enumerate() {
-            if offset == admission_count {
+            if attempts == admission_count {
                 execution_plan
                     .deferrals
                     .push(PlannedDeferral::Slots { request_id });
@@ -297,6 +340,7 @@ impl ComposedPolicy {
                         message,
                         event_index,
                     });
+                    attempts += 1;
                     continue;
                 }
             };
@@ -336,6 +380,10 @@ impl ComposedPolicy {
                         reason,
                         event_index,
                     });
+                    if record.backfill_skips.len() < max_skipped {
+                        record.backfill_skips.push(request_id);
+                        continue;
+                    }
                     break;
                 }
                 AdmissionDecision::Reject(reason) => {
@@ -345,6 +393,7 @@ impl ComposedPolicy {
                         reason,
                         event_index,
                     });
+                    attempts += 1;
                     continue;
                 }
             };
@@ -369,6 +418,7 @@ impl ComposedPolicy {
                 break;
             }
             scheduled.push(candidate);
+            attempts += 1;
             pending_total = pending_total.saturating_add(reserved_kv_bytes);
             *pending_by_model.entry(model_id).or_default() += reserved_kv_bytes;
             execution_plan.lifecycle.push(LifecycleAction::Admit {
@@ -494,7 +544,12 @@ impl ComposedPolicy {
 
 impl ExecutionPolicy for ComposedPolicy {
     fn descriptor(&self) -> PolicyDescriptor {
+        let head_of_line = match self.head_of_line {
+            HeadOfLine::Block => "block".to_owned(),
+            HeadOfLine::Backfill { max_skipped } => format!("backfill-{max_skipped}"),
+        };
         PolicyDescriptor::new("composed")
+            .with_config("head_of_line", head_of_line)
             .with_component(self.scheduler.descriptor())
             .with_component(self.admission.descriptor())
             .with_component(self.batch.descriptor())
@@ -758,6 +813,84 @@ mod tests {
         );
         assert_eq!(decision.record.ranking.ranked, vec![id(5), id(6)]);
         assert_eq!(decision.record.admissions.len(), 1);
+    }
+
+    #[test]
+    fn backfill_admits_smaller_work_past_a_memory_deferred_head() {
+        // Same state as the head-of-line test: one page free, the head needs
+        // two. Backfill skips it and admits the one-page request behind it.
+        let mut snapshot = snapshot(4, 64, BatchCapabilities::ALL, &[(5, 5, 4), (6, 1, 4)]);
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        let policy = ComposedPolicy::default()
+            .with_admission(MemoryAwareAdmission)
+            .with_head_of_line(HeadOfLine::Backfill { max_skipped: 1 });
+
+        let decision = plan(&policy, &snapshot);
+
+        assert_eq!(decision.record.backfill_skips, vec![id(5)]);
+        assert!(matches!(
+            decision.plan.deferrals.as_slice(),
+            [PlannedDeferral::Admission { request_id, event_index: 1, .. }] if *request_id == id(5)
+        ));
+        assert!(matches!(
+            decision.plan.lifecycle.as_slice(),
+            [LifecycleAction::Admit { request_id, .. }] if *request_id == id(6)
+        ));
+        assert_eq!(decision.plan.batches.last().unwrap().rows[0].event_index, 2);
+        assert_eq!(
+            policy.descriptor().to_string(),
+            "composed{head_of_line=backfill-1}[fifo,memory-aware-admission,\
+             unbounded-batch,unbucketed-prefill]"
+        );
+    }
+
+    #[test]
+    fn backfill_stops_after_its_skip_limit() {
+        // Two large requests both defer; with one skip allowed admission stops
+        // at the second, so the small request behind them still waits.
+        let mut snapshot = snapshot(
+            4,
+            64,
+            BatchCapabilities::ALL,
+            &[(5, 5, 4), (7, 5, 4), (6, 1, 4)],
+        );
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        let policy = ComposedPolicy::default()
+            .with_admission(MemoryAwareAdmission)
+            .with_head_of_line(HeadOfLine::Backfill { max_skipped: 1 });
+
+        let decision = plan(&policy, &snapshot);
+
+        assert_eq!(decision.record.backfill_skips, vec![id(5)]);
+        assert!(decision.plan.lifecycle.is_empty());
+        assert_eq!(decision.plan.deferrals.len(), 2);
+    }
+
+    #[test]
+    fn backfill_skips_do_not_consume_slots() {
+        // One free slot: the skipped head must not use it up.
+        let mut snapshot = snapshot(
+            2,
+            64,
+            BatchCapabilities::ALL,
+            &[(5, 5, 4), (6, 1, 4), (8, 1, 4)],
+        );
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        let policy = ComposedPolicy::default()
+            .with_admission(MemoryAwareAdmission)
+            .with_head_of_line(HeadOfLine::Backfill { max_skipped: 1 });
+
+        let decision = plan(&policy, &snapshot);
+
+        assert_eq!(decision.record.ranking.limit, 3);
+        assert!(matches!(
+            decision.plan.lifecycle.as_slice(),
+            [LifecycleAction::Admit { request_id, .. }] if *request_id == id(6)
+        ));
+        assert_eq!(
+            decision.plan.deferrals.last(),
+            Some(&PlannedDeferral::Slots { request_id: id(8) })
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct DecisionRecord {
     pub ranking: RankingRecord,
     /// Every ranked request the policy considered, in ranking order.
     pub admissions: Vec<AdmissionRecord>,
+    /// Requests deferred by admission that backfill skipped past, in order.
+    pub backfill_skips: Vec<RequestId>,
     /// Every batch-policy call, in planning order.
     pub selections: Vec<SelectionRecord>,
     /// Every prefill-grouping call, in planning order.
@@ -35,8 +37,9 @@ pub struct DecisionRecord {
 pub struct RankingRecord {
     /// Slots free for admission after predicted releases.
     pub slots_available: usize,
-    /// Number of requests the scheduler was asked for (slots plus one, so
-    /// the first waiting request can be recorded).
+    /// Number of requests the scheduler was asked for: free slots, plus the
+    /// backfill skips allowed, plus one so the first request left waiting
+    /// for a slot can be recorded.
     pub limit: usize,
     /// Requests in the order the scheduler returned them.
     pub ranked: Vec<RequestId>,

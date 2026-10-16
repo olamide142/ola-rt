@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Step 1 is
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–2 are
 implemented.
 
 ## Goal
@@ -33,8 +33,8 @@ through that protocol and produce byte-identical results when re-run.
 
 ### 1. Schedulers
 
-All four new schedulers break ties by `(queued_at, request_id)`, so rankings
-are total and deterministic.
+All schedulers break ties by `(queued_at, request_id)`, so rankings are total
+and deterministic.
 
 | Scheduler | Ranks by | Descriptor |
 | --- | --- | --- |
@@ -170,7 +170,12 @@ Each step keeps `make verify` and `make test-fixture` green.
    `ShortestJobFirst` with optional aging; test ranking, tie-breaks, and aging
    on snapshots. **Done.**
 2. **Backfill.** Add `HeadOfLine::Backfill` to `ComposedPolicy`, with skips in
-   `DecisionRecord`; add conflict tests beside the P2 ones.
+   `DecisionRecord`; add conflict tests beside the P2 ones. **Done.**
+   The scheduler is asked for `slots + max_skipped + 1` requests, because a
+   skip consumes no slot. The `ComposedPolicy` descriptor now always states
+   `head_of_line` (`block` or `backfill-N`). `DecisionRecord::backfill_skips`
+   was added to `PlanReport` schema 2 in place, since that version had not
+   been published.
 3. **Budgets.** Add `BatchPressure`, `MixedTokenBudgetPolicy`, and
    `QueueAdaptiveTokenBudget`, with tests.
 4. **Simulation harness.** Add `SyntheticModel`, the virtual-clock cost

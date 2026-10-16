@@ -63,7 +63,7 @@ Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 - [x] Add priority scheduling.
 - [x] Add deadline-aware scheduling.
 - [x] Add estimated-size or shortest-job-first scheduling.
-- [ ] Add a memory/cache-aware baseline.
+- [x] Add a memory/cache-aware baseline. (Memory-aware admission with backfill.)
 - [ ] Add configurable prefill/decode mixing.
 - [ ] Compare fixed and adaptive token budgets.
 - [ ] Define starvation and fairness measurements.

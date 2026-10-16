@@ -25,7 +25,7 @@ pub use batch::{
     PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate, PrefillGroupingStrategy,
     UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
-pub use composed::ComposedPolicy;
+pub use composed::{ComposedPolicy, HeadOfLine};
 pub use decision::{
     AdmissionOutcome, AdmissionRecord, BatchHook, CapabilityFallback, DecisionRecord,
     GroupingDecision, GroupingRecord, RankingRecord, SelectionRecord, SelectionStage,

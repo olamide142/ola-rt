@@ -2467,7 +2467,7 @@ mod tests {
     fn default_policy_has_a_stable_composed_descriptor() {
         assert_eq!(
             Executor::default().policy_descriptor().to_string(),
-            "composed[fifo,unconstrained-admission,unbounded-batch,unbucketed-prefill]"
+            "composed{head_of_line=block}[fifo,unconstrained-admission,unbounded-batch,unbucketed-prefill]"
         );
     }
 
@@ -2569,7 +2569,7 @@ mod tests {
 
         assert_eq!(
             decision.policy.to_string(),
-            "composed[fifo,unconstrained-admission,fifo-token-budget{max_tokens=2},unbucketed-prefill]"
+            "composed{head_of_line=block}[fifo,unconstrained-admission,fifo-token-budget{max_tokens=2},unbucketed-prefill]"
         );
         assert_eq!(
             decision.ranking,
