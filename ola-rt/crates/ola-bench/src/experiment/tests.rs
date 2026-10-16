@@ -385,6 +385,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             "llama-generation",
             "llama-prefill-strategies",
             "llama-chunked-prefill",
+            "cost-calibration",
             "kv-block-pressure",
             "fifo-workload",
             "prefill-bucketing",

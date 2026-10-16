@@ -747,3 +747,153 @@ fn values(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
         .map(|(name, value)| ((*name).to_owned(), *value))
         .collect()
 }
+
+/// Fits iteration cost on the loaded model over a grid of batch widths and
+/// prompt lengths, each measured batched and split.
+pub struct CostCalibration;
+
+impl Experiment for CostCalibration {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: crate::COST_CALIBRATION,
+            name: "Cost calibration",
+            description: "Fit fixed, per-token, and per-call iteration cost by least squares",
+            category: ExperimentCategory::Benchmark,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Host,
+            payload_version: 1,
+            requirements: vec![Requirement::LoadedModel],
+            parameters: vec![
+                ParameterSpec::text("widths", "Comma-separated batch widths", "1,2,4"),
+                ParameterSpec::text("lengths", "Comma-separated prompt lengths", "4,8,16"),
+                ParameterSpec::integer("warmups", "Discarded grid sweeps", 1),
+                ParameterSpec::integer("repetitions", "Measured grid sweeps, one fit each", 5),
+            ],
+        }
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let model = loaded(context)?;
+        let widths = lengths(parameters, "widths")?;
+        let prompt_lengths = lengths(parameters, "lengths")?;
+        let sweep =
+            || crate::measure_iteration_costs(model, &widths, &prompt_lengths).map_err(run_error);
+        let warmups = parameters.size("warmups")?;
+        for _ in 0..warmups {
+            sweep()?;
+        }
+        let mut pooled = Vec::new();
+        let mut fits = Vec::new();
+        for _ in 0..parameters.integer("repetitions")? {
+            let observations = sweep()?;
+            fits.push(crate::fit_cost_model(&observations).map_err(run_error)?);
+            pooled.extend(observations);
+        }
+        let pooled_fit = crate::fit_cost_model(&pooled).map_err(run_error)?;
+
+        let micros = |name| MetricSpec::new(name, Unit::Micros, TimeDomain::Host, Direction::Lower);
+        let mut outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            "shape-grid",
+            Vec::new(),
+            vec![
+                micros("fixed_micros"),
+                micros("per_dense_token_micros"),
+                micros("per_invocation_micros"),
+                MetricSpec::new(
+                    "invocation_overhead_tokens",
+                    Unit::Tokens,
+                    TimeDomain::Host,
+                    Direction::Neither,
+                ),
+                micros("residual_rms_micros"),
+            ],
+            vec![(
+                plain_variant("fit"),
+                fits.iter()
+                    .map(|fit| {
+                        values(&[
+                            ("fixed_micros", fit.fixed_micros),
+                            ("per_dense_token_micros", fit.per_dense_token_micros),
+                            ("per_invocation_micros", fit.per_invocation_micros),
+                            (
+                                "invocation_overhead_tokens",
+                                fit.invocation_overhead_tokens().map_or(0.0, as_f64),
+                            ),
+                            ("residual_rms_micros", fit.residual_rms_micros),
+                        ])
+                    })
+                    .collect(),
+            )],
+            String::new(),
+        )?;
+        // `finish` records single-pass probes; this study ran warm-up sweeps.
+        outcome.report.protocol.warmups = warmups;
+        outcome.report.protocol.ordering = "full grid sweep per repetition".into();
+        let interval_json = |interval: Option<super::Interval>| {
+            interval.map(|interval| serde_json::json!([interval.low, interval.high]))
+        };
+        let intervals = pooled_fit.intervals;
+        let cost = pooled_fit.cost_model();
+        outcome.report.details = Some(serde_json::json!({
+            "pooled_fit": {
+                "observations": pooled_fit.observations,
+                "fixed_micros": pooled_fit.fixed_micros,
+                "per_dense_token_micros": pooled_fit.per_dense_token_micros,
+                "per_invocation_micros": pooled_fit.per_invocation_micros,
+                "residual_rms_micros": pooled_fit.residual_rms_micros,
+                "ci95": {
+                    "fixed_micros": interval_json(intervals.map(|i| i.fixed_micros)),
+                    "per_dense_token_micros": interval_json(intervals.map(|i| i.per_dense_token_micros)),
+                    "per_invocation_micros": interval_json(intervals.map(|i| i.per_invocation_micros)),
+                },
+                "cost_model": {
+                    "fixed_micros": cost.fixed_micros,
+                    "per_invocation_micros": cost.per_invocation_micros,
+                    "per_dense_token_micros": cost.per_dense_token_micros,
+                },
+                "invocation_overhead_tokens": pooled_fit.invocation_overhead_tokens(),
+            },
+            "observations": pooled
+                .iter()
+                .map(|observation| serde_json::json!([
+                    observation.dense_tokens,
+                    observation.invocations,
+                    observation.micros,
+                ]))
+                .collect::<Vec<_>>(),
+        }));
+        let estimate = |name: &str| outcome.report.summaries[0].estimates[name];
+        let describe = |name: &str| {
+            let estimate = estimate(name);
+            estimate.ci95.map_or_else(
+                || format!("{:.1} µs", estimate.mean),
+                |interval| {
+                    format!(
+                        "{:.1} µs [{:.1}–{:.1}]",
+                        estimate.mean, interval.low, interval.high
+                    )
+                },
+            )
+        };
+        outcome.summary = format!(
+            "{} sweeps × {} shapes · fixed {} · per token {} · per call {} · overhead ≈ {} tokens · residual {:.1} µs",
+            fits.len(),
+            widths.len() * prompt_lengths.len() * 2,
+            describe("fixed_micros"),
+            describe("per_dense_token_micros"),
+            describe("per_invocation_micros"),
+            pooled_fit
+                .invocation_overhead_tokens()
+                .map_or_else(|| "n/a".to_owned(), |tokens| tokens.to_string()),
+            pooled_fit.residual_rms_micros,
+        );
+        Ok(outcome)
+    }
+}

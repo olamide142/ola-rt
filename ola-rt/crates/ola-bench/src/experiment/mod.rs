@@ -18,7 +18,7 @@ pub use compare::{
     compare_reports,
 };
 pub use metric::{Direction, MetricSpec, TimeDomain, Unit};
-pub use model::{ChunkedPrefill, LlamaGeneration, PrefillStrategies};
+pub use model::{ChunkedPrefill, CostCalibration, LlamaGeneration, PrefillStrategies};
 pub use registry::{
     Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
     ExperimentOutcome, ExperimentRegistry, HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS,

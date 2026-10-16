@@ -280,6 +280,7 @@ pub struct Executor {
     policy: Box<dyn ExecutionPolicy>,
     results: BTreeMap<RequestId, ExecutionResult>,
     prepared: BTreeMap<RequestId, Result<Vec<u32>, String>>,
+    measurements: PolicyMeasurements,
     generation: u64,
 }
 
@@ -304,6 +305,7 @@ impl Executor {
             policy: Box::new(ComposedPolicy::default()),
             results: BTreeMap::new(),
             prepared: BTreeMap::new(),
+            measurements: PolicyMeasurements::default(),
             generation: 0,
         }
     }
@@ -337,6 +339,14 @@ impl Executor {
     /// Returns the configured policy's stable name and configuration.
     pub fn policy_descriptor(&self) -> PolicyDescriptor {
         self.policy.descriptor()
+    }
+
+    /// Supplies measured inputs, such as calibrated invocation overhead,
+    /// that every planning snapshot carries to the policy.
+    #[must_use]
+    pub const fn with_policy_measurements(mut self, measurements: PolicyMeasurements) -> Self {
+        self.measurements = measurements;
+        self
     }
 
     /// Bounds resumable prompt work performed for one request per iteration.
@@ -616,7 +626,7 @@ impl Executor {
                 .collect(),
             memory: state.memory,
             device: None,
-            measurements: PolicyMeasurements::default(),
+            measurements: self.measurements,
         }
     }
 
@@ -2766,6 +2776,44 @@ mod tests {
             executor.state().request(request_id).unwrap().status,
             RequestStatus::Queued
         );
+    }
+
+    #[test]
+    fn policy_measurements_reach_the_planning_snapshot() {
+        use std::sync::{Arc, Mutex};
+
+        struct Recording(Arc<Mutex<Option<crate::PolicyMeasurements>>>);
+
+        impl ExecutionPolicy for Recording {
+            fn descriptor(&self) -> PolicyDescriptor {
+                PolicyDescriptor::new("recording")
+            }
+
+            fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
+                *self.0.lock().unwrap() = Some(snapshot.measurements);
+                ComposedPolicy::default().plan(snapshot)
+            }
+
+            fn enforces_model_kv_capacity(&self) -> bool {
+                false
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let measured = crate::PolicyMeasurements {
+            prefill_invocation_overhead_tokens: Some(42),
+        };
+        let mut executor = Executor::default()
+            .with_policy(Recording(seen.clone()))
+            .with_policy_measurements(measured);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        executor.submit(request("1", 1), Timestamp::ZERO).unwrap();
+
+        executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), Some(measured));
     }
 
     #[test]

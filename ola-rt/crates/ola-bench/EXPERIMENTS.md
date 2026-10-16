@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Steps 1–4 are implemented.
+Covers `todo.md` P4. Steps 1–5 are implemented.
 
 ## Goal
 
@@ -213,7 +213,16 @@ Each step keeps `make verify` and `make test-fixture` green.
    v2 files compare directly with new runs; `read_compatible` reads either
    format. The chunked-prefill fairness sweep is kept in `details`.
 5. **Calibration.** Add the multi-shape fit with intervals, feeding
-   `CostModel` and `PolicyMeasurements`.
+   `CostModel` and `PolicyMeasurements`. **Done.**
+   `cost-calibration` is a host-time study: each repetition sweeps a
+   width × length grid, every shape both batched and split into one call
+   per request (so dense tokens and calls vary independently), and fits
+   `c + a·dense + b·calls`; intervals come from the repetitions, and the
+   pooled fit with observation-bootstrap intervals is kept in `details`.
+   `CostFit::from_report` turns a saved calibration into a `CostModel` for
+   virtual-time comparisons and into `PolicyMeasurements`, which
+   `Executor::with_policy_measurements` now delivers in every snapshot. On
+   tiny Llama (debug build) one call costs about one token of work.
 6. **Data-driven UI.** Build the catalogue from the registry and remove the
    bespoke code.
 7. **CLI and parity.** Add `ola-cli` and the UI/CLI parity test, then update

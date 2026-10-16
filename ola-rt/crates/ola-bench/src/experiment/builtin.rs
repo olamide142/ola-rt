@@ -26,6 +26,7 @@ impl ExperimentRegistry {
             Box::new(super::LlamaGeneration),
             Box::new(super::PrefillStrategies),
             Box::new(super::ChunkedPrefill),
+            Box::new(super::CostCalibration),
             Box::new(KvBlockPressure),
             Box::new(FifoWorkload),
             Box::new(PrefillBucketing),

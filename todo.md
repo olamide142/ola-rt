@@ -87,7 +87,7 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [x] Validate schema versions and sample consistency.
 - [x] Compare reports across models, devices, policies, kernels, and revisions.
 - [x] Report regressions and uncertainty rather than relying on one run.
-- [ ] Expand calibration to multiple shapes and confidence intervals.
+- [x] Expand calibration to multiple shapes and confidence intervals.
 - [ ] Make UI benchmark and experiment catalogs data-driven.
 - [ ] Run the same named experiments through the CLI and UI.
 - [x] Separate simulation-time metrics from host performance.

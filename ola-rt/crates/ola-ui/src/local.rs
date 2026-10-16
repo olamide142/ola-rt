@@ -1331,6 +1331,31 @@ mod tests {
         assert!(chunked.summary.contains("tensor calls 1 → 2"));
         assert!(chunked.summary.contains("output preserved"));
         assert!(chunked.report.details.is_some());
+
+        let calibration = registry
+            .run(ola_bench::COST_CALIBRATION, &context, &[])
+            .unwrap();
+        assert_eq!(calibration.report.experiment.kind, ExperimentKind::Study);
+        assert_eq!(calibration.report.protocol.repetitions, 5);
+        let fit = ola_bench::CostFit::from_report(&calibration.report).unwrap();
+        assert!(fit.residual_rms_micros.is_finite());
+        // A measured cost model drives the virtual-time harness.
+        let trace = ola_bench::SchedulingTrace::mixed_short_long(ola_bench::TraceParameters {
+            seed: 1,
+            requests: 10,
+            mean_interarrival_micros: 1_000,
+        });
+        let run = ola_bench::run_scheduling_trial(
+            &trace,
+            ComposedPolicy::default().with_admission(MemoryAwareAdmission),
+            &ola_bench::SimulationConfig {
+                cost: fit.cost_model(),
+                ..ola_bench::SimulationConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(run.requests.len(), 10);
+        println!("{}", calibration.summary);
     }
 
     #[test]

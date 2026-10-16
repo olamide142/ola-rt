@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod calibration;
 mod experiment;
 mod plan_report;
 mod random;
@@ -26,12 +27,16 @@ use ola_runtime::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use calibration::{
+    CALIBRATION_RESAMPLES, COST_CALIBRATION, CalibrationError, CostFit, CostIntervals,
+    CostObservation, fit_cost_model, measure_iteration_costs,
+};
 pub use experiment::{
     AdaptivePrefillCost, BOOTSTRAP_RESAMPLES, BuildInfo, Change, ChunkedPrefill, CompareError,
-    CompareOptions, Direction, EXPERIMENT_SCHEMA, Estimate, Experiment, ExperimentCategory,
-    ExperimentContext, ExperimentDescriptor, ExperimentError, ExperimentIdentity, ExperimentKind,
-    ExperimentOutcome, ExperimentRegistry, ExperimentReport, FifoWorkload,
-    HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS, IdentityDifference, Interval,
+    CompareOptions, CostCalibration, Direction, EXPERIMENT_SCHEMA, Estimate, Experiment,
+    ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
+    ExperimentIdentity, ExperimentKind, ExperimentOutcome, ExperimentRegistry, ExperimentReport,
+    FifoWorkload, HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS, IdentityDifference, Interval,
     KvBlockPressure, LlamaGeneration, MetricComparison, MetricSpec, ParameterSpec, ParameterValue,
     Parameters, PrefillBucketing, PrefillStrategies, Protocol, ReportComparison, ReportError,
     ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample, SchedulerComparison,
