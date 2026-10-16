@@ -18,7 +18,11 @@ wgpu = ["burn/wgpu", "ola-burn/wgpu"]
 burn.workspace = true
 ola-bench.workspace = true
 ola-burn.workspace = true
+ola-core.workspace = true
 ola-model.workspace = true
+ola-runtime.workspace = true
+ola-serve.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]
 ola-ui.workspace = true

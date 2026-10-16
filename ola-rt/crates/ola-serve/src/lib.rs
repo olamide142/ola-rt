@@ -2,6 +2,7 @@
 
 mod driver;
 mod error;
+pub mod http;
 
 pub use driver::{
     Driver, DriverConfig, GenerationOutput, Health, ModelStatus, Reply, RequestEvent,

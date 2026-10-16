@@ -1,7 +1,7 @@
 # Runtime driver and serving design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P5. Steps 1–3 are implemented.
+Covers `todo.md` P5. Steps 1–4 are implemented.
 
 ## Goal
 
@@ -91,8 +91,15 @@ touching `Executor`. This is P5's completion criterion.
    gauges lagging terminal events, which led to publishing before each one;
    the driver and lifecycle suites then passed 1,760 runs, 960 of them under
    CPU contention.
-4. Native HTTP endpoints with server-sent events and disconnect-cancels;
-   `ola serve` and `make serve`.
+4. **Native HTTP.** **Done.** `http::router` and `http::serve` (axum,
+   HTTP/1). Malformed bodies are transport errors answered without reaching
+   the driver; each `ServeError` has its own status and stable `kind`. A
+   closed connection cancels the request: for streams because writes fail
+   and the stream (and its handle) is dropped, and for JSON requests because
+   hyper watches the read side and drops the handler; both are tested over
+   real sockets. `ola serve` drains on Ctrl-C, and `make serve` wraps it. A
+   live run against the tiny-Llama fixture streamed text matching the final
+   result and drained cleanly.
 5. `/v1/completions`; end-to-end streaming, cancellation, overload, failure,
    and shutdown tests, including the tiny-Llama fixture; docs.
 

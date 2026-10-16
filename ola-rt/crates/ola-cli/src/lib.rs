@@ -1,8 +1,11 @@
-//! Command-line frontend for the OlaRT experiment registry.
+//! Command-line frontend for OlaRT experiments and serving.
 //!
 //! The terminal workbench and this CLI share `ola_bench::ExperimentRegistry`,
-//! so a named experiment runs identically from either. Exit codes: `0`
-//! success, `1` a comparison found a regression, `2` usage or run errors.
+//! so a named experiment runs identically from either. `ola serve` serves a
+//! model over the `ola-serve` HTTP API. Exit codes: `0` success, `1` a
+//! comparison found a regression, `2` usage or run errors.
+
+mod serve;
 
 use std::{io::Write, path::PathBuf};
 
@@ -27,6 +30,8 @@ const USAGE: &str = "usage:
                          [--results-dir DIR] [--json]
   ola experiment compare <baseline.json> <candidate.json>
                          [--threshold FRACTION] [--allow-workload-mismatch]
+  ola serve --model DIR [--backend cpu|wgpu|cuda] [--name ID] [--addr HOST:PORT]
+            [--max-active N] [--max-in-flight N] [--drain-secs S]
 
 Exit codes: 0 success, 1 regression found by compare, 2 error.";
 
@@ -45,6 +50,7 @@ pub fn run(args: impl IntoIterator<Item = String>, out: &mut impl Write) -> u8 {
         ["experiment", "compare", baseline, candidate, rest @ ..] => {
             compare(baseline, candidate, rest, out)
         }
+        ["serve", rest @ ..] => serve::serve(rest, out),
         ["--help" | "-h" | "help"] | [] => {
             let _ = writeln!(out, "{USAGE}");
             Ok(EXIT_OK)

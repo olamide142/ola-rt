@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 20:56 BST (Europe/London)
+**Last updated:** 2026-10-16 21:52 BST (Europe/London)
 
-**Source revision:** working tree based on `bdeade4` on `master`
+**Source revision:** working tree based on `dac3969` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), and P4 (experiment
@@ -10,8 +10,9 @@ framework) are complete; every benchmark and experiment is a registered
 experiment with a versioned, interval-carrying report that the workbench and
 the `ola` CLI run identically. P5 (runtime driver and serving) is in
 progress: a driver thread with streaming, cancellable request handles and
-bounded admission, bounded retention, health and readiness, and draining
-shutdown work; HTTP is not yet built. Current branch commits are
+bounded admission, bounded retention, health and readiness, draining
+shutdown, and a native HTTP API with server-sent events (`ola serve`) work;
+the OpenAI-compatible endpoint remains. Current branch commits are
 not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -178,7 +179,7 @@ performance claim.
 | Page-native decode attention | Working reference | Stable online softmax consumes K/V pages directly |
 | Fused accelerator attention | Not implemented | Page traversal currently uses portable Burn tensor operations |
 | Continuous batching | Tensor foundation working | Compatible same-model variable-length prefill and decode are tensorized; decode page traversal remains request-local |
-| Production server | Not implemented | No HTTP endpoints or OpenAI-compatible API yet |
+| Production server | Native API working | `ola serve`: health, readiness, models, JSON or server-sent-event generation, request status and cancellation, disconnect-cancels, distinct error statuses, drain on Ctrl-C; no OpenAI-compatible endpoint, auth, or TLS yet |
 
 ## Implemented system
 
@@ -370,6 +371,8 @@ performance claim.
 
 ### `ola-cli`
 
+- `ola serve --model DIR`: loads a Llama artifact with memory-aware
+  admission and serves the HTTP API, draining on Ctrl-C (`make serve`).
 - `ola` binary: `experiment list`, `experiment run` (model, backend,
   parameter overrides, results directory, JSON), and `experiment compare`
   (exit 1 on a regression, 2 on an error). Wrapped by `make experiments` and
@@ -413,6 +416,10 @@ performance claim.
 - `drain(grace)` finishes accepted work until a deadline on the driver's
   clock; `shutdown()` stops at once; both return the executor.
 - `MonotonicClock` and `ManualClock` (`ola-core`) stamp arrivals and steps.
+- `http` (axum): `/health`, `/ready`, `/v1/models`, `/v1/generate` (JSON or
+  server-sent events), and `GET`/`DELETE /v1/requests/{id}`; malformed
+  bodies are transport errors; each serving error has its own status and
+  stable kind; closing a connection cancels, streaming or not.
 
 ### `ola-ui`
 
@@ -448,7 +455,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 234 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 242 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 5
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -459,7 +466,11 @@ At the working tree recorded above:
   making cancellation and shutdown races deterministic. The driver and
   lifecycle suites (15 tests) passed 1,760 runs, 960 of them under CPU
   contention, after stress runs exposed and fixed health gauges lagging
-  terminal events.
+  terminal events. The HTTP suite (8 tests over real sockets) passed 390
+  runs, 240 under contention.
+- A live `ola serve` run on the tiny-Llama fixture answered health, models,
+  JSON and streamed generation (deltas equal to the final text), and
+  drained cleanly on Ctrl-C.
 - `make test-fixture` against the pinned artifact (at the P4 close): **5 passed** — the model
   experiments' conformance, scalar-oracle
   logits within `2e-5`, the UI integration, planned multi-request execution
@@ -619,7 +630,8 @@ and `TOKENS` variables.
 - Checkpoint loading accepts one SafeTensors file only.
 - RoPE scaling, tied embeddings, projection biases, and non-SiLU Llama variants
   are rejected.
-- The serving layer has no HTTP transport yet.
+- The HTTP server has no OpenAI-compatible endpoint, authentication, TLS,
+  or HTTP/2, and serves one model per process.
 - Benchmark probes are foundations, not publication-quality performance claims.
 - Scheduling comparisons default to an illustrative cost model and a
   synthetic model. `cost-calibration` can now supply a measured cost model,
@@ -657,7 +669,8 @@ and `TOKENS` variables.
    - retain per-step numerical comparison with the full-sequence oracle.
 
 4. **Serving and experiment infrastructure**
-   - finish P5: HTTP with server-sent events and `/v1/completions`.
+   - finish P5: `/v1/completions` and end-to-end serving tests on the
+     fixture.
 
 ## Update protocol
 
@@ -671,6 +684,11 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 21:52 BST — working tree on `dac3969`:** P5 step 4: native HTTP API
+  (axum) with server-sent events, distinct error statuses, and
+  disconnect-cancels for streaming and JSON requests; `ola serve` and
+  `make serve`.
 
 - **2026-10-16 20:56 BST — working tree on `bdeade4`:** P5 step 3: bounded
   finished-request retention, lock-free health and readiness with

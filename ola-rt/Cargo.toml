@@ -22,11 +22,13 @@ rust-version = "1.95"
 [workspace.dependencies]
 # Keep the foundation adapter lean. Additional accelerator features must be
 # enabled deliberately by the model/execution work that needs them.
+axum = { version = "0.8.8", default-features = false, features = ["http1", "json", "tokio"] }
 burn = { version = "0.22.0", default-features = false, features = ["std", "flex", "extension"] }
 burn-backend = { version = "0.22.0", default-features = false }
 burn-cubecl = { version = "0.22.0", default-features = false }
 burn-store = { version = "0.22.0", default-features = false, features = ["std", "safetensors", "pytorch"] }
 crossterm = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
 ola-cli = { path = "crates/ola-cli" }

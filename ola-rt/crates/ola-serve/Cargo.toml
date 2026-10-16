@@ -6,13 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+axum.workspace = true
+futures-util.workspace = true
 ola-core.workspace = true
 ola-model.workspace = true
 ola-runtime.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "net"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "net", "rt", "rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

@@ -8,15 +8,16 @@ TOKENS ?= 8
 RESULTS_DIR ?=
 ID ?=
 SET ?=
+ADDR ?= 127.0.0.1:8080
 
 .DEFAULT_GOAL := help
 
 .PHONY: help fmt fmt-check check test clippy doc verify \
 	check-wgpu check-cuda gpu-info ui ui-wgpu llama llama-wgpu \
-	test-fixture test-gpu-fixture require-model experiments experiment require-id
+	test-fixture test-gpu-fixture require-model experiments experiment require-id serve
 
 help: ## Show available commands and configurable variables.
-	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results ID=experiment-id SET=\"key=value ...\""}' Makefile
+	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results ID=experiment-id SET=\"key=value ...\" ADDR=127.0.0.1:8080"}' Makefile
 
 fmt: ## Format every Rust crate.
 	$(CARGO) fmt --manifest-path $(MANIFEST) --all
@@ -71,6 +72,9 @@ experiments: ## List registered experiments, their kinds, and parameters.
 
 experiment: require-id ## Run experiment ID (MODEL, SET="key=value ...", RESULTS_DIR optional).
 	$(CARGO) run --manifest-path $(MANIFEST) -p ola-cli -- experiment run "$(ID)" $(if $(MODEL),--model "$(MODEL)",) $(foreach pair,$(SET),--set "$(pair)") $(if $(RESULTS_DIR),--results-dir "$(RESULTS_DIR)",)
+
+serve: require-model ## Serve MODEL over HTTP at ADDR; Ctrl-C drains in-flight requests.
+	$(CARGO) run --manifest-path $(MANIFEST) -p ola-cli -- serve --model "$(MODEL)" --addr "$(ADDR)"
 
 require-id:
 	@test -n "$(ID)" || { echo "ID=<experiment-id> is required; see make experiments" >&2; exit 2; }

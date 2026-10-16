@@ -125,10 +125,10 @@ Design: `ola-rt/crates/ola-serve/SERVING.md`.
 - [x] Expose process health.
 - [x] Expose readiness to accept work.
 - [x] Expose loaded-model state.
-- [ ] Add a minimal HTTP generation endpoint.
-- [ ] Add streaming HTTP responses.
+- [x] Add a minimal HTTP generation endpoint.
+- [x] Add streaming HTTP responses.
 - [ ] Add an OpenAI-compatible boundary after the native API stabilizes.
-- [ ] Keep transport, runtime, model, admission, and execution errors distinct.
+- [x] Keep transport, runtime, model, admission, and execution errors distinct.
 - [x] Add graceful shutdown and in-flight request handling.
 - [ ] Test streaming, cancellation, overload, failure, and shutdown.
 

@@ -101,6 +101,13 @@ fn errors_exit_with_code_two() {
     assert_eq!(code, EXIT_ERROR);
     let (code, _) = ola(&["bogus"]);
     assert_eq!(code, EXIT_ERROR);
+
+    let (code, output) = ola(&["serve"]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(output.contains("serve needs --model DIR"));
+    let (code, output) = ola(&["serve", "--model", "x", "--max-active", "0"]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(output.contains("--max-active expects a positive integer"));
 }
 
 #[test]
