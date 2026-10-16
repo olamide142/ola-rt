@@ -18,12 +18,13 @@ Last reviewed: 2026-10-16
 ## P1: Execution-plan IR
 
 Keep this runtime-focused rather than starting with a full model/compiler IR.
+Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 
-- [ ] Define `ExecutionPlan` responsibilities and boundaries.
-- [ ] Represent selected requests and deterministic ordering.
-- [ ] Represent prefill, continued-prefill, and decode phases.
-- [ ] Represent tensor groups and individual fallbacks.
-- [ ] Represent real input and padding positions.
+- [x] Define `ExecutionPlan` responsibilities and boundaries.
+- [x] Represent selected requests and deterministic ordering.
+- [x] Represent prefill, continued-prefill, and decode phases.
+- [x] Represent tensor groups and individual fallbacks.
+- [x] Represent real input and padding positions.
 - [ ] Represent request-local KV growth and release actions.
 - [ ] Represent model, backend/device, and kernel selections.
 - [ ] Record token, memory, padding, and invocation-cost estimates.
@@ -31,7 +32,7 @@ Keep this runtime-focused rather than starting with a full model/compiler IR.
 - [ ] Validate plans before lifecycle, session, or KV mutation.
 - [ ] Preserve deterministic events when execution is regrouped.
 - [ ] Add a stable serialized/report representation.
-- [ ] Test duplicate, stale, invalid, and over-capacity plans.
+- [x] Test duplicate, stale, invalid, and over-capacity plans.
 - [ ] Compare planned execution against the single-request correctness path.
 
 Done when one iteration can be explained by a complete, validated plan before model execution begins.
