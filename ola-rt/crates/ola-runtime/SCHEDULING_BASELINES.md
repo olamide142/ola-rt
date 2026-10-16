@@ -1,7 +1,7 @@
 # Scheduling baselines design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–5 are
+Covers `todo.md` P3 and builds on `EXECUTION_POLICY.md`. Steps 1–6 are
 implemented.
 
 ## Goal
@@ -209,7 +209,15 @@ Each step keeps `make verify` and `make test-fixture` green.
    misses more than FIFO under overload, the known EDF domino effect.
    Empty classes are omitted from summaries.
 6. **Isolation and equivalence.** Add the isolation matrix, synthetic output
-   equivalence, and the fixture equivalence test.
+   equivalence, and the fixture equivalence test. **Done.**
+   `run_perturbed_trial` applies `Perturbation::{Cancel, SubmitInvalid}`
+   mid-run, and runs now report end-of-trial live sessions and KV. Under
+   FIFO, priority, EDF, SJF, and backfill, cancelling a running and a
+   queued request, injecting an invalid request, and mixing in impossible
+   requests leave every other request's output unchanged and leak nothing.
+   The fixture test `scheduling_policies_preserve_real_model_outputs` checks
+   the same equivalence on tiny Llama, and asserts the policies produced at
+   least three distinct admission orders.
 7. **Surface.** Add the UI experiment and README sections, and update
    `progress_report.md`.
 

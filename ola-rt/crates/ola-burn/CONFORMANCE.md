@@ -124,3 +124,10 @@ equal those it produces when run alone. The test also asserts that it
 exercised tensor invocations, continued prefill, budget deferral, and
 predicted slot reuse, and that Llama never fell back from a declared tensor
 hook. It runs with the other fixture tests (`make test-fixture`).
+
+`llama::factory::tests::scheduling_policies_preserve_real_model_outputs`
+runs five requests with differing priorities, deadlines, and lengths under
+FIFO, priority, shortest-job-first, earliest-deadline-first, and
+memory-aware backfill (two slots, two-token chunks). Every policy must
+reproduce each request's single-request output, and at least three distinct
+admission orders must occur, so the check cannot pass vacuously.

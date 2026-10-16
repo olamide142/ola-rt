@@ -177,6 +177,40 @@ pub struct SchedulingRun {
     pub iterations: Vec<TrialIteration>,
     /// Virtual time when the trial stopped.
     pub makespan_micros: u64,
+    /// Outcomes of requests injected by perturbations, in injection order.
+    pub injected: Vec<TrialOutcome>,
+    /// Live sessions when the trial stopped.
+    pub final_live_requests: usize,
+    /// KV bytes still reserved when the trial stopped.
+    pub final_reserved_kv_bytes: u64,
+    /// Physical KV bytes still in use when the trial stopped.
+    pub final_kv_cache_bytes: u64,
+}
+
+/// A change applied while a trial runs, for isolation experiments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Perturbation {
+    /// Cancel a trace request at a virtual time if it is queued or running
+    /// then.
+    Cancel {
+        /// Trace position of the request.
+        trace_index: usize,
+        /// Virtual time of the cancellation.
+        at_micros: u64,
+    },
+    /// Submit a request the synthetic model cannot prepare (text input).
+    SubmitInvalid {
+        /// Virtual arrival time.
+        at_micros: u64,
+    },
+}
+
+impl Perturbation {
+    const fn at_micros(self) -> u64 {
+        match self {
+            Self::Cancel { at_micros, .. } | Self::SubmitInvalid { at_micros } => at_micros,
+        }
+    }
 }
 
 /// Failure to run a scheduling trial.
@@ -242,6 +276,30 @@ pub fn run_scheduling_trial<P>(
 where
     P: ExecutionPolicy + 'static,
 {
+    run_perturbed_trial(trace, policy, config, &[])
+}
+
+/// Like [`run_scheduling_trial`], applying each perturbation at the first
+/// iteration boundary at or after its time. A perturbation whose time is
+/// after the trial ends is not applied.
+///
+/// # Errors
+///
+/// Returns [`SimulationError`] if the executor rejects the configuration, a
+/// plan, or a perturbation.
+pub fn run_perturbed_trial<P>(
+    trace: &SchedulingTrace,
+    policy: P,
+    config: &SimulationConfig,
+    perturbations: &[Perturbation],
+) -> Result<SchedulingRun, SimulationError>
+where
+    P: ExecutionPolicy + 'static,
+{
+    let mut pending = perturbations.to_vec();
+    pending.sort_by_key(|perturbation| perturbation.at_micros());
+    let mut pending = pending.into_iter().peekable();
+    let mut injected_ids = Vec::new();
     let descriptor = policy.descriptor();
     let mut executor =
         Executor::with_max_active_requests(Runtime::default(), config.max_active_requests)?
@@ -266,6 +324,29 @@ where
                 trace_request_spec(request),
                 Timestamp::from_micros(request.arrival_micros),
             )?);
+        }
+        while let Some(perturbation) = pending.next_if(|next| next.at_micros() <= clock) {
+            match perturbation {
+                Perturbation::Cancel { trace_index, .. } => {
+                    if let Some(&request_id) = ids.get(trace_index) {
+                        let live = executor.state().request(request_id).is_some_and(|record| {
+                            matches!(
+                                record.status,
+                                RequestStatus::Queued | RequestStatus::Running
+                            )
+                        });
+                        if live {
+                            executor.cancel(request_id, Timestamp::from_micros(clock))?;
+                        }
+                    }
+                }
+                Perturbation::SubmitInvalid { .. } => {
+                    injected_ids.push(executor.submit(
+                        RequestSpec::text(MODEL_ID, "not tokens"),
+                        Timestamp::from_micros(clock),
+                    )?);
+                }
+            }
         }
         let next_arrival = trace
             .requests
@@ -391,6 +472,22 @@ where
         })
         .collect();
 
+    let injected = injected_ids
+        .iter()
+        .map(|request_id| {
+            match executor
+                .state()
+                .request(*request_id)
+                .map(|record| &record.status)
+            {
+                Some(RequestStatus::Completed) => TrialOutcome::Completed,
+                Some(RequestStatus::Failed(_)) => TrialOutcome::Failed,
+                Some(RequestStatus::Cancelled) => TrialOutcome::Cancelled,
+                _ => TrialOutcome::Unfinished,
+            }
+        })
+        .collect();
+
     Ok(SchedulingRun {
         policy: descriptor,
         trace: trace.name,
@@ -398,6 +495,10 @@ where
         requests,
         iterations,
         makespan_micros: clock,
+        injected,
+        final_live_requests: executor.active_request_count(),
+        final_reserved_kv_bytes: executor.reserved_kv_bytes(),
+        final_kv_cache_bytes: executor.state().memory.kv_cache_bytes,
     })
 }
 
@@ -557,5 +658,123 @@ mod tests {
                 .iter()
                 .any(|request| request.outcome == TrialOutcome::Unfinished)
         );
+    }
+
+    /// A named constructor, so each scenario gets a fresh policy.
+    type NamedPolicy = (&'static str, Box<dyn Fn() -> ComposedPolicy>);
+
+    fn scheduler_matrix() -> Vec<NamedPolicy> {
+        vec![
+            ("fifo", Box::new(fifo)),
+            (
+                "priority",
+                Box::new(|| fifo().with_scheduler(ola_runtime::PriorityScheduler::new())),
+            ),
+            (
+                "edf",
+                Box::new(|| fifo().with_scheduler(ola_runtime::EarliestDeadlineFirst)),
+            ),
+            (
+                "sjf",
+                Box::new(|| fifo().with_scheduler(ShortestJobFirst::new(JobCost::Prompt))),
+            ),
+            (
+                "backfill",
+                Box::new(|| {
+                    fifo().with_head_of_line(ola_runtime::HeadOfLine::Backfill { max_skipped: 4 })
+                }),
+            ),
+        ]
+    }
+
+    fn assert_no_leaks(run: &SchedulingRun, label: &str) {
+        assert_eq!(
+            (
+                run.final_live_requests,
+                run.final_reserved_kv_bytes,
+                run.final_kv_cache_bytes
+            ),
+            (0, 0, 0),
+            "{label} leaked a slot or KV memory"
+        );
+    }
+
+    #[test]
+    fn cancellation_and_failure_are_isolated_under_every_scheduler() {
+        let trace = SchedulingTrace::overload(TraceParameters {
+            requests: 40,
+            ..PARAMETERS
+        });
+        let config = SimulationConfig::default();
+        for (name, policy) in scheduler_matrix() {
+            let baseline = run_scheduling_trial(&trace, policy(), &config).unwrap();
+            assert_no_leaks(&baseline, name);
+            // Cancel one request mid-flight and one while it still waits.
+            let running = baseline
+                .requests
+                .iter()
+                .find(|request| {
+                    request.completed_micros > request.started_micros.map(|start| start + 1)
+                })
+                .unwrap();
+            let queued = baseline
+                .requests
+                .iter()
+                .find(|request| {
+                    request.trace_index != running.trace_index
+                        && request.started_micros.unwrap() > request.arrival_micros + 1
+                })
+                .unwrap();
+            let perturbations = [
+                Perturbation::Cancel {
+                    trace_index: running.trace_index,
+                    at_micros: running.started_micros.unwrap() + 1,
+                },
+                Perturbation::Cancel {
+                    trace_index: queued.trace_index,
+                    at_micros: queued.arrival_micros + 1,
+                },
+                Perturbation::SubmitInvalid {
+                    at_micros: baseline.makespan_micros / 2,
+                },
+            ];
+
+            let perturbed = run_perturbed_trial(&trace, policy(), &config, &perturbations).unwrap();
+
+            assert_no_leaks(&perturbed, name);
+            assert_eq!(perturbed.injected, vec![TrialOutcome::Failed], "{name}");
+            for (request, unperturbed) in perturbed.requests.iter().zip(&baseline.requests) {
+                if [running.trace_index, queued.trace_index].contains(&request.trace_index) {
+                    assert_eq!(request.outcome, TrialOutcome::Cancelled, "{name}");
+                } else {
+                    assert_eq!(request.outcome, TrialOutcome::Completed, "{name}");
+                    assert_eq!(request.output_tokens, unperturbed.output_tokens, "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn impossible_requests_are_isolated_under_every_scheduler() {
+        let config = SimulationConfig::default();
+        let trace = SchedulingTrace::impossible(PARAMETERS, config.kv.capacity_tokens());
+        for (name, policy) in scheduler_matrix() {
+            let run = run_scheduling_trial(&trace, policy(), &config).unwrap();
+
+            assert_no_leaks(&run, name);
+            for (request, traced) in run.requests.iter().zip(&trace.requests) {
+                let impossible = traced.prompt_tokens > config.kv.capacity_tokens();
+                let expected = if impossible {
+                    TrialOutcome::Rejected
+                } else {
+                    TrialOutcome::Completed
+                };
+                assert_eq!(
+                    request.outcome, expected,
+                    "{name}, trace index {}",
+                    request.trace_index
+                );
+            }
+        }
     }
 }

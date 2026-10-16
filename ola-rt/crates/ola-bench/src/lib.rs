@@ -43,8 +43,8 @@ pub use scheduling_summary::{
     SchedulingSummary, SlowdownSummary, compare_schedulers, isolated_end_to_end, summarize_run,
 };
 pub use simulation::{
-    CostModel, SchedulingRun, SimulationConfig, SimulationError, TrialIteration, TrialOutcome,
-    TrialRequest, run_scheduling_trial, trace_request_spec,
+    CostModel, Perturbation, SchedulingRun, SimulationConfig, SimulationError, TrialIteration,
+    TrialOutcome, TrialRequest, run_perturbed_trial, run_scheduling_trial, trace_request_spec,
 };
 pub use synthetic::{KvGeometry, synthetic_artifact, synthetic_prompt, synthetic_token};
 pub use trace::{SchedulingTrace, TraceParameters, TraceRequest};

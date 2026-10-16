@@ -460,6 +460,119 @@ mod tests {
         );
     }
 
+    /// Every scheduling baseline must change only *when* requests run, never
+    /// what they produce. Priorities, deadlines, and lengths are chosen so
+    /// that each policy admits the queue in a different order.
+    #[test]
+    #[ignore = "requires the pinned external Hugging Face conformance fixture"]
+    fn scheduling_policies_preserve_real_model_outputs() {
+        use ola_core::{
+            GenerationConfig, ModelDescriptor, Priority, RequestId, RequestSpec, Timestamp,
+        };
+        use ola_runtime::{
+            ComposedPolicy, EarliestDeadlineFirst, ExecutionPolicy, Executor, HeadOfLine, JobCost,
+            MemoryAwareAdmission, PriorityScheduler, Runtime, ShortestJobFirst,
+        };
+
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in CONFORMANCE.md");
+        let artifact = LlamaFactory::new(Device::flex())
+            .load_local(directory)
+            .unwrap();
+        // (prompt, output limit, priority, deadline)
+        let workload = [
+            ("Once upon a time there was", 6, 0, Some(900)),
+            ("Hello world", 5, 5, Some(100)),
+            ("The quick brown fox jumps", 2, 0, None),
+            ("a", 4, 5, Some(50)),
+            ("Hello", 3, 0, Some(400)),
+        ];
+        let request =
+            |(prompt, max_new_tokens, priority, deadline): (&str, usize, i32, Option<u64>)| {
+                let mut request = RequestSpec::text("tiny", prompt);
+                request.generation = GenerationConfig {
+                    max_new_tokens,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: Some(0),
+                };
+                request.priority = Priority::new(priority);
+                request.deadline = deadline.map(Timestamp::from_micros);
+                request
+            };
+        let run = |executor: &mut Executor, ids: &[RequestId]| {
+            let mut first_ranking = None;
+            for step in 1..=500 {
+                if ids.iter().all(|id| executor.result(*id).is_some()) {
+                    return first_ranking.expect("at least one iteration ran");
+                }
+                let iteration = executor
+                    .step_iteration(Timestamp::from_micros(step))
+                    .unwrap();
+                first_ranking.get_or_insert(iteration.decision.ranking.ranked);
+            }
+            panic!("workload did not complete within 500 iterations");
+        };
+
+        let oracle = workload
+            .iter()
+            .map(|entry| {
+                let mut executor = Executor::default();
+                executor
+                    .register_model(ModelDescriptor::language("tiny", "llama"), artifact.clone())
+                    .unwrap();
+                let id = executor.submit(request(*entry), Timestamp::ZERO).unwrap();
+                run(&mut executor, &[id]);
+                executor.result(id).unwrap().token_ids.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let base = || ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+        let policies: Vec<Box<dyn ExecutionPolicy>> = vec![
+            Box::new(base()),
+            Box::new(base().with_scheduler(PriorityScheduler::new())),
+            Box::new(base().with_scheduler(ShortestJobFirst::new(JobCost::PromptPlusOutputLimit))),
+            Box::new(base().with_scheduler(EarliestDeadlineFirst)),
+            Box::new(base().with_head_of_line(HeadOfLine::Backfill { max_skipped: 2 })),
+        ];
+        let mut rankings = Vec::new();
+        for policy in policies {
+            let name = policy.descriptor().to_string();
+            let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+                .unwrap()
+                .with_prefill_chunk_size(2)
+                .unwrap()
+                .with_policy(policy);
+            executor
+                .register_model(ModelDescriptor::language("tiny", "llama"), artifact.clone())
+                .unwrap();
+            let ids = workload
+                .iter()
+                .map(|entry| executor.submit(request(*entry), Timestamp::ZERO).unwrap())
+                .collect::<Vec<_>>();
+            let ranking = run(&mut executor, &ids)
+                .into_iter()
+                .map(|id| ids.iter().position(|candidate| *candidate == id).unwrap())
+                .collect::<Vec<_>>();
+            for ((id, expected), entry) in ids.iter().zip(&oracle).zip(&workload) {
+                assert_eq!(
+                    &executor.result(*id).unwrap().token_ids,
+                    expected,
+                    "{name} changed the output for {:?}",
+                    entry.0
+                );
+            }
+            rankings.push(ranking);
+        }
+        rankings.sort();
+        rankings.dedup();
+        assert!(
+            rankings.len() >= 3,
+            "policies should admit in different orders, got {rankings:?}"
+        );
+    }
+
     /// Validates the opt-in GPU backend against the CPU reference on identical
     /// checkpoint weights and input IDs.
     #[cfg(feature = "wgpu")]

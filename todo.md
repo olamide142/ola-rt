@@ -59,7 +59,7 @@ Done when existing FIFO, memory admission, token budgeting, and grouping run thr
 
 Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 
-- [ ] Preserve FIFO as the correctness baseline.
+- [x] Preserve FIFO as the correctness baseline.
 - [x] Add priority scheduling.
 - [x] Add deadline-aware scheduling.
 - [x] Add estimated-size or shortest-job-first scheduling.
@@ -67,7 +67,7 @@ Design: `ola-rt/crates/ola-runtime/SCHEDULING_BASELINES.md`.
 - [x] Add configurable prefill/decode mixing. (`MixedTokenBudgetPolicy`; adaptive budget policy exists, comparison pending.)
 - [ ] Compare fixed and adaptive token budgets.
 - [x] Define starvation and fairness measurements.
-- [ ] Test cancellation, failure, and memory-pressure isolation.
+- [x] Test cancellation, failure, and memory-pressure isolation.
 - [x] Add mixed short/long prompt traces.
 - [x] Add prefill/decode competition traces.
 - [x] Add overload and impossible-request traces.
