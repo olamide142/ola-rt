@@ -1,9 +1,8 @@
 # ExecutionPlan design proposal
 
-Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–3 are
-implemented: decodes and continued prefills run through plan → validate →
-commit and are exposed as `ExecutorIteration::execution_plan`. Admissions
-still use the interleaved path until step 4.
+Status: **accepted** (2026-10-16). Covers `todo.md` P1. Steps 1–4 are
+implemented: every `step_iteration` is planned, validated, and committed as
+one `ExecutionPlan`, exposed as `ExecutorIteration::execution_plan`.
 
 ## Goal
 
@@ -222,7 +221,9 @@ Each step keeps `make verify` and the fixture tests green.
    current admission path. **Done.** Admissions reuse the same grouping and
    execution helpers.
 4. Add `Scheduler::rank` and move admission into the plan using the slot
-   option chosen in problem 1.
+   option chosen in problem 1. **Done.** Final
+   continued-prefill chunks of one-token requests are also predicted
+   releases, matching the historical refill behaviour.
 5. Record plan-versus-execution divergence (mode fallback, EOS-freed slots).
 6. Add the serialized report. Migrate `ola-observe` and the UI from
    `IterationPlan` to `ExecutionPlan` and drop the projection.

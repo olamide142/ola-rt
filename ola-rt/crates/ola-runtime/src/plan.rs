@@ -203,8 +203,10 @@ pub struct ExecutionPlan {
     pub batches: Vec<PlannedBatch>,
     /// Eligible work left for a later iteration.
     pub deferrals: Vec<PlannedDeferral>,
-    /// Decode rows that reach `max_new_tokens`, whose slots and reservations
-    /// this plan has already reused for admission.
+    /// Live requests whose row in this plan must finish them by reaching
+    /// `max_new_tokens`: limit-reaching decodes, and final continued-prefill
+    /// chunks with a one-token limit. Their slots and reservations may be
+    /// reused by admissions in the same plan.
     pub predicted_releases: Vec<RequestId>,
 }
 
@@ -226,6 +228,8 @@ pub struct PrefillView {
     pub cursor: usize,
     /// Total tokenized prompt length.
     pub prompt_tokens: usize,
+    /// Caller output limit.
+    pub max_new_tokens: usize,
     /// KV bytes reserved for the request.
     pub reserved_kv_bytes: u64,
 }
@@ -325,7 +329,8 @@ pub enum PlanError {
     InvalidPositions(RequestId),
     /// Event indices are not exactly `0..n`.
     InvalidEventOrder,
-    /// A predicted release is not a limit-reaching decode row in this plan.
+    /// A predicted release is not a row in this plan that must finish its
+    /// request.
     InvalidRelease(RequestId),
     /// Admissions exceed the slots available after predicted releases.
     SlotCapacity {
@@ -388,7 +393,7 @@ impl fmt::Display for PlanError {
             }
             Self::InvalidRelease(id) => write!(
                 formatter,
-                "request {id:?} is not a limit-reaching decode in this plan"
+                "request {id:?} is not guaranteed to finish in this plan"
             ),
             Self::SlotCapacity {
                 live_after,
@@ -495,7 +500,7 @@ impl ExecutionPlan {
         }
 
         let mut prefilled = BTreeSet::new();
-        let mut decoded = BTreeSet::new();
+        let mut finishing = BTreeSet::new();
         for (index, batch) in self.batches.iter().enumerate() {
             if batch.rows.is_empty() {
                 return Err(PlanError::EmptyBatch(index));
@@ -512,9 +517,24 @@ impl ExecutionPlan {
                         prefilled.insert(row.request_id);
                     }
                     PlannedPhase::Decode => {
-                        decoded.insert(row.request_id);
+                        if view
+                            .decoding
+                            .get(&row.request_id)
+                            .is_some_and(DecodeView::reaches_limit)
+                        {
+                            finishing.insert(row.request_id);
+                        }
                     }
-                    PlannedPhase::ContinuedPrefill => {}
+                    PlannedPhase::ContinuedPrefill => {
+                        if row.final_prompt_chunk
+                            && view
+                                .prefilling
+                                .get(&row.request_id)
+                                .is_some_and(|pending| pending.max_new_tokens <= 1)
+                        {
+                            finishing.insert(row.request_id);
+                        }
+                    }
                 }
             }
         }
@@ -564,11 +584,7 @@ impl ExecutionPlan {
 
         let mut released = BTreeSet::new();
         for request_id in &self.predicted_releases {
-            let reaches_limit = view
-                .decoding
-                .get(request_id)
-                .is_some_and(DecodeView::reaches_limit);
-            if !decoded.contains(request_id) || !reaches_limit || !released.insert(*request_id) {
+            if !finishing.contains(request_id) || !released.insert(*request_id) {
                 return Err(PlanError::InvalidRelease(*request_id));
             }
         }
@@ -724,6 +740,7 @@ mod tests {
                     model_id: model(),
                     cursor: 3,
                     prompt_tokens: 7,
+                    max_new_tokens: 4,
                     reserved_kv_bytes: 100,
                 },
             )]),
@@ -981,6 +998,20 @@ mod tests {
             not_executed.validate(&view()),
             Err(PlanError::InvalidRelease(id(3)))
         );
+    }
+
+    #[test]
+    fn final_prefill_chunks_release_only_one_token_requests() {
+        let mut plan = plan();
+        plan.predicted_releases.push(id(2));
+        assert_eq!(
+            plan.validate(&view()),
+            Err(PlanError::InvalidRelease(id(2)))
+        );
+
+        let mut one_token = view();
+        one_token.prefilling.get_mut(&id(2)).unwrap().max_new_tokens = 1;
+        assert_eq!(plan.validate(&one_token), Ok(()));
     }
 
     #[test]

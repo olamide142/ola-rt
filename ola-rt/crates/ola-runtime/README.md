@@ -50,13 +50,22 @@ same allocation and scheduling experiments.
 `step` intentionally performs at most one model operation: either a queued
 request's prefill or one active request's decode. `step_iteration` is the first
 continuous-batching control-plane boundary: it advances every request that was
-active at iteration entry once, then fills slots released by completions or
-failures. Each token event identifies whether prefill or decode produced it.
+active at iteration entry once, then fills free slots from the scheduler. Each
+token event identifies whether prefill or decode produced it.
+
+Every iteration is first described by an `ExecutionPlan` (see
+`EXECUTION_PLAN.md`), validated against a read-only snapshot, and only then
+committed; `ExecutorIteration::execution_plan` exposes it. Because the plan is
+built before any model runs, a slot is reused in the same iteration only when
+its request must finish by reaching `max_new_tokens`. Slots freed by EOS or
+failure are refilled on the next iteration, and the waiting queue head is
+recorded as a `PlannedDeferral::Slots`.
 
 The iteration path groups selected prefill and decode operations by loaded
-model. A model may implement `CausalModel::prefill_batch` and `decode_batch` to
-pack compatible groups into tensor invocations; models that return `None`
-retain the independent-session correctness path. Prefill batches may contain
+model. A model declares `CausalModel::batch_capabilities` and implements
+`prefill_batch`, `prefill_chunk_batch`, and `decode_batch` to pack compatible
+groups into tensor invocations; models without declared hooks, or hooks that
+return `None`, retain the independent-session correctness path. Prefill batches may contain
 different prompt lengths. Lifecycle events are restored to deterministic
 request order even when backend invocation order groups models differently.
 

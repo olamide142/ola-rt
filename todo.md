@@ -29,8 +29,8 @@ Design: `ola-rt/crates/ola-runtime/EXECUTION_PLAN.md` (slot refill: option C).
 - [ ] Represent model, backend/device, and kernel selections.
 - [ ] Record token, memory, padding, and invocation-cost estimates.
 - [ ] Record deferrals and policy reasons.
-- [ ] Validate plans before lifecycle, session, or KV mutation.
-- [ ] Preserve deterministic events when execution is regrouped.
+- [x] Validate plans before lifecycle, session, or KV mutation.
+- [x] Preserve deterministic events when execution is regrouped.
 - [ ] Add a stable serialized/report representation.
 - [x] Test duplicate, stale, invalid, and over-capacity plans.
 - [ ] Compare planned execution against the single-request correctness path.

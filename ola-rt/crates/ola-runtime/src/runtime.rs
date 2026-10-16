@@ -133,6 +133,23 @@ impl<S: Scheduler> Runtime<S> {
         Ok(Some(id))
     }
 
+    /// Ranks up to `limit` queued requests without changing lifecycle state.
+    pub fn rank_next(&mut self, limit: usize) -> Result<Vec<RequestId>, RuntimeError> {
+        let ranked = self.scheduler.rank(&self.state, limit);
+        let mut seen = std::collections::BTreeSet::new();
+        for id in &ranked {
+            let queued = self
+                .state
+                .requests
+                .get(id)
+                .is_some_and(|record| record.status == RequestStatus::Queued);
+            if ranked.len() > limit || !queued || !seen.insert(*id) {
+                return Err(RuntimeError::InvalidSchedule(*id));
+            }
+        }
+        Ok(ranked)
+    }
+
     /// Starts a scheduler-selected queued request after external admission.
     pub fn start_selected(
         &mut self,

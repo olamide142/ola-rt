@@ -120,6 +120,14 @@ pub enum AdmissionDecision {
 pub trait AdmissionPolicy: Send {
     /// Evaluates one queued request against current observable resources.
     fn decide(&mut self, context: &AdmissionContext) -> AdmissionDecision;
+
+    /// Whether admitted reservations never exceed a model's KV pool.
+    ///
+    /// When true, plan validation rejects admissions that would exceed the
+    /// pool. Permissive policies leave allocation failures to execution.
+    fn enforces_model_kv_capacity(&self) -> bool {
+        false
+    }
 }
 
 /// Compatibility policy that never defers scheduler-selected work.
@@ -139,6 +147,10 @@ impl AdmissionPolicy for UnconstrainedAdmission {
 pub struct MemoryAwareAdmission;
 
 impl AdmissionPolicy for MemoryAwareAdmission {
+    fn enforces_model_kv_capacity(&self) -> bool {
+        true
+    }
+
     fn decide(&mut self, context: &AdmissionContext) -> AdmissionDecision {
         let Some(profile) = context.kv_cache else {
             return AdmissionDecision::Reject(AdmissionReason::MissingKvCacheProfile);

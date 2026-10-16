@@ -5,7 +5,9 @@ use std::{
     num::NonZeroUsize,
 };
 
-use ola_core::{Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp};
+use ola_core::{
+    GenerationConfig, Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp,
+};
 use ola_model::{
     BatchCapabilities, CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError,
     PrefillOutcome, SessionMetrics,
@@ -14,10 +16,10 @@ use ola_model::{
 use crate::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, BatchCandidate,
     BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, DecodeView, ExecutionBatch,
-    ExecutionPlan, FifoScheduler, IterationPlan, PlanError, PlannedBatch, PlannedDeferral,
-    PlannedPhase, PlannedRow, PlanningView, PrefillBatcher, PrefillView, Runtime, RuntimeError,
-    RuntimeState, Scheduler, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
-    UnconstrainedAdmission,
+    ExecutionPlan, FifoScheduler, IterationPlan, LifecycleAction, PlanError, PlannedBatch,
+    PlannedDeferral, PlannedPhase, PlannedRow, PlanningView, PrefillBatcher, PrefillView,
+    QueuedView, Runtime, RuntimeError, RuntimeState, Scheduler, UnboundedBatchPolicy,
+    UnbucketedPrefillBatcher, UnconstrainedAdmission,
 };
 
 /// Final output retained after successful execution.
@@ -114,8 +116,7 @@ pub struct ExecutorIteration {
     pub events: Vec<ExecutorEvent>,
     /// Auditable batch-policy decision for this iteration.
     pub plan: IterationPlan,
-    /// Validated plan for decodes and continued prefills of work that was
-    /// live at the iteration boundary. Admissions are not planned yet.
+    /// Validated plan committed by this iteration.
     pub execution_plan: ExecutionPlan,
     /// Model invocations used to execute the selected plan.
     pub execution_batches: Vec<ExecutionBatch>,
@@ -248,9 +249,12 @@ struct PendingPrefill {
     reserved_kv_bytes: u64,
 }
 
-enum PrefillPreparation {
-    Ready(PendingPrefill),
-    Event(ExecutorEvent),
+/// Inputs prepared while planning an admission and consumed at commit.
+struct PlannedAdmission {
+    model: CausalLanguageModel,
+    prompt_tokens: Vec<u32>,
+    generation: GenerationConfig,
+    max_new_tokens: usize,
 }
 
 #[derive(Default)]
@@ -455,60 +459,22 @@ impl<S: Scheduler> Executor<S> {
 
     /// Advances one deterministic generation iteration.
     ///
-    /// Every request active at entry receives one decode step. Slots freed by
-    /// completion or failure are then filled from the configured scheduler;
-    /// newly admitted requests receive prefill but are not decoded again in the
+    /// The iteration is planned, validated, and committed as one
+    /// [`ExecutionPlan`]. Every request active at entry receives one decode
+    /// step. Free slots, including those of requests that must finish by
+    /// reaching `max_new_tokens`, are filled from the configured scheduler;
+    /// slots freed by EOS or failure are refilled next iteration. Newly
+    /// admitted requests receive prefill but are not decoded again in the
     /// same iteration.
     pub fn step_iteration(&mut self, at: Timestamp) -> Result<ExecutorIteration, ExecutorError> {
         self.validate_iteration_time(at)?;
         let mut plan = IterationPlan::default();
-        let execution_plan = self.plan_live_work(at, &mut plan)?;
+        let (execution_plan, mut admissions) = self.plan_iteration(at, &mut plan)?;
         execution_plan
-            .validate(&self.planning_view())
+            .validate(&self.planning_view(&admissions))
             .map_err(ExecutorError::InvalidPlan)?;
-        let (mut events, mut execution_batches) = self.commit_live_work(&execution_plan, at)?;
-
-        let available_slots = self
-            .max_active_requests
-            .saturating_sub(self.live_request_count());
-        let admission_count = available_slots.min(self.runtime.state().queued_len());
-        let mut pending = Vec::with_capacity(admission_count);
-        let mut admission_events = Vec::new();
-        let mut pending_reserved_kv_bytes = 0_u64;
-        let mut pending_model_reservations = BTreeMap::<ModelId, u64>::new();
-        for index in 0..admission_count {
-            let preparation = self.prepare_next_prefill(
-                at,
-                &mut plan,
-                pending_reserved_kv_bytes,
-                &pending_model_reservations,
-            )?;
-            match preparation {
-                PrefillPreparation::Ready(prepared) => {
-                    pending_reserved_kv_bytes =
-                        pending_reserved_kv_bytes.saturating_add(prepared.reserved_kv_bytes);
-                    *pending_model_reservations
-                        .entry(prepared.model_id.clone())
-                        .or_default() += prepared.reserved_kv_bytes;
-                    pending.push((index, prepared));
-                }
-                PrefillPreparation::Event(event) => {
-                    let deferred = matches!(
-                        event,
-                        ExecutorEvent::Deferred { .. } | ExecutorEvent::BatchDeferred { .. }
-                    );
-                    admission_events.push((index, event));
-                    if deferred {
-                        break;
-                    }
-                }
-            }
-        }
-        let prefill = self.prefill_selected_batch(pending, at)?;
-        admission_events.extend(prefill.indexed_events);
-        admission_events.sort_by_key(|(index, _)| *index);
-        events.extend(admission_events.into_iter().map(|(_, event)| event));
-        execution_batches.extend(prefill.execution_batches);
+        let (mut events, execution_batches) =
+            self.commit_plan(&execution_plan, &mut admissions, at)?;
         if events.is_empty() {
             events.push(ExecutorEvent::Idle);
         }
@@ -578,164 +544,17 @@ impl<S: Scheduler> Executor<S> {
         &self.runtime
     }
 
-    /// Validates, admits, and creates one request-local session without running
-    /// its prompt. Delaying execution lets the iteration group newly admitted
-    /// requests into model-compatible prefill batches.
-    fn prepare_next_prefill(
-        &mut self,
-        at: Timestamp,
-        plan: &mut IterationPlan,
-        pending_reserved_kv_bytes: u64,
-        pending_model_reservations: &BTreeMap<ModelId, u64>,
-    ) -> Result<PrefillPreparation, ExecutorError> {
-        let Some(request_id) = self.runtime.select_next()? else {
-            return Ok(PrefillPreparation::Event(ExecutorEvent::Idle));
-        };
-        let request = self
-            .runtime
-            .state()
-            .request(request_id)
-            .expect("a selected request retains its runtime record")
-            .request
-            .clone();
-        let model_id = request.spec.model.clone();
-        let Some(model) = self.models.get(&model_id).cloned() else {
-            self.runtime.start_selected(request_id, at)?;
-            let event = self.fail_started(
-                request_id,
-                format!("model `{model_id}` has no executable attached"),
-                at,
-            )?;
-            return Ok(PrefillPreparation::Event(event));
-        };
-        let prompt_tokens = match prepare_prompt(&model, &request) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                self.runtime.start_selected(request_id, at)?;
-                let event = self.fail_started(request_id, error.to_string(), at)?;
-                return Ok(PrefillPreparation::Event(event));
-            }
-        };
-        let context = AdmissionContext {
-            request_id,
-            model_id: model_id.clone(),
-            prompt_tokens: prompt_tokens.len(),
-            max_new_tokens: request.spec.generation.max_new_tokens,
-            kv_cache: model.kv_cache_profile(),
-            memory: self.runtime.state().memory,
-            reserved_kv_bytes: self
-                .reserved_kv_bytes()
-                .saturating_add(pending_reserved_kv_bytes),
-            model_reserved_kv_bytes: self.reserved_kv_bytes_for_model(&model_id).saturating_add(
-                pending_model_reservations
-                    .get(&model_id)
-                    .copied()
-                    .unwrap_or(0),
-            ),
-        };
-        let reserved_kv_bytes = match self.admission.decide(&context) {
-            AdmissionDecision::Admit { reserved_kv_bytes } => reserved_kv_bytes,
-            AdmissionDecision::Defer(reason) => {
-                return Ok(PrefillPreparation::Event(ExecutorEvent::Deferred {
-                    request_id,
-                    reason,
-                }));
-            }
-            AdmissionDecision::Reject(reason) => {
-                self.runtime.reject(request_id, reason.to_string(), at)?;
-                return Ok(PrefillPreparation::Event(ExecutorEvent::Rejected {
-                    request_id,
-                    reason,
-                }));
-            }
-        };
-        let candidate = BatchCandidate {
-            request_id,
-            phase: BatchPhase::Prefill,
-            token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
-        };
-        let selected = self.select_batch_candidates(plan, &[candidate])?;
-        if selected.is_empty() {
-            plan.deferred.push(candidate);
-            return Ok(PrefillPreparation::Event(ExecutorEvent::BatchDeferred {
-                request_id,
-                phase: ExecutionPhase::Prefill,
-                token_cost: candidate.token_cost,
-            }));
-        }
-        plan.scheduled.push(candidate);
-
-        let lease = self.runtime.start_selected(request_id, at)?;
-        let session = match model.create_session(request.spec.generation.clone()) {
-            Ok(session) => session,
-            Err(error) => {
-                let event = self.fail_started(lease.request_id, error.to_string(), at)?;
-                return Ok(PrefillPreparation::Event(event));
-            }
-        };
-        Ok(PrefillPreparation::Ready(PendingPrefill {
-            request_id: lease.request_id,
-            model_id,
-            model,
-            session,
-            prompt_tokens,
-            cursor: 0,
-            max_new_tokens: request.spec.generation.max_new_tokens,
-            last_step_at: at,
-            reserved_kv_bytes,
-        }))
-    }
-
-    /// Executes prepared prompts in stable model groups and returns events
-    /// tagged with their original admission positions.
-    fn prefill_selected_batch(
-        &mut self,
-        prepared: Vec<(usize, PendingPrefill)>,
-        at: Timestamp,
-    ) -> Result<BatchOutcome, ExecutorError> {
-        let mut rows = Vec::with_capacity(prepared.len());
-        let mut members = BTreeMap::new();
-        for (event_index, pending) in prepared {
-            let end = pending
-                .cursor
-                .saturating_add(self.next_prefill_chunk_len(&pending));
-            rows.push((
-                pending.model_id.clone(),
-                PlannedRow {
-                    request_id: pending.request_id,
-                    event_index,
-                    positions: pending.cursor..end,
-                    final_prompt_chunk: end == pending.prompt_tokens.len(),
-                },
-            ));
-            members.insert(pending.request_id, pending);
-        }
-        let mut outcome = BatchOutcome::default();
-        for batch in self.plan_prefill_batches(PlannedPhase::Prefill, rows) {
-            let group = batch
-                .rows
-                .iter()
-                .map(|row| {
-                    members
-                        .remove(&row.request_id)
-                        .expect("planned rows come from prepared prompts")
-                })
-                .collect();
-            outcome.extend(self.execute_prefill_batch(&batch, group, at)?);
-        }
-        Ok(outcome)
-    }
-
-    /// Plans decodes and continued prefills for work live at the boundary.
+    /// Plans one complete iteration before anything executes.
     ///
-    /// These operations do not depend on this iteration's outcomes, so they
-    /// are fully described before any model executes. Event indices follow
-    /// candidate order: decodes first, then continued prefills.
-    fn plan_live_work(
+    /// Event indices follow the historical order: decodes, continued
+    /// prefills, then admissions. Slots and reservations of requests that
+    /// must finish by reaching their output limit are reused for admission;
+    /// slots freed by EOS or failure are refilled next iteration.
+    fn plan_iteration(
         &mut self,
         at: Timestamp,
         plan: &mut IterationPlan,
-    ) -> Result<ExecutionPlan, ExecutorError> {
+    ) -> Result<(ExecutionPlan, BTreeMap<RequestId, PlannedAdmission>), ExecutorError> {
         let mut execution_plan = ExecutionPlan {
             generation: self.generation,
             at,
@@ -800,6 +619,7 @@ impl<S: Scheduler> Executor<S> {
                 }
             })
             .collect::<Vec<_>>();
+        let prefill_candidates_len = prefill_candidates.len();
         let selected = self.select_batch_candidates(plan, &prefill_candidates)?;
         let mut prefill_rows = Vec::new();
         for (index, candidate) in prefill_candidates.into_iter().enumerate() {
@@ -817,28 +637,207 @@ impl<S: Scheduler> Executor<S> {
                 .get(&candidate.request_id)
                 .expect("ready prefill requests retain their session");
             let end = pending.cursor.saturating_add(candidate.token_cost);
+            let final_prompt_chunk = end == pending.prompt_tokens.len();
+            if final_prompt_chunk && pending.max_new_tokens <= 1 {
+                execution_plan.predicted_releases.push(candidate.request_id);
+            }
             prefill_rows.push((
                 pending.model_id.clone(),
                 PlannedRow {
                     request_id: candidate.request_id,
                     event_index,
                     positions: pending.cursor..end,
-                    final_prompt_chunk: end == pending.prompt_tokens.len(),
+                    final_prompt_chunk,
                 },
             ));
         }
+        let prefill_count = prefill_candidates_len;
         execution_plan
             .batches
             .extend(self.plan_prefill_batches(PlannedPhase::ContinuedPrefill, prefill_rows));
-        Ok(execution_plan)
+
+        let admissions = self.plan_admissions(
+            plan,
+            &mut execution_plan,
+            decode_count.saturating_add(prefill_count),
+        )?;
+        Ok((execution_plan, admissions))
+    }
+
+    /// Ranks queued work and plans admissions into the remaining slots.
+    ///
+    /// Each ranked request consumes one admission attempt whether it is
+    /// admitted, rejected, or fails preparation. Planning stops at the first
+    /// admission or budget deferral, preserving FIFO head-of-line semantics.
+    fn plan_admissions(
+        &mut self,
+        plan: &mut IterationPlan,
+        execution_plan: &mut ExecutionPlan,
+        first_event_index: usize,
+    ) -> Result<BTreeMap<RequestId, PlannedAdmission>, ExecutorError> {
+        let mut released_total = 0_u64;
+        let mut released_by_model = BTreeMap::<ModelId, u64>::new();
+        for request_id in &execution_plan.predicted_releases {
+            let (model_id, bytes) = if let Some(active) = self.active.get(request_id) {
+                (&active.model_id, active.reserved_kv_bytes)
+            } else {
+                let pending = &self.prefilling[request_id];
+                (&pending.model_id, pending.reserved_kv_bytes)
+            };
+            released_total = released_total.saturating_add(bytes);
+            *released_by_model.entry(model_id.clone()).or_default() += bytes;
+        }
+        let live_after = self
+            .live_request_count()
+            .saturating_sub(execution_plan.predicted_releases.len());
+        let admission_count = self
+            .max_active_requests
+            .saturating_sub(live_after)
+            .min(self.runtime.state().queued_len());
+        let ranked = self.runtime.rank_next(admission_count.saturating_add(1))?;
+
+        let mut admissions = BTreeMap::new();
+        let mut rows = Vec::new();
+        let mut pending_total = 0_u64;
+        let mut pending_by_model = BTreeMap::<ModelId, u64>::new();
+        for (offset, request_id) in ranked.into_iter().enumerate() {
+            if offset == admission_count {
+                execution_plan
+                    .deferrals
+                    .push(PlannedDeferral::Slots { request_id });
+                break;
+            }
+            let event_index = first_event_index.saturating_add(offset);
+            let request = self
+                .runtime
+                .state()
+                .request(request_id)
+                .expect("a ranked request retains its runtime record")
+                .request
+                .clone();
+            let model_id = request.spec.model.clone();
+            let Some(model) = self.models.get(&model_id).cloned() else {
+                execution_plan.lifecycle.push(LifecycleAction::Fail {
+                    request_id,
+                    message: format!("model `{model_id}` has no executable attached"),
+                    event_index,
+                });
+                continue;
+            };
+            let prompt_tokens = match prepare_prompt(&model, &request) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    execution_plan.lifecycle.push(LifecycleAction::Fail {
+                        request_id,
+                        message: error.to_string(),
+                        event_index,
+                    });
+                    continue;
+                }
+            };
+            let model_released = released_by_model.get(&model_id).copied().unwrap_or(0);
+            let model_pending = pending_by_model.get(&model_id).copied().unwrap_or(0);
+            let context = AdmissionContext {
+                request_id,
+                model_id: model_id.clone(),
+                prompt_tokens: prompt_tokens.len(),
+                max_new_tokens: request.spec.generation.max_new_tokens,
+                kv_cache: model.kv_cache_profile(),
+                memory: self.runtime.state().memory,
+                reserved_kv_bytes: self
+                    .reserved_kv_bytes()
+                    .saturating_sub(released_total)
+                    .saturating_add(pending_total),
+                model_reserved_kv_bytes: self
+                    .reserved_kv_bytes_for_model(&model_id)
+                    .saturating_sub(model_released)
+                    .saturating_add(model_pending),
+            };
+            let reserved_kv_bytes = match self.admission.decide(&context) {
+                AdmissionDecision::Admit { reserved_kv_bytes } => reserved_kv_bytes,
+                AdmissionDecision::Defer(reason) => {
+                    execution_plan.deferrals.push(PlannedDeferral::Admission {
+                        request_id,
+                        reason,
+                        event_index,
+                    });
+                    break;
+                }
+                AdmissionDecision::Reject(reason) => {
+                    execution_plan.lifecycle.push(LifecycleAction::Reject {
+                        request_id,
+                        reason,
+                        event_index,
+                    });
+                    continue;
+                }
+            };
+            let candidate = BatchCandidate {
+                request_id,
+                phase: BatchPhase::Prefill,
+                token_cost: self.initial_prefill_chunk_len(&model, prompt_tokens.len()),
+            };
+            if self.select_batch_candidates(plan, &[candidate])?.is_empty() {
+                plan.deferred.push(candidate);
+                execution_plan
+                    .deferrals
+                    .push(budget_deferral(candidate, event_index));
+                break;
+            }
+            plan.scheduled.push(candidate);
+            pending_total = pending_total.saturating_add(reserved_kv_bytes);
+            *pending_by_model.entry(model_id.clone()).or_default() += reserved_kv_bytes;
+            execution_plan.lifecycle.push(LifecycleAction::Admit {
+                request_id,
+                model_id: model_id.clone(),
+                reserved_kv_bytes,
+            });
+            rows.push((
+                model_id,
+                PlannedRow {
+                    request_id,
+                    event_index,
+                    positions: 0..candidate.token_cost,
+                    final_prompt_chunk: candidate.token_cost == prompt_tokens.len(),
+                },
+            ));
+            admissions.insert(
+                request_id,
+                PlannedAdmission {
+                    model,
+                    prompt_tokens,
+                    max_new_tokens: request.spec.generation.max_new_tokens,
+                    generation: request.spec.generation,
+                },
+            );
+        }
+        execution_plan
+            .batches
+            .extend(self.plan_prefill_batches(PlannedPhase::Prefill, rows));
+        Ok(admissions)
     }
 
     /// Snapshot of live work that plans are validated against.
-    fn planning_view(&self) -> PlanningView {
+    fn planning_view(&self, admissions: &BTreeMap<RequestId, PlannedAdmission>) -> PlanningView {
+        let state = self.runtime.state();
         PlanningView {
             generation: self.generation,
             max_active_requests: self.max_active_requests,
-            queued: BTreeMap::new(),
+            queued: state
+                .queued_ids()
+                .filter_map(|request_id| {
+                    let record = state.request(request_id)?;
+                    Some((
+                        request_id,
+                        QueuedView {
+                            model_id: record.request.spec.model.clone(),
+                            prompt_tokens: admissions
+                                .get(&request_id)
+                                .map(|admission| admission.prompt_tokens.len()),
+                        },
+                    ))
+                })
+                .collect(),
             prefilling: self
                 .prefilling
                 .iter()
@@ -849,6 +848,7 @@ impl<S: Scheduler> Executor<S> {
                             model_id: pending.model_id.clone(),
                             cursor: pending.cursor,
                             prompt_tokens: pending.prompt_tokens.len(),
+                            max_new_tokens: pending.max_new_tokens,
                             reserved_kv_bytes: pending.reserved_kv_bytes,
                         },
                     )
@@ -873,6 +873,7 @@ impl<S: Scheduler> Executor<S> {
             model_kv_capacity: self
                 .models
                 .iter()
+                .filter(|_| self.admission.enforces_model_kv_capacity())
                 .filter_map(|(model_id, model)| {
                     model
                         .kv_cache_profile()
@@ -882,29 +883,111 @@ impl<S: Scheduler> Executor<S> {
         }
     }
 
-    /// Executes a validated live-work plan and returns events in plan order.
-    fn commit_live_work(
+    /// Commits a validated plan: lifecycle actions first, then every
+    /// invocation in order. Returns events sorted by planned index.
+    fn commit_plan(
         &mut self,
         plan: &ExecutionPlan,
+        admissions: &mut BTreeMap<RequestId, PlannedAdmission>,
         at: Timestamp,
     ) -> Result<(Vec<ExecutorEvent>, Vec<ExecutionBatch>), ExecutorError> {
         let mut outcome = BatchOutcome::default();
+        let mut admitted = BTreeMap::new();
+        let admit_events = plan
+            .batches
+            .iter()
+            .filter(|batch| batch.phase == PlannedPhase::Prefill)
+            .flat_map(|batch| &batch.rows)
+            .map(|row| (row.request_id, row.event_index))
+            .collect::<BTreeMap<_, _>>();
+        for action in &plan.lifecycle {
+            match action {
+                LifecycleAction::Admit {
+                    request_id,
+                    model_id,
+                    reserved_kv_bytes,
+                } => {
+                    let admission = admissions
+                        .remove(request_id)
+                        .expect("planned admissions retain their prepared inputs");
+                    let lease = self.runtime.start_selected(*request_id, at)?;
+                    match admission.model.create_session(admission.generation) {
+                        Ok(session) => {
+                            admitted.insert(
+                                *request_id,
+                                PendingPrefill {
+                                    request_id: lease.request_id,
+                                    model_id: model_id.clone(),
+                                    model: admission.model,
+                                    session,
+                                    prompt_tokens: admission.prompt_tokens,
+                                    cursor: 0,
+                                    max_new_tokens: admission.max_new_tokens,
+                                    last_step_at: at,
+                                    reserved_kv_bytes: *reserved_kv_bytes,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            let event = self.fail_started(*request_id, error.to_string(), at)?;
+                            outcome
+                                .indexed_events
+                                .push((admit_events[request_id], event));
+                        }
+                    }
+                }
+                LifecycleAction::Reject {
+                    request_id,
+                    reason,
+                    event_index,
+                } => {
+                    self.runtime.reject(*request_id, reason.to_string(), at)?;
+                    outcome.indexed_events.push((
+                        *event_index,
+                        ExecutorEvent::Rejected {
+                            request_id: *request_id,
+                            reason: reason.clone(),
+                        },
+                    ));
+                }
+                LifecycleAction::Fail {
+                    request_id,
+                    message,
+                    event_index,
+                } => {
+                    self.runtime.start_selected(*request_id, at)?;
+                    let event = self.fail_started(*request_id, message.clone(), at)?;
+                    outcome.indexed_events.push((*event_index, event));
+                }
+            }
+        }
         for deferral in &plan.deferrals {
-            if let PlannedDeferral::Budget {
-                request_id,
-                phase,
-                token_cost,
-                event_index,
-            } = deferral
-            {
-                outcome.indexed_events.push((
+            match deferral {
+                PlannedDeferral::Budget {
+                    request_id,
+                    phase,
+                    token_cost,
+                    event_index,
+                } => outcome.indexed_events.push((
                     *event_index,
                     ExecutorEvent::BatchDeferred {
                         request_id: *request_id,
                         phase: execution_phase(*phase),
                         token_cost: *token_cost,
                     },
-                ));
+                )),
+                PlannedDeferral::Admission {
+                    request_id,
+                    reason,
+                    event_index,
+                } => outcome.indexed_events.push((
+                    *event_index,
+                    ExecutorEvent::Deferred {
+                        request_id: *request_id,
+                        reason: reason.clone(),
+                    },
+                )),
+                PlannedDeferral::Slots { .. } => {}
             }
         }
         let planned = plan
@@ -931,7 +1014,7 @@ impl<S: Scheduler> Executor<S> {
                         .collect();
                     self.execute_decode_batch(batch, members, at)?
                 }
-                PlannedPhase::Prefill | PlannedPhase::ContinuedPrefill => {
+                PlannedPhase::ContinuedPrefill => {
                     let members = batch
                         .rows
                         .iter()
@@ -942,6 +1025,30 @@ impl<S: Scheduler> Executor<S> {
                         })
                         .collect();
                     self.execute_prefill_batch(batch, members, at)?
+                }
+                PlannedPhase::Prefill => {
+                    // Rows whose session creation failed already emitted an
+                    // event; the rest still execute together.
+                    let mut batch = batch.clone();
+                    batch
+                        .rows
+                        .retain(|row| admitted.contains_key(&row.request_id));
+                    if batch.rows.is_empty() {
+                        continue;
+                    }
+                    if batch.rows.len() == 1 {
+                        batch.mode = BatchExecutionMode::Individual;
+                    }
+                    let members = batch
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            admitted
+                                .remove(&row.request_id)
+                                .expect("admitted rows retain their sessions")
+                        })
+                        .collect();
+                    self.execute_prefill_batch(&batch, members, at)?
                 }
             };
             outcome.extend(executed);
@@ -1876,7 +1983,7 @@ mod tests {
             self.metrics.kv_cache_bytes += 8;
             Ok(GeneratedToken {
                 id: input_token + 1,
-                is_end_of_sequence: false,
+                is_end_of_sequence: input_token + 1 == TEST_EOS_TOKEN,
             })
         }
 
@@ -1888,6 +1995,9 @@ mod tests {
             self
         }
     }
+
+    /// Decoding this token ends a test sequence early.
+    const TEST_EOS_TOKEN: u32 = 999;
 
     fn artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IncrementModel)
@@ -2660,6 +2770,82 @@ mod tests {
                 ExecutorEvent::Token { .. },
                 ExecutorEvent::BatchDeferred { request_id, phase: ExecutionPhase::Decode, .. },
             ] if *request_id == second
+        ));
+    }
+
+    #[test]
+    fn eos_freed_slots_refill_on_the_next_iteration() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 1).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let early = executor.submit(request("997", 5), Timestamp::ZERO).unwrap();
+        let waiting = executor.submit(request("1", 2), Timestamp::ZERO).unwrap();
+        executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        // EOS cannot be known when the plan is built, so the freed slot is
+        // not reused in the same iteration and the wait is recorded.
+        let finished = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        assert!(matches!(
+            finished.events.as_slice(),
+            [ExecutorEvent::Token { request_id, finished: true, .. }] if *request_id == early
+        ));
+        assert!(finished.execution_plan.predicted_releases.is_empty());
+        assert_eq!(
+            finished.execution_plan.deferrals,
+            vec![PlannedDeferral::Slots {
+                request_id: waiting
+            }]
+        );
+        assert_eq!(finished.queued_requests, 1);
+
+        let refilled = executor.step_iteration(Timestamp::from_micros(30)).unwrap();
+        assert!(matches!(
+            refilled.events.as_slice(),
+            [ExecutorEvent::Token { request_id, phase: ExecutionPhase::Prefill, .. }]
+                if *request_id == waiting
+        ));
+    }
+
+    #[test]
+    fn admissions_and_preparation_failures_are_planned_before_execution() {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let malformed = executor.submit(request("abc", 2), Timestamp::ZERO).unwrap();
+        let admitted = executor.submit(request("1 2", 2), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+
+        let plan = &iteration.execution_plan;
+        assert!(matches!(
+            plan.lifecycle.as_slice(),
+            [
+                LifecycleAction::Fail { request_id: failed, event_index: 0, .. },
+                LifecycleAction::Admit { request_id: started, .. },
+            ] if *failed == malformed && *started == admitted
+        ));
+        assert_eq!(
+            plan.batches,
+            vec![PlannedBatch {
+                phase: PlannedPhase::Prefill,
+                model_id: "tiny".into(),
+                mode: BatchExecutionMode::Individual,
+                rows: vec![PlannedRow {
+                    request_id: admitted,
+                    event_index: 1,
+                    positions: 0..2,
+                    final_prompt_chunk: true,
+                }],
+            }]
+        );
+        assert!(matches!(
+            iteration.events.as_slice(),
+            [
+                ExecutorEvent::Failed { request_id: failed, .. },
+                ExecutorEvent::Token { request_id: started, .. },
+            ] if *failed == malformed && *started == admitted
         ));
     }
 
