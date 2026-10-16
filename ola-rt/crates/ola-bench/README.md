@@ -95,6 +95,32 @@ summaries. Every strategy must preserve output tokens. These are operational
 host measurements, not a wall-clock fairness guarantee or publication-quality
 performance claim.
 
+## Experiment framework
+
+Every benchmark and experiment is an `Experiment` in `ExperimentRegistry`
+(see `EXPERIMENTS.md`). A run produces an `ExperimentReport`
+(`ola-experiment/1`):
+
+- every metric declares its unit, clock (virtual, host, or untimed), and
+  which direction is better;
+- raw samples are kept beside summaries, and summaries are recomputed and
+  checked on every read;
+- each summary carries a seeded bootstrap 95% interval;
+- identity covers experiment and payload version, probe or study, model,
+  device, build (git revision, profile, target, features), workload digest,
+  protocol, and each variant's policy and kernel;
+- `write_new` never overwrites, and `read_compatible` also converts legacy
+  prefill schema-v2 reports.
+
+`compare_reports` lists identity differences and classifies each metric as
+improved or regressed only when intervals separate and the change exceeds a
+threshold; otherwise inconclusive. Probes are labelled not for publication;
+studies must meet minimum repetitions (3, or 5 plus a warm-up in host time).
+`cost-calibration` fits `fixed + per_token·dense + per_call·calls` by least
+squares over a shape grid, and `CostFit::from_report` turns a saved fit into
+a `CostModel` for virtual-time comparisons. The terminal workbench and the
+`ola` CLI (`ola-cli`) are both thin frontends over the registry.
+
 ## Scheduling comparisons
 
 Scheduling policies are compared in virtual time, so every number is exactly

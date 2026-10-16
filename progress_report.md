@@ -1,13 +1,14 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 16:24 BST (Europe/London)
+**Last updated:** 2026-10-16 17:47 BST (Europe/London)
 
-**Source revision:** working tree based on `896b9c9` on `master`
+**Source revision:** working tree based on `f2fd10d` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
-execution policy), and P3 (scheduler and policy baselines) are complete;
-scheduling policies are compared in reproducible virtual time on seeded
-traces; current branch commits are not pushed
+execution policy), P3 (scheduler and policy baselines), and P4 (experiment
+framework) are complete; every benchmark and experiment is a registered
+experiment with a versioned, interval-carrying report that the workbench and
+the `ola` CLI run identically; current branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -143,7 +144,7 @@ performance claim.
 
 | Area | Status | Current capability |
 | --- | --- | --- |
-| Workspace architecture | Working | Nine crates with explicit dependency boundaries |
+| Workspace architecture | Working | Ten crates with explicit dependency boundaries |
 | Core request model | Working | IDs, timestamps, multimodal inputs, generation controls, validation |
 | Model selection | Working | Catalog, model definitions, architecture registry, factories |
 | Runtime lifecycle | Working | Queue, active set, terminal states, timing, model residency checks |
@@ -157,6 +158,8 @@ performance claim.
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
 | Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
+| Experiment framework | Working | `ExperimentRegistry` of nine experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
+| Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
 | Kernel abstraction | First vertical slice | Validated paged-attention contract, stable metadata, and portable Burn reference used by Llama decode |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
@@ -351,6 +354,23 @@ performance claim.
 - Deterministic cost-aware policy analysis exposing candidate estimates,
   selected strategy, and resulting invocation/padding shape.
 
+- Experiment framework (`experiment/`, see `EXPERIMENTS.md`): the
+  `Experiment` trait and `ExperimentRegistry` with descriptors (category,
+  probe or study, clock, requirements, typed parameters); `ExperimentReport`
+  (`ola-experiment/1`) with unit/clock/direction per metric, raw samples,
+  recompute-on-read validation, seeded bootstrap 95% intervals, build and
+  workload identity, and non-overwriting persistence; `compare_reports`;
+  conversion of legacy prefill v2 reports.
+- Least-squares iteration-cost calibration over a batched/split shape grid
+  with bootstrap intervals, convertible to a virtual-time `CostModel`.
+
+### `ola-cli`
+
+- `ola` binary: `experiment list`, `experiment run` (model, backend,
+  parameter overrides, results directory, JSON), and `experiment compare`
+  (exit 1 on a regression, 2 on an error). Wrapped by `make experiments` and
+  `make experiment ID=…`.
+
 ### `ola-observe`
 
 - Read-only observation of executor iterations and retained runtime state.
@@ -408,10 +428,15 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 187 tests, Clippy
-  with warnings denied, and documentation) with zero compiler warnings; 4
+- `make verify`: **passed** (formatting, workspace checks, 212 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 5
   fixture tests ignored by default.
-- `make test-fixture` against the pinned artifact: **4 passed** — scalar-oracle
+- The CLI and the workbench produce identical reports (apart from recording
+  time) for prefill bucketing and the five-seed scheduler study; `ola
+  experiment compare` flags a doubled FIFO p95 as a regression with exit 1
+  and an identical study as clean with exit 0.
+- `make test-fixture` against the pinned artifact: **5 passed** — the model
+  experiments' conformance, scalar-oracle
   logits within `2e-5`, the UI integration, planned multi-request execution
   matching single-request output, and every scheduling baseline reproducing
   single-request outputs on tiny Llama with at least three distinct
@@ -519,6 +544,11 @@ cargo run -p ola-ui
 # Open the UI with local Llama chat
 cargo run -p ola-ui -- --model /path/to/llama-artifact
 
+# List, run, and compare registered experiments
+cargo run -p ola-cli -- experiment list
+cargo run -p ola-cli -- experiment run scheduler-comparison --results-dir results
+cargo run -p ola-cli -- experiment compare base.json candidate.json
+
 # Open the UI with WGPU-backed local Llama chat
 cargo run -p ola-ui --features wgpu -- \
   --backend wgpu --model /path/to/llama-artifact
@@ -566,15 +596,16 @@ and `TOKENS` variables.
   are rejected.
 - The serving layer has no streaming transport or HTTP implementation.
 - Benchmark probes are foundations, not publication-quality performance claims.
-- Scheduling comparisons use an illustrative cost model and a synthetic
-  model. Which budget policy helps depends on the overhead-to-token cost
-  ratio, so conclusions should be re-checked once the cost model is
-  calibrated from measured kernels (P4).
-- Scheduling summaries are in-memory; persisted, versioned scheduling
-  reports belong to P4.
-- Adaptive calibration uses a two-point linear model over p50 prefill-iteration
-  time. It rejects invalid fits but does not yet use multi-shape regression or
-  confidence intervals.
+- Scheduling comparisons default to an illustrative cost model and a
+  synthetic model. `cost-calibration` can now supply a measured cost model,
+  but the scheduling conclusions have not yet been re-run against one.
+- The in-executor adaptive prefill policy still calibrates from two points;
+  the least-squares fit is available to experiments but not yet wired into
+  the default policy.
+- Reports have a kernel-identity field, but no experiment sets it until the
+  kernel track exists.
+- Report comparison treats overlapping intervals as inconclusive; it does
+  not yet run a paired test, so small real changes need more repetitions.
 
 ## Recommended next milestones
 
@@ -583,18 +614,16 @@ and `TOKENS` variables.
      permit it;
    - benchmark chunk-size/fairness tradeoffs under mixed decode and long-prompt
      traces;
-   - expand adaptive calibration to multiple prompt shapes and confidence
-     intervals before considering it as the default policy;
-   - add report-to-report comparisons across models, devices, and revisions;
+   - wire the multi-shape calibration into the adaptive policy before
+     considering it as the default;
    - optimize the request-local portion of tensor-batched paged attention;
    - keep per-request block tables, lifecycle, cancellation, and outputs
      isolated;
    - compare throughput and latency against the single-request oracle.
 
 2. **Measurement and policy experiments**
-   - feed the new observation records into reproducible benchmark summaries;
-   - compare token budgets and prefill/decode mixes under fixed traces;
-   - expose repeatable configurations and results through the workbench.
+   - re-run the scheduler and budget studies against a measured cost model;
+   - gate regressions in CI with `ola experiment compare`.
 
 3. **Paged-attention optimization**
    - benchmark page size and fragmentation tradeoffs;
@@ -604,8 +633,7 @@ and `TOKENS` variables.
 
 4. **Serving and experiment infrastructure**
    - add streaming output and an HTTP boundary;
-   - persist structured benchmark configurations and results;
-   - make UI benchmark and experiment catalogs data-driven.
+   - add a runtime driver that owns the executor loop (P5).
 
 ## Update protocol
 
@@ -619,6 +647,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 17:47 BST — working tree on `f2fd10d`:** Completed P4: the
+  `ola-experiment/1` report with typed metrics, raw samples, recomputed
+  summaries and full identity; seeded bootstrap intervals and
+  `compare_reports`; the experiment registry with all nine benchmarks and
+  experiments ported; legacy prefill v2 import; least-squares cost
+  calibration feeding virtual time; the workbench driven by the registry;
+  and the `ola` CLI with a CLI/UI report-parity test.
 
 - **2026-10-16 16:24 BST — working tree on `896b9c9`:** Completed P3:
   priority, earliest-deadline-first, and shortest-job-first schedulers with

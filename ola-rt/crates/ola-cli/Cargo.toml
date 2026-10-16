@@ -1,0 +1,27 @@
+[package]
+name = "ola-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ola"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["burn/cuda", "ola-burn/cuda"]
+wgpu = ["burn/wgpu", "ola-burn/wgpu"]
+
+[dependencies]
+burn.workspace = true
+ola-bench.workspace = true
+ola-burn.workspace = true
+ola-model.workspace = true
+
+[dev-dependencies]
+ola-ui.workspace = true
+
+[lints]
+workspace = true

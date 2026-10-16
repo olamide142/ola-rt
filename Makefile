@@ -6,15 +6,17 @@ MODEL ?=
 PROMPT ?= Hello
 TOKENS ?= 8
 RESULTS_DIR ?=
+ID ?=
+SET ?=
 
 .DEFAULT_GOAL := help
 
 .PHONY: help fmt fmt-check check test clippy doc verify \
 	check-wgpu check-cuda gpu-info ui ui-wgpu llama llama-wgpu \
-	test-fixture test-gpu-fixture require-model
+	test-fixture test-gpu-fixture require-model experiments experiment require-id
 
 help: ## Show available commands and configurable variables.
-	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results"}' Makefile
+	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results ID=experiment-id SET=\"key=value ...\""}' Makefile
 
 fmt: ## Format every Rust crate.
 	$(CARGO) fmt --manifest-path $(MANIFEST) --all
@@ -63,6 +65,15 @@ test-fixture: require-model ## Run ignored CPU tests against the pinned external
 test-gpu-fixture: require-model ## Run tensor-batch and UI integrations on WGPU.
 	OLA_LLAMA_CONFORMANCE_DIR="$(MODEL)" $(CARGO) test --manifest-path $(MANIFEST) -p ola-burn --features wgpu llama::factory::tests::wgpu_executor_tensor_batches_prefill_and_decode -- --ignored --exact
 	OLA_LLAMA_CONFORMANCE_DIR="$(MODEL)" $(CARGO) test --manifest-path $(MANIFEST) -p ola-ui --features wgpu local::tests::local_wgpu_backend_loads_and_generates_through_the_executor -- --ignored --exact
+
+experiments: ## List registered experiments, their kinds, and parameters.
+	$(CARGO) run --manifest-path $(MANIFEST) -p ola-cli -- experiment list
+
+experiment: require-id ## Run experiment ID (MODEL, SET="key=value ...", RESULTS_DIR optional).
+	$(CARGO) run --manifest-path $(MANIFEST) -p ola-cli -- experiment run "$(ID)" $(if $(MODEL),--model "$(MODEL)",) $(foreach pair,$(SET),--set "$(pair)") $(if $(RESULTS_DIR),--results-dir "$(RESULTS_DIR)",)
+
+require-id:
+	@test -n "$(ID)" || { echo "ID=<experiment-id> is required; see make experiments" >&2; exit 2; }
 
 require-model:
 	@test -n "$(MODEL)" || { echo "MODEL=/path/to/llama-artifact is required" >&2; exit 2; }

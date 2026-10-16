@@ -4720,6 +4720,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ola-cli"
+version = "0.1.0"
+dependencies = [
+ "burn",
+ "ola-bench",
+ "ola-burn",
+ "ola-model",
+ "ola-ui",
+]
+
+[[package]]
 name = "ola-core"
 version = "0.1.0"
 

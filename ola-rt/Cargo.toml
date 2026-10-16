@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ola-bench",
     "crates/ola-burn",
+    "crates/ola-cli",
     "crates/ola-core",
     "crates/ola-kernel",
     "crates/ola-model",
@@ -28,6 +29,7 @@ burn-store = { version = "0.22.0", default-features = false, features = ["std", 
 crossterm = "0.29"
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
+ola-cli = { path = "crates/ola-cli" }
 ola-core = { path = "crates/ola-core" }
 ola-kernel = { path = "crates/ola-kernel" }
 ola-model = { path = "crates/ola-model" }

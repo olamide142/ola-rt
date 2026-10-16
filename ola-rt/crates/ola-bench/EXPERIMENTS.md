@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Steps 1–6 are implemented.
+Covers `todo.md` P4. All seven steps are implemented.
 
 ## Goal
 
@@ -233,7 +233,13 @@ Each step keeps `make verify` and `make test-fixture` green.
    shrank from 1,517 to 1,019 lines; `OLA_SOFTWARE_REVISION` is replaced by
    the build-time revision.
 7. **CLI and parity.** Add `ola-cli` and the UI/CLI parity test, then update
-   documentation and `progress_report.md`.
+   documentation and `progress_report.md`. **Done.**
+   `ola-cli` (binary `ola`) exits 0 on success, 1 when `compare` finds a
+   regression, and 2 on errors; `make experiments` and `make experiment
+   ID=…` wrap it. A test runs prefill bucketing and the scheduler study from
+   both frontends and requires identical reports apart from the recording
+   time; to make that hold, the workbench now records a device only when a
+   model is loaded, as the CLI does.
 
 ## Out of scope for P4
 

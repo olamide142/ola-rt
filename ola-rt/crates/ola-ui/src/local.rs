@@ -385,9 +385,11 @@ fn worker_loop(
     let context = ExperimentContext {
         model: model.clone(),
         model_label: model.as_ref().and(model_name.clone()),
-        device: Some(
-            std::env::var("OLA_BENCH_DEVICE_LABEL").unwrap_or_else(|_| device.label().to_owned()),
-        ),
+        // The device describes the loaded model's backend; model-free
+        // experiments record none, matching the CLI.
+        device: model.as_ref().map(|_| {
+            std::env::var("OLA_BENCH_DEVICE_LABEL").unwrap_or_else(|_| device.label().to_owned())
+        }),
     };
     while let Ok(command) = commands.recv() {
         let event = match command {

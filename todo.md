@@ -81,7 +81,7 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 
 - [x] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
 - [x] Retain raw measurements alongside derived summaries.
-- [ ] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity.
+- [x] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity. (The kernel field exists; nothing sets it until the kernel track.)
 - [x] Generalize versioned persistence beyond prefill reports.
 - [x] Keep report creation non-overwriting by default.
 - [x] Validate schema versions and sample consistency.
@@ -89,11 +89,11 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [x] Report regressions and uncertainty rather than relying on one run.
 - [x] Expand calibration to multiple shapes and confidence intervals.
 - [x] Make UI benchmark and experiment catalogs data-driven.
-- [ ] Run the same named experiments through the CLI and UI.
+- [x] Run the same named experiments through the CLI and UI.
 - [x] Separate simulation-time metrics from host performance.
 - [x] Label operational probes versus publication-quality experiments.
 
-Done when a new policy or kernel comparison requires neither bespoke UI code nor a one-off report schema.
+Done when a new policy or kernel comparison requires neither bespoke UI code nor a one-off report schema. **Met 2026-10-16.**
 
 ## Adaptive execution policy
 
