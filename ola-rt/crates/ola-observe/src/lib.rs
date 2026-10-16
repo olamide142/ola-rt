@@ -504,6 +504,7 @@ mod tests {
                 kv_cache_bytes: 64,
                 phase: ExecutionPhase::Decode,
                 finished: true,
+                at: Timestamp::from_micros(70),
             }],
             execution_plan: ExecutionPlan {
                 batches: vec![PlannedBatch {
@@ -527,6 +528,8 @@ mod tests {
                 mode: BatchExecutionMode::Individual,
                 input_tokens: 1,
                 padding_tokens: 0,
+                started_at: Timestamp::from_micros(70),
+                finished_at: Timestamp::from_micros(70),
             }],
             active_requests: 0,
             queued_requests: 0,
@@ -620,6 +623,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 13,
                 padding_tokens: 3,
+                started_at: Timestamp::from_micros(10),
+                finished_at: Timestamp::from_micros(10),
             }],
             active_requests: 0,
             queued_requests: 0,
@@ -656,6 +661,7 @@ mod tests {
                 kv_cache_bytes: 0,
                 phase: ExecutionPhase::Decode,
                 finished: true,
+                at: Timestamp::from_micros(10),
             }],
             execution_plan: ExecutionPlan::default(),
             decision: DecisionRecord::default(),

@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 22:00 BST (Europe/London)
+**Last updated:** 2026-10-16 22:31 BST (Europe/London)
 
-**Source revision:** working tree based on `e172ea5` on `master`
+**Source revision:** working tree based on `ff89d24` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -11,7 +11,9 @@ benchmark and experiment is a registered experiment with a versioned,
 interval-carrying report; `ola serve` serves a model over a native HTTP API
 and an OpenAI-compatible completions endpoint, with streaming,
 cancellation, backpressure, health, and draining shutdown, and its outputs
-match direct execution on tiny Llama. P6 (observability) is next. Current
+match direct execution on tiny Llama. P6 (observability) is in progress:
+tokens and lifecycle events are now stamped when the model call producing
+them finishes, which corrected one P3 finding. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -456,7 +458,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 245 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 248 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 10
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -487,7 +489,8 @@ At the working tree recorded above:
 - Virtual-time scheduling comparisons (seed 3, 120 requests) are exactly
   reproducible and pin measured effects: priority cuts urgent p95
   completion from 159.4 ms to 23.6 ms; SJF speeds short requests and slows
-  long ones; backfill lowers p50 completion and starvation when the KV pool
+  long ones and, after the P6 timing correction, raises slowdown fairness
+  (0.55 vs FIFO's 0.32); backfill lowers p50 completion and starvation when the KV pool
   binds; EDF reduces deadline misses only under moderate contention.
 - Isolation: cancellation (running and queued), injected failures, and
   impossible requests leave other requests' outputs unchanged and leak no
@@ -630,8 +633,12 @@ and `TOKENS` variables.
   in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
 - Execution plans record the model but not backend/device or kernel choices,
   and do not yet carry the cost-aware grouping policy's estimates or reasons.
-- Inter-token latency currently uses the terminal decode span divided by token
-  gaps; individual token timestamps are not retained yet.
+- Per-token timestamps are retained, but `ola-observe` still reports the
+  averaged inter-token latency until P6 step 2 replaces it with per-gap
+  distributions.
+- Batch timing measures from just before a model call to after its token IDs
+  return to the host; work a backend leaves queued beyond that boundary is
+  not attributed.
 - Finished-request status is kept in memory for a bounded number of
   requests and never persisted.
 - Checkpoint loading accepts one SafeTensors file only.
@@ -694,6 +701,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-16 22:31 BST — working tree on `ff89d24`:** P6 step 1: `Executor::with_clock`
+  times every model invocation and stamps tokens, first token, completion,
+  and failure when the producing invocation finishes; results keep per-token
+  timestamps; the simulator stamps at virtual batch finish. Negative result:
+  the old iteration-start stamping had understated isolated times and
+  reversed the P3 SJF fairness finding (SJF raises fairness: 0.55 vs 0.32).
 
 - **2026-10-16 22:00 BST — working tree on `e172ea5`:** Completed P5: OpenAI-compatible
   `/v1/completions` with streaming, `finish_reason` on results, and

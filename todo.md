@@ -136,7 +136,9 @@ Done when a client can submit, observe, stream, cancel, and retrieve a request w
 
 ## P6: Observability closure
 
-- [ ] Retain per-token timestamps.
+Design: `ola-rt/crates/ola-observe/OBSERVABILITY.md`.
+
+- [x] Retain per-token timestamps. (Stamped when the producing invocation finishes.)
 - [ ] Report real TPOT distributions instead of a terminal-span average.
 - [ ] Record scheduler, admission, batching, and memory choices.
 - [ ] Record model-operation latency with documented boundaries.

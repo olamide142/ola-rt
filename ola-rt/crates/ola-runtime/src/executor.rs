@@ -3,9 +3,12 @@ use std::{
     error::Error,
     fmt,
     num::NonZeroUsize,
+    sync::Arc,
 };
 
-use ola_core::{Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp};
+use ola_core::{
+    Clock, Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp,
+};
 use ola_model::{
     CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, PrefillOutcome,
     SessionMetrics,
@@ -31,6 +34,9 @@ pub struct ExecutionResult {
     pub text: String,
     /// Final model-session measurements captured before cache release.
     pub metrics: SessionMetrics,
+    /// When each token in `token_ids` was produced: the finish time of the
+    /// invocation that selected it.
+    pub token_times: Vec<Timestamp>,
 }
 
 /// Model work represented by a token event.
@@ -72,6 +78,8 @@ pub enum ExecutorEvent {
         phase: ExecutionPhase,
         /// Whether the request completed with this token.
         finished: bool,
+        /// When the token was produced: its invocation's finish time.
+        at: Timestamp,
     },
     /// Model preparation or execution failed and the request became terminal.
     Failed {
@@ -217,6 +225,7 @@ struct ActiveGeneration {
     session: Box<dyn GenerationSession>,
     prompt_tokens: usize,
     generated: Vec<u32>,
+    token_times: Vec<Timestamp>,
     last_token: GeneratedToken,
     max_new_tokens: usize,
     last_step_at: Timestamp,
@@ -283,6 +292,7 @@ pub struct Executor {
     prepared: BTreeMap<RequestId, Result<Vec<u32>, String>>,
     measurements: PolicyMeasurements,
     generation: u64,
+    clock: Option<Arc<dyn Clock>>,
 }
 
 impl Default for Executor {
@@ -308,7 +318,30 @@ impl Executor {
             prepared: BTreeMap::new(),
             measurements: PolicyMeasurements::default(),
             generation: 0,
+            clock: None,
         }
+    }
+
+    /// Reads `clock` around every model invocation.
+    ///
+    /// Each [`ExecutionBatch`] then records when its invocation started and
+    /// finished, and tokens, first-token, completion, and failure times are
+    /// stamped when the invocation that produced them finished rather than
+    /// at the iteration's planning time. The clock must share the epoch of
+    /// the timestamps passed to [`step_iteration`](Self::step_iteration);
+    /// readings earlier than the iteration time are clamped to it.
+    ///
+    /// Without a clock every time in an iteration is its planning time,
+    /// which keeps replays and tests deterministic.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// Returns the clock reading, or `at` without a clock, never earlier
+    /// than `at`.
+    fn now(&self, at: Timestamp) -> Timestamp {
+        self.clock.as_ref().map_or(at, |clock| clock.now().max(at))
     }
 
     /// Wraps a runtime with a bounded number of concurrently live sessions.
@@ -879,6 +912,13 @@ impl Executor {
             .zip(&members)
             .map(|(row, pending)| pending.prompt_tokens[row.positions.clone()].to_vec())
             .collect::<Vec<_>>();
+        // Only a tensor invocation is timed as a whole; individual
+        // invocations below read the clock around each call.
+        let started_at = if batch.mode == BatchExecutionMode::Tensor {
+            self.now(at)
+        } else {
+            at
+        };
         let batched = if batch.mode == BatchExecutionMode::Tensor {
             let prompt_slices = prompts.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let final_chunks = batch
@@ -922,12 +962,15 @@ impl Executor {
                     })
                     .collect();
             }
+            let finished_at = self.now(at);
             outcome.execution_batches.push(ExecutionBatch {
                 phase: BatchPhase::Prefill,
                 request_ids: members.iter().map(|pending| pending.request_id).collect(),
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: batch.input_tokens(),
                 padding_tokens: batch.padding_tokens(),
+                started_at,
+                finished_at,
             });
             for (((row, mut pending), prompt), result) in
                 batch.rows.iter().zip(members).zip(prompts).zip(results)
@@ -935,20 +978,24 @@ impl Executor {
                 if result.is_ok() {
                     pending.cursor = pending.cursor.saturating_add(prompt.len());
                 }
-                let event = self.finish_prefill(pending, result, at)?;
+                let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
         } else {
             for (row, mut pending) in batch.rows.iter().zip(members) {
+                let started_at = self.now(at);
+                let result = execute_prefill_segment(&mut pending, row.input_tokens());
+                let finished_at = self.now(at);
                 outcome.execution_batches.push(ExecutionBatch {
                     phase: BatchPhase::Prefill,
                     request_ids: vec![pending.request_id],
                     mode: BatchExecutionMode::Individual,
                     input_tokens: row.input_tokens(),
                     padding_tokens: 0,
+                    started_at,
+                    finished_at,
                 });
-                let result = execute_prefill_segment(&mut pending, row.input_tokens());
-                let event = self.finish_prefill(pending, result, at)?;
+                let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
         }
@@ -1008,6 +1055,7 @@ impl Executor {
             session: pending.session,
             prompt_tokens: pending.prompt_tokens.len(),
             generated: vec![token.id],
+            token_times: Vec::new(),
             last_token: token,
             max_new_tokens: pending.max_new_tokens,
             last_step_at: at,
@@ -1030,6 +1078,13 @@ impl Executor {
             .map(|active| active.last_token.id)
             .collect::<Vec<_>>();
         let model = members[0].model.clone();
+        // Only a tensor invocation is timed as a whole; individual
+        // invocations below read the clock around each call.
+        let started_at = if batch.mode == BatchExecutionMode::Tensor {
+            self.now(at)
+        } else {
+            at
+        };
         let batched = if batch.mode == BatchExecutionMode::Tensor {
             let mut sessions: Vec<&mut dyn GenerationSession> = Vec::with_capacity(members.len());
             for active in &mut members {
@@ -1056,28 +1111,35 @@ impl Executor {
                     })
                     .collect();
             }
+            let finished_at = self.now(at);
             outcome.execution_batches.push(ExecutionBatch {
                 phase: BatchPhase::Decode,
                 request_ids: members.iter().map(|active| active.request_id).collect(),
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: members.len(),
                 padding_tokens: 0,
+                started_at,
+                finished_at,
             });
             for ((row, active), result) in batch.rows.iter().zip(members).zip(results) {
-                let event = self.finish_decode(active, result, at)?;
+                let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
         } else {
             for (row, mut active) in batch.rows.iter().zip(members) {
+                let started_at = self.now(at);
+                let result = active.session.decode(active.last_token.id);
+                let finished_at = self.now(at);
                 outcome.execution_batches.push(ExecutionBatch {
                     phase: BatchPhase::Decode,
                     request_ids: vec![active.request_id],
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at,
+                    finished_at,
                 });
-                let result = active.session.decode(active.last_token.id);
-                let event = self.finish_decode(active, result, at)?;
+                let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
         }
@@ -1110,6 +1172,7 @@ impl Executor {
     ) -> Result<ExecutorEvent, ExecutorError> {
         let metrics = active.session.metrics();
         active.reserved_kv_bytes = active.reserved_kv_bytes.max(metrics.kv_cache_bytes);
+        active.token_times.push(at);
         let finished =
             active.last_token.is_end_of_sequence || active.generated.len() >= active.max_new_tokens;
         let event = ExecutorEvent::Token {
@@ -1119,6 +1182,7 @@ impl Executor {
             kv_cache_bytes: metrics.kv_cache_bytes,
             phase,
             finished,
+            at,
         };
 
         if finished {
@@ -1134,6 +1198,7 @@ impl Executor {
                     token_ids: active.generated,
                     text,
                     metrics,
+                    token_times: active.token_times,
                 },
             );
             drop(active.session);
@@ -1636,6 +1701,7 @@ mod tests {
                     generated_tokens: 3,
                     kv_cache_bytes: 32,
                 },
+                token_times: [20, 30, 40].map(Timestamp::from_micros).to_vec(),
             })
         );
     }
@@ -1720,6 +1786,105 @@ mod tests {
         assert_eq!(record.status, RequestStatus::Cancelled);
     }
 
+    /// Advances by 10 µs on every reading, so each read is distinguishable.
+    #[derive(Default)]
+    struct TickingClock(std::sync::atomic::AtomicU64);
+
+    impl TickingClock {
+        fn starting_at(micros: u64) -> Arc<Self> {
+            Arc::new(Self(std::sync::atomic::AtomicU64::new(micros)))
+        }
+
+        fn peek(&self) -> Timestamp {
+            Timestamp::from_micros(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    impl Clock for TickingClock {
+        fn now(&self) -> Timestamp {
+            let previous = self.0.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
+            Timestamp::from_micros(previous + 10)
+        }
+    }
+
+    #[test]
+    fn a_clock_stamps_work_when_its_invocation_finishes() {
+        let clock = TickingClock::starting_at(1_000);
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_clock(clock.clone());
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "increment"),
+                individual_artifact(),
+            )
+            .unwrap();
+        let first = executor.submit(request("1 2", 2), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request("5", 2), Timestamp::ZERO).unwrap();
+
+        let admitted = executor.step_iteration(clock.peek()).unwrap();
+        // Individual invocations each get their own interval, in order.
+        let [a, b] = admitted.execution_batches.as_slice() else {
+            panic!("expected two individual prefills");
+        };
+        assert_eq!(
+            (a.started_at, a.finished_at, b.started_at, b.finished_at),
+            (
+                Timestamp::from_micros(1_010),
+                Timestamp::from_micros(1_020),
+                Timestamp::from_micros(1_030),
+                Timestamp::from_micros(1_040),
+            )
+        );
+        assert_eq!(a.latency_micros(), 10);
+        let token_times = admitted
+            .events
+            .iter()
+            .map(|event| match event {
+                ExecutorEvent::Token { request_id, at, .. } => (*request_id, *at),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            token_times,
+            vec![(first, a.finished_at), (second, b.finished_at)]
+        );
+        let timing = executor.state().request(second).unwrap().timing;
+        assert_eq!(timing.started_at, Some(Timestamp::from_micros(1_000)));
+        assert_eq!(timing.first_token_at, Some(b.finished_at));
+
+        let decoded = executor.step_iteration(clock.peek()).unwrap();
+        let finished = decoded.execution_batches[0].finished_at;
+        let result = executor.result(first).unwrap();
+        assert_eq!(result.token_times, vec![a.finished_at, finished]);
+        assert_eq!(
+            executor.state().request(first).unwrap().timing.completed_at,
+            Some(finished)
+        );
+    }
+
+    #[test]
+    fn without_a_clock_every_time_is_the_planning_time() {
+        let mut executor = Executor::default();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let id = executor.submit(request("1 2", 2), Timestamp::ZERO).unwrap();
+        let at = Timestamp::from_micros(50);
+        let iteration = executor.step_iteration(at).unwrap();
+
+        let batch = &iteration.execution_batches[0];
+        assert_eq!((batch.started_at, batch.finished_at), (at, at));
+        assert!(matches!(
+            iteration.events[0],
+            ExecutorEvent::Token { at: token_at, .. } if token_at == at
+        ));
+        assert_eq!(
+            executor.state().request(id).unwrap().timing.first_token_at,
+            Some(at)
+        );
+    }
+
     #[test]
     fn chunked_prefill_and_decode_share_an_iteration_budget() {
         let policy = crate::FifoTokenBudgetPolicy::new(3).unwrap();
@@ -1789,6 +1954,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 3,
                 padding_tokens: 1,
+                started_at: Timestamp::from_micros(3),
+                finished_at: Timestamp::from_micros(3),
             }
         );
         assert!(matches!(
@@ -1969,6 +2136,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                started_at: Timestamp::from_micros(10),
+                finished_at: Timestamp::from_micros(10),
             }]
         );
 
@@ -2008,6 +2177,8 @@ mod tests {
                     mode: BatchExecutionMode::Tensor,
                     input_tokens: 2,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(20),
+                    finished_at: Timestamp::from_micros(20),
                 },
                 ExecutionBatch {
                     phase: BatchPhase::Prefill,
@@ -2015,6 +2186,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(20),
+                    finished_at: Timestamp::from_micros(20),
                 },
             ]
         );
@@ -2062,6 +2235,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(10),
+                    finished_at: Timestamp::from_micros(10),
                 },
                 ExecutionBatch {
                     phase: BatchPhase::Prefill,
@@ -2069,6 +2244,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(10),
+                    finished_at: Timestamp::from_micros(10),
                 },
             ]
         );
@@ -2093,6 +2270,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(20),
+                    finished_at: Timestamp::from_micros(20),
                 },
                 ExecutionBatch {
                     phase: BatchPhase::Decode,
@@ -2100,6 +2279,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(20),
+                    finished_at: Timestamp::from_micros(20),
                 },
             ]
         );
@@ -2206,6 +2387,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                started_at: Timestamp::from_micros(20),
+                finished_at: Timestamp::from_micros(20),
             }]
         );
         assert_eq!(
@@ -2948,6 +3131,8 @@ mod tests {
                     mode: BatchExecutionMode::Tensor,
                     input_tokens: 12,
                     padding_tokens: 2,
+                    started_at: Timestamp::from_micros(10),
+                    finished_at: Timestamp::from_micros(10),
                 },
                 ExecutionBatch {
                     phase: BatchPhase::Prefill,
@@ -2955,6 +3140,8 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 9,
                     padding_tokens: 0,
+                    started_at: Timestamp::from_micros(10),
+                    finished_at: Timestamp::from_micros(10),
                 },
             ]
         );

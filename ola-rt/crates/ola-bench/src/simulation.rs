@@ -7,7 +7,11 @@
 //! microseconds, so every timestamp, and therefore every latency, is exactly
 //! reproducible and independent of the host.
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use ola_core::Input;
 use ola_core::{ModelDescriptor, Priority, RequestId, RequestSpec, Timestamp};
@@ -47,6 +51,23 @@ impl Default for CostModel {
 }
 
 impl CostModel {
+    /// Returns when each batch finishes, in microseconds after its
+    /// iteration starts: the fixed boundary cost is paid first, then
+    /// invocations run in order. The last offset equals
+    /// [`iteration_micros`](Self::iteration_micros).
+    pub fn batch_finish_offsets(&self, batches: &[ExecutionBatch]) -> Vec<u64> {
+        batches
+            .iter()
+            .scan(self.fixed_micros, |elapsed, batch| {
+                *elapsed = self
+                    .iteration_micros(std::slice::from_ref(batch))
+                    .saturating_sub(self.fixed_micros)
+                    .saturating_add(*elapsed);
+                Some(*elapsed)
+            })
+            .collect()
+    }
+
     /// Returns the virtual duration of an iteration that ran `batches`.
     pub fn iteration_micros(&self, batches: &[ExecutionBatch]) -> u64 {
         batches.iter().fold(self.fixed_micros, |total, batch| {
@@ -314,6 +335,12 @@ where
 
     let mut ids = Vec::with_capacity(trace.requests.len());
     let mut rejected = BTreeSet::new();
+    // Virtual times at which work became observable. The executor has no
+    // clock here, so it stamps everything at the iteration's start; these
+    // record when the producing invocation finished instead, as a live
+    // executor clock would.
+    let mut first_token_at = BTreeMap::new();
+    let mut completed_at = BTreeMap::new();
     let mut iterations = Vec::new();
     let mut clock = 0_u64;
     while iterations.len() < config.max_iterations {
@@ -363,9 +390,40 @@ where
         }
 
         let iteration = executor.step_iteration(Timestamp::from_micros(clock))?;
+        let finishes = config
+            .cost
+            .batch_finish_offsets(&iteration.execution_batches);
+        let finished_at = |request_id: RequestId| {
+            iteration
+                .execution_batches
+                .iter()
+                .zip(&finishes)
+                .find(|(batch, _)| batch.request_ids.contains(&request_id))
+                .map_or(clock, |(_, offset)| clock.saturating_add(*offset))
+        };
         for event in &iteration.events {
-            if let ExecutorEvent::Rejected { request_id, .. } = event {
-                rejected.insert(*request_id);
+            match event {
+                ExecutorEvent::Rejected { request_id, .. } => {
+                    rejected.insert(*request_id);
+                }
+                ExecutorEvent::Token {
+                    request_id,
+                    generated_tokens,
+                    finished,
+                    ..
+                } => {
+                    let at = finished_at(*request_id);
+                    if *generated_tokens == 1 {
+                        first_token_at.insert(*request_id, at);
+                    }
+                    if *finished {
+                        completed_at.insert(*request_id, at);
+                    }
+                }
+                ExecutorEvent::Failed { request_id, .. } => {
+                    completed_at.insert(*request_id, finished_at(*request_id));
+                }
+                _ => {}
             }
         }
         let duration = config.cost.iteration_micros(&iteration.execution_batches);
@@ -457,8 +515,16 @@ where
                 request_id,
                 arrival_micros: request.arrival_micros,
                 started_micros: micros(record.timing.started_at),
-                first_token_micros: micros(record.timing.first_token_at),
-                completed_micros: micros(record.timing.completed_at),
+                first_token_micros: first_token_at
+                    .get(&request_id)
+                    .copied()
+                    .or(micros(record.timing.first_token_at)),
+                // Cancellations and rejections happen at a planning
+                // boundary, which the runtime record already holds.
+                completed_micros: completed_at
+                    .get(&request_id)
+                    .copied()
+                    .or(micros(record.timing.completed_at)),
                 outcome,
                 output_tokens: executor
                     .result(request_id)
@@ -522,6 +588,8 @@ mod tests {
     #[test]
     fn cost_model_charges_fixed_invocation_and_dense_token_costs() {
         let batch = |input_tokens, padding_tokens| ExecutionBatch {
+            started_at: Timestamp::ZERO,
+            finished_at: Timestamp::ZERO,
             phase: ola_runtime::BatchPhase::Prefill,
             request_ids: Vec::new(),
             mode: ola_runtime::BatchExecutionMode::Tensor,

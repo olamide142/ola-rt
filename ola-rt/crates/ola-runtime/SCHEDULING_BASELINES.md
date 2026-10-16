@@ -203,11 +203,22 @@ Each step keeps `make verify` and `make test-fixture` green.
 
    Measured effects (seed 3, 120 requests): priority cuts urgent p95
    completion more than 4× with no urgent starvation; SJF speeds short
-   requests and slows long ones, lowering fairness; backfill lowers p50
+   requests and slows long ones, and raises slowdown fairness (Jain 0.55
+   against FIFO's 0.32 on the overload trace; see the correction below);
+   backfill lowers p50
    completion and starvation under a binding pool; EDF misses fewer
    deadlines only under moderate contention (2 slots, 6 ms mean gap) and
    misses more than FIFO under overload, the known EDF domino effect.
    Empty classes are omitted from summaries.
+
+   **Correction (P6).** These trials originally stamped tokens at the start
+   of the iteration that produced them, not when their invocation finished.
+   That understated every isolated time by one iteration and made it zero
+   for one-token requests, which then dropped out of slowdown. The P3 text
+   said SJF *lowers* fairness; with tokens stamped at the virtual finish of
+   their batch, SJF raises it. Over the five-seed overload study, FIFO's
+   fairness moved 0.47 → 0.41 and SJF's 0.46 → 0.49, while latencies moved
+   only 0.5–1.5%. The other findings above still hold and remain tested.
 6. **Isolation and equivalence.** Add the isolation matrix, synthetic output
    equivalence, and the fixture equivalence test. **Done.**
    `run_perturbed_trial` applies `Perturbation::{Cancel, SubmitInvalid}`

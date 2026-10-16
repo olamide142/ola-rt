@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use ola_core::RequestId;
+use ola_core::{RequestId, Timestamp};
 
 use crate::{GroupingDecision, PolicyDescriptor};
 
@@ -35,9 +35,27 @@ pub struct ExecutionBatch {
     pub input_tokens: usize,
     /// Artificial prompt positions computed only to make tensor rows rectangular.
     pub padding_tokens: usize,
+    /// Time just before the model was invoked.
+    ///
+    /// With an executor clock this is read from the clock; without one it is
+    /// the iteration's planning time.
+    pub started_at: Timestamp,
+    /// Time after the invocation returned its selected token IDs to the
+    /// host, so it includes any device synchronization the read-back forces.
+    /// Tokens, first-token, completion, and failure times produced by this
+    /// invocation are stamped with it.
+    pub finished_at: Timestamp,
 }
 
 impl ExecutionBatch {
+    /// Returns the measured invocation latency in microseconds; zero without
+    /// an executor clock.
+    pub fn latency_micros(&self) -> u64 {
+        self.finished_at
+            .as_micros()
+            .saturating_sub(self.started_at.as_micros())
+    }
+
     /// Returns all dense input positions computed by this invocation.
     pub fn dense_input_tokens(&self) -> usize {
         self.input_tokens.saturating_add(self.padding_tokens)
@@ -631,6 +649,8 @@ mod tests {
             mode: BatchExecutionMode::Tensor,
             input_tokens: 13,
             padding_tokens: 3,
+            started_at: Timestamp::ZERO,
+            finished_at: Timestamp::ZERO,
         };
 
         assert_eq!(batch.dense_input_tokens(), 16);

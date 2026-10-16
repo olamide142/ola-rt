@@ -1052,6 +1052,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 5,
                 padding_tokens: 1,
+                started_at: Timestamp::from_micros(10),
+                finished_at: Timestamp::from_micros(10),
             }]
         );
 
@@ -1065,6 +1067,8 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                started_at: Timestamp::from_micros(20),
+                finished_at: Timestamp::from_micros(20),
             }]
         );
         assert_eq!(decoded.active_requests, 2);

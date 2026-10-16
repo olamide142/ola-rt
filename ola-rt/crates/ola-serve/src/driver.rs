@@ -64,6 +64,9 @@ pub struct GenerationOutput {
     pub timing: RequestTiming,
     /// Why generation stopped.
     pub finish_reason: FinishReason,
+    /// When each token in `token_ids` was produced, in the driver clock's
+    /// epoch.
+    pub token_times: Vec<Timestamp>,
 }
 
 /// Why a completed request stopped generating.
@@ -263,12 +266,16 @@ pub struct Driver {
 impl Driver {
     /// Starts a thread that owns `executor`, reading time from `clock`.
     ///
+    /// The clock is also installed on the executor, so tokens and lifecycle
+    /// events are stamped when the model invocation producing them finishes.
     /// Models must be registered on the executor before it is handed over.
     pub fn spawn(
         executor: Executor,
         clock: impl Clock + 'static,
         config: DriverConfig,
     ) -> io::Result<Self> {
+        let clock: Arc<dyn Clock> = Arc::new(clock);
+        let executor = executor.with_clock(Arc::clone(&clock));
         let (commands, receiver) = mpsc::channel();
         let models = executor
             .state()
@@ -289,7 +296,7 @@ impl Driver {
             ServiceState::NoModels
         };
         let shared = Arc::new(Shared {
-            clock: Arc::new(clock),
+            clock,
             max_in_flight: config.max_in_flight,
             in_flight: AtomicUsize::new(0),
             state: AtomicU8::new(state.as_u8()),
@@ -978,6 +985,7 @@ impl Worker {
                 metrics: result.metrics,
                 timing,
                 finish_reason,
+                token_times: result.token_times,
             }),
             None => RequestEvent::Failed(ServeError::Internal(
                 "a finished request had no result".into(),

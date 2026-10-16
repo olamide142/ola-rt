@@ -574,7 +574,12 @@ mod tests {
         let p50 = |summary, label| class(summary, label).completion.p50_micros;
         assert!(p50(sjf_run, "size=short") < p50(fifo_run, "size=short"));
         assert!(p50(sjf_run, "size=long") > p50(fifo_run, "size=long"));
-        assert!(sjf_run.slowdown.jain_fairness < fifo_run.slowdown.jain_fairness);
+        // Short jobs no longer wait behind long ones, so slowdowns are more
+        // even: about 0.55 against FIFO's 0.32 on this trace. Before P6 the
+        // simulator stamped tokens at iteration start, which dropped
+        // one-token requests from slowdown (zero isolated time) and
+        // understated every isolated time, and this comparison reversed.
+        assert!(sjf_run.slowdown.jain_fairness > fifo_run.slowdown.jain_fairness);
     }
 
     #[test]

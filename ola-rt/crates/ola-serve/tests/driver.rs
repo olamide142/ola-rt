@@ -285,3 +285,36 @@ fn shutdown_ends_unfinished_requests_and_refuses_new_ones() {
     assert!(!executor.has_active_request());
     assert_eq!(executor.state().queued_len(), 0);
 }
+
+#[test]
+fn tokens_are_stamped_when_their_model_call_finishes() {
+    let gate = Gate::closed();
+    let (driver, clock) = driver(&gate, 1, DriverConfig::default());
+    let mut handle = driver.handle().submit(request("hi")).wait().unwrap();
+
+    // Each call is released 100 µs after the previous one, so its token
+    // must carry the later time rather than its iteration's start.
+    // The reply's bytes, then end-of-sequence.
+    let calls = REPLY.len() + 1;
+    for _ in 0..calls {
+        gate.wait_until_blocked();
+        clock.advance(Duration::from_micros(100));
+        gate.permit(1);
+        assert!(matches!(
+            handle.blocking_next(),
+            Some(RequestEvent::Token { .. })
+        ));
+    }
+    let Some(RequestEvent::Finished(output)) = handle.blocking_next() else {
+        panic!("expected the result after the last token");
+    };
+
+    assert_eq!(output.token_times.len(), output.token_ids.len());
+    let expected = (1..=output.token_times.len() as u64)
+        .map(|step| ola_core::Timestamp::from_micros(step * 100))
+        .collect::<Vec<_>>();
+    assert_eq!(output.token_times, expected);
+    assert_eq!(output.timing.first_token_at, Some(expected[0]));
+    assert_eq!(output.timing.completed_at, expected.last().copied());
+    assert_eq!(output.timing.started_at, Some(ola_core::Timestamp::ZERO));
+}
