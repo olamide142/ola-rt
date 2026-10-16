@@ -82,7 +82,7 @@ Design: `ola-rt/crates/ola-bench/EXPERIMENTS.md`.
 - [x] Define generic experiment identity, configuration, workload, protocol, sample, summary, and metadata types.
 - [x] Retain raw measurements alongside derived summaries.
 - [ ] Record model, device, revision, build, policy, kernel, warm-up, repetitions, and workload identity.
-- [ ] Generalize versioned persistence beyond prefill reports.
+- [x] Generalize versioned persistence beyond prefill reports.
 - [x] Keep report creation non-overwriting by default.
 - [x] Validate schema versions and sample consistency.
 - [x] Compare reports across models, devices, policies, kernels, and revisions.

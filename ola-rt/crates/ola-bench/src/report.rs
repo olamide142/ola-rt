@@ -503,6 +503,84 @@ mod tests {
         assert!(decoded.cost_aware.is_some());
     }
 
+    #[test]
+    fn legacy_reports_convert_into_comparable_experiment_reports() {
+        let config = PrefillThreeWayTrialConfig {
+            execution: PrefillExecutionConfig {
+                prompts: vec![vec![1, 2], vec![3, 4, 5]],
+                max_new_tokens: 2,
+            },
+            warmup_trials: 1,
+            measured_trials: 2,
+            adaptive_invocation_overhead_tokens: 10,
+        };
+        let order = [
+            PrefillStrategy::Unbucketed,
+            PrefillStrategy::PowerOfTwo,
+            PrefillStrategy::CostAware,
+        ];
+        let comparison = PrefillThreeWayComparison {
+            warmup_trials: 1,
+            strategy_order_by_trial: vec![order, order],
+            unbucketed: strategy(vec![sample(11, 20), sample(11, 22)]),
+            power_of_two: strategy(vec![sample(7, 16), sample(7, 18)]),
+            cost_aware: strategy(vec![sample(7, 17), sample(7, 19)]),
+        };
+        let legacy =
+            PrefillBenchmarkReport::new_three_way(metadata(), &config, &comparison).unwrap();
+
+        let converted = crate::ExperimentReport::from_prefill_v2(&legacy).unwrap();
+
+        assert_eq!(converted.experiment.id, "llama-prefill-strategies");
+        // Two measured trials are too few for a host-time study.
+        assert_eq!(converted.experiment.kind, crate::ExperimentKind::Probe);
+        assert_eq!(converted.protocol.repetitions, 2);
+        assert_eq!(
+            converted
+                .variants
+                .iter()
+                .map(|variant| variant.label.as_str())
+                .collect::<Vec<_>>(),
+            ["unbucketed", "power-of-two", "cost-aware"]
+        );
+        assert_eq!(
+            converted.variants[2].policy.as_deref(),
+            Some("cost-aware-prefill{invocation_overhead_tokens=10}")
+        );
+        for (repetition, trial) in legacy.trials.iter().enumerate() {
+            let sample = converted
+                .samples
+                .iter()
+                .find(|sample| sample.variant == "unbucketed" && sample.repetition == repetition)
+                .unwrap();
+            assert_eq!(
+                sample.values["padding_tokens"],
+                trial.unbucketed.prefill_padding_tokens as f64
+            );
+            assert_eq!(
+                sample.values["prefill_iteration"],
+                trial.unbucketed.prefill_iteration_micros as f64
+            );
+        }
+        assert_eq!(
+            converted.metadata.build.revision,
+            legacy.metadata.software_revision
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "ola-legacy-import-{}-{}",
+            std::process::id(),
+            converted.metadata.recorded_at_unix_micros
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        legacy
+            .write_json_new(directory.join("legacy.json"))
+            .unwrap();
+        let read = crate::ExperimentReport::read_compatible(directory.join("legacy.json")).unwrap();
+        assert_eq!(read, converted);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn metadata() -> PrefillBenchmarkMetadata {
         PrefillBenchmarkMetadata {
             recorded_at_unix_micros: 123,

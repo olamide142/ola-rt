@@ -1,7 +1,7 @@
 # Experiment framework design proposal
 
 Status: **accepted** (2026-10-16) with all five recommended decisions.
-Covers `todo.md` P4. Steps 1–3 are implemented.
+Covers `todo.md` P4. Steps 1–4 are implemented.
 
 ## Goal
 
@@ -205,7 +205,13 @@ Each step keeps `make verify` and `make test-fixture` green.
    registry checks requirements before a run and identity plus study
    minimums after it. The UI still uses its own copies until step 6.
 4. **Model experiments.** Port Llama generation, prefill strategies (with
-   the v2 import), and chunked prefill.
+   the v2 import), and chunked prefill. **Done.**
+   Llama generation and chunked prefill are probes; prefill strategies
+   becomes a host-time study (calibration, then 5 rotated trials after a
+   warm-up, up from 3). Its metrics are produced from `PrefillReportSample`
+   for both live runs and `ExperimentReport::from_prefill_v2`, so imported
+   v2 files compare directly with new runs; `read_compatible` reads either
+   format. The chunked-prefill fairness sweep is kept in `details`.
 5. **Calibration.** Add the multi-shape fit with intervals, feeding
    `CostModel` and `PolicyMeasurements`.
 6. **Data-driven UI.** Build the catalogue from the registry and remove the

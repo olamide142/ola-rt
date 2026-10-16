@@ -382,6 +382,9 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             .map(|descriptor| descriptor.id)
             .collect::<Vec<_>>(),
         [
+            "llama-generation",
+            "llama-prefill-strategies",
+            "llama-chunked-prefill",
             "kv-block-pressure",
             "fifo-workload",
             "prefill-bucketing",
@@ -390,6 +393,15 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         ]
     );
     for descriptor in descriptors {
+        if descriptor.requirements.contains(&Requirement::LoadedModel) {
+            assert!(matches!(
+                run(descriptor.id, &[]),
+                Err(ExperimentError::MissingRequirement(
+                    Requirement::LoadedModel
+                ))
+            ));
+            continue;
+        }
         let outcome = run(descriptor.id, &[]).unwrap();
         assert_eq!(outcome.report.experiment.id, descriptor.id);
         assert!(

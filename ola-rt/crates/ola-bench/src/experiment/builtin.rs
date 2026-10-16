@@ -1,4 +1,4 @@
-//! Built-in experiments that need no loaded model.
+//! Built-in experiments that need no loaded model, and the built-in registry.
 
 use std::{collections::BTreeMap, time::Duration, time::Instant};
 
@@ -23,6 +23,9 @@ impl ExperimentRegistry {
     /// Returns every built-in experiment, in display order.
     pub fn builtin() -> Self {
         Self::new(vec![
+            Box::new(super::LlamaGeneration),
+            Box::new(super::PrefillStrategies),
+            Box::new(super::ChunkedPrefill),
             Box::new(KvBlockPressure),
             Box::new(FifoWorkload),
             Box::new(PrefillBucketing),
@@ -695,7 +698,7 @@ impl ExperimentOutcome {
 }
 
 #[allow(clippy::too_many_arguments, reason = "one call site per experiment")]
-fn finish(
+pub(super) fn finish(
     descriptor: &ExperimentDescriptor,
     context: &ExperimentContext,
     parameters: &Parameters,
@@ -755,7 +758,7 @@ fn metric(name: &str, unit: Unit, domain: TimeDomain, better: Direction) -> Metr
     MetricSpec::new(name, unit, domain, better)
 }
 
-fn plain_variant(label: &str) -> Variant {
+pub(super) fn plain_variant(label: &str) -> Variant {
     Variant {
         label: label.to_owned(),
         policy: None,
@@ -770,7 +773,7 @@ fn values(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
         .collect()
 }
 
-fn lengths(parameters: &Parameters, name: &str) -> Result<Vec<usize>, ExperimentError> {
+pub(super) fn lengths(parameters: &Parameters, name: &str) -> Result<Vec<usize>, ExperimentError> {
     parameters
         .text(name)?
         .split(',')
@@ -786,7 +789,7 @@ fn lengths(parameters: &Parameters, name: &str) -> Result<Vec<usize>, Experiment
         .collect()
 }
 
-fn run_error(error: impl std::fmt::Display) -> ExperimentError {
+pub(super) fn run_error(error: impl std::fmt::Display) -> ExperimentError {
     ExperimentError::Run(error.to_string())
 }
 
@@ -798,11 +801,11 @@ fn micros(duration: Duration) -> f64 {
     clippy::cast_precision_loss,
     reason = "measurements are far below 2^52"
 )]
-fn as_f64(value: impl TryInto<u64>) -> f64 {
+pub(super) fn as_f64(value: impl TryInto<u64>) -> f64 {
     value.try_into().map_or(f64::MAX, |value: u64| value as f64)
 }
 
-fn format_duration(duration: Duration) -> String {
+pub(super) fn format_duration(duration: Duration) -> String {
     if duration.as_secs_f64() >= 1.0 {
         format!("{:.2} s", duration.as_secs_f64())
     } else if duration.as_millis() >= 1 {
@@ -812,7 +815,7 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MiB", as_f64(bytes) / (1024.0 * 1024.0))
     } else if bytes >= 1024 {

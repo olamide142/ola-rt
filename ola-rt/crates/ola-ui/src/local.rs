@@ -1285,6 +1285,56 @@ mod tests {
 
     #[test]
     #[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR and its pinned external artifact"]
+    fn experiment_registry_runs_model_experiments_on_the_fixture() {
+        use ola_bench::{ExperimentContext, ExperimentKind, ExperimentRegistry};
+
+        let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
+            .map(std::path::PathBuf::from)
+            .expect("set OLA_LLAMA_CONFORMANCE_DIR as documented in ola-burn/CONFORMANCE.md");
+        let context = ExperimentContext {
+            model: Some(
+                LlamaFactory::new(Device::flex())
+                    .load_local(directory)
+                    .unwrap(),
+            ),
+            model_label: Some("ola-rt-tiny-random-llama".into()),
+            device: Some("cpu".into()),
+        };
+        let registry = ExperimentRegistry::builtin();
+
+        let generation = registry.run("llama-generation", &context, &[]).unwrap();
+        assert!(generation.summary.contains("tok/s"));
+        assert_eq!(
+            generation.report.metadata.model.as_deref(),
+            Some("ola-rt-tiny-random-llama")
+        );
+
+        let strategies = registry
+            .run("llama-prefill-strategies", &context, &[])
+            .unwrap();
+        assert_eq!(strategies.report.experiment.kind, ExperimentKind::Study);
+        assert_eq!(strategies.report.protocol.repetitions, 5);
+        assert!(strategies.summary.contains("5 rotating trials + 1 warmup"));
+        assert!(strategies.summary.contains("padding U/P/A 11 / 2 /"));
+        assert!(
+            strategies
+                .report
+                .summaries
+                .iter()
+                .all(|summary| summary.estimates["prefill_iteration"].ci95.is_some())
+        );
+
+        let chunked = registry
+            .run("llama-chunked-prefill", &context, &[])
+            .unwrap();
+        assert!(chunked.summary.contains("prefill calls 1 → 3"));
+        assert!(chunked.summary.contains("tensor calls 1 → 2"));
+        assert!(chunked.summary.contains("output preserved"));
+        assert!(chunked.report.details.is_some());
+    }
+
+    #[test]
+    #[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR and its pinned external artifact"]
     fn local_backend_loads_and_generates_without_blocking_the_ui_contract() {
         let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
             .map(PathBuf::from)
