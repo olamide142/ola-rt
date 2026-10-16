@@ -150,23 +150,27 @@ to scheduler order.
 
 ```rust,no_run
 use ola_runtime::{
-    CostAwarePrefillBatcher, Executor, FifoTokenBudgetPolicy, Runtime,
+    ComposedPolicy, CostAwarePrefillBatcher, Executor, FifoTokenBudgetPolicy, Runtime,
 };
 
-let policy = FifoTokenBudgetPolicy::new(256).expect("the budget is positive");
+let budget = FifoTokenBudgetPolicy::new(256).expect("the budget is positive");
+let policy = ComposedPolicy::default()
+    .with_batch(budget)
+    .with_grouping(CostAwarePrefillBatcher::new(32));
 let executor = Executor::with_max_active_requests(Runtime::default(), 8)?
-    .with_batch_policy(policy)
-    .with_prefill_batcher(CostAwarePrefillBatcher::new(32))
+    .with_policy(policy)
     .with_prefill_chunk_size(64)?;
 
 # Ok::<(), ola_runtime::ExecutorError>(())
 ```
 
-This policy controls iteration-level composition only. The compatibility
-`Executor::step` method still performs one directly selected operation.
-`step_iteration` may tensor-batch selected prefill and decode work when the
-attached model supports it; selection and execution mechanism remain
-separately observable.
+Sub-policies are components of the executor's `ExecutionPolicy`; the default
+`ComposedPolicy` combines FIFO scheduling, unconstrained admission, unbounded
+batching, and unbucketed grouping, and each `with_*` builder replaces one
+component (see `EXECUTION_POLICY.md`). `step_iteration` is the only way to
+advance the executor, so every state change goes through a validated plan.
+It may tensor-batch selected prefill and decode work when the attached model
+supports it; selection and execution mechanism remain separately observable.
 
 `with_prefill_chunk_size` adds interruption points to architectures that
 advertise resumable prefill. A long prompt retains its session, token cursor,

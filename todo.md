@@ -43,14 +43,14 @@ Done when one iteration can be explained by a complete, validated plan before mo
 Design: `ola-rt/crates/ola-runtime/EXECUTION_POLICY.md`.
 
 - [x] Define an immutable workload, lifecycle, model, KV, memory, device, and measurement snapshot. (Device and measurement fields exist but stay empty until P6/P4.)
-- [ ] Define `ExecutionPolicy` as runtime state to `ExecutionPlan`.
-- [ ] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.
-- [ ] Keep individual sub-policies independently replaceable.
+- [x] Define `ExecutionPolicy` as runtime state to `ExecutionPlan`.
+- [x] Compose or adapt `Scheduler`, `AdmissionPolicy`, `BatchPolicy`, and `PrefillBatcher`.
+- [x] Keep individual sub-policies independently replaceable.
 - [ ] Make decisions deterministic for identical state and configuration.
 - [ ] Record decision inputs, alternatives, estimates, and reasons.
 - [ ] Add capability checks and explicit fallbacks.
-- [ ] Prevent policies from mutating authoritative runtime state.
-- [ ] Give every reportable policy a stable name and configuration.
+- [x] Prevent policies from mutating authoritative runtime state.
+- [x] Give every reportable policy a stable name and configuration.
 - [ ] Test scheduler, admission, batching, memory, and kernel-selection conflicts.
 
 Done when existing FIFO, memory admission, token budgeting, and grouping run through the unified policy path without output or lifecycle regressions.

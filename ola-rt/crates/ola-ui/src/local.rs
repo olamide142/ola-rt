@@ -18,7 +18,8 @@ use ola_burn::llama::LlamaFactory;
 use ola_core::{GenerationConfig, ModelDescriptor, RequestSpec, Timestamp};
 use ola_model::{CausalLanguageModel, SessionMetrics};
 use ola_runtime::{
-    Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, MemoryAwareAdmission, Runtime,
+    ComposedPolicy, Executor, ExecutorEvent, KvBlockManager, KvBlockMetrics, MemoryAwareAdmission,
+    Runtime,
 };
 
 use crate::{
@@ -502,7 +503,8 @@ fn generate(
 ) -> Result<GenerationResult, String> {
     const MODEL_ID: &str = "local-llama";
 
-    let mut executor = Executor::default().with_admission_policy(MemoryAwareAdmission);
+    let mut executor = Executor::default()
+        .with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission));
     executor
         .register_model(ModelDescriptor::language(MODEL_ID, "llama"), model.clone())
         .map_err(|error| error.to_string())?;
@@ -518,32 +520,34 @@ fn generate(
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
     let mut step = 1_u64;
-    loop {
-        match executor
-            .step(Timestamp::from_micros(step))
-            .map_err(|error| error.to_string())?
-        {
-            ExecutorEvent::Token { finished: true, .. } => break,
-            ExecutorEvent::Token { .. } => step += 1,
-            ExecutorEvent::PrefillProgress { .. } => step += 1,
-            ExecutorEvent::Failed { message, .. } => return Err(message),
-            ExecutorEvent::Deferred { reason, .. } => {
-                return Err(format!("generation admission deferred: {reason}"));
-            }
-            ExecutorEvent::BatchDeferred {
-                phase, token_cost, ..
-            } => {
-                return Err(format!(
-                    "generation deferred by batch policy during {phase:?} (cost {token_cost} tokens)"
-                ));
-            }
-            ExecutorEvent::Rejected { reason, .. } => {
-                return Err(format!("generation admission rejected: {reason}"));
-            }
-            ExecutorEvent::Idle => {
-                return Err("executor became idle before generation completed".into());
+    'generation: loop {
+        let iteration = executor
+            .step_iteration(Timestamp::from_micros(step))
+            .map_err(|error| error.to_string())?;
+        for event in iteration.events {
+            match event {
+                ExecutorEvent::Token { finished: true, .. } => break 'generation,
+                ExecutorEvent::Token { .. } | ExecutorEvent::PrefillProgress { .. } => {}
+                ExecutorEvent::Failed { message, .. } => return Err(message),
+                ExecutorEvent::Deferred { reason, .. } => {
+                    return Err(format!("generation admission deferred: {reason}"));
+                }
+                ExecutorEvent::BatchDeferred {
+                    phase, token_cost, ..
+                } => {
+                    return Err(format!(
+                        "generation deferred by batch policy during {phase:?} (cost {token_cost} tokens)"
+                    ));
+                }
+                ExecutorEvent::Rejected { reason, .. } => {
+                    return Err(format!("generation admission rejected: {reason}"));
+                }
+                ExecutorEvent::Idle => {
+                    return Err("executor became idle before generation completed".into());
+                }
             }
         }
+        step += 1;
     }
     let elapsed = started.elapsed();
     let result = executor

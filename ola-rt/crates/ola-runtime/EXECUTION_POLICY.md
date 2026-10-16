@@ -1,7 +1,7 @@
 # ExecutionPolicy design proposal
 
 Status: **accepted** (2026-10-16) with all four recommended decisions.
-Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–2 are implemented.
+Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. Steps 1–3 are implemented.
 
 ## Goal
 
@@ -181,9 +181,13 @@ Each step keeps `make verify` and `make test-fixture` green.
    prepared-prompt cache; validate against the snapshot; drop
    `PlanningView`. **Done.**
 3. **`ExecutionPolicy` and `ComposedPolicy`.** Move the planning code out of
-   `Executor`, add `with_policy`, and migrate the `with_*` call sites.
-4. **Scheduler and `step()`.** Make `Runtime` non-generic, retire `step()`,
-   and migrate the UI, `ola-serve`, and `ola-bench`.
+   `Executor`, add `with_policy`, and migrate the `with_*` call sites. **Done.**
+   `Executor::step()` was retired in this step rather than step 4, because it
+   called the admission policy directly and that policy now lives inside
+   `ComposedPolicy`. `Scheduler::rank` reads the snapshot; `Runtime<S>` keeps
+   its scheduler only for `Runtime::start_next`/`select_next` until step 4.
+4. **Scheduler.** Make `Runtime` non-generic and migrate `ola-serve`,
+   `ola-bench`, and `ola-observe`. (`step()` was already retired in step 3.)
 5. **`DecisionRecord`.** Add the record, `PrefillGrouping` returning
    alternatives, `CostAwarePrefillDecision` preserved, capability fallbacks,
    and `PlanReport` v2.

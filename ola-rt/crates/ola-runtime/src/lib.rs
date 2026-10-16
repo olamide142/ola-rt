@@ -2,6 +2,7 @@
 
 mod admission;
 mod batch;
+mod composed;
 mod error;
 mod executor;
 mod kv_cache;
@@ -23,6 +24,7 @@ pub use batch::{
     PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate, PrefillGroupingStrategy,
     UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
+pub use composed::ComposedPolicy;
 pub use error::RuntimeError;
 pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
@@ -35,7 +37,7 @@ pub use plan::{
     DecodeView, ExecutionPlan, LifecycleAction, PlanDivergence, PlanError, PlanEstimates,
     PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PrefillView, ReleaseReason,
 };
-pub use policy::PolicyDescriptor;
+pub use policy::{ExecutionPolicy, PolicyDecision, PolicyDescriptor, PolicyError};
 pub use runtime::Runtime;
 pub use scheduler::{FifoScheduler, Scheduler};
 pub use snapshot::{

@@ -14,9 +14,9 @@ use ola_core::{
 };
 use ola_model::CausalLanguageModel;
 use ola_runtime::{
-    BatchExecutionMode, BatchPhase, CostAwarePrefillBatcher, CostAwarePrefillDecision, Executor,
-    ExecutorError, ExecutorEvent, PowerOfTwoPrefillBatcher, PrefillBatcher, Runtime, RuntimeError,
-    Scheduler, UnbucketedPrefillBatcher,
+    BatchExecutionMode, BatchPhase, ComposedPolicy, CostAwarePrefillBatcher,
+    CostAwarePrefillDecision, Executor, ExecutorError, ExecutorEvent, PowerOfTwoPrefillBatcher,
+    PrefillBatcher, Runtime, RuntimeError, Scheduler, UnbucketedPrefillBatcher,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1150,7 +1150,7 @@ where
     const MODEL_ID: &str = "prefill-execution-benchmark";
 
     let executor = Executor::with_max_active_requests(Runtime::default(), max_active_requests)?
-        .with_prefill_batcher(batcher);
+        .with_policy(ComposedPolicy::default().with_grouping(batcher));
     let mut executor = match chunk_size {
         Some(chunk_size) => executor.with_prefill_chunk_size(chunk_size)?,
         None => executor,

@@ -2,7 +2,71 @@
 //!
 //! See `EXECUTION_POLICY.md` in this crate for the design.
 
-use std::fmt;
+use std::{error::Error, fmt};
+
+use ola_core::RequestId;
+
+use crate::{ExecutionPlan, ExecutorIteration, PlanningSnapshot};
+
+/// Turns an immutable snapshot of runtime state into an execution plan.
+///
+/// `plan` takes `&self`, so identical snapshots and configuration produce
+/// identical decisions, and a plan rejected by validation leaves the policy
+/// unchanged. Stateful policies learn only in [`observe`](Self::observe),
+/// after an iteration has been committed.
+pub trait ExecutionPolicy: Send {
+    /// Returns the policy's stable name, configuration, and components.
+    fn descriptor(&self) -> PolicyDescriptor;
+
+    /// Plans one iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError`] when a component returns an impossible
+    /// decision; the executor then mutates nothing.
+    fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError>;
+
+    /// Whether admitted reservations never exceed a model's KV pool, so plan
+    /// validation may enforce it.
+    fn enforces_model_kv_capacity(&self) -> bool;
+
+    /// Receives each committed iteration; the only place a policy may learn.
+    fn observe(&mut self, _iteration: &ExecutorIteration) {}
+}
+
+/// Output of one planning pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyDecision {
+    /// Plan to validate and commit.
+    pub plan: ExecutionPlan,
+}
+
+/// A policy component returned a decision that cannot be planned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyError {
+    /// The scheduler ranked a request that is not queued, ranked one twice,
+    /// or returned more requests than requested.
+    InvalidRanking(RequestId),
+    /// The batch policy selected an unknown candidate or selected one twice.
+    InvalidBatchSelection(RequestId),
+}
+
+impl fmt::Display for PolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRanking(request) => write!(
+                formatter,
+                "scheduler ranked invalid or duplicate request `{request}`"
+            ),
+            Self::InvalidBatchSelection(request) => write!(
+                formatter,
+                "batch policy returned invalid or duplicate request `{request}`"
+            ),
+        }
+    }
+}
+
+impl Error for PolicyError {}
 
 /// Stable name and configuration of a policy, for reports and comparisons.
 ///

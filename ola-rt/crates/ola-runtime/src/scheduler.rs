@@ -1,6 +1,6 @@
 use ola_core::RequestId;
 
-use crate::{PolicyDescriptor, RuntimeState};
+use crate::{PlanningSnapshot, PolicyDescriptor, RuntimeState};
 
 /// Selects the next queued request without mutating runtime state.
 pub trait Scheduler {
@@ -14,27 +14,11 @@ pub trait Scheduler {
 
     /// Ranks up to `limit` distinct queued requests in admission order.
     ///
-    /// Planners use this to consider several requests before any of them
-    /// starts. The default repeatedly calls [`select`](Self::select) on a
-    /// private copy of the queue with earlier selections removed; schedulers
-    /// with a cheaper ordering should override it.
-    fn rank(&self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
-        let mut remaining = state.clone();
-        let mut ranked = Vec::new();
-        while ranked.len() < limit {
-            let Some(request_id) = self.select(&remaining) else {
-                break;
-            };
-            ranked.push(request_id);
-            let before = remaining.queue.len();
-            remaining.queue.retain(|queued| *queued != request_id);
-            if remaining.queue.len() == before {
-                // Not queued: return it so `Runtime` reports the policy error.
-                break;
-            }
-        }
-        ranked
-    }
+    /// Execution policies call this with the snapshot they plan from, so a
+    /// ranking can use prompt lengths, priorities, and deadlines without
+    /// touching runtime state. Returning a request that is not queued, a
+    /// duplicate, or more than `limit` requests is a policy error.
+    fn rank(&self, snapshot: &PlanningSnapshot, limit: usize) -> Vec<RequestId>;
 }
 
 /// First-in, first-out baseline scheduler.
@@ -50,7 +34,12 @@ impl Scheduler for FifoScheduler {
         PolicyDescriptor::new("fifo")
     }
 
-    fn rank(&self, state: &RuntimeState, limit: usize) -> Vec<RequestId> {
-        state.queued_ids().take(limit).collect()
+    fn rank(&self, snapshot: &PlanningSnapshot, limit: usize) -> Vec<RequestId> {
+        snapshot
+            .queued
+            .iter()
+            .take(limit)
+            .map(|request| request.request_id)
+            .collect()
     }
 }

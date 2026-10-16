@@ -337,8 +337,8 @@ mod tests {
     fn planned_multi_request_execution_matches_single_request_oracle() {
         use ola_core::{GenerationConfig, ModelDescriptor, RequestId, RequestSpec, Timestamp};
         use ola_runtime::{
-            BatchExecutionMode, Executor, FifoTokenBudgetPolicy, PlanDivergence, PlannedPhase,
-            PowerOfTwoPrefillBatcher, Runtime,
+            BatchExecutionMode, ComposedPolicy, Executor, FifoTokenBudgetPolicy, PlanDivergence,
+            PlannedPhase, PowerOfTwoPrefillBatcher, Runtime,
         };
 
         let directory = std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR")
@@ -398,8 +398,11 @@ mod tests {
             .unwrap()
             .with_prefill_chunk_size(2)
             .unwrap()
-            .with_prefill_batcher(PowerOfTwoPrefillBatcher)
-            .with_batch_policy(FifoTokenBudgetPolicy::new(4).unwrap());
+            .with_policy(
+                ComposedPolicy::default()
+                    .with_grouping(PowerOfTwoPrefillBatcher)
+                    .with_batch(FifoTokenBudgetPolicy::new(4).unwrap()),
+            );
         executor
             .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
             .unwrap();
