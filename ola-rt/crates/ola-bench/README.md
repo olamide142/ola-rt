@@ -121,6 +121,20 @@ squares over a shape grid, and `CostFit::from_report` turns a saved fit into
 a `CostModel` for virtual-time comparisons. The terminal workbench and the
 `ola` CLI (`ola-cli`) are both thin frontends over the registry.
 
+## Memory pressure
+
+The synthetic model allocates from a real `KvBlockManager` pool, so
+simulations exercise allocation failure, preemption, and resume. Output
+tokens are at least 1000 and prompt tokens below it, so a resumed request
+(prompt plus earlier output) continues exactly as a real model would.
+`SchedulingTrace::early_stopping` models callers that set a generous output
+limit most requests never reach.
+
+The `kv-pressure` study compares worst-case reservation
+(`MemoryAwareAdmission`) with `WatermarkAdmission` plus newest-first
+preemption over seeded traces in virtual time, reporting latency,
+throughput, peak KV, preemptions, failures, and unfinished requests.
+
 ## Scheduling comparisons
 
 Scheduling policies are compared in virtual time, so every number is exactly

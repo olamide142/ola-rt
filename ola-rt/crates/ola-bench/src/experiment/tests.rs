@@ -391,6 +391,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             "prefill-bucketing",
             "adaptive-prefill-cost",
             "scheduler-comparison",
+            "kv-pressure",
         ]
     );
     for descriptor in descriptors {
@@ -522,4 +523,31 @@ fn the_registry_validates_parameters_requirements_and_protocols() {
             Requirement::LoadedModel
         ))
     ));
+}
+
+#[test]
+fn watermark_admission_beats_worst_case_reservation_when_requests_stop_early() {
+    let outcome = run("kv-pressure", &[("requests", "60")]).unwrap();
+    let estimate = |variant: &str, metric: &str| {
+        outcome
+            .report
+            .summaries
+            .iter()
+            .find(|summary| summary.variant == variant)
+            .unwrap()
+            .estimates[metric]
+    };
+
+    let (worst, watermark) = (
+        estimate("worst-case", "completion_p95"),
+        estimate("watermark", "completion_p95"),
+    );
+    // Separated intervals: the gain is not noise across seeds.
+    assert!(watermark.ci95.unwrap().high < worst.ci95.unwrap().low);
+    assert!(estimate("watermark", "preemptions").mean > 0.0);
+    assert_eq!(estimate("worst-case", "preemptions").mean, 0.0);
+    for variant in ["worst-case", "watermark"] {
+        assert_eq!(estimate(variant, "failed").mean, 0.0);
+        assert_eq!(estimate(variant, "unfinished").mean, 0.0);
+    }
 }

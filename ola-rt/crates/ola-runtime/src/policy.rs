@@ -32,6 +32,12 @@ pub trait ExecutionPolicy: Send {
 
     /// Receives each committed iteration; the only place a policy may learn.
     fn observe(&mut self, _iteration: &ExecutorIteration) {}
+
+    /// Whether a KV allocation that fails during execution should requeue
+    /// the request, as a preemption, instead of failing it.
+    fn recovers_kv_exhaustion(&self) -> bool {
+        false
+    }
 }
 
 impl<P: ExecutionPolicy + ?Sized> ExecutionPolicy for Box<P> {
@@ -41,6 +47,10 @@ impl<P: ExecutionPolicy + ?Sized> ExecutionPolicy for Box<P> {
 
     fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
         (**self).plan(snapshot)
+    }
+
+    fn recovers_kv_exhaustion(&self) -> bool {
+        (**self).recovers_kv_exhaustion()
     }
 
     fn enforces_model_kv_capacity(&self) -> bool {

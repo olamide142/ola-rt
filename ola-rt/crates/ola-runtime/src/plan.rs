@@ -78,6 +78,9 @@ pub enum PreemptionReason {
         /// Blocks missing before any preemption.
         shortfall_blocks: usize,
     },
+    /// An allocation failed during execution, which the planner did not
+    /// predict; the request is requeued instead of failed. Never planned.
+    AllocationFailed,
 }
 
 impl LifecycleAction {

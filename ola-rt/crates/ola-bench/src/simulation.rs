@@ -171,6 +171,9 @@ pub struct TrialIteration {
     pub slot_deferrals: usize,
     /// Admission deferrals backfill skipped past.
     pub backfill_skips: usize,
+    /// Live requests returned to the queue, planned or after a failed
+    /// allocation.
+    pub preemptions: usize,
     /// Multi-row groups planned individually for lack of a batch hook.
     pub capability_fallbacks: usize,
     /// Queued requests after the iteration.
@@ -481,6 +484,11 @@ where
             budget_deferrals: estimates.budget_deferrals,
             slot_deferrals: count(|deferral| matches!(deferral, PlannedDeferral::Slots { .. })),
             backfill_skips: iteration.decision.backfill_skips.len(),
+            preemptions: iteration
+                .events
+                .iter()
+                .filter(|event| matches!(event, ExecutorEvent::Preempted { .. }))
+                .count(),
             capability_fallbacks: iteration.decision.capability_fallbacks.len(),
             queued_requests: iteration.queued_requests,
             live_requests: iteration.active_requests,

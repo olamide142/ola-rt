@@ -18,7 +18,7 @@ mod state;
 
 pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
-    UnconstrainedAdmission,
+    UnconstrainedAdmission, WatermarkAdmission,
 };
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,

@@ -205,3 +205,96 @@ fn traces_show_preemption_and_output_continuing_without_repeats() {
     assert!(admissions >= 2, "{mine:?}");
     assert!(matches!(mine.last().unwrap().event, TraceEvent::Completed));
 }
+
+/// Unconstrained admission and no planned preemption, but failed
+/// allocations are recovered: every shortfall reaches execution.
+struct RecoverOnly(ComposedPolicy);
+
+impl ola_runtime::ExecutionPolicy for RecoverOnly {
+    fn descriptor(&self) -> ola_runtime::PolicyDescriptor {
+        self.0.descriptor()
+    }
+
+    fn plan(
+        &self,
+        snapshot: &ola_runtime::PlanningSnapshot,
+    ) -> Result<ola_runtime::PolicyDecision, ola_runtime::PolicyError> {
+        self.0.plan(snapshot)
+    }
+
+    fn enforces_model_kv_capacity(&self) -> bool {
+        false
+    }
+
+    fn recovers_kv_exhaustion(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_failed_allocation_requeues_the_request_instead_of_failing_it() {
+    let (executor, ids) = executor(ComposedPolicy::default());
+    let mut executor = executor.with_policy(RecoverOnly(ComposedPolicy::default()));
+    let iterations = run(&mut executor);
+    let events = iterations.iter().flat_map(|iteration| &iteration.events);
+
+    let exhausted = iterations
+        .iter()
+        .flat_map(|iteration| &iteration.divergences)
+        .filter(|divergence| matches!(divergence, PlanDivergence::KvCapacityExhausted { .. }))
+        .count();
+    let recovered = events
+        .clone()
+        .filter(|event| {
+            matches!(
+                event,
+                ExecutorEvent::Preempted {
+                    reason: ola_runtime::PreemptionReason::AllocationFailed,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(exhausted > 0, "allocations must fail during execution");
+    assert_eq!(recovered, exhausted, "every failure is recovered");
+    assert!(
+        !events
+            .clone()
+            .any(|event| matches!(event, ExecutorEvent::Failed { .. }))
+    );
+    for id in &ids {
+        assert_eq!(executor.result(*id).unwrap().token_ids, expected());
+    }
+}
+
+#[test]
+fn a_request_alone_in_a_pool_too_small_for_it_still_fails() {
+    let mut executor = Executor::default().with_policy(RecoverOnly(ComposedPolicy::default()));
+    executor
+        .register_model(
+            ModelDescriptor::language("synthetic", "synthetic"),
+            synthetic_artifact(KvGeometry {
+                bytes_per_token: 8,
+                tokens_per_block: 4,
+                capacity_bytes: 2 * 4 * 8,
+            }),
+        )
+        .unwrap();
+    let mut spec = RequestSpec::text("synthetic", "");
+    spec.inputs = vec![Input::Tokens(synthetic_prompt(PROMPT, None))];
+    spec.generation.max_new_tokens = OUTPUT;
+    let id = executor.submit(spec, Timestamp::ZERO).unwrap();
+
+    let iterations = run(&mut executor);
+
+    assert!(
+        iterations
+            .iter()
+            .flat_map(|iteration| &iteration.events)
+            .any(|event| matches!(event, ExecutorEvent::Failed { request_id, .. } if *request_id == id))
+    );
+    assert!(matches!(
+        executor.state().request(id).unwrap().status,
+        RequestStatus::Failed(_)
+    ));
+}

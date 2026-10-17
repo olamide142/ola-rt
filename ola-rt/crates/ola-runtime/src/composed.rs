@@ -772,6 +772,12 @@ impl ExecutionPolicy for ComposedPolicy {
     fn enforces_model_kv_capacity(&self) -> bool {
         self.admission.enforces_model_kv_capacity()
     }
+
+    /// Recovery requeues work just as planned preemption does, so it is on
+    /// exactly when preemption is.
+    fn recovers_kv_exhaustion(&self) -> bool {
+        self.preemption.descriptor().name != "no-preemption"
+    }
 }
 
 /// Makes room for `count` events at the start of an iteration.

@@ -116,6 +116,8 @@ pub struct SchedulingSummary {
     pub slot_deferrals: usize,
     /// Backfill skips across iterations.
     pub backfill_skips: usize,
+    /// Live requests returned to the queue to free KV blocks.
+    pub preemptions: usize,
     /// Capability fallbacks across iterations.
     pub capability_fallbacks: usize,
     /// Slowdowns and fairness.
@@ -364,6 +366,7 @@ pub fn summarize_run(
         budget_deferrals: total(|iteration| iteration.budget_deferrals),
         slot_deferrals: total(|iteration| iteration.slot_deferrals),
         backfill_skips: total(|iteration| iteration.backfill_skips),
+        preemptions: total(|iteration| iteration.preemptions),
         capability_fallbacks: total(|iteration| iteration.capability_fallbacks),
         slowdown: metrics.slowdown,
         starved: metrics.starved,

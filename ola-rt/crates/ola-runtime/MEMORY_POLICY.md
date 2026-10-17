@@ -1,7 +1,7 @@
 # Memory and cache policy design
 
 Status: **accepted** (2026-10-17) with all recommended decisions.
-Covers `todo.md` P7. Steps 1–2 are implemented.
+Covers `todo.md` P7. Steps 1–3 are implemented.
 
 ## Goal
 
@@ -104,9 +104,31 @@ deterministic. That is P7's completion criterion.
    random-weight Llama and on the tiny-Llama fixture, preempted requests
    produce exactly their solo greedy output, so re-prefilling generated
    tokens did not flip any near-tie in these runs.
-3. Optimistic admission: `WatermarkAdmission` (headroom over the physical
-   check), preempt-instead-of-fail recovery when an allocation still fails,
-   and a virtual-time cache-pressure study against conservative admission.
+3. **Optimistic admission and recovery.** **Done.** `WatermarkAdmission
+   { headroom_tokens }` reserves prompt plus headroom (capped at the worst
+   case) and still rejects requests whose worst case exceeds the pool.
+   `ExecutionPolicy::recovers_kv_exhaustion` (on exactly when
+   `ComposedPolicy` preempts) makes a failed allocation requeue the request
+   as `PreemptionReason::AllocationFailed`, unless the request could never
+   fit the whole pool. A first rule, "fail when alone in the pool", was
+   wrong: when one batched decode failed for every row, requeuing the first
+   rows dropped their sessions, so the last row looked alone and failed
+   although the freed blocks would have let it run. The rule now depends
+   only on the request. Simulation summaries count preemptions.
+
+   **Study** (`kv-pressure`, five seeds × 120 requests, 2,048-token pool,
+   24 slots, headroom 32). On `early_stopping`, watermark admission with
+   preemption cut completion p95 from 473 ms to 250 ms, p50 from 231 to
+   107 ms, and TTFT p95 from 419 to 183 ms, and raised throughput from 12,568
+   to 19,821 tokens/s (+58%), with 32.6 preemptions per run and no failures;
+   every interval separates. Worst-case reservation left a third of the
+   pool unused (peak 85 KB of 131 KB against 127 KB). On `overload` and
+   `mixed_short_long` the default pool never binds and both policies are
+   identical; with a 256-token pool, where requests use most of their limit,
+   watermark admission triggered no preemptions and stayed within 1% of
+   worst-case latency and throughput with overlapping intervals. On these
+   workloads it never lost; the default stays conservative until real-model
+   studies agree.
 4. Prefix cache: hashed shared blocks, prefix attachment, LRU eviction,
    admission accounting, metrics, identical-output tests, and a shared-prefix
    study of prefill tokens saved.

@@ -1049,6 +1049,18 @@ impl Executor {
                         .push(PlanDivergence::KvCapacityExhausted {
                             request_id: pending.request_id,
                         });
+                    if self.recovers_kv_exhaustion(
+                        &pending.model,
+                        pending.cursor.saturating_add(row.input_tokens()),
+                    ) {
+                        let event = self.requeue_pending(
+                            pending,
+                            PreemptionReason::AllocationFailed,
+                            finished_at,
+                        )?;
+                        outcome.indexed_events.push((row.event_index, event));
+                        continue;
+                    }
                 }
                 let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
@@ -1076,6 +1088,18 @@ impl Executor {
                         .push(PlanDivergence::KvCapacityExhausted {
                             request_id: pending.request_id,
                         });
+                    if self.recovers_kv_exhaustion(
+                        &pending.model,
+                        pending.cursor.saturating_add(row.input_tokens()),
+                    ) {
+                        let event = self.requeue_pending(
+                            pending,
+                            PreemptionReason::AllocationFailed,
+                            finished_at,
+                        )?;
+                        outcome.indexed_events.push((row.event_index, event));
+                        continue;
+                    }
                 }
                 let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
@@ -1226,6 +1250,18 @@ impl Executor {
                         .push(PlanDivergence::KvCapacityExhausted {
                             request_id: active.request_id,
                         });
+                    if self.recovers_kv_exhaustion(
+                        &active.model,
+                        active.next_position().saturating_add(1),
+                    ) {
+                        let event = self.requeue_active(
+                            active,
+                            PreemptionReason::AllocationFailed,
+                            finished_at,
+                        )?;
+                        outcome.indexed_events.push((row.event_index, event));
+                        continue;
+                    }
                 }
                 let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
@@ -1253,6 +1289,18 @@ impl Executor {
                         .push(PlanDivergence::KvCapacityExhausted {
                             request_id: active.request_id,
                         });
+                    if self.recovers_kv_exhaustion(
+                        &active.model,
+                        active.next_position().saturating_add(1),
+                    ) {
+                        let event = self.requeue_active(
+                            active,
+                            PreemptionReason::AllocationFailed,
+                            finished_at,
+                        )?;
+                        outcome.indexed_events.push((row.event_index, event));
+                        continue;
+                    }
                 }
                 let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
@@ -1335,27 +1383,79 @@ impl Executor {
         reason: PreemptionReason,
         at: Timestamp,
     ) -> Result<ExecutorEvent, ExecutorError> {
-        self.runtime.preempt(request_id, at)?;
-        self.bump_generation();
         if let Some(active) = self.active.remove(&request_id) {
             self.ready.retain(|ready| *ready != request_id);
-            let mut prompt = active.prompt.clone();
-            prompt.extend_from_slice(&active.generated);
-            self.prepared.insert(request_id, Ok(prompt));
-            self.resumed.insert(
-                request_id,
-                Resumed {
-                    prompt: active.prompt,
-                    generated: active.generated,
-                    token_times: active.token_times,
-                },
-            );
-        } else if let Some(pending) = self.prefilling.remove(&request_id) {
-            // Its prompt (with any earlier output) is prefilled again from
-            // the start; an existing resume record stays as it is.
-            self.prefill_ready.retain(|ready| *ready != request_id);
-            self.prepared.insert(request_id, Ok(pending.prompt_tokens));
+            return self.requeue_active(active, reason, at);
         }
+        if let Some(pending) = self.prefilling.remove(&request_id) {
+            self.prefill_ready.retain(|ready| *ready != request_id);
+            return self.requeue_pending(pending, reason, at);
+        }
+        // Validation admits only live requests, so this reports the
+        // runtime's own transition error.
+        self.runtime.preempt(request_id, at)?;
+        unreachable!("a preempted request is live")
+    }
+
+    /// Returns a decoding request to the queue, dropping its session and KV
+    /// blocks but keeping its output so it resumes by prefilling prompt and
+    /// output together.
+    fn requeue_active(
+        &mut self,
+        active: ActiveGeneration,
+        reason: PreemptionReason,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
+        let ActiveGeneration {
+            request_id,
+            session,
+            prompt,
+            generated,
+            token_times,
+            ..
+        } = active;
+        drop(session);
+        self.runtime.preempt(request_id, at)?;
+        self.bump_generation();
+        let mut resume_prompt = prompt.clone();
+        resume_prompt.extend_from_slice(&generated);
+        self.prepared.insert(request_id, Ok(resume_prompt));
+        let generated_tokens = generated.len();
+        self.resumed.insert(
+            request_id,
+            Resumed {
+                prompt,
+                generated,
+                token_times,
+            },
+        );
+        self.refresh_kv_memory();
+        Ok(ExecutorEvent::Preempted {
+            request_id,
+            reason,
+            generated_tokens,
+        })
+    }
+
+    /// Returns a request with an unfinished prompt to the queue; its prompt
+    /// (with any earlier output) is prefilled again from the start, and an
+    /// existing resume record stays as it is.
+    fn requeue_pending(
+        &mut self,
+        pending: PendingPrefill,
+        reason: PreemptionReason,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
+        let PendingPrefill {
+            request_id,
+            session,
+            prompt_tokens,
+            ..
+        } = pending;
+        drop(session);
+        self.runtime.preempt(request_id, at)?;
+        self.bump_generation();
+        self.prepared.insert(request_id, Ok(prompt_tokens));
         self.refresh_kv_memory();
         Ok(ExecutorEvent::Preempted {
             request_id,
@@ -1365,6 +1465,19 @@ impl Executor {
                 .get(&request_id)
                 .map_or(0, |resumed| resumed.generated.len()),
         })
+    }
+
+    /// Whether a KV-capacity failure on `model` should requeue the request
+    /// instead of failing it: the policy must opt in, and the request's
+    /// cache after the failed operation (`required_tokens` positions) must
+    /// fit the whole pool, so it can run once other work releases blocks. A
+    /// request that could never fit fails. The test depends only on the
+    /// request, not on which batch peers were requeued first.
+    fn recovers_kv_exhaustion(&self, model: &CausalLanguageModel, required_tokens: usize) -> bool {
+        self.policy.recovers_kv_exhaustion()
+            && model.kv_pool_status().is_some_and(|pool| {
+                required_tokens.div_ceil(pool.tokens_per_block.max(1)) <= pool.total_blocks
+            })
     }
 
     fn fail_started(

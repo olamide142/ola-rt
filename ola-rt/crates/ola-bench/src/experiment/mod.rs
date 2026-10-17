@@ -11,7 +11,8 @@ mod report;
 mod statistics;
 
 pub use builtin::{
-    AdaptivePrefillCost, FifoWorkload, KvBlockPressure, PrefillBucketing, SchedulerComparison,
+    AdaptivePrefillCost, FifoWorkload, KvBlockPressure, KvPressure, PrefillBucketing,
+    SchedulerComparison,
 };
 pub use compare::{
     Change, CompareError, CompareOptions, IdentityDifference, MetricComparison, ReportComparison,

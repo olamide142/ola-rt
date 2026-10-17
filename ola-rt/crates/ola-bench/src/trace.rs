@@ -64,6 +64,20 @@ impl SchedulingTrace {
         })
     }
 
+    /// Chat-like requests whose callers allow a generous output limit
+    /// (128–256 tokens) that most never reach: three quarters stop after
+    /// 8–64 tokens. Worst-case KV reservation strands memory on exactly
+    /// this workload.
+    pub fn early_stopping(parameters: TraceParameters) -> Self {
+        Self::generate("early_stopping", parameters, |random, _| {
+            let mut request = shaped(random, 16..=64, 128..=256);
+            if random.chance(75) {
+                request.eos_after = Some(random.between(8, 64));
+            }
+            request
+        })
+    }
+
     /// A first quarter of short prompts with long outputs (many live
     /// decodes), then long prompts with short outputs competing with them.
     pub fn prefill_decode_competition(parameters: TraceParameters) -> Self {

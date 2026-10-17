@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 18:27 BST (Europe/London)
+**Last updated:** 2026-10-17 20:10 BST (Europe/London)
 
-**Source revision:** working tree based on `3bbbe0d` on `master`
+**Source revision:** working tree based on `754c6e8` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -20,7 +20,9 @@ reports device memory, utilization, and time spent in model calls. P7
 (memory and cache policy) is in progress: models report KV-pool occupancy
 to the planner, pool exhaustion is a typed failure, and live requests can be
 preempted and resumed by recompute with output identical to uninterrupted
-runs. Current
+runs. Watermark admission with preemption cut completion p95 by 47% and
+raised throughput 58% on an early-stopping workload in virtual time, with no
+measurable cost where requests run to their limit. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -476,7 +478,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 272 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 276 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 12
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -647,10 +649,12 @@ and `TOKENS` variables.
   page attention is not yet a fused ragged multi-request kernel.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
   reclaim part of a reservation as a sequence approaches completion.
-- Preemption is opt-in (`ComposedPolicy::with_preemption`). Without it,
-  running out of KV blocks (possible without memory-aware admission) still
-  fails the request; with it, an allocation the planner did not predict can
-  still fail until P7 step 3 adds preempt-instead-of-fail recovery.
+- Preemption and watermark admission are opt-in
+  (`ComposedPolicy::with_preemption`, `WatermarkAdmission`); the default
+  stays conservative worst-case reservation. The `kv-pressure` gains are
+  virtual-time results on the synthetic model and need confirming on a real
+  model under load. Without preemption, running out of KV blocks still fails
+  the request.
 - Preemption recomputes: a resumed request re-prefills its prompt and output.
   Swapping KV to host memory is not implemented.
 - Device-wide admission is enforced only when a caller supplies a capacity and
@@ -731,6 +735,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 20:10 BST — working tree on `754c6e8`:** P7 step 3: `WatermarkAdmission`,
+  preempt-instead-of-fail recovery for allocations the planner did not
+  predict (only requests that could never fit fail), the `early_stopping`
+  trace, and the `kv-pressure` study: on early-stopping requests watermark
+  admission with preemption cut completion p95 473 → 250 ms and raised
+  throughput 58% with separated intervals; on full-length workloads it was
+  neutral.
 
 - **2026-10-17 18:27 BST — working tree on `3bbbe0d`:** P7 step 2: preemption by
   recompute (plan action, runtime transition, resume without repeated

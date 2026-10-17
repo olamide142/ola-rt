@@ -266,8 +266,10 @@ pub enum PlanReportLifecycle {
     Preempt {
         /// Request identifier.
         request_id: u64,
+        /// `kv_shortfall` for planned preemption.
+        reason: String,
         /// Blocks the pool was short before preemption.
-        shortfall_blocks: usize,
+        shortfall_blocks: Option<usize>,
         /// Position of the resulting event.
         event_index: usize,
     },
@@ -501,11 +503,19 @@ fn lifecycle(action: &LifecycleAction) -> PlanReportLifecycle {
         },
         LifecycleAction::Preempt {
             request_id,
-            reason: PreemptionReason::KvShortfall { shortfall_blocks },
+            reason,
             event_index,
         } => PlanReportLifecycle::Preempt {
             request_id: request_id.get(),
-            shortfall_blocks: *shortfall_blocks,
+            reason: match reason {
+                PreemptionReason::KvShortfall { .. } => "kv_shortfall",
+                PreemptionReason::AllocationFailed => "allocation_failed",
+            }
+            .into(),
+            shortfall_blocks: match reason {
+                PreemptionReason::KvShortfall { shortfall_blocks } => Some(*shortfall_blocks),
+                PreemptionReason::AllocationFailed => None,
+            },
             event_index: *event_index,
         },
     }

@@ -232,6 +232,70 @@ impl AdmissionPolicy for MemoryAwareAdmission {
     }
 }
 
+/// Admits on the prompt plus a fixed headroom instead of the worst case.
+///
+/// Reservations cover only `prompt + headroom_tokens` positions, so the
+/// model pool is deliberately over-committed: requests that end early never
+/// held memory for tokens they did not produce. When live requests outgrow
+/// their reservations, the pool runs short, and the planner must preempt.
+/// Use it only with [`ComposedPolicy::with_preemption`](crate::ComposedPolicy::with_preemption),
+/// which also checks each admission against the pool's free blocks.
+///
+/// A request whose worst case could never fit the pool is still rejected,
+/// since no amount of preemption would let it finish. The device-wide
+/// budget is not consulted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WatermarkAdmission {
+    /// Positions reserved beyond the prompt.
+    pub headroom_tokens: usize,
+}
+
+impl AdmissionPolicy for WatermarkAdmission {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("watermark-admission")
+            .with_config("headroom_tokens", self.headroom_tokens.to_string())
+    }
+
+    fn enforces_model_kv_capacity(&self) -> bool {
+        true
+    }
+
+    fn decide(&self, context: &AdmissionContext) -> AdmissionDecision {
+        let Some(profile) = context.kv_cache else {
+            return AdmissionDecision::Reject(AdmissionReason::MissingKvCacheProfile);
+        };
+        let Some(worst_case_bytes) = estimate_kv_bytes(context) else {
+            return AdmissionDecision::Reject(AdmissionReason::EstimateOverflow);
+        };
+        if worst_case_bytes > profile.capacity_bytes() {
+            return AdmissionDecision::Reject(AdmissionReason::RequestExceedsModelKvCapacity {
+                required_bytes: worst_case_bytes,
+                capacity_bytes: profile.capacity_bytes(),
+            });
+        }
+        let Some(required_bytes) = context
+            .prompt_tokens
+            .checked_add(self.headroom_tokens)
+            .and_then(|tokens| profile.estimate_bytes(tokens))
+            .map(|bytes| bytes.min(worst_case_bytes))
+        else {
+            return AdmissionDecision::Reject(AdmissionReason::EstimateOverflow);
+        };
+        let model_available = profile
+            .capacity_bytes()
+            .saturating_sub(context.model_reserved_kv_bytes);
+        if required_bytes > model_available {
+            return AdmissionDecision::Defer(AdmissionReason::ModelKvCapacity {
+                required_bytes,
+                available_bytes: model_available,
+            });
+        }
+        AdmissionDecision::Admit {
+            reserved_kv_bytes: required_bytes,
+        }
+    }
+}
+
 fn estimate_kv_bytes(context: &AdmissionContext) -> Option<u64> {
     let profile = context.kv_cache?;
     // The first selected output token is not a decode input yet, so at most
@@ -308,5 +372,49 @@ mod tests {
                 capacity_bytes: 512,
             })
         );
+    }
+
+    #[test]
+    fn watermark_reserves_the_prompt_plus_headroom_but_rejects_what_can_never_fit() {
+        let watermark = WatermarkAdmission { headroom_tokens: 4 };
+        // Four 16-token pages: a 10-token prompt allowed 40 tokens is 49
+        // positions at worst (four pages) but 14 with headroom (one page).
+        let context = AdmissionContext {
+            prompt_tokens: 10,
+            max_new_tokens: 40,
+            ..context()
+        };
+        assert_eq!(
+            watermark.decide(&context),
+            AdmissionDecision::Admit {
+                reserved_kv_bytes: 128,
+            }
+        );
+        assert_eq!(
+            MemoryAwareAdmission.decide(&context),
+            AdmissionDecision::Admit {
+                reserved_kv_bytes: 512,
+            }
+        );
+
+        let crowded = AdmissionContext {
+            model_reserved_kv_bytes: 448,
+            ..context.clone()
+        };
+        assert_eq!(
+            watermark.decide(&crowded),
+            AdmissionDecision::Defer(AdmissionReason::ModelKvCapacity {
+                required_bytes: 128,
+                available_bytes: 64,
+            })
+        );
+        let impossible = AdmissionContext {
+            max_new_tokens: 60,
+            ..context
+        };
+        assert!(matches!(
+            watermark.decide(&impossible),
+            AdmissionDecision::Reject(AdmissionReason::RequestExceedsModelKvCapacity { .. })
+        ));
     }
 }

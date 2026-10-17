@@ -142,10 +142,11 @@ pub enum TraceEvent {
     /// later, prefilling its prompt and output together; its next `token`
     /// continues the output.
     Preempted {
-        /// Why, such as `kv_shortfall`.
+        /// `kv_shortfall` (planned) or `allocation_failed` (recovered).
         reason: String,
-        /// Blocks the pool was short before preemption.
-        shortfall_blocks: usize,
+        /// Blocks the pool was short before a planned preemption.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shortfall_blocks: Option<usize>,
         /// Output tokens kept for the resume.
         generated_tokens: usize,
     },
@@ -414,13 +415,18 @@ impl Tracer {
                 reason,
                 generated_tokens,
             } => {
-                let ola_runtime::PreemptionReason::KvShortfall { shortfall_blocks } = reason;
+                let (reason, shortfall_blocks) = match reason {
+                    ola_runtime::PreemptionReason::KvShortfall { shortfall_blocks } => {
+                        ("kv_shortfall", Some(*shortfall_blocks))
+                    }
+                    ola_runtime::PreemptionReason::AllocationFailed => ("allocation_failed", None),
+                };
                 push(
                     *request_id,
                     at,
                     TraceEvent::Preempted {
-                        reason: "kv_shortfall".into(),
-                        shortfall_blocks: *shortfall_blocks,
+                        reason: reason.into(),
+                        shortfall_blocks,
                         generated_tokens: *generated_tokens,
                     },
                 );

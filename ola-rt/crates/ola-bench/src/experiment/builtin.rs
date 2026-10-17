@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, time::Duration, time::Instant};
 use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
     ComposedPolicy, EarliestDeadlineFirst, ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager,
-    MemoryAwareAdmission, PriorityScheduler, Runtime, ShortestJobFirst,
+    MemoryAwareAdmission, NewestFirst, PriorityScheduler, Runtime, ShortestJobFirst,
+    WatermarkAdmission,
 };
 
 use super::{
@@ -33,6 +34,7 @@ impl ExperimentRegistry {
             Box::new(PrefillBucketing),
             Box::new(AdaptivePrefillCost),
             Box::new(SchedulerComparison),
+            Box::new(KvPressure),
         ])
     }
 }
@@ -712,6 +714,231 @@ impl Experiment for SchedulerComparison {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ")
+        );
+        Ok(ExperimentOutcome { summary, ..outcome })
+    }
+}
+
+/// Worst-case KV reservation against watermark admission with preemption,
+/// on a pool that binds, in virtual time.
+pub struct KvPressure;
+
+impl KvPressure {
+    fn policies(headroom_tokens: usize) -> Vec<(&'static str, Box<dyn ExecutionPolicy>)> {
+        vec![
+            (
+                "worst-case",
+                Box::new(ComposedPolicy::default().with_admission(MemoryAwareAdmission)),
+            ),
+            (
+                "watermark",
+                Box::new(
+                    ComposedPolicy::default()
+                        .with_admission(WatermarkAdmission { headroom_tokens })
+                        .with_preemption(NewestFirst),
+                ),
+            ),
+        ]
+    }
+}
+
+impl Experiment for KvPressure {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "kv-pressure",
+            name: "KV pressure",
+            description: "Worst-case KV reservation versus watermark admission with preemption",
+            category: ExperimentCategory::Experiment,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Virtual,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::text(
+                    "trace",
+                    "early_stopping, mixed_short_long, or overload",
+                    "early_stopping",
+                ),
+                ParameterSpec::integer("seeds", "Trace seeds, one per repetition", 5),
+                ParameterSpec::integer("requests", "Requests per trace", 120),
+                ParameterSpec::integer(
+                    "mean_interarrival_micros",
+                    "Mean arrival gap in virtual microseconds",
+                    1_000,
+                ),
+                ParameterSpec::integer("max_active_requests", "Executor slots", 24),
+                ParameterSpec::integer("kv_capacity_tokens", "KV pool size in tokens", 2_048),
+                ParameterSpec::integer(
+                    "headroom_tokens",
+                    "Watermark positions reserved beyond the prompt",
+                    32,
+                ),
+            ],
+        }
+    }
+
+    fn traceable(&self) -> bool {
+        true
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let trace_name = parameters.text("trace")?.to_owned();
+        let seeds = (1..=parameters.integer("seeds")?).collect::<Vec<_>>();
+        let geometry = KvGeometry::default();
+        let config = SimulationConfig {
+            max_active_requests: parameters.size("max_active_requests")?,
+            kv: KvGeometry {
+                capacity_bytes: parameters
+                    .integer("kv_capacity_tokens")?
+                    .saturating_mul(geometry.bytes_per_token),
+                ..geometry
+            },
+            ..SimulationConfig::default()
+        };
+        let headroom_tokens = parameters.size("headroom_tokens")?;
+        let base = TraceParameters {
+            seed: 0,
+            requests: parameters.size("requests")?,
+            mean_interarrival_micros: parameters.integer("mean_interarrival_micros")?,
+        };
+        let generate = |seed| {
+            let parameters = TraceParameters { seed, ..base };
+            Ok(match trace_name.as_str() {
+                "early_stopping" => SchedulingTrace::early_stopping(parameters),
+                "mixed_short_long" => SchedulingTrace::mixed_short_long(parameters),
+                "overload" => SchedulingTrace::overload(parameters),
+                _ => {
+                    return Err(ExperimentError::InvalidParameter {
+                        name: "trace".into(),
+                        reason: format!("unknown trace `{trace_name}`"),
+                    });
+                }
+            })
+        };
+
+        let labels = Self::policies(headroom_tokens)
+            .into_iter()
+            .map(|(label, policy)| (label, policy.descriptor().to_string()))
+            .collect::<Vec<_>>();
+        let mut samples = labels
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<BTreeMap<String, f64>>>>();
+        let mut content = String::new();
+        for &seed in &seeds {
+            let trace = generate(seed)?;
+            for request in &trace.requests {
+                content.push_str(&format!("{request:?};"));
+            }
+            let mut runs = labels
+                .iter()
+                .map(|(label, _)| {
+                    context
+                        .trace
+                        .as_ref()
+                        .map(|trace| trace.run(format!("{label}/seed={seed}")))
+                })
+                .collect::<Vec<_>>();
+            let mut trace_error = None;
+            let comparison = compare_schedulers_observed(
+                &trace,
+                &config,
+                Self::policies(headroom_tokens)
+                    .into_iter()
+                    .map(|(_, policy)| policy)
+                    .collect(),
+                DEFAULT_STARVATION_FACTOR,
+                &mut |index, iteration, state| {
+                    if let Some(Some(run)) = runs.get_mut(index)
+                        && trace_error.is_none()
+                        && let Err(error) = run.observe(iteration, state)
+                    {
+                        trace_error = Some(error);
+                    }
+                },
+            )
+            .map_err(run_error)?;
+            if let Some(error) = trace_error {
+                return Err(error);
+            }
+            for (variant, summary) in samples.iter_mut().zip(&comparison.summaries) {
+                variant.push(values(&[
+                    ("completion_p50", as_f64(summary.completion.p50_micros)),
+                    ("completion_p95", as_f64(summary.completion.p95_micros)),
+                    ("ttft_p95", as_f64(summary.time_to_first_token.p95_micros)),
+                    (
+                        "throughput",
+                        summary.output_tokens_per_second().unwrap_or(0.0),
+                    ),
+                    ("peak_kv_cache_bytes", as_f64(summary.peak_kv_cache_bytes)),
+                    ("preemptions", as_f64(summary.preemptions)),
+                    ("failed", as_f64(summary.failed + summary.rejected)),
+                    ("unfinished", as_f64(summary.unfinished)),
+                ]));
+            }
+        }
+
+        let latency = |name| metric(name, Unit::Micros, TimeDomain::Virtual, Direction::Lower);
+        let count = |name, better| metric(name, Unit::Count, TimeDomain::Virtual, better);
+        let outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            &trace_name,
+            seeds.clone(),
+            vec![
+                latency("completion_p50"),
+                latency("completion_p95"),
+                latency("ttft_p95"),
+                metric(
+                    "throughput",
+                    Unit::TokensPerSecond,
+                    TimeDomain::Virtual,
+                    Direction::Higher,
+                ),
+                metric(
+                    "peak_kv_cache_bytes",
+                    Unit::Bytes,
+                    TimeDomain::Virtual,
+                    Direction::Neither,
+                ),
+                count("preemptions", Direction::Neither),
+                count("failed", Direction::Lower),
+                count("unfinished", Direction::Lower),
+            ],
+            labels
+                .iter()
+                .zip(samples)
+                .map(|((label, policy), samples)| {
+                    (Variant::policy(*label, policy.clone()), samples)
+                })
+                .collect(),
+            String::new(),
+        )?
+        .with_content_digest(&content);
+        let estimate = |variant: &str, metric: &str| {
+            outcome
+                .report
+                .summaries
+                .iter()
+                .find(|summary| summary.variant == variant)
+                .map_or(0.0, |summary| summary.estimates[metric].mean)
+        };
+        let summary = format!(
+            "{trace_name}, {} seeds × {} requests, virtual time · completion p95 \
+             worst-case {:.1} ms vs watermark {:.1} ms · throughput {:.0} vs {:.0} tok/s · \
+             {:.1} preemptions per run",
+            seeds.len(),
+            base.requests,
+            estimate("worst-case", "completion_p95") / 1_000.0,
+            estimate("watermark", "completion_p95") / 1_000.0,
+            estimate("worst-case", "throughput"),
+            estimate("watermark", "throughput"),
+            estimate("watermark", "preemptions"),
         );
         Ok(ExperimentOutcome { summary, ..outcome })
     }
