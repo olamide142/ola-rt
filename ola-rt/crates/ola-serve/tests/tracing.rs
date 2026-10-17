@@ -61,6 +61,7 @@ fn kinds(records: &[TraceRecord]) -> Vec<&'static str> {
             TraceEvent::Failed { .. } => "failed",
             TraceEvent::Rejected { .. } => "rejected",
             TraceEvent::Cancelled => "cancelled",
+            TraceEvent::Preempted { .. } => "preempted",
         })
         .collect()
 }

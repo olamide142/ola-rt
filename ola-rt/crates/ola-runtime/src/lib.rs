@@ -10,6 +10,7 @@ mod kv_cache;
 mod model_registry;
 mod plan;
 mod policy;
+mod preemption;
 mod runtime;
 mod scheduler;
 mod snapshot;
@@ -29,7 +30,8 @@ pub use batch::{
 pub use composed::{ComposedPolicy, HeadOfLine};
 pub use decision::{
     AdmissionOutcome, AdmissionRecord, BatchHook, CapabilityFallback, DecisionRecord,
-    GroupingDecision, GroupingRecord, RankingRecord, SelectionRecord, SelectionStage,
+    GroupingDecision, GroupingRecord, PreemptionRecord, RankingRecord, SelectionRecord,
+    SelectionStage,
 };
 pub use error::RuntimeError;
 pub use executor::{
@@ -41,10 +43,13 @@ pub use kv_cache::{
 pub use model_registry::ModelRegistry;
 pub use plan::{
     DecodeView, ExecutionPlan, IterationId, LifecycleAction, PlanDivergence, PlanError,
-    PlanEstimates, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PrefillView,
-    ReleaseReason,
+    PlanEstimates, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PreemptionReason,
+    PrefillView, ReleaseReason,
 };
 pub use policy::{ExecutionPolicy, PolicyDecision, PolicyDescriptor, PolicyError};
+pub use preemption::{
+    LowestPriorityFirst, NewestFirst, NoPreemption, PreemptionCandidate, PreemptionPolicy,
+};
 pub use runtime::Runtime;
 pub use scheduler::{
     EarliestDeadlineFirst, FifoScheduler, JobCost, PriorityScheduler, Scheduler, ShortestJobFirst,

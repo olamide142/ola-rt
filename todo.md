@@ -158,7 +158,7 @@ Design: `ola-rt/crates/ola-runtime/MEMORY_POLICY.md`.
 
 - [ ] Reclaim unused worst-case reservations as requests approach completion.
 - [ ] Define cache eviction policy and observable reasons.
-- [ ] Add safe request preemption.
+- [x] Add safe request preemption. (Recompute; outputs identical to uninterrupted runs on the synthetic model and tiny Llama.)
 - [ ] Evaluate swapping after eviction and preemption semantics stabilize.
 - [ ] Add prefix detection and prefix-cache reuse.
 - [ ] Add prefix-cache hit, reuse, and eviction metrics.

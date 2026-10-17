@@ -47,13 +47,18 @@ impl Default for KvGeometry {
 }
 
 /// Builds the prompt that asks the synthetic model to stop after
-/// `eos_after` generated tokens, or never early when `None`.
+/// `eos_after` generated tokens, or never early when `None`. `eos_after`
+/// must stay below 1000, the floor of output tokens.
 pub fn synthetic_prompt(prompt_tokens: usize, eos_after: Option<usize>) -> Vec<u32> {
     let marker = eos_after.map_or(0, |step| u32::try_from(step).unwrap_or(u32::MAX));
     let mut prompt = vec![1; prompt_tokens.max(1)];
     prompt[0] = marker;
     prompt
 }
+
+/// Every output token is at least this; prompt tokens (and end-of-sequence
+/// markers) stay below it, which lets a resumed request be recognized.
+const SYNTHETIC_OUTPUT_FLOOR: u32 = 1_000;
 
 /// Returns the token the synthetic model emits at `step` (1-based) for a
 /// prompt of `prompt_tokens` tokens.
@@ -167,7 +172,8 @@ impl CausalModel for SyntheticModel {
             sequence,
             bytes_per_token: self.bytes_per_token,
             prompt: Vec::new(),
-            generated: 0,
+            resumed: 0,
+            emitted: 0,
             ready: false,
         }))
     }
@@ -222,18 +228,26 @@ struct SyntheticSession {
     sequence: KvSequenceId,
     bytes_per_token: u64,
     prompt: Vec<u32>,
-    generated: usize,
+    /// Output tokens already in `prompt` because a preempted request
+    /// resumed by prefilling its prompt and earlier output together.
+    resumed: usize,
+    /// Tokens this session has emitted.
+    emitted: usize,
     ready: bool,
 }
 
 impl SyntheticSession {
+    /// Emits the next output token. Tokens depend on the original prompt
+    /// length and the output position, so a resumed request continues
+    /// exactly where it stopped, as a real model's would.
     fn emit(&mut self) -> GeneratedToken {
-        self.generated += 1;
+        self.emitted += 1;
+        let generated = self.resumed + self.emitted;
         let eos_after = self.prompt.first().copied().unwrap_or(0);
         GeneratedToken {
-            id: synthetic_token(self.prompt.len(), self.generated),
+            id: synthetic_token(self.prompt.len() - self.resumed, generated),
             is_end_of_sequence: eos_after != 0
-                && usize::try_from(eos_after).is_ok_and(|step| step == self.generated),
+                && usize::try_from(eos_after).is_ok_and(|step| step == generated),
         }
     }
 }
@@ -271,6 +285,14 @@ impl GenerationSession for SyntheticSession {
             return Ok(PrefillOutcome::Pending);
         }
         self.ready = true;
+        // Output tokens are at least 1000 and prompt tokens are small, so a
+        // prompt ending in output tokens is a resumed request.
+        self.resumed = self
+            .prompt
+            .iter()
+            .rev()
+            .take_while(|token| **token >= SYNTHETIC_OUTPUT_FLOOR)
+            .count();
         Ok(PrefillOutcome::Token(self.emit()))
     }
 
@@ -288,15 +310,16 @@ impl GenerationSession for SyntheticSession {
     }
 
     fn metrics(&self) -> SessionMetrics {
-        // The cache holds the prompt plus every generated token except the
-        // latest, which has not yet been fed back as a decode input.
+        // The cache holds the prefilled sequence plus every token this
+        // session emitted except the latest, which has not yet been fed
+        // back as a decode input.
         let cached = self
             .prompt
             .len()
-            .saturating_add(self.generated.saturating_sub(1));
+            .saturating_add(self.emitted.saturating_sub(1));
         SessionMetrics {
-            prompt_tokens: self.prompt.len(),
-            generated_tokens: self.generated,
+            prompt_tokens: self.prompt.len() - self.resumed,
+            generated_tokens: self.resumed + self.emitted,
             kv_cache_bytes: (cached as u64).saturating_mul(self.bytes_per_token),
         }
     }

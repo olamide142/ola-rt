@@ -79,6 +79,7 @@ impl Runtime {
             .ok_or(RuntimeError::RequestIdExhausted)?;
         let request = Request::new(id, arrival_at, spec)?;
         let record = RequestRecord {
+            preemptions: 0,
             request,
             status: RequestStatus::Queued,
             timing: RequestTiming {
@@ -131,7 +132,9 @@ impl Runtime {
 
         let model_id = record.request.spec.model.clone();
         record.status = RequestStatus::Running;
-        record.timing.started_at = Some(started_at);
+        // A resumed request keeps its first start: queue latency measures
+        // the wait before service began, not the wait after preemption.
+        record.timing.started_at.get_or_insert(started_at);
         self.state.queue.remove(position);
         self.state.active.insert(id);
 
@@ -263,6 +266,19 @@ impl Runtime {
         }
         record.status = RequestStatus::Cancelled;
         record.timing.completed_at = Some(cancelled_at);
+        Ok(())
+    }
+
+    /// Returns a running request to the front of the queue, keeping its
+    /// timing, so it resumes before work that has not started.
+    pub fn preempt(&mut self, request_id: RequestId, at: Timestamp) -> Result<(), RuntimeError> {
+        let record = self.record_for_running(request_id, "preempt")?;
+        let started_at = record.timing.started_at.unwrap_or(record.timing.queued_at);
+        ensure_not_before(request_id, "preemption", started_at, at)?;
+        record.status = RequestStatus::Queued;
+        record.preemptions = record.preemptions.saturating_add(1);
+        self.state.active.remove(&request_id);
+        self.state.queue.push_front(request_id);
         Ok(())
     }
 

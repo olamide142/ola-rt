@@ -48,6 +48,8 @@ pub struct RequestRecord {
     pub status: RequestStatus,
     /// Lifecycle timestamps.
     pub timing: RequestTiming,
+    /// Times the request was preempted back to the queue and resumed.
+    pub preemptions: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

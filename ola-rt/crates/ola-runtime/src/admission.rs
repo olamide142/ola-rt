@@ -54,6 +54,14 @@ pub enum AdmissionReason {
         /// Unreserved device bytes after non-KV accounting.
         available_bytes: u64,
     },
+    /// The model's pool has too few free blocks for the request's first
+    /// prefill after this iteration's live growth.
+    KvPoolFull {
+        /// Blocks the first prefill would allocate.
+        needed_blocks: usize,
+        /// Free blocks left after live growth and earlier admissions.
+        available_blocks: usize,
+    },
     /// One request cannot fit in the configured device budget even alone.
     RequestExceedsDeviceMemory {
         /// Page-rounded bytes required by the request.
@@ -90,6 +98,13 @@ impl fmt::Display for AdmissionReason {
             } => write!(
                 formatter,
                 "device budget needs {required_bytes} KV bytes but only {available_bytes} are unreserved"
+            ),
+            Self::KvPoolFull {
+                needed_blocks,
+                available_blocks,
+            } => write!(
+                formatter,
+                "first prefill needs {needed_blocks} KV blocks but only {available_blocks} are free"
             ),
             Self::RequestExceedsDeviceMemory {
                 required_bytes,

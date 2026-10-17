@@ -19,8 +19,8 @@ use crate::{
     ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, IterationId, LifecycleAction,
     ModelSnapshot, PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase,
     PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements,
-    PrefillView, QueuedRequest, ReleaseReason, RequestRecord, Runtime, RuntimeError, RuntimeState,
-    composed::is_complete_prompt,
+    PreemptionReason, PrefillView, QueuedRequest, ReleaseReason, RequestRecord, Runtime,
+    RuntimeError, RuntimeState, composed::is_complete_prompt,
 };
 
 /// Final output retained after successful execution.
@@ -103,6 +103,16 @@ pub enum ExecutorEvent {
         phase: ExecutionPhase,
         /// Input token positions that the operation would process.
         token_cost: usize,
+    },
+    /// A live request returned to the queue; it resumes later where it
+    /// stopped, without repeating tokens.
+    Preempted {
+        /// Request moved back to the queue.
+        request_id: RequestId,
+        /// Why it was chosen.
+        reason: PreemptionReason,
+        /// Output tokens it had generated, all kept.
+        generated_tokens: usize,
     },
     /// Admission policy terminated a request that can never fit.
     Rejected {
@@ -227,6 +237,7 @@ struct ActiveGeneration {
     model_id: ModelId,
     model: CausalLanguageModel,
     session: Box<dyn GenerationSession>,
+    prompt: Vec<u32>,
     prompt_tokens: usize,
     generated: Vec<u32>,
     token_times: Vec<Timestamp>,
@@ -255,6 +266,14 @@ struct PendingPrefill {
     max_new_tokens: usize,
     last_step_at: Timestamp,
     reserved_kv_bytes: u64,
+}
+
+/// What a preempted request keeps while queued, to resume without
+/// repeating output.
+struct Resumed {
+    prompt: Vec<u32>,
+    generated: Vec<u32>,
+    token_times: Vec<Timestamp>,
 }
 
 #[derive(Default)]
@@ -298,6 +317,7 @@ pub struct Executor {
     generation: u64,
     clock: Option<Arc<dyn Clock>>,
     iterations: u64,
+    resumed: BTreeMap<RequestId, Resumed>,
 }
 
 impl Default for Executor {
@@ -325,6 +345,7 @@ impl Executor {
             generation: 0,
             clock: None,
             iterations: 0,
+            resumed: BTreeMap::new(),
         }
     }
 
@@ -457,6 +478,7 @@ impl Executor {
     ) -> Result<(), ExecutorError> {
         self.runtime.cancel(request_id, cancelled_at)?;
         self.prepared.remove(&request_id);
+        self.resumed.remove(&request_id);
         self.bump_generation();
         if self.active.remove(&request_id).is_some() {
             self.ready.retain(|ready| *ready != request_id);
@@ -611,6 +633,13 @@ impl Executor {
     /// Builds the immutable input for one planning pass.
     fn snapshot(&self, at: Timestamp) -> PlanningSnapshot {
         let state = self.runtime.state();
+        let arrival = |request_id: &RequestId| {
+            state
+                .request(*request_id)
+                .map_or((ola_core::Priority::NORMAL, Timestamp::ZERO), |record| {
+                    (record.request.spec.priority, record.timing.queued_at)
+                })
+        };
         PlanningSnapshot {
             at,
             generation: self.generation,
@@ -635,7 +664,11 @@ impl Executor {
                                 Err(format!("model `{}` has no executable attached", spec.model))
                             }
                         },
-                        max_new_tokens: spec.generation.max_new_tokens,
+                        max_new_tokens: spec.generation.max_new_tokens.saturating_sub(
+                            self.resumed
+                                .get(&request_id)
+                                .map_or(0, |resumed| resumed.generated.len()),
+                        ),
                         priority: spec.priority,
                         deadline: spec.deadline,
                         queued_at: record.timing.queued_at,
@@ -652,8 +685,14 @@ impl Executor {
                             model_id: pending.model_id.clone(),
                             cursor: pending.cursor,
                             prompt_tokens: pending.prompt_tokens.len(),
-                            max_new_tokens: pending.max_new_tokens,
+                            max_new_tokens: pending.max_new_tokens.saturating_sub(
+                                self.resumed
+                                    .get(request_id)
+                                    .map_or(0, |resumed| resumed.generated.len()),
+                            ),
                             reserved_kv_bytes: pending.reserved_kv_bytes,
+                            priority: arrival(request_id).0,
+                            arrived_at: arrival(request_id).1,
                         },
                     )
                 })
@@ -670,6 +709,8 @@ impl Executor {
                             generated_tokens: active.generated.len(),
                             max_new_tokens: active.max_new_tokens,
                             reserved_kv_bytes: active.reserved_kv_bytes,
+                            priority: arrival(request_id).0,
+                            arrived_at: arrival(request_id).1,
                         },
                     )
                 })
@@ -776,6 +817,7 @@ impl Executor {
                     event_index,
                 } => {
                     self.prepared.remove(request_id);
+                    self.resumed.remove(request_id);
                     self.runtime.reject(*request_id, reason.to_string(), at)?;
                     outcome.indexed_events.push((
                         *event_index,
@@ -793,6 +835,14 @@ impl Executor {
                     self.prepared.remove(request_id);
                     self.runtime.start_selected(*request_id, at)?;
                     let event = self.fail_started(*request_id, message.clone(), at)?;
+                    outcome.indexed_events.push((*event_index, event));
+                }
+                LifecycleAction::Preempt {
+                    request_id,
+                    reason,
+                    event_index,
+                } => {
+                    let event = self.preempt(*request_id, *reason, at)?;
                     outcome.indexed_events.push((*event_index, event));
                 }
             }
@@ -1079,15 +1129,28 @@ impl Executor {
                 at,
             );
         }
-        self.runtime.mark_first_token(pending.request_id, at)?;
+        // A resumed request prefilled prompt and earlier output together, so
+        // this token continues its output; its first token was long ago.
+        let (prompt, generated, token_times) = match self.resumed.remove(&pending.request_id) {
+            Some(resumed) => {
+                let mut generated = resumed.generated;
+                generated.push(token.id);
+                (resumed.prompt, generated, resumed.token_times)
+            }
+            None => {
+                self.runtime.mark_first_token(pending.request_id, at)?;
+                (pending.prompt_tokens, vec![token.id], Vec::new())
+            }
+        };
         let active = ActiveGeneration {
             request_id: pending.request_id,
             model_id: pending.model_id,
             model: pending.model,
             session: pending.session,
-            prompt_tokens: pending.prompt_tokens.len(),
-            generated: vec![token.id],
-            token_times: Vec::new(),
+            prompt_tokens: prompt.len(),
+            prompt,
+            generated,
+            token_times,
             last_token: token,
             max_new_tokens: pending.max_new_tokens,
             last_step_at: at,
@@ -1264,6 +1327,46 @@ impl Executor {
         Ok(event)
     }
 
+    /// Releases a live request's session and returns it to the queue,
+    /// keeping its output so it resumes by prefilling prompt and output.
+    fn preempt(
+        &mut self,
+        request_id: RequestId,
+        reason: PreemptionReason,
+        at: Timestamp,
+    ) -> Result<ExecutorEvent, ExecutorError> {
+        self.runtime.preempt(request_id, at)?;
+        self.bump_generation();
+        if let Some(active) = self.active.remove(&request_id) {
+            self.ready.retain(|ready| *ready != request_id);
+            let mut prompt = active.prompt.clone();
+            prompt.extend_from_slice(&active.generated);
+            self.prepared.insert(request_id, Ok(prompt));
+            self.resumed.insert(
+                request_id,
+                Resumed {
+                    prompt: active.prompt,
+                    generated: active.generated,
+                    token_times: active.token_times,
+                },
+            );
+        } else if let Some(pending) = self.prefilling.remove(&request_id) {
+            // Its prompt (with any earlier output) is prefilled again from
+            // the start; an existing resume record stays as it is.
+            self.prefill_ready.retain(|ready| *ready != request_id);
+            self.prepared.insert(request_id, Ok(pending.prompt_tokens));
+        }
+        self.refresh_kv_memory();
+        Ok(ExecutorEvent::Preempted {
+            request_id,
+            reason,
+            generated_tokens: self
+                .resumed
+                .get(&request_id)
+                .map_or(0, |resumed| resumed.generated.len()),
+        })
+    }
+
     fn fail_started(
         &mut self,
         request_id: RequestId,
@@ -1271,6 +1374,7 @@ impl Executor {
         at: Timestamp,
     ) -> Result<ExecutorEvent, ExecutorError> {
         self.runtime.fail(request_id, message.clone(), at)?;
+        self.resumed.remove(&request_id);
         self.refresh_kv_memory();
         Ok(ExecutorEvent::Failed {
             request_id,

@@ -9,7 +9,7 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
-use ola_core::{ModelId, RequestId, Timestamp};
+use ola_core::{ModelId, Priority, RequestId, Timestamp};
 
 use crate::{AdmissionReason, BatchExecutionMode, BatchPhase, PlanningSnapshot};
 
@@ -56,6 +56,28 @@ pub enum LifecycleAction {
         /// Position of the resulting event in the iteration.
         event_index: usize,
     },
+    /// Return a live request to the queue, releasing its session, KV
+    /// blocks, slot, and reservation before any invocation runs. Its
+    /// generated tokens are kept; it resumes by prefilling prompt and
+    /// generated tokens together.
+    Preempt {
+        /// Live request moved back to the queue.
+        request_id: RequestId,
+        /// Why it was chosen.
+        reason: PreemptionReason,
+        /// Position of the resulting event in the iteration.
+        event_index: usize,
+    },
+}
+
+/// Why a live request was preempted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreemptionReason {
+    /// The model's KV pool could not hold this iteration's growth.
+    KvShortfall {
+        /// Blocks missing before any preemption.
+        shortfall_blocks: usize,
+    },
 }
 
 impl LifecycleAction {
@@ -64,7 +86,8 @@ impl LifecycleAction {
         match self {
             Self::Admit { request_id, .. }
             | Self::Reject { request_id, .. }
-            | Self::Fail { request_id, .. } => *request_id,
+            | Self::Fail { request_id, .. }
+            | Self::Preempt { request_id, .. } => *request_id,
         }
     }
 }
@@ -296,10 +319,15 @@ pub struct PrefillView {
     pub cursor: usize,
     /// Total tokenized prompt length.
     pub prompt_tokens: usize,
-    /// Caller output limit.
+    /// Output tokens still allowed: the caller's limit minus any generated
+    /// before a preemption.
     pub max_new_tokens: usize,
     /// KV bytes reserved for the request.
     pub reserved_kv_bytes: u64,
+    /// Caller-supplied priority.
+    pub priority: Priority,
+    /// Time the request first entered the queue.
+    pub arrived_at: Timestamp,
 }
 
 /// Live request ready for one decode step.
@@ -315,6 +343,10 @@ pub struct DecodeView {
     pub max_new_tokens: usize,
     /// KV bytes reserved for the request.
     pub reserved_kv_bytes: u64,
+    /// Caller-supplied priority.
+    pub priority: Priority,
+    /// Time the request first entered the queue.
+    pub arrived_at: Timestamp,
 }
 
 impl DecodeView {
@@ -641,8 +673,23 @@ impl ExecutionPlan {
         };
         let mut admitted = BTreeMap::new();
         let mut event_indices = Vec::new();
+        let mut preempted = BTreeSet::new();
         for action in &self.lifecycle {
             let request_id = action.request_id();
+            if let LifecycleAction::Preempt { event_index, .. } = action {
+                if !view.decoding.contains_key(&request_id)
+                    && !view.prefilling.contains_key(&request_id)
+                {
+                    return Err(PlanError::InvalidStatus {
+                        request_id,
+                        expected: "decoding or prefilling",
+                    });
+                }
+                claim(request_id)?;
+                event_indices.push(*event_index);
+                preempted.insert(request_id);
+                continue;
+            }
             let Some(queued) = view.queued.get(&request_id) else {
                 return Err(PlanError::InvalidStatus {
                     request_id,
@@ -674,6 +721,7 @@ impl ExecutionPlan {
                     claim(request_id)?;
                     event_indices.push(*event_index);
                 }
+                LifecycleAction::Preempt { .. } => unreachable!("handled above"),
             }
         }
 
@@ -766,6 +814,8 @@ impl ExecutionPlan {
                 return Err(PlanError::InvalidRelease(*request_id));
             }
         }
+        // Preemption frees a slot and a reservation before admissions run.
+        released.extend(preempted);
 
         let live_after = view
             .live_requests()
@@ -946,6 +996,8 @@ mod tests {
                     prompt_tokens: 7,
                     max_new_tokens: 4,
                     reserved_kv_bytes: 100,
+                    priority: ola_core::Priority::NORMAL,
+                    arrived_at: Timestamp::ZERO,
                 },
             )]),
             decoding: BTreeMap::from([
@@ -957,6 +1009,8 @@ mod tests {
                         generated_tokens: 3,
                         max_new_tokens: 4,
                         reserved_kv_bytes: 100,
+                        priority: ola_core::Priority::NORMAL,
+                        arrived_at: Timestamp::ZERO,
                     },
                 ),
                 (
@@ -967,6 +1021,8 @@ mod tests {
                         generated_tokens: 1,
                         max_new_tokens: 8,
                         reserved_kv_bytes: 100,
+                        priority: ola_core::Priority::NORMAL,
+                        arrived_at: Timestamp::ZERO,
                     },
                 ),
             ]),

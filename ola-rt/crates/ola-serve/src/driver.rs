@@ -127,6 +127,8 @@ pub struct RequestSnapshot {
     pub timing: RequestTiming,
     /// Output tokens generated so far.
     pub generated_tokens: usize,
+    /// Times the request was preempted and resumed.
+    pub preemptions: u32,
 }
 
 /// Whether the driver is taking work.
@@ -1057,7 +1059,11 @@ impl Worker {
                     });
                     self.deliver_token(request_id, token.id, generated_tokens, phase, finished);
                 }
-                ExecutorEvent::PrefillProgress { .. } => progressed = true,
+                // Preemption is invisible to the client: its stream resumes
+                // where it stopped once the request is re-admitted.
+                ExecutorEvent::PrefillProgress { .. } | ExecutorEvent::Preempted { .. } => {
+                    progressed = true;
+                }
                 ExecutorEvent::Failed {
                     request_id,
                     message,
@@ -1157,6 +1163,8 @@ impl Worker {
                 status: record.status,
                 timing: record.timing,
                 generated_tokens: live.decoder.tokens().len(),
+
+                preemptions: record.preemptions,
             }),
             _ => self.drop_trace(id),
         }
@@ -1189,6 +1197,8 @@ impl Worker {
                 status: record.status.clone(),
                 timing: record.timing,
                 generated_tokens: live.decoder.tokens().len(),
+
+                preemptions: record.preemptions,
             });
         }
         self.finished

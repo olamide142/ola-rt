@@ -404,3 +404,54 @@ fn a_served_request_is_traced_from_arrival_to_completion() {
     let (_, health) = server.json("GET", "/health", None);
     assert!(health["busy_us"].as_u64().unwrap() > 0);
 }
+
+#[test]
+#[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR"]
+fn preempted_requests_on_the_fixture_match_their_solo_output() {
+    let directory = PathBuf::from(std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR").unwrap());
+    let tight = LlamaFactory::new(Device::flex())
+        .with_kv_cache(ola_burn::llama::LlamaKvCacheConfig::new(32, 4))
+        .load_local(&directory)
+        .unwrap();
+    let model = fixture();
+    let prompts = ["Hello", "The quick brown fox", "Once upon a time"];
+    let reference = prompts.map(|prompt| oracle(&model, prompt, 16));
+
+    let mut executor = Executor::with_max_active_requests(Runtime::default(), 3)
+        .unwrap()
+        .with_policy(ComposedPolicy::default().with_preemption(ola_runtime::NewestFirst));
+    executor
+        .register_model(ModelDescriptor::language(MODEL, "llama"), tight)
+        .unwrap();
+    let ids = prompts.map(|prompt| {
+        let mut spec = RequestSpec::text(MODEL, prompt);
+        spec.generation = GenerationConfig {
+            max_new_tokens: 16,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+        };
+        executor.submit(spec, Timestamp::ZERO).unwrap()
+    });
+    let mut preemptions = 0;
+    for step in 1..=500 {
+        let iteration = executor
+            .step_iteration(Timestamp::from_micros(step))
+            .unwrap();
+        for event in &iteration.events {
+            match event {
+                ExecutorEvent::Preempted { .. } => preemptions += 1,
+                ExecutorEvent::Failed { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        if iteration.is_idle() {
+            break;
+        }
+    }
+
+    assert!(preemptions > 0, "the pool must force preemption");
+    for (id, expected) in ids.iter().zip(&reference) {
+        assert_eq!(&executor.take_result(*id).unwrap().text, expected);
+    }
+}

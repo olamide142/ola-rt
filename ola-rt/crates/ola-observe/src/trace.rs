@@ -138,6 +138,17 @@ pub enum TraceEvent {
     },
     /// The request was cancelled.
     Cancelled,
+    /// The request was returned to the queue to free KV blocks. It resumes
+    /// later, prefilling its prompt and output together; its next `token`
+    /// continues the output.
+    Preempted {
+        /// Why, such as `kv_shortfall`.
+        reason: String,
+        /// Blocks the pool was short before preemption.
+        shortfall_blocks: usize,
+        /// Output tokens kept for the resume.
+        generated_tokens: usize,
+    },
 }
 
 impl TraceEvent {
@@ -398,6 +409,22 @@ impl Tracer {
                 );
                 terminal.push(*request_id);
             }
+            ExecutorEvent::Preempted {
+                request_id,
+                reason,
+                generated_tokens,
+            } => {
+                let ola_runtime::PreemptionReason::KvShortfall { shortfall_blocks } = reason;
+                push(
+                    *request_id,
+                    at,
+                    TraceEvent::Preempted {
+                        reason: "kv_shortfall".into(),
+                        shortfall_blocks: *shortfall_blocks,
+                        generated_tokens: *generated_tokens,
+                    },
+                );
+            }
             // Deferrals are already recorded as decisions.
             ExecutorEvent::Idle
             | ExecutorEvent::Deferred { .. }
@@ -429,7 +456,8 @@ const fn event_request(event: &ExecutorEvent) -> Option<RequestId> {
         | ExecutorEvent::Failed { request_id, .. }
         | ExecutorEvent::Deferred { request_id, .. }
         | ExecutorEvent::BatchDeferred { request_id, .. }
-        | ExecutorEvent::Rejected { request_id, .. } => Some(*request_id),
+        | ExecutorEvent::Rejected { request_id, .. }
+        | ExecutorEvent::Preempted { request_id, .. } => Some(*request_id),
     }
 }
 

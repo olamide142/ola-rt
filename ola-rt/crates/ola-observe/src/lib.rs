@@ -142,6 +142,8 @@ pub struct IterationMeasurement {
     pub rejected_requests: usize,
     /// Temporary admission-policy deferrals.
     pub admission_deferrals: usize,
+    /// Live requests returned to the queue to free KV blocks.
+    pub preempted_requests: usize,
     /// Live sessions after the iteration.
     pub active_requests: usize,
     /// Queued requests after the iteration.
@@ -204,6 +206,8 @@ pub struct ObservationTotals {
     pub rejected_requests: usize,
     /// Temporary admission deferrals.
     pub admission_deferrals: usize,
+    /// Preemptions.
+    pub preemptions: usize,
     /// Batch-policy deferrals.
     pub batch_deferrals: usize,
     /// Model invocations reported as tensorized.
@@ -304,6 +308,7 @@ impl ExecutionObserver {
             failed_requests: 0,
             rejected_requests: 0,
             admission_deferrals: 0,
+            preempted_requests: 0,
             active_requests: iteration.active_requests,
             queued_requests: iteration.queued_requests,
             kv_cache_bytes: iteration.kv_cache_bytes,
@@ -341,6 +346,7 @@ impl ExecutionObserver {
                     terminal.push(*request_id);
                 }
                 ExecutorEvent::Deferred { .. } => measurement.admission_deferrals += 1,
+                ExecutorEvent::Preempted { .. } => measurement.preempted_requests += 1,
                 ExecutorEvent::Idle
                 | ExecutorEvent::PrefillProgress { .. }
                 | ExecutorEvent::BatchDeferred { .. } => {}
@@ -404,6 +410,7 @@ impl ExecutionObserver {
         self.totals.failed_requests += measurement.failed_requests;
         self.totals.rejected_requests += measurement.rejected_requests;
         self.totals.admission_deferrals += measurement.admission_deferrals;
+        self.totals.preemptions += measurement.preempted_requests;
         self.totals.batch_deferrals += measurement.batch_deferred_operations;
         self.totals.tensor_batches += measurement.tensor_batches;
         self.totals.tensor_batched_operations += measurement.tensor_batched_operations;

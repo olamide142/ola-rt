@@ -1058,6 +1058,80 @@ mod tests {
         assert_eq!(second_metrics, second_oracle.metrics());
     }
 
+    /// Runs `prompts` together on `model` with newest-first preemption and
+    /// returns each output and the number of preemptions.
+    fn run_with_preemption(model: BurnLlamaModel, prompts: &[&str]) -> (Vec<Vec<u32>>, usize) {
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), prompts.len())
+            .unwrap()
+            .with_policy(
+                ola_runtime::ComposedPolicy::default().with_preemption(ola_runtime::NewestFirst),
+            );
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "llama"),
+                CausalLanguageModel::new(NumericTokenizer, model),
+            )
+            .unwrap();
+        let ids = prompts
+            .iter()
+            .map(|prompt| {
+                let mut spec = RequestSpec::text("tiny", *prompt);
+                spec.generation = greedy(10);
+                executor.submit(spec, Timestamp::ZERO).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut preemptions = 0;
+        for step in 1..=200 {
+            let iteration = executor
+                .step_iteration(Timestamp::from_micros(step))
+                .unwrap();
+            for event in &iteration.events {
+                match event {
+                    ola_runtime::ExecutorEvent::Preempted { .. } => preemptions += 1,
+                    ola_runtime::ExecutorEvent::Failed { message, .. } => panic!("{message}"),
+                    _ => {}
+                }
+            }
+            if iteration.is_idle() {
+                break;
+            }
+        }
+        let outputs = ids
+            .iter()
+            .map(|id| executor.result(*id).unwrap().token_ids.clone())
+            .collect();
+        (outputs, preemptions)
+    }
+
+    #[test]
+    fn preempted_llama_requests_resume_with_identical_greedy_output() {
+        let config = tiny_model_config();
+        let device: burn::tensor::Device = Default::default();
+        let module = LlamaForCausalLM::init(&config, &device);
+        let model = |capacity_tokens| {
+            BurnLlamaModel::with_kv_cache(
+                module.clone(),
+                config.clone(),
+                device.clone(),
+                LlamaKvCacheConfig::new(capacity_tokens, 4),
+            )
+            .unwrap()
+        };
+        let prompts = ["1 2 3", "4 5 6", "7 8 9"];
+
+        // Alone, with room to spare, each request is the reference.
+        let reference = prompts
+            .iter()
+            .map(|prompt| run_with_preemption(model(64), &[prompt]).0.remove(0))
+            .collect::<Vec<_>>();
+        // Together in seven 4-token blocks, three requests needing three
+        // blocks each must be preempted and resumed by recompute.
+        let (outputs, preemptions) = run_with_preemption(model(28), &prompts);
+
+        assert!(preemptions > 0, "the pool must force preemption");
+        assert_eq!(outputs, reference);
+    }
+
     #[test]
     fn executor_uses_the_llama_tensor_decode_path_for_compatible_requests() {
         let artifact = CausalLanguageModel::new(NumericTokenizer, tiny_model());

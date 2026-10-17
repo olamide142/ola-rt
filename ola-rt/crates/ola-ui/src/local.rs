@@ -550,7 +550,10 @@ fn generate(
         for event in iteration.events {
             match event {
                 ExecutorEvent::Token { finished: true, .. } => break 'generation,
-                ExecutorEvent::Token { .. } | ExecutorEvent::PrefillProgress { .. } => {}
+                // A preempted request resumes on its own.
+                ExecutorEvent::Token { .. }
+                | ExecutorEvent::PrefillProgress { .. }
+                | ExecutorEvent::Preempted { .. } => {}
                 ExecutorEvent::Failed { message, .. } => return Err(message),
                 ExecutorEvent::Deferred { reason, .. } => {
                     return Err(format!("generation admission deferred: {reason}"));

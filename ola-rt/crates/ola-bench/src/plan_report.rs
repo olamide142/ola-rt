@@ -11,16 +11,17 @@ use ola_runtime::{
     AdmissionDecision, AdmissionOutcome, AdmissionRecord, BatchCandidate, BatchExecutionMode,
     BatchHook, BatchPhase, CostAwarePrefillDecision, DecisionRecord, ExecutionPlan,
     ExecutorIteration, LifecycleAction, PlanDivergence, PlanEstimates, PlannedBatch,
-    PlannedDeferral, PlannedPhase, PrefillGroupingEstimate, PrefillGroupingStrategy, ReleaseReason,
-    SelectionStage,
+    PlannedDeferral, PlannedPhase, PreemptionReason, PrefillGroupingEstimate,
+    PrefillGroupingStrategy, ReleaseReason, SelectionStage,
 };
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for serialized execution plans.
 ///
 /// Version 2 added [`PlanReport::decision`]; version 3 added
-/// [`PlanReport::iteration`]; version 4 added the KV-exhaustion divergence.
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 4;
+/// [`PlanReport::iteration`]; version 4 added the KV-exhaustion divergence;
+/// version 5 added preemption.
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 5;
 
 /// One iteration's validated plan and observed divergences.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -261,6 +262,15 @@ pub enum PlanReportLifecycle {
         /// Position of the resulting event.
         event_index: usize,
     },
+    /// A live request returned to the queue to free KV blocks.
+    Preempt {
+        /// Request identifier.
+        request_id: u64,
+        /// Blocks the pool was short before preemption.
+        shortfall_blocks: usize,
+        /// Position of the resulting event.
+        event_index: usize,
+    },
 }
 
 /// Serialized [`PlannedPhase`] or budget-deferral phase.
@@ -487,6 +497,15 @@ fn lifecycle(action: &LifecycleAction) -> PlanReportLifecycle {
         } => PlanReportLifecycle::Fail {
             request_id: request_id.get(),
             message: message.clone(),
+            event_index: *event_index,
+        },
+        LifecycleAction::Preempt {
+            request_id,
+            reason: PreemptionReason::KvShortfall { shortfall_blocks },
+            event_index,
+        } => PlanReportLifecycle::Preempt {
+            request_id: request_id.get(),
+            shortfall_blocks: *shortfall_blocks,
             event_index: *event_index,
         },
     }

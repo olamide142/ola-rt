@@ -30,6 +30,23 @@ pub struct DecisionRecord {
     /// Groups the policy wanted as tensor invocations but planned
     /// individually because the model does not declare the hook.
     pub capability_fallbacks: Vec<CapabilityFallback>,
+    /// Pools found short of this iteration's growth, and who was preempted.
+    pub preemptions: Vec<PreemptionRecord>,
+}
+
+/// A model pool that could not hold an iteration's KV growth.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreemptionRecord {
+    /// Model whose pool was short.
+    pub model_id: ModelId,
+    /// Blocks free (including evictable cached blocks) at the boundary.
+    pub free_blocks: usize,
+    /// Blocks live work would add this iteration.
+    pub demand_blocks: usize,
+    /// Every live request on the model, as the preemption policy saw them.
+    pub candidates: Vec<crate::PreemptionCandidate>,
+    /// Requests preempted, in order. Empty when the policy declined.
+    pub preempted: Vec<RequestId>,
 }
 
 /// Inputs and output of the scheduler's ranking.

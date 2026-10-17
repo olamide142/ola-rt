@@ -1,7 +1,7 @@
 # Memory and cache policy design
 
 Status: **accepted** (2026-10-17) with all recommended decisions.
-Covers `todo.md` P7. Step 1 is implemented.
+Covers `todo.md` P7. Steps 1–2 are implemented.
 
 ## Goal
 
@@ -75,13 +75,38 @@ deterministic. That is P7's completion criterion.
    pools and type their failures; the synthetic model now allocates from a
    `KvBlockManager`. The scheduler study's samples are identical before and
    after, because its policies use memory-aware admission.
-2. Recompute preemption: the `Preempt` action, the Running→Queued transition
-   that keeps generated tokens, resume, `PreemptionPolicy`, events and
-   traces, and output-equivalence tests on the synthetic model and tiny
-   Llama.
-3. Optimistic admission: `WatermarkAdmission`, predicted-shortfall
-   preemption, preempt-instead-of-fail recovery, and a virtual-time
-   cache-pressure study against conservative admission.
+2. **Recompute preemption.** **Done.** `LifecycleAction::Preempt` (validated:
+   only live requests, nothing else for them that iteration, slot and
+   reservation released before admissions); `Runtime::preempt` moves a
+   request to the front of the queue, keeping its first start and counting
+   `preemptions`. The executor keeps a preempted request's prompt, output,
+   and token times; its re-admission prefills prompt and output together,
+   and the resulting token continues the output (no repeat, no new first
+   token). `PreemptionPolicy` (`NoPreemption` default, `NewestFirst`,
+   `LowestPriorityFirst`) orders victims; `ComposedPolicy::with_preemption`
+   computes each pool's block demand from live work (a decode needs a block
+   when its position starts one; a continued prefill needs its chunk's
+   blocks), preempts until the shortfall is covered, plans the rest without
+   the victims, and records a `PreemptionRecord`. `ExecutorEvent::Preempted`,
+   trace event `preempted`, observer counts, `PlanReport` schema 5, and
+   `preemptions` in request status. Pulled forward from step 3: with
+   preemption enabled, an admission whose first prefill does not fit the
+   blocks left after live growth is deferred (`AdmissionReason::KvPoolFull`);
+   without it a resumed request immediately failed its own re-prefill.
+
+   The synthetic model now continues a resumed request exactly, as a real
+   model does: output tokens are at least 1000 and prompt tokens below it,
+   so a resumed prompt reveals how much output it carries. Evidence: on the
+   synthetic pool, three requests that cannot fit together finish with at
+   least one preemption, no failures, and output identical to running
+   alone; without preemption the same workload fails with
+   `KvCapacityExhausted`; cancelling a preempted request releases it. On a
+   random-weight Llama and on the tiny-Llama fixture, preempted requests
+   produce exactly their solo greedy output, so re-prefilling generated
+   tokens did not flip any near-tie in these runs.
+3. Optimistic admission: `WatermarkAdmission` (headroom over the physical
+   check), preempt-instead-of-fail recovery when an allocation still fails,
+   and a virtual-time cache-pressure study against conservative admission.
 4. Prefix cache: hashed shared blocks, prefix attachment, LRU eviction,
    admission accounting, metrics, identical-output tests, and a shared-prefix
    study of prefill tokens saved.

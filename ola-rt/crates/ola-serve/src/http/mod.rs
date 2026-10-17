@@ -193,6 +193,7 @@ struct RequestJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     generated_tokens: usize,
+    preemptions: u32,
     timing: TimingJson,
 }
 
@@ -210,6 +211,7 @@ impl From<RequestSnapshot> for RequestJson {
             status,
             error,
             generated_tokens: snapshot.generated_tokens,
+            preemptions: snapshot.preemptions,
             timing: snapshot.timing.into(),
         }
     }

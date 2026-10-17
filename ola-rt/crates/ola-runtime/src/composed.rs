@@ -7,13 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use ola_core::{ModelId, RequestId};
 
 use crate::{
-    AdmissionContext, AdmissionDecision, AdmissionOutcome, AdmissionPolicy, AdmissionRecord,
-    BatchCandidate, BatchContext, BatchExecutionMode, BatchHook, BatchPhase, BatchPolicy,
-    CapabilityFallback, DecisionRecord, ExecutionPlan, ExecutionPolicy, FifoScheduler,
-    GroupingRecord, LifecycleAction, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow,
-    PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError, PrefillBatcher, RankingRecord,
-    Scheduler, SelectionRecord, SelectionStage, UnboundedBatchPolicy, UnbucketedPrefillBatcher,
-    UnconstrainedAdmission,
+    AdmissionContext, AdmissionDecision, AdmissionOutcome, AdmissionPolicy, AdmissionReason,
+    AdmissionRecord, BatchCandidate, BatchContext, BatchExecutionMode, BatchHook, BatchPhase,
+    BatchPolicy, CapabilityFallback, DecisionRecord, ExecutionPlan, ExecutionPolicy, FifoScheduler,
+    GroupingRecord, LifecycleAction, NoPreemption, PlannedBatch, PlannedDeferral, PlannedPhase,
+    PlannedRow, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
+    PreemptionCandidate, PreemptionPolicy, PreemptionReason, PreemptionRecord, PrefillBatcher,
+    RankingRecord, Scheduler, SelectionRecord, SelectionStage, UnboundedBatchPolicy,
+    UnbucketedPrefillBatcher, UnconstrainedAdmission,
 };
 
 /// Execution policy built from a scheduler, an admission policy, a batch
@@ -27,6 +28,7 @@ pub struct ComposedPolicy {
     batch: Box<dyn BatchPolicy>,
     grouping: Box<dyn PrefillBatcher>,
     head_of_line: HeadOfLine,
+    preemption: Box<dyn PreemptionPolicy>,
 }
 
 /// What admission does when the policy defers a ranked request.
@@ -61,6 +63,7 @@ impl Default for ComposedPolicy {
             batch: Box::new(UnboundedBatchPolicy),
             grouping: Box::new(UnbucketedPrefillBatcher),
             head_of_line: HeadOfLine::Block,
+            preemption: Box::new(NoPreemption),
         }
     }
 }
@@ -93,6 +96,116 @@ impl ComposedPolicy {
     pub fn with_grouping(mut self, grouping: impl PrefillBatcher + 'static) -> Self {
         self.grouping = Box::new(grouping);
         self
+    }
+
+    /// Replaces how victims are chosen when a model's KV pool cannot hold
+    /// an iteration's growth. The default never preempts.
+    #[must_use]
+    pub fn with_preemption(mut self, preemption: impl PreemptionPolicy + 'static) -> Self {
+        self.preemption = Box::new(preemption);
+        self
+    }
+
+    /// Chooses live requests to preempt so each model's pool can hold this
+    /// iteration's growth, recording every short pool.
+    ///
+    /// Demand assumes every live operation runs: a decode writes one
+    /// position, needing a new block when its position starts one; a
+    /// continued prefill writes its next chunk. Free blocks include
+    /// evictable cached blocks. A victim frees the blocks it holds and no
+    /// longer needs its own growth.
+    ///
+    /// Also returns, per pooled model, the blocks left for admissions once
+    /// the remaining live work has grown.
+    fn choose_preemptions(
+        &self,
+        snapshot: &PlanningSnapshot,
+        record: &mut DecisionRecord,
+    ) -> (Vec<(RequestId, PreemptionReason)>, BTreeMap<ModelId, usize>) {
+        let mut victims = Vec::new();
+        let mut room = BTreeMap::new();
+        for (model_id, model) in &snapshot.models {
+            let Some(pool) = model.kv_pool else {
+                continue;
+            };
+            let block = pool.tokens_per_block.max(1);
+            let mut candidates = Vec::new();
+            for (request_id, view) in &snapshot.decoding {
+                if &view.model_id == model_id {
+                    candidates.push(PreemptionCandidate {
+                        request_id: *request_id,
+                        model_id: model_id.clone(),
+                        priority: view.priority,
+                        arrived_at: view.arrived_at,
+                        held_blocks: view.position.div_ceil(block),
+                        needed_blocks: usize::from(view.position % block == 0),
+                        generated_tokens: view.generated_tokens,
+                    });
+                }
+            }
+            for (request_id, view) in &snapshot.prefilling {
+                if &view.model_id == model_id {
+                    let chunk = snapshot.initial_prefill_chunk(
+                        model_id,
+                        view.prompt_tokens.saturating_sub(view.cursor),
+                    );
+                    let held = view.cursor.div_ceil(block);
+                    candidates.push(PreemptionCandidate {
+                        request_id: *request_id,
+                        model_id: model_id.clone(),
+                        priority: view.priority,
+                        arrived_at: view.arrived_at,
+                        held_blocks: held,
+                        needed_blocks: (view.cursor + chunk).div_ceil(block) - held,
+                        generated_tokens: 0,
+                    });
+                }
+            }
+            let demand = candidates
+                .iter()
+                .map(|candidate| candidate.needed_blocks)
+                .sum::<usize>();
+            let free = pool.free_blocks.saturating_add(pool.cached_blocks);
+            if demand <= free {
+                room.insert(model_id.clone(), free - demand);
+                continue;
+            }
+            let shortfall = demand - free;
+            let mut freed = 0;
+            let mut preempted = Vec::new();
+            for request_id in self.preemption.order(&candidates) {
+                if freed >= shortfall {
+                    break;
+                }
+                if preempted.contains(&request_id) {
+                    continue;
+                }
+                if let Some(candidate) = candidates
+                    .iter()
+                    .find(|candidate| candidate.request_id == request_id)
+                {
+                    freed += candidate.held_blocks + candidate.needed_blocks;
+                    preempted.push(request_id);
+                }
+            }
+            room.insert(model_id.clone(), freed.saturating_sub(shortfall));
+            victims.extend(preempted.iter().map(|request_id| {
+                (
+                    *request_id,
+                    PreemptionReason::KvShortfall {
+                        shortfall_blocks: shortfall,
+                    },
+                )
+            }));
+            record.preemptions.push(PreemptionRecord {
+                model_id: model_id.clone(),
+                free_blocks: free,
+                demand_blocks: demand,
+                candidates,
+                preempted,
+            });
+        }
+        (victims, room)
     }
 
     /// Replaces what admission does after a deferral.
@@ -133,6 +246,7 @@ impl ComposedPolicy {
         snapshot: &PlanningSnapshot,
         scheduled: &mut Vec<BatchCandidate>,
         record: &mut DecisionRecord,
+        room: &mut Option<BTreeMap<ModelId, usize>>,
     ) -> Result<ExecutionPlan, PolicyError> {
         let mut execution_plan = ExecutionPlan {
             generation: snapshot.generation,
@@ -245,6 +359,7 @@ impl ComposedPolicy {
             &mut execution_plan,
             decode_count.saturating_add(prefill_count),
             record,
+            room,
         )?;
         Ok(execution_plan)
     }
@@ -261,6 +376,7 @@ impl ComposedPolicy {
         execution_plan: &mut ExecutionPlan,
         first_event_index: usize,
         record: &mut DecisionRecord,
+        room: &mut Option<BTreeMap<ModelId, usize>>,
     ) -> Result<(), PolicyError> {
         let mut released_total = 0_u64;
         let mut released_by_model = BTreeMap::<&ModelId, u64>::new();
@@ -364,7 +480,26 @@ impl ComposedPolicy {
                     .saturating_sub(model_released)
                     .saturating_add(model_pending),
             };
-            let decision = self.admission.decide(&context);
+            let mut decision = self.admission.decide(&context);
+            // Physical blocks, when the planner tracks them: the first
+            // prefill must fit what live growth and earlier admissions left.
+            let mut first_prefill_blocks = None;
+            if let (AdmissionDecision::Admit { .. }, Some(room), Some(pool)) =
+                (&decision, room.as_ref(), model.kv_pool)
+            {
+                let needed_blocks = snapshot
+                    .initial_prefill_chunk(model_id, prompt_tokens)
+                    .div_ceil(pool.tokens_per_block.max(1));
+                let available_blocks = room.get(model_id).copied().unwrap_or(0);
+                if needed_blocks > available_blocks {
+                    decision = AdmissionDecision::Defer(AdmissionReason::KvPoolFull {
+                        needed_blocks,
+                        available_blocks,
+                    });
+                } else {
+                    first_prefill_blocks = Some(needed_blocks);
+                }
+            }
             let decided = |budget_selected| AdmissionRecord {
                 request_id,
                 outcome: AdmissionOutcome::Decided {
@@ -422,6 +557,11 @@ impl ComposedPolicy {
             }
             scheduled.push(candidate);
             attempts += 1;
+            if let (Some(room), Some(blocks)) = (room.as_mut(), first_prefill_blocks)
+                && let Some(left) = room.get_mut(model_id)
+            {
+                *left = left.saturating_sub(blocks);
+            }
             pending_total = pending_total.saturating_add(reserved_kv_bytes);
             *pending_by_model.entry(model_id).or_default() += reserved_kv_bytes;
             execution_plan.lifecycle.push(LifecycleAction::Admit {
@@ -553,12 +693,20 @@ impl ExecutionPolicy for ComposedPolicy {
             HeadOfLine::Block => "block".to_owned(),
             HeadOfLine::Backfill { max_skipped } => format!("backfill-{max_skipped}"),
         };
-        PolicyDescriptor::new("composed")
+        let descriptor = PolicyDescriptor::new("composed")
             .with_config("head_of_line", head_of_line)
             .with_component(self.scheduler.descriptor())
             .with_component(self.admission.descriptor())
             .with_component(self.batch.descriptor())
-            .with_component(self.grouping.descriptor())
+            .with_component(self.grouping.descriptor());
+        // Listed only when enabled, so policies without preemption keep the
+        // descriptors their reports already carry.
+        let preemption = self.preemption.descriptor();
+        if preemption.name == "no-preemption" {
+            descriptor
+        } else {
+            descriptor.with_component(preemption)
+        }
     }
 
     fn plan(&self, snapshot: &PlanningSnapshot) -> Result<PolicyDecision, PolicyError> {
@@ -567,12 +715,84 @@ impl ExecutionPolicy for ComposedPolicy {
             policy: self.descriptor(),
             ..DecisionRecord::default()
         };
-        let plan = self.plan_iteration(snapshot, &mut scheduled, &mut record)?;
+        // With preemption enabled, admissions must also fit the pool's free
+        // blocks, or a resumed request would fail its own re-prefill.
+        let (victims, room) = if self.preemption.descriptor().name == "no-preemption" {
+            (Vec::new(), None)
+        } else {
+            let (victims, room) = self.choose_preemptions(snapshot, &mut record);
+            (victims, Some(room))
+        };
+        let mut room = room;
+        if victims.is_empty() {
+            let plan = self.plan_iteration(snapshot, &mut scheduled, &mut record, &mut room)?;
+            return Ok(PolicyDecision { plan, record });
+        }
+        // The rest of the iteration is planned as if the victims had already
+        // left, and nothing new is admitted to a pool being relieved, so the
+        // freed blocks go to the work that stays.
+        let pressured = record
+            .preemptions
+            .iter()
+            .filter(|pool| !pool.preempted.is_empty())
+            .map(|pool| pool.model_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut remaining = snapshot.clone();
+        for (request_id, _) in &victims {
+            remaining.decoding.remove(request_id);
+            remaining.prefilling.remove(request_id);
+        }
+        remaining
+            .decode_order
+            .retain(|request_id| remaining.decoding.contains_key(request_id));
+        remaining
+            .prefill_order
+            .retain(|request_id| remaining.prefilling.contains_key(request_id));
+        remaining
+            .queued
+            .retain(|queued| !pressured.contains(&queued.model_id));
+        let mut plan = self.plan_iteration(&remaining, &mut scheduled, &mut record, &mut room)?;
+        shift_event_indices(&mut plan, victims.len());
+        plan.lifecycle.splice(
+            0..0,
+            victims
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(event_index, (request_id, reason))| LifecycleAction::Preempt {
+                        request_id,
+                        reason,
+                        event_index,
+                    },
+                ),
+        );
         Ok(PolicyDecision { plan, record })
     }
 
     fn enforces_model_kv_capacity(&self) -> bool {
         self.admission.enforces_model_kv_capacity()
+    }
+}
+
+/// Makes room for `count` events at the start of an iteration.
+fn shift_event_indices(plan: &mut ExecutionPlan, count: usize) {
+    for row in plan.batches.iter_mut().flat_map(|batch| &mut batch.rows) {
+        row.event_index += count;
+    }
+    for action in &mut plan.lifecycle {
+        match action {
+            LifecycleAction::Reject { event_index, .. }
+            | LifecycleAction::Fail { event_index, .. }
+            | LifecycleAction::Preempt { event_index, .. } => *event_index += count,
+            LifecycleAction::Admit { .. } => {}
+        }
+    }
+    for deferral in &mut plan.deferrals {
+        match deferral {
+            PlannedDeferral::Admission { event_index, .. }
+            | PlannedDeferral::Budget { event_index, .. } => *event_index += count,
+            PlannedDeferral::Slots { .. } => {}
+        }
     }
 }
 
@@ -745,6 +965,8 @@ mod tests {
                 generated_tokens: generated,
                 max_new_tokens: max,
                 reserved_kv_bytes: reserved,
+                priority: ola_core::Priority::NORMAL,
+                arrived_at: Timestamp::ZERO,
             },
         );
         snapshot.decode_order.push(id(request));
@@ -776,6 +998,8 @@ mod tests {
                 prompt_tokens: 6,
                 max_new_tokens: 3,
                 reserved_kv_bytes: 32,
+                priority: ola_core::Priority::NORMAL,
+                arrived_at: Timestamp::ZERO,
             },
         );
         snapshot.prefill_order.push(id(2));

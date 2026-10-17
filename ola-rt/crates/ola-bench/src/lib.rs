@@ -1285,6 +1285,9 @@ where
                         "admission rejection",
                     ));
                 }
+                ExecutorEvent::Preempted { .. } => {
+                    return Err(ExecutionBenchmarkError::UnexpectedDeferral("preemption"));
+                }
                 ExecutorEvent::Idle => {
                     return Err(ExecutionBenchmarkError::UnexpectedIdle);
                 }
@@ -1441,6 +1444,9 @@ fn run_prefill_fairness(
                     return Err(ExecutionBenchmarkError::UnexpectedDeferral(
                         "admission rejection",
                     ));
+                }
+                ExecutorEvent::Preempted { .. } => {
+                    return Err(ExecutionBenchmarkError::UnexpectedDeferral("preemption"));
                 }
                 ExecutorEvent::Idle => return Err(ExecutionBenchmarkError::UnexpectedIdle),
             }
