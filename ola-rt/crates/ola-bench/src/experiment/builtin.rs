@@ -35,6 +35,7 @@ impl ExperimentRegistry {
             Box::new(AdaptivePrefillCost),
             Box::new(SchedulerComparison),
             Box::new(KvPressure),
+            Box::new(PrefixCache),
         ])
     }
 }
@@ -939,6 +940,187 @@ impl Experiment for KvPressure {
             estimate("worst-case", "throughput"),
             estimate("watermark", "throughput"),
             estimate("watermark", "preemptions"),
+        );
+        Ok(ExperimentOutcome { summary, ..outcome })
+    }
+}
+
+/// The synthetic pool with and without its prefix cache, on prompts that
+/// share a system prompt, in virtual time.
+pub struct PrefixCache;
+
+impl Experiment for PrefixCache {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "prefix-cache",
+            name: "Prefix cache",
+            description: "Prefill reuse for prompts that share a system prompt",
+            category: ExperimentCategory::Experiment,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Virtual,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::integer("seeds", "Trace seeds, one per repetition", 5),
+                ParameterSpec::integer("requests", "Requests per trace", 120),
+                ParameterSpec::integer(
+                    "mean_interarrival_micros",
+                    "Mean arrival gap in virtual microseconds",
+                    2_000,
+                ),
+                ParameterSpec::integer("prefix_tokens", "Shared prompt prefix length", 256),
+                ParameterSpec::integer("max_active_requests", "Executor slots", 8),
+                ParameterSpec::integer("kv_capacity_tokens", "KV pool size in tokens", 4_096),
+            ],
+        }
+    }
+
+    fn traceable(&self) -> bool {
+        true
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let seeds = (1..=parameters.integer("seeds")?).collect::<Vec<_>>();
+        let geometry = KvGeometry::default();
+        let config = SimulationConfig {
+            max_active_requests: parameters.size("max_active_requests")?,
+            kv: KvGeometry {
+                capacity_bytes: parameters
+                    .integer("kv_capacity_tokens")?
+                    .saturating_mul(geometry.bytes_per_token),
+                ..geometry
+            },
+            ..SimulationConfig::default()
+        };
+        let prefix_tokens = parameters.size("prefix_tokens")?;
+        let base = TraceParameters {
+            seed: 0,
+            requests: parameters.size("requests")?,
+            mean_interarrival_micros: parameters.integer("mean_interarrival_micros")?,
+        };
+        let policy = || ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+        let descriptor = policy().descriptor().to_string();
+        let variants = [("no-cache", false), ("prefix-cache", true)];
+        let mut samples = variants
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<BTreeMap<String, f64>>>>();
+        let mut content = String::new();
+        for &seed in &seeds {
+            let trace =
+                SchedulingTrace::shared_prefix(TraceParameters { seed, ..base }, prefix_tokens);
+            for request in &trace.requests {
+                content.push_str(&format!("{request:?};"));
+            }
+            for ((label, cached), samples) in variants.iter().zip(&mut samples) {
+                let config = SimulationConfig {
+                    prefix_cache: *cached,
+                    ..config
+                };
+                let mut run = context
+                    .trace
+                    .as_ref()
+                    .map(|trace| trace.run(format!("{label}/seed={seed}")));
+                let mut trace_error = None;
+                let comparison = compare_schedulers_observed(
+                    &trace,
+                    &config,
+                    vec![Box::new(policy())],
+                    DEFAULT_STARVATION_FACTOR,
+                    &mut |_, iteration, state| {
+                        if let Some(run) = &mut run
+                            && trace_error.is_none()
+                            && let Err(error) = run.observe(iteration, state)
+                        {
+                            trace_error = Some(error);
+                        }
+                    },
+                )
+                .map_err(run_error)?;
+                if let Some(error) = trace_error {
+                    return Err(error);
+                }
+                let summary = &comparison.summaries[0];
+                samples.push(values(&[
+                    ("ttft_p50", as_f64(summary.time_to_first_token.p50_micros)),
+                    ("ttft_p95", as_f64(summary.time_to_first_token.p95_micros)),
+                    ("completion_p95", as_f64(summary.completion.p95_micros)),
+                    (
+                        "throughput",
+                        summary.output_tokens_per_second().unwrap_or(0.0),
+                    ),
+                    ("input_tokens", as_f64(summary.input_tokens)),
+                    ("completed", as_f64(summary.completed)),
+                ]));
+            }
+        }
+
+        let latency = |name| metric(name, Unit::Micros, TimeDomain::Virtual, Direction::Lower);
+        let outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            "shared_prefix",
+            seeds.clone(),
+            vec![
+                latency("ttft_p50"),
+                latency("ttft_p95"),
+                latency("completion_p95"),
+                metric(
+                    "throughput",
+                    Unit::TokensPerSecond,
+                    TimeDomain::Virtual,
+                    Direction::Higher,
+                ),
+                metric(
+                    "input_tokens",
+                    Unit::Tokens,
+                    TimeDomain::Untimed,
+                    Direction::Lower,
+                ),
+                metric(
+                    "completed",
+                    Unit::Count,
+                    TimeDomain::Untimed,
+                    Direction::Higher,
+                ),
+            ],
+            variants
+                .iter()
+                .zip(samples)
+                .map(|((label, cached), samples)| {
+                    (
+                        Variant::policy(*label, format!("{descriptor} prefix_cache={cached}")),
+                        samples,
+                    )
+                })
+                .collect(),
+            String::new(),
+        )?
+        .with_content_digest(&content);
+        let estimate = |variant: &str, metric: &str| {
+            outcome
+                .report
+                .summaries
+                .iter()
+                .find(|summary| summary.variant == variant)
+                .map_or(0.0, |summary| summary.estimates[metric].mean)
+        };
+        let summary = format!(
+            "shared_prefix ({prefix_tokens} tokens), {} seeds × {} requests, virtual time · \
+             TTFT p95 {:.1} → {:.1} ms · prefill tokens {:.0} → {:.0} · throughput {:.0} → {:.0} tok/s",
+            seeds.len(),
+            base.requests,
+            estimate("no-cache", "ttft_p95") / 1_000.0,
+            estimate("prefix-cache", "ttft_p95") / 1_000.0,
+            estimate("no-cache", "input_tokens"),
+            estimate("prefix-cache", "input_tokens"),
+            estimate("no-cache", "throughput"),
+            estimate("prefix-cache", "throughput"),
         );
         Ok(ExperimentOutcome { summary, ..outcome })
     }

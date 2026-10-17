@@ -455,3 +455,52 @@ fn preempted_requests_on_the_fixture_match_their_solo_output() {
         assert_eq!(&executor.take_result(*id).unwrap().text, expected);
     }
 }
+
+#[test]
+#[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR"]
+fn prefix_cache_reuse_on_the_fixture_matches_recomputation() {
+    let directory = PathBuf::from(std::env::var_os("OLA_LLAMA_CONFORMANCE_DIR").unwrap());
+    let cached = LlamaFactory::new(Device::flex())
+        .with_kv_cache(ola_burn::llama::LlamaKvCacheConfig::new(512, 4).with_prefix_cache())
+        .load_local(&directory)
+        .unwrap();
+    let model = fixture();
+    let system = "You are a careful assistant. Answer briefly and precisely. Question: ";
+    let prompts = [
+        format!("{system}what is two plus two?"),
+        format!("{system}name a primary colour."),
+    ];
+    let reference = prompts.clone().map(|prompt| oracle(&model, &prompt, 12));
+
+    let mut executor = Executor::default().with_prefill_chunk_size(64).unwrap();
+    executor
+        .register_model(ModelDescriptor::language(MODEL, "llama"), cached.clone())
+        .unwrap();
+    let mut step = 0;
+    for (prompt, expected) in prompts.iter().zip(&reference) {
+        let mut spec = RequestSpec::text(MODEL, prompt.as_str());
+        spec.generation = GenerationConfig {
+            max_new_tokens: 12,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+        };
+        let id = executor.submit(spec, Timestamp::from_micros(step)).unwrap();
+        loop {
+            step += 1;
+            if executor
+                .step_iteration(Timestamp::from_micros(step))
+                .unwrap()
+                .is_idle()
+            {
+                break;
+            }
+        }
+        assert_eq!(&executor.take_result(id).unwrap().text, expected);
+    }
+    let reused = cached.kv_pool_status().unwrap().prefix_hit_tokens;
+    assert!(
+        reused >= 8,
+        "the second prompt reused the shared prefix ({reused} tokens)"
+    );
+}

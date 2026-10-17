@@ -43,6 +43,13 @@ impl CausalModel for BurnLlamaModel {
         true
     }
 
+    fn cached_prefix(&self, tokens: &[u32]) -> ola_model::CachedPrefix {
+        self.cache_pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cached_prefix(tokens)
+    }
+
     fn kv_pool_status(&self) -> Option<ola_model::KvPoolStatus> {
         Some(
             self.cache_pool
@@ -230,7 +237,7 @@ impl CausalModel for BurnLlamaModel {
                             "backend returned a token ID outside the u32 range",
                         )
                     })?;
-                    session.tokens.extend_from_slice(prompt);
+                    session.accept_tokens(prompt);
                     session.metrics.prompt_tokens = prompt.len();
                     session.metrics.kv_cache_bytes = session
                         .cache
@@ -361,7 +368,7 @@ impl CausalModel for BurnLlamaModel {
                 .zip(is_final.iter().copied())
                 .zip(selected)
                 .map(|(((session, chunk), is_final), selected)| {
-                    session.tokens.extend_from_slice(chunk);
+                    session.accept_tokens(chunk);
                     session.metrics.prompt_tokens = session.tokens.len();
                     session.metrics.kv_cache_bytes = session
                         .cache
@@ -500,7 +507,7 @@ impl CausalModel for BurnLlamaModel {
                             "backend returned a token ID outside the u32 range",
                         )
                     })?;
-                    session.tokens.push(input_token);
+                    session.accept_tokens(&[input_token]);
                     session.metrics.kv_cache_bytes = session
                         .cache
                         .as_ref()
@@ -527,6 +534,15 @@ struct LlamaSession {
 }
 
 impl LlamaSession {
+    /// Records tokens whose KV was just written, in the session and in the
+    /// cache's prefix index.
+    fn accept_tokens(&mut self, tokens: &[u32]) {
+        self.tokens.extend_from_slice(tokens);
+        if let Some(cache) = &self.cache {
+            cache.record_tokens(tokens);
+        }
+    }
+
     fn select_token(
         &mut self,
         logits: Tensor<3>,
@@ -675,7 +691,7 @@ impl GenerationSession for LlamaSession {
             .prefill(input_ids, cache)
             .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
-        self.tokens.extend_from_slice(prompt_tokens);
+        self.accept_tokens(prompt_tokens);
         self.metrics.prompt_tokens = prompt_tokens.len();
         self.select_token(logits, ExecutionStage::Prefill)
     }
@@ -700,7 +716,7 @@ impl GenerationSession for LlamaSession {
             .prefill_chunk(input_ids, cache)
             .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
-        self.tokens.extend_from_slice(prompt_tokens);
+        self.accept_tokens(prompt_tokens);
         self.metrics.prompt_tokens = self.tokens.len();
         if is_final {
             self.select_token(logits, ExecutionStage::Prefill)
@@ -727,8 +743,27 @@ impl GenerationSession for LlamaSession {
             .decode(input_ids, cache)
             .map_err(|error| cache_error(ExecutionStage::Decode, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
-        self.tokens.push(input_token);
+        self.accept_tokens(&[input_token]);
         self.select_token(logits, ExecutionStage::Decode)
+    }
+
+    fn attach_prefix(&mut self, tokens: &[u32]) -> Result<usize, ModelExecutionError> {
+        if !self.tokens.is_empty() || self.last_generated.is_some() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "a cached prefix can only start a fresh session",
+            ));
+        }
+        let cache = self.cache.as_mut().ok_or_else(|| {
+            ModelExecutionError::new(ExecutionStage::Prefill, "the session has no KV cache")
+        })?;
+        let attached = cache
+            .attach_prefix(tokens)
+            .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
+        self.metrics.kv_cache_bytes = cache.bytes();
+        self.tokens.extend_from_slice(&tokens[..attached]);
+        self.metrics.prompt_tokens = attached;
+        Ok(attached)
     }
 
     fn metrics(&self) -> SessionMetrics {
@@ -1130,6 +1165,87 @@ mod tests {
 
         assert!(preemptions > 0, "the pool must force preemption");
         assert_eq!(outputs, reference);
+    }
+
+    /// Runs `prompts` one after another on `model`, each to completion,
+    /// with resumable prefill so cached prefixes can be reused.
+    fn run_sequentially(model: BurnLlamaModel, prompts: &[&str]) -> Vec<Vec<u32>> {
+        let mut executor = Executor::default().with_prefill_chunk_size(64).unwrap();
+        executor
+            .register_model(
+                ModelDescriptor::language("tiny", "llama"),
+                CausalLanguageModel::new(NumericTokenizer, model),
+            )
+            .unwrap();
+        let mut step = 0;
+        prompts
+            .iter()
+            .map(|prompt| {
+                let mut spec = RequestSpec::text("tiny", *prompt);
+                spec.generation = greedy(4);
+                let id = executor.submit(spec, Timestamp::from_micros(step)).unwrap();
+                loop {
+                    step += 1;
+                    if executor
+                        .step_iteration(Timestamp::from_micros(step))
+                        .unwrap()
+                        .is_idle()
+                    {
+                        break;
+                    }
+                }
+                executor.take_result(id).unwrap().token_ids
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_cached_llama_prefix_gives_the_same_greedy_output_as_recomputing_it() {
+        let config = tiny_model_config();
+        let device: burn::tensor::Device = Default::default();
+        let module = LlamaForCausalLM::init(&config, &device);
+        let model = |cache: LlamaKvCacheConfig| {
+            BurnLlamaModel::with_kv_cache(module.clone(), config.clone(), device.clone(), cache)
+                .unwrap()
+        };
+        // Eight shared tokens: two full 4-token blocks.
+        let prompts = ["1 2 3 4 5 6 7 8 9", "1 2 3 4 5 6 7 8 11 12"];
+
+        let cached = model(LlamaKvCacheConfig::new(64, 4).with_prefix_cache());
+        let shared = cached.cache_pool.clone();
+        let with_cache = run_sequentially(cached, &prompts);
+        let plain = run_sequentially(model(LlamaKvCacheConfig::new(64, 4)), &prompts);
+
+        assert_eq!(with_cache, plain);
+        let hits = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .status()
+            .prefix_hit_tokens;
+        assert_eq!(hits, 8, "the second prompt reused the first's two blocks");
+    }
+
+    #[test]
+    fn a_prefill_chunk_spanning_several_blocks_matches_whole_prompt_prefill() {
+        let config = tiny_model_config();
+        let device: burn::tensor::Device = Default::default();
+        let module = LlamaForCausalLM::init(&config, &device);
+        // Four-token blocks: a 10-token chunk reserves three blocks at once.
+        let model =
+            BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(64, 4))
+                .unwrap();
+        let prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+        let mut whole = model.create_session(greedy(1)).unwrap();
+        let expected = whole.prefill(&prompt).unwrap();
+        let mut chunked = model.create_session(greedy(1)).unwrap();
+        assert_eq!(
+            chunked.prefill_chunk(&prompt[..1], false).unwrap(),
+            PrefillOutcome::Pending
+        );
+        let actual = chunked.prefill_chunk(&prompt[1..], true).unwrap();
+
+        assert_eq!(actual, PrefillOutcome::Token(expected));
     }
 
     #[test]

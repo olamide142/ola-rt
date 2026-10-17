@@ -11,6 +11,7 @@ use super::LlamaConfig;
 pub struct LlamaKvCacheConfig {
     capacity_tokens: usize,
     tokens_per_block: usize,
+    prefix_cache: bool,
 }
 
 impl LlamaKvCacheConfig {
@@ -22,7 +23,16 @@ impl LlamaKvCacheConfig {
         Self {
             capacity_tokens,
             tokens_per_block,
+            prefix_cache: false,
         }
+    }
+
+    /// Keeps full KV blocks after their sessions end so later sessions with
+    /// the same prompt prefix reuse them instead of recomputing.
+    #[must_use]
+    pub const fn with_prefix_cache(mut self) -> Self {
+        self.prefix_cache = true;
+        self
     }
 
     /// Uses one model context of capacity and 16 token positions per block.
@@ -91,6 +101,23 @@ impl LlamaKvCache {
 
     pub(crate) const fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    /// Attaches the longest cached prefix of `tokens` to this empty cache.
+    pub(crate) fn attach_prefix(&mut self, tokens: &[u32]) -> Result<usize, KvBlockError> {
+        let attached = lock_pool(&self.pool)
+            .manager
+            .attach_prefix(self.sequence, tokens)?;
+        self.tokens = attached;
+        Ok(attached)
+    }
+
+    /// Reports the content of positions whose KV has been written.
+    pub(crate) fn record_tokens(&self, tokens: &[u32]) {
+        let result = lock_pool(&self.pool)
+            .manager
+            .record_tokens(self.sequence, tokens);
+        debug_assert!(result.is_ok(), "recorded content follows written positions");
     }
 
     pub(crate) fn reserve(&mut self, additional_tokens: usize) -> Result<(), KvBlockError> {
@@ -224,9 +251,19 @@ impl LlamaKvPool {
             total_blocks: metrics.total_blocks,
             free_blocks: metrics.free_blocks,
             allocated_blocks: metrics.allocated_blocks,
-            cached_blocks: 0,
+            cached_blocks: metrics.cached_blocks,
             tokens_per_block: self.manager.tokens_per_block(),
             live_sequences: metrics.live_sequences,
+            evictions: metrics.evictions,
+            prefix_hit_tokens: metrics.prefix_hit_tokens,
+        }
+    }
+
+    pub(crate) fn cached_prefix(&self, tokens: &[u32]) -> ola_model::CachedPrefix {
+        let found = self.manager.lookup_prefix(tokens);
+        ola_model::CachedPrefix {
+            tokens: found.tokens,
+            evictable_blocks: found.evictable_blocks,
         }
     }
 
@@ -236,11 +273,14 @@ impl LlamaKvPool {
         device: burn::tensor::Device,
     ) -> Result<Self, KvBlockError> {
         let profile = config.profile(model)?;
-        let manager = KvBlockManager::new(
+        let mut manager = KvBlockManager::new(
             profile.capacity_bytes(),
             profile.tokens_per_block(),
             profile.bytes_per_token(),
         )?;
+        if config.prefix_cache {
+            manager = manager.with_prefix_cache();
+        }
         let physical_blocks = manager.metrics().total_blocks;
         let layers = (0..model.num_hidden_layers)
             .map(|_| LlamaLayerPages {
@@ -360,12 +400,15 @@ impl LlamaKvPool {
             .get(layer)
             .expect("model and cache layer counts must agree");
         let mut pages = Vec::new();
+        // Blocks reserved past the populated prefix (a chunk is reserved
+        // whole, then read position by position) are not read.
         for (logical_block, block) in self
             .manager
             .block_table(sequence)
             .expect("a live cache owns a block table")
             .iter()
             .enumerate()
+            .take(token_count.div_ceil(tokens_per_block))
         {
             let remaining = token_count - logical_block * tokens_per_block;
             let used = remaining.min(tokens_per_block);

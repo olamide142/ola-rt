@@ -464,10 +464,14 @@ impl ComposedPolicy {
             };
             let model_released = released_by_model.get(model_id).copied().unwrap_or(0);
             let model_pending = pending_by_model.get(model_id).copied().unwrap_or(0);
+            let cached = request
+                .cached_prefix_tokens
+                .min(prompt_tokens.saturating_sub(1));
             let context = AdmissionContext {
                 request_id,
                 model_id: model_id.clone(),
                 prompt_tokens,
+                cached_prefix_tokens: cached,
                 max_new_tokens: request.max_new_tokens,
                 kv_cache: model.kv_cache,
                 memory: snapshot.memory,
@@ -487,9 +491,12 @@ impl ComposedPolicy {
             if let (AdmissionDecision::Admit { .. }, Some(room), Some(pool)) =
                 (&decision, room.as_ref(), model.kv_pool)
             {
-                let needed_blocks = snapshot
-                    .initial_prefill_chunk(model_id, prompt_tokens)
-                    .div_ceil(pool.tokens_per_block.max(1));
+                // Blocks for the computed tokens, plus cached blocks that
+                // attaching takes off the evictable list.
+                let block = pool.tokens_per_block.max(1);
+                let computed = snapshot.initial_prefill_chunk(model_id, prompt_tokens - cached);
+                let needed_blocks = (cached + computed).div_ceil(block) - cached / block
+                    + request.cached_prefix_evictable_blocks;
                 let available_blocks = room.get(model_id).copied().unwrap_or(0);
                 if needed_blocks > available_blocks {
                     decision = AdmissionDecision::Defer(AdmissionReason::KvPoolFull {
@@ -537,7 +544,7 @@ impl ComposedPolicy {
             let candidate = BatchCandidate {
                 request_id,
                 phase: BatchPhase::Prefill,
-                token_cost: snapshot.initial_prefill_chunk(model_id, prompt_tokens),
+                token_cost: snapshot.initial_prefill_chunk(model_id, prompt_tokens - cached),
             };
             let budget_selected = !self
                 .select_batch_candidates(
@@ -574,8 +581,8 @@ impl ComposedPolicy {
                 PlannedRow {
                     request_id,
                     event_index,
-                    positions: 0..candidate.token_cost,
-                    final_prompt_chunk: candidate.token_cost == prompt_tokens,
+                    positions: cached..cached + candidate.token_cost,
+                    final_prompt_chunk: cached + candidate.token_cost == prompt_tokens,
                 },
             ));
         }
@@ -928,6 +935,8 @@ mod tests {
                 .iter()
                 .map(|&(request, prompt_tokens, max_new_tokens)| QueuedRequest {
                     request_id: id(request),
+                    cached_prefix_tokens: 0,
+                    cached_prefix_evictable_blocks: 0,
                     model_id: model(),
                     prompt_tokens: Ok(prompt_tokens),
                     max_new_tokens,

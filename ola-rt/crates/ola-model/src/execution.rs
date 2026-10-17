@@ -96,6 +96,16 @@ pub trait Tokenizer: Send + Sync {
     ) -> Result<String, ModelExecutionError>;
 }
 
+/// Prefix-cache reuse available for a token sequence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CachedPrefix {
+    /// Leading tokens whose KV is cached, a whole number of blocks.
+    pub tokens: usize,
+    /// Of those blocks, how many no live session holds; attaching them
+    /// removes them from the evictable pool.
+    pub evictable_blocks: usize,
+}
+
 /// Occupancy of a model's shared, block-granular KV-cache pool.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KvPoolStatus {
@@ -111,6 +121,10 @@ pub struct KvPoolStatus {
     pub tokens_per_block: usize,
     /// Sessions currently holding a cache sequence.
     pub live_sequences: usize,
+    /// Cached blocks evicted so far to satisfy allocations.
+    pub evictions: u64,
+    /// Tokens whose KV was reused from the prefix cache so far.
+    pub prefix_hit_tokens: u64,
 }
 
 /// Shared weights and immutable configuration for a causal language model.
@@ -151,6 +165,12 @@ pub trait CausalModel: Send + Sync {
     /// allocates its cache from one.
     fn kv_pool_status(&self) -> Option<KvPoolStatus> {
         None
+    }
+
+    /// Returns how much of `tokens` a new session could reuse from the
+    /// model's prefix cache, without changing it.
+    fn cached_prefix(&self, _tokens: &[u32]) -> CachedPrefix {
+        CachedPrefix::default()
     }
 
     /// Attempts one tensor-batched prefill across compatible sessions.
@@ -349,6 +369,15 @@ pub trait GenerationSession: Send {
     /// distinguish model output from the next decode input.
     fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError>;
 
+    /// Attaches the model's cached KV for the longest cached prefix of
+    /// `tokens` to a session that has processed nothing, and returns how
+    /// many tokens it covers. Prefill then continues from that position
+    /// through [`prefill_chunk`](Self::prefill_chunk). Models without a
+    /// prefix cache reuse nothing.
+    fn attach_prefix(&mut self, _tokens: &[u32]) -> Result<usize, ModelExecutionError> {
+        Ok(0)
+    }
+
     /// Returns a cheap snapshot suitable for telemetry and policy state.
     fn metrics(&self) -> SessionMetrics;
 
@@ -419,6 +448,12 @@ impl CausalLanguageModel {
     /// Returns the shared KV pool's occupancy, when the model has one.
     pub fn kv_pool_status(&self) -> Option<KvPoolStatus> {
         self.model.kv_pool_status()
+    }
+
+    /// Returns how much of `tokens` a new session could reuse from the
+    /// model's prefix cache.
+    pub fn cached_prefix(&self, tokens: &[u32]) -> CachedPrefix {
+        self.model.cached_prefix(tokens)
     }
 
     /// Returns the artifact-compatible tokenizer.

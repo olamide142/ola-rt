@@ -39,7 +39,7 @@ pub use experiment::{
     ExperimentTrace, FifoWorkload, HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS,
     IdentityDifference, Interval, KvBlockPressure, KvPressure, LlamaGeneration, MetricComparison,
     MetricSpec, ParameterSpec, ParameterValue, Parameters, PrefillBucketing, PrefillStrategies,
-    Protocol, ReportComparison, ReportError, ReportParts, Requirement, RunMetadata,
+    PrefixCache, Protocol, ReportComparison, ReportError, ReportParts, Requirement, RunMetadata,
     STUDY_MIN_REPETITIONS, Sample, SchedulerComparison, TimeDomain, Unit, Variant, VariantSummary,
     WorkloadIdentity, compare_reports, content_digest,
 };
@@ -67,8 +67,11 @@ pub use simulation::{
     TrialOutcome, TrialRequest, run_observed_trial, run_perturbed_trial, run_scheduling_trial,
     trace_request_spec,
 };
-pub use synthetic::{KvGeometry, synthetic_artifact, synthetic_prompt, synthetic_token};
-pub use trace::{SchedulingTrace, TraceParameters, TraceRequest};
+pub use synthetic::{
+    KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_prompt,
+    synthetic_shared_prompt, synthetic_token,
+};
+pub use trace::{SchedulingTrace, SharedPrefix, TraceParameters, TraceRequest};
 
 #[derive(Clone, Debug, PartialEq)]
 /// One request arrival in a workload trace.

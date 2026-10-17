@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 20:10 BST (Europe/London)
+**Last updated:** 2026-10-17 21:31 BST (Europe/London)
 
-**Source revision:** working tree based on `754c6e8` on `master`
+**Source revision:** working tree based on `e278b3d` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -22,7 +22,8 @@ to the planner, pool exhaustion is a typed failure, and live requests can be
 preempted and resumed by recompute with output identical to uninterrupted
 runs. Watermark admission with preemption cut completion p95 by 47% and
 raised throughput 58% on an early-stopping workload in virtual time, with no
-measurable cost where requests run to their limit. Current
+measurable cost where requests run to their limit. A block-level prefix
+cache reuses shared prompt prefixes with output identical to recomputation. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -478,8 +479,8 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 276 tests, Clippy
-  with warnings denied, and documentation) with zero compiler warnings; 12
+- `make verify`: **passed** (formatting, workspace checks, 287 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 13
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
   time) for prefill bucketing and the five-seed scheduler study; `ola
@@ -494,7 +495,8 @@ At the working tree recorded above:
 - A live `ola serve` run on the tiny-Llama fixture answered health, models,
   JSON and streamed generation (deltas equal to the final text), and
   drained cleanly on Ctrl-C.
-- `make test-fixture` against the pinned artifact: **12 passed**, including
+- `make test-fixture` against the pinned artifact: **13 passed**, including
+  prefix-cache reuse matching recomputation with the real tokenizer,
   preempted requests on a tight pool matching their solo output, including
   a served request traced from arrival to completion with each token
   carrying its invocation's finish time. The five
@@ -638,7 +640,8 @@ and `TOKENS` variables.
   validated local GPU path.
 - Physical page tensors are materialized lazily and retained at the pool's
   high-water mark for deterministic reuse.
-- There is no cache eviction, preemption, swapping, prefix reuse, or
+- Prefix caching is opt-in per model pool; worst-case reservations count a
+  shared prefix once per request (conservative). There is no swapping or
   quantization.
 - Variable-length prefill uses right padding to the longest prompt in its
   execution group. Cost-aware grouping can choose power-of-two buckets.
@@ -735,6 +738,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 21:31 BST — working tree on `e278b3d`:** P7 step 4: block-level prefix
+  cache (reference counts, verified chained hashes, LRU eviction), planned
+  prefix attachment, shared-prefix traces, and the `prefix-cache` study
+  (85% fewer prefill tokens with a 256-token shared prefix, 45% with 32);
+  outputs identical to recomputation on the synthetic model, a random
+  Llama, and the fixture. Fixed a latent Llama bug where a prefill chunk
+  spanning several blocks panicked.
 
 - **2026-10-17 20:10 BST — working tree on `754c6e8`:** P7 step 3: `WatermarkAdmission`,
   preempt-instead-of-fail recovery for allocations the planner did not

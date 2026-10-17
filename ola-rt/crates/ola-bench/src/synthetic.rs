@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ola_core::GenerationConfig;
 use ola_model::{
-    BatchCapabilities, CausalLanguageModel, CausalModel, ExecutionStage, GeneratedToken,
-    GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionError, PrefillOutcome,
-    SessionMetrics, Tokenizer,
+    BatchCapabilities, CachedPrefix, CausalLanguageModel, CausalModel, ExecutionStage,
+    GeneratedToken, GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionError,
+    PrefillOutcome, SessionMetrics, Tokenizer,
 };
 use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
 
@@ -56,6 +56,23 @@ pub fn synthetic_prompt(prompt_tokens: usize, eos_after: Option<usize>) -> Vec<u
     prompt
 }
 
+/// Builds a prompt of `prompt_tokens` whose first `shared_tokens` match
+/// every other prompt built this way and whose remainder is derived from
+/// `seed`. Prompt tokens stay below the output floor; the first token is the
+/// no-early-stop marker.
+pub fn synthetic_shared_prompt(prompt_tokens: usize, shared_tokens: usize, seed: u64) -> Vec<u32> {
+    let mut prompt = synthetic_prompt(prompt_tokens, None);
+    let mut state = seed;
+    for token in prompt.iter_mut().skip(shared_tokens.max(1)) {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        // 2..=999: distinct from the shared filler and below output tokens.
+        *token = 2 + u32::try_from((state >> 33) % 998).unwrap_or(0);
+    }
+    prompt
+}
+
 /// Every output token is at least this; prompt tokens (and end-of-sequence
 /// markers) stay below it, which lets a resumed request be recognized.
 const SYNTHETIC_OUTPUT_FLOOR: u32 = 1_000;
@@ -77,10 +94,28 @@ pub fn synthetic_token(prompt_tokens: usize, step: usize) -> u32 {
 ///
 /// Panics if `kv` has a zero field, which is a configuration error.
 pub fn synthetic_artifact(kv: KvGeometry) -> CausalLanguageModel {
+    build_artifact(kv, false)
+}
+
+/// Like [`synthetic_artifact`], with the pool's prefix cache enabled: full
+/// blocks outlive their sessions and later sessions with the same prompt
+/// prefix reuse them.
+///
+/// # Panics
+///
+/// Panics if `kv` has a zero field, which is a configuration error.
+pub fn synthetic_artifact_with_prefix_cache(kv: KvGeometry) -> CausalLanguageModel {
+    build_artifact(kv, true)
+}
+
+fn build_artifact(kv: KvGeometry, prefix_cache: bool) -> CausalLanguageModel {
     let profile = KvCacheProfile::new(kv.bytes_per_token, kv.tokens_per_block, kv.capacity_bytes)
         .expect("KV geometry fields must be positive");
-    let pool = KvBlockManager::new(kv.capacity_bytes, kv.tokens_per_block, kv.bytes_per_token)
+    let mut pool = KvBlockManager::new(kv.capacity_bytes, kv.tokens_per_block, kv.bytes_per_token)
         .expect("KV geometry must hold at least one block");
+    if prefix_cache {
+        pool = pool.with_prefix_cache();
+    }
     CausalLanguageModel::new(
         SyntheticTokenizer,
         SyntheticModel {
@@ -150,10 +185,20 @@ impl CausalModel for SyntheticModel {
             total_blocks: metrics.total_blocks,
             free_blocks: metrics.free_blocks,
             allocated_blocks: metrics.allocated_blocks,
-            cached_blocks: 0,
+            cached_blocks: metrics.cached_blocks,
             tokens_per_block: pool.tokens_per_block(),
             live_sequences: metrics.live_sequences,
+            evictions: metrics.evictions,
+            prefix_hit_tokens: metrics.prefix_hit_tokens,
         })
+    }
+
+    fn cached_prefix(&self, tokens: &[u32]) -> CachedPrefix {
+        let found = lock(&self.pool).lookup_prefix(tokens);
+        CachedPrefix {
+            tokens: found.tokens,
+            evictable_blocks: found.evictable_blocks,
+        }
     }
 
     fn batch_capabilities(&self) -> BatchCapabilities {
@@ -277,9 +322,13 @@ impl GenerationSession for SyntheticSession {
                 "prompt chunk cannot be empty",
             ));
         }
-        lock(&self.pool)
-            .append(self.sequence, prompt_tokens.len())
-            .map_err(|error| pool_error(ExecutionStage::Prefill, error))?;
+        {
+            let mut pool = lock(&self.pool);
+            pool.append(self.sequence, prompt_tokens.len())
+                .map_err(|error| pool_error(ExecutionStage::Prefill, error))?;
+            pool.record_tokens(self.sequence, prompt_tokens)
+                .map_err(|error| pool_error(ExecutionStage::Prefill, error))?;
+        }
         self.prompt.extend_from_slice(prompt_tokens);
         if !is_final {
             return Ok(PrefillOutcome::Pending);
@@ -296,16 +345,20 @@ impl GenerationSession for SyntheticSession {
         Ok(PrefillOutcome::Token(self.emit()))
     }
 
-    fn decode(&mut self, _input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
+    fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
         if !self.ready {
             return Err(ModelExecutionError::new(
                 ExecutionStage::Decode,
                 "decode requires prefill",
             ));
         }
-        lock(&self.pool)
-            .append(self.sequence, 1)
-            .map_err(|error| pool_error(ExecutionStage::Decode, error))?;
+        {
+            let mut pool = lock(&self.pool);
+            pool.append(self.sequence, 1)
+                .map_err(|error| pool_error(ExecutionStage::Decode, error))?;
+            pool.record_tokens(self.sequence, &[input_token])
+                .map_err(|error| pool_error(ExecutionStage::Decode, error))?;
+        }
         Ok(self.emit())
     }
 
@@ -324,8 +377,28 @@ impl GenerationSession for SyntheticSession {
         }
     }
 
+    fn attach_prefix(&mut self, tokens: &[u32]) -> Result<usize, ModelExecutionError> {
+        self.attach(tokens)
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+impl SyntheticSession {
+    fn attach(&mut self, tokens: &[u32]) -> Result<usize, ModelExecutionError> {
+        if !self.prompt.is_empty() || self.ready {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "a cached prefix can only start a fresh session",
+            ));
+        }
+        let attached = lock(&self.pool)
+            .attach_prefix(self.sequence, tokens)
+            .map_err(|error| pool_error(ExecutionStage::Prefill, error))?;
+        self.prompt.extend_from_slice(&tokens[..attached]);
+        Ok(attached)
     }
 }
 

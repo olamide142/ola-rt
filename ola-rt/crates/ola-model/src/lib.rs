@@ -11,9 +11,9 @@ pub use catalog::ModelCatalog;
 pub use definition::{ModelDefinition, ModelSource};
 pub use error::{ArchitectureLoadError, ModelError};
 pub use execution::{
-    BatchCapabilities, CausalLanguageModel, CausalModel, ExecutionStage, GeneratedToken,
-    GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionError, PrefillOutcome,
-    SessionMetrics, Tokenizer,
+    BatchCapabilities, CachedPrefix, CausalLanguageModel, CausalModel, ExecutionStage,
+    GeneratedToken, GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionError,
+    PrefillOutcome, SessionMetrics, Tokenizer,
 };
 pub use factory::{ArchitectureFactory, ArchitectureRegistry, LoadedModel};
 pub use streaming::IncrementalDecoder;

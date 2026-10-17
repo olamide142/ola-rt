@@ -8,7 +8,7 @@
 use crate::random::SplitMix64;
 
 /// One request in a scheduling trace.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TraceRequest {
     /// Virtual arrival time in microseconds.
     pub arrival_micros: u64,
@@ -23,6 +23,39 @@ pub struct TraceRequest {
     /// Generated-token step at which the request emits EOS, if before its
     /// output limit.
     pub eos_after: Option<usize>,
+    /// When set, the prompt starts with a prefix shared by every request
+    /// that has one, followed by tokens unique to this request; otherwise
+    /// prompts are uniform. Requires `eos_after` to be `None`, because the
+    /// end-of-sequence marker is the prompt's first token.
+    pub shared_prefix: Option<SharedPrefix>,
+}
+
+/// A prompt made of a common prefix and a request-specific remainder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedPrefix {
+    /// Prompt tokens identical across requests.
+    pub tokens: usize,
+    /// Seed for this request's unique remainder.
+    pub seed: u64,
+}
+
+// Written out so a trace without shared prefixes prints, and therefore
+// digests, exactly as it did before the field existed.
+impl std::fmt::Debug for TraceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("TraceRequest");
+        debug
+            .field("arrival_micros", &self.arrival_micros)
+            .field("prompt_tokens", &self.prompt_tokens)
+            .field("max_new_tokens", &self.max_new_tokens)
+            .field("priority", &self.priority)
+            .field("deadline_micros", &self.deadline_micros)
+            .field("eos_after", &self.eos_after);
+        if let Some(shared_prefix) = &self.shared_prefix {
+            debug.field("shared_prefix", shared_prefix);
+        }
+        debug.finish()
+    }
 }
 
 /// Parameters shared by every trace generator.
@@ -74,6 +107,21 @@ impl SchedulingTrace {
             if random.chance(75) {
                 request.eos_after = Some(random.between(8, 64));
             }
+            request
+        })
+    }
+
+    /// Every prompt starts with the same `prefix_tokens` (a system prompt)
+    /// followed by 8–32 tokens unique to the request; outputs are 8–32
+    /// tokens. No request stops early, so prefixes stay comparable.
+    pub fn shared_prefix(parameters: TraceParameters, prefix_tokens: usize) -> Self {
+        Self::generate("shared_prefix", parameters, |random, _| {
+            let mut request = shaped(random, 8..=32, 8..=32);
+            request.prompt_tokens += prefix_tokens;
+            request.shared_prefix = Some(SharedPrefix {
+                tokens: prefix_tokens,
+                seed: random.between_u64(0, u64::MAX - 1),
+            });
             request
         })
     }
@@ -205,6 +253,7 @@ fn shaped(
         priority: 0,
         deadline_micros: None,
         eos_after: None,
+        shared_prefix: None,
     }
 }
 

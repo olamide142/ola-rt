@@ -654,8 +654,21 @@ impl Executor {
                         .request(request_id)
                         .expect("queued requests retain their runtime record");
                     let spec = &record.request.spec;
+                    // A cache hit must leave a token to compute, and resuming
+                    // after it needs resumable prefill.
+                    let cached =
+                        match (self.prepared.get(&request_id), self.models.get(&spec.model)) {
+                            (Some(Ok(tokens)), Some(model))
+                                if model.supports_chunked_prefill() && tokens.len() > 1 =>
+                            {
+                                model.cached_prefix(&tokens[..tokens.len() - 1])
+                            }
+                            _ => ola_model::CachedPrefix::default(),
+                        };
                     QueuedRequest {
                         request_id,
+                        cached_prefix_tokens: cached.tokens,
+                        cached_prefix_evictable_blocks: cached.evictable_blocks,
                         model_id: spec.model.clone(),
                         prompt_tokens: match self.prepared.get(&request_id) {
                             Some(Ok(tokens)) => Ok(tokens.len()),
@@ -755,7 +768,7 @@ impl Executor {
             .iter()
             .filter(|batch| batch.phase == PlannedPhase::Prefill)
             .flat_map(|batch| &batch.rows)
-            .map(|row| (row.request_id, row.event_index))
+            .map(|row| (row.request_id, (row.event_index, row.positions.start)))
             .collect::<BTreeMap<_, _>>();
         for action in &plan.lifecycle {
             match action {
@@ -781,7 +794,26 @@ impl Executor {
                         .clone();
                     let max_new_tokens = generation.max_new_tokens;
                     let lease = self.runtime.start_selected(*request_id, at)?;
-                    match model.create_session(generation) {
+                    let (event_index, cached) = admit_events[request_id];
+                    // The plan starts the first prefill after the cached
+                    // prefix it saw; attach exactly that much or fail.
+                    let session = model.create_session(generation).and_then(|mut session| {
+                        if cached == 0 {
+                            return Ok(session);
+                        }
+                        let attached = session.attach_prefix(&prompt_tokens[..cached])?;
+                        if attached == cached {
+                            Ok(session)
+                        } else {
+                            Err(ModelExecutionError::new(
+                                ola_model::ExecutionStage::SessionCreation,
+                                format!(
+                                    "planned {cached} cached prefix tokens but attached {attached}"
+                                ),
+                            ))
+                        }
+                    });
+                    match session {
                         Ok(session) => {
                             admitted.insert(
                                 *request_id,
@@ -791,7 +823,7 @@ impl Executor {
                                     model,
                                     session,
                                     prompt_tokens,
-                                    cursor: 0,
+                                    cursor: cached,
                                     max_new_tokens,
                                     last_step_at: at,
                                     reserved_kv_bytes: *reserved_kv_bytes,
@@ -800,9 +832,7 @@ impl Executor {
                         }
                         Err(error) => {
                             let event = self.fail_started(*request_id, error.to_string(), at)?;
-                            outcome
-                                .indexed_events
-                                .push((admit_events[request_id], event));
+                            outcome.indexed_events.push((event_index, event));
                             outcome
                                 .divergences
                                 .push(PlanDivergence::SessionCreationFailed {

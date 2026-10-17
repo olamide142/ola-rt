@@ -1,7 +1,7 @@
 # Memory and cache policy design
 
 Status: **accepted** (2026-10-17) with all recommended decisions.
-Covers `todo.md` P7. Steps 1–3 are implemented.
+Covers `todo.md` P7. Steps 1–4 are implemented.
 
 ## Goal
 
@@ -129,9 +129,43 @@ deterministic. That is P7's completion criterion.
    worst-case latency and throughput with overlapping intervals. On these
    workloads it never lost; the default stays conservative until real-model
    studies agree.
-4. Prefix cache: hashed shared blocks, prefix attachment, LRU eviction,
-   admission accounting, metrics, identical-output tests, and a shared-prefix
-   study of prefill tokens saved.
+4. **Prefix cache.** **Done.** `KvBlockManager::with_prefix_cache`: blocks
+   are reference-counted; sessions report written content through
+   `record_tokens`, and each completed block is indexed by a chained FNV
+   hash of its tokens and its parent, verified token by token on lookup so
+   a collision cannot share the wrong KV. Freed blocks with cached content
+   go to an LRU list (`cached_blocks`) and are evicted, oldest first and
+   counted, only when an allocation needs them. `attach_prefix` gives an
+   empty sequence the longest cached run of full blocks; a shared block is
+   never written again because attachment always ends on a full block.
+   Models expose `cached_prefix` and sessions `attach_prefix` (Llama via
+   `LlamaKvCacheConfig::with_prefix_cache`, the synthetic model via
+   `synthetic_artifact_with_prefix_cache`). The planning snapshot carries
+   each queued request's cache hit (leaving at least one prompt token to
+   compute, and only with resumable prefill); the planner starts the first
+   prefill after it and counts the blocks it computes plus the evictable
+   blocks attaching takes. The executor attaches exactly the planned prefix
+   or fails the request. Worst-case reservations still count the whole
+   prompt per request, so shared blocks are counted once only in the
+   physical check; this is conservative, not exact. A preempted request's
+   own blocks become cached when it is released, so its resume can reuse
+   them. Traces show `cached_prefix_tokens` on admission.
+
+   Correctness: on the synthetic model, a random-weight Llama, and the
+   tiny-Llama fixture with its real tokenizer, outputs with the cache match
+   recomputation exactly. Writing the fixture test exposed a latent Llama
+   bug unrelated to caching: a prefill chunk spanning more than one block
+   read past its populated prefix and panicked; any chunk size above the
+   block size would have hit it. A regression test covers it.
+
+   **Study** (`prefix-cache`, five seeds × 120 requests, 2 ms mean arrival
+   gap, 8 slots). With a 256-token shared prefix (about 93% of each prompt)
+   the cache computed 85% fewer input tokens (35.4k → 5.1k), cut TTFT p95
+   from 190 to 4 ms and completion p95 from 208 to 21 ms, and raised
+   throughput 76%: without it the server saturated. With a 32-token prefix
+   it computed 45% fewer input tokens and cut completion p95 from 23.2 to
+   20.6 ms (separated), while TTFT and throughput were not distinguishable
+   because load did not saturate.
 5. A swap evaluation, a page-size and fragmentation experiment,
    replay-determinism tests, docs, and closing P7.
 

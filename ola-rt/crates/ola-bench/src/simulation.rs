@@ -20,7 +20,10 @@ use ola_runtime::{
     PlannedDeferral, PolicyDescriptor, RequestStatus, Runtime, RuntimeState,
 };
 
-use crate::{KvGeometry, SchedulingTrace, synthetic_artifact, synthetic_prompt};
+use crate::{
+    KvGeometry, SchedulingTrace, synthetic_artifact, synthetic_artifact_with_prefix_cache,
+    synthetic_prompt,
+};
 
 const MODEL_ID: &str = "synthetic";
 
@@ -92,6 +95,8 @@ pub struct SimulationConfig {
     pub cost: CostModel,
     /// Iterations after which the trial stops; remaining work is unfinished.
     pub max_iterations: usize,
+    /// Whether the synthetic model's pool keeps a prefix cache.
+    pub prefix_cache: bool,
 }
 
 impl Default for SimulationConfig {
@@ -102,6 +107,7 @@ impl Default for SimulationConfig {
             kv: KvGeometry::default(),
             cost: CostModel::default(),
             max_iterations: 100_000,
+            prefix_cache: false,
         }
     }
 }
@@ -269,10 +275,14 @@ impl From<ExecutorError> for SimulationError {
 /// Builds the request a trace entry submits.
 pub fn trace_request_spec(request: &crate::TraceRequest) -> RequestSpec {
     let mut spec = RequestSpec::text(MODEL_ID, "");
-    spec.inputs = vec![Input::Tokens(synthetic_prompt(
-        request.prompt_tokens,
-        request.eos_after,
-    ))];
+    spec.inputs = vec![Input::Tokens(match request.shared_prefix {
+        Some(shared) => crate::synthetic::synthetic_shared_prompt(
+            request.prompt_tokens,
+            shared.tokens,
+            shared.seed,
+        ),
+        None => synthetic_prompt(request.prompt_tokens, request.eos_after),
+    })];
     spec.generation.max_new_tokens = request.max_new_tokens;
     spec.generation.temperature = 0.0;
     spec.priority = Priority::new(request.priority);
@@ -357,7 +367,11 @@ where
     }
     executor.register_model(
         ModelDescriptor::language(MODEL_ID, "synthetic"),
-        synthetic_artifact(config.kv),
+        if config.prefix_cache {
+            synthetic_artifact_with_prefix_cache(config.kv)
+        } else {
+            synthetic_artifact(config.kv)
+        },
     )?;
 
     let mut ids = Vec::with_capacity(trace.requests.len());

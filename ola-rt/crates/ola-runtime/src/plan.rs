@@ -374,6 +374,7 @@ struct ValidationView<'a> {
 struct QueuedView<'a> {
     model_id: &'a ModelId,
     prompt_tokens: Option<usize>,
+    cached_prefix_tokens: usize,
 }
 
 impl<'a> ValidationView<'a> {
@@ -390,6 +391,7 @@ impl<'a> ValidationView<'a> {
                         QueuedView {
                             model_id: &request.model_id,
                             prompt_tokens: request.prompt_tokens.as_ref().ok().copied(),
+                            cached_prefix_tokens: request.cached_prefix_tokens,
                         },
                     )
                 })
@@ -889,7 +891,7 @@ fn validate_row(
             let prompt = queued
                 .prompt_tokens
                 .ok_or(PlanError::InvalidPositions(request_id))?;
-            (queued.model_id, Some((0, prompt)))
+            (queued.model_id, Some((queued.cached_prefix_tokens, prompt)))
         }
         PlannedPhase::ContinuedPrefill => {
             let pending = view
@@ -984,6 +986,8 @@ mod tests {
             },
             queued: vec![QueuedRequest {
                 request_id: id(1),
+                cached_prefix_tokens: 0,
+                cached_prefix_evictable_blocks: 0,
                 model_id: model(),
                 prompt_tokens: Ok(5),
                 max_new_tokens: 4,

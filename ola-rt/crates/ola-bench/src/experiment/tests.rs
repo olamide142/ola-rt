@@ -392,6 +392,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             "adaptive-prefill-cost",
             "scheduler-comparison",
             "kv-pressure",
+            "prefix-cache",
         ]
     );
     for descriptor in descriptors {
@@ -550,4 +551,30 @@ fn watermark_admission_beats_worst_case_reservation_when_requests_stop_early() {
         assert_eq!(estimate(variant, "failed").mean, 0.0);
         assert_eq!(estimate(variant, "unfinished").mean, 0.0);
     }
+}
+
+#[test]
+fn the_prefix_cache_cuts_prefill_work_on_shared_system_prompts() {
+    let outcome = run("prefix-cache", &[("requests", "40"), ("seeds", "3")]).unwrap();
+    let estimate = |variant: &str, metric: &str| {
+        outcome
+            .report
+            .summaries
+            .iter()
+            .find(|summary| summary.variant == variant)
+            .unwrap()
+            .estimates[metric]
+    };
+
+    let (plain, cached) = (
+        estimate("no-cache", "input_tokens"),
+        estimate("prefix-cache", "input_tokens"),
+    );
+    assert!(cached.ci95.unwrap().high < plain.ci95.unwrap().low);
+    assert!(
+        cached.mean < plain.mean / 2.0,
+        "most of each prompt is shared"
+    );
+    assert_eq!(estimate("no-cache", "completed").mean, 40.0);
+    assert_eq!(estimate("prefix-cache", "completed").mean, 40.0);
 }

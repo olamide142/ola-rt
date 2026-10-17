@@ -29,6 +29,13 @@ pub struct QueuedRequest {
     pub model_id: ModelId,
     /// Tokenized prompt length, or the preparation error to report.
     pub prompt_tokens: Result<usize, String>,
+    /// Leading prompt tokens whose KV the model's prefix cache holds; the
+    /// first prefill starts after them. Always leaves at least one prompt
+    /// token to compute, and is zero without resumable prefill.
+    pub cached_prefix_tokens: usize,
+    /// Cached prefix blocks no live session holds, which admission takes
+    /// out of the evictable pool.
+    pub cached_prefix_evictable_blocks: usize,
     /// Caller output limit.
     pub max_new_tokens: usize,
     /// Caller-supplied priority.

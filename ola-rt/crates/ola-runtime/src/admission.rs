@@ -14,6 +14,8 @@ pub struct AdmissionContext {
     pub model_id: ModelId,
     /// Tokenized prompt length.
     pub prompt_tokens: usize,
+    /// Leading prompt tokens the model's prefix cache already holds.
+    pub cached_prefix_tokens: usize,
     /// Maximum number of generated tokens requested by the caller.
     pub max_new_tokens: usize,
     /// Architecture-provided physical KV layout, when available.
@@ -315,6 +317,7 @@ mod tests {
             request_id: RequestId::new(1),
             model_id: "tiny".into(),
             prompt_tokens: 17,
+            cached_prefix_tokens: 0,
             max_new_tokens: 16,
             kv_cache: KvCacheProfile::new(8, 16, 512),
             memory: MemoryState::default(),

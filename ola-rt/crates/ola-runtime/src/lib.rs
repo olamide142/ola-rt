@@ -38,7 +38,7 @@ pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
 };
 pub use kv_cache::{
-    KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId,
+    KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId, PrefixMatch,
 };
 pub use model_registry::ModelRegistry;
 pub use plan::{

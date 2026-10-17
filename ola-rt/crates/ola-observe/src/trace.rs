@@ -79,6 +79,9 @@ pub enum TraceEvent {
         /// Whether an admitted request's first prefill fit the token budget.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget_selected: Option<bool>,
+        /// Leading prompt tokens reused from the prefix cache, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_prefix_tokens: Option<usize>,
     },
     /// Backfill admitted later-ranked work past this deferred request.
     BackfillSkipped,
@@ -481,6 +484,7 @@ fn admission_event(outcome: &AdmissionOutcome) -> TraceEvent {
         reason,
         reserved_kv_bytes: None,
         budget_selected: None,
+        cached_prefix_tokens: None,
     };
     match outcome {
         AdmissionOutcome::NoSlot => event("no_slot", None),
@@ -488,15 +492,17 @@ fn admission_event(outcome: &AdmissionOutcome) -> TraceEvent {
             event("preparation_failed", Some(message.clone()))
         }
         AdmissionOutcome::Decided {
+            context,
             decision,
             budget_selected,
-            ..
         } => match decision {
             AdmissionDecision::Admit { reserved_kv_bytes } => TraceEvent::Admission {
                 outcome: "admitted".into(),
                 reason: None,
                 reserved_kv_bytes: Some(*reserved_kv_bytes),
                 budget_selected: *budget_selected,
+                cached_prefix_tokens: (context.cached_prefix_tokens > 0)
+                    .then_some(context.cached_prefix_tokens),
             },
             AdmissionDecision::Defer(reason) => event("deferred", Some(reason.to_string())),
             AdmissionDecision::Reject(reason) => event("rejected", Some(reason.to_string())),

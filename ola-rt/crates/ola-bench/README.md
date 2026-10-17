@@ -130,6 +130,11 @@ tokens are at least 1000 and prompt tokens below it, so a resumed request
 `SchedulingTrace::early_stopping` models callers that set a generous output
 limit most requests never reach.
 
+`synthetic_artifact_with_prefix_cache` (or `SimulationConfig::prefix_cache`)
+enables the pool's prefix cache, and `SchedulingTrace::shared_prefix` builds
+prompts that share a system prompt and end in tokens unique to each request.
+The `prefix-cache` study compares the pool with and without the cache.
+
 The `kv-pressure` study compares worst-case reservation
 (`MemoryAwareAdmission`) with `WatermarkAdmission` plus newest-first
 preemption over seeded traces in virtual time, reporting latency,

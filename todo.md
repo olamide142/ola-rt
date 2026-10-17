@@ -157,12 +157,12 @@ Done when a request can be traced from arrival through every decision, execution
 Design: `ola-rt/crates/ola-runtime/MEMORY_POLICY.md`.
 
 - [x] Reclaim unused worst-case reservations as requests approach completion. (By not reserving them: watermark admission with preemption.)
-- [ ] Define cache eviction policy and observable reasons.
+- [x] Define cache eviction policy and observable reasons. (LRU of unreferenced cached blocks, only when an allocation needs space; counted.)
 - [x] Add safe request preemption. (Recompute; outputs identical to uninterrupted runs on the synthetic model and tiny Llama.)
 - [ ] Evaluate swapping after eviction and preemption semantics stabilize.
-- [ ] Add prefix detection and prefix-cache reuse.
-- [ ] Add prefix-cache hit, reuse, and eviction metrics.
-- [ ] Track prefix ownership, lifetime, accounting, and isolation.
+- [x] Add prefix detection and prefix-cache reuse.
+- [x] Add prefix-cache hit, reuse, and eviction metrics.
+- [x] Track prefix ownership, lifetime, accounting, and isolation. (Reference counts, LRU lifetime, verified matches, full immutable blocks; reservations stay conservative.)
 - [x] Define recovery when a planned batch cannot obtain its KV allocation. (Requeue as a preemption unless the request can never fit.)
 - [ ] Add fragmentation-aware admission or placement experiments.
 - [ ] Test cache pressure, preemption, cancellation, and recovery.

@@ -55,6 +55,7 @@ fn list_shows_every_experiment_with_requirements_and_parameters() {
         "adaptive-prefill-cost",
         "scheduler-comparison",
         "kv-pressure",
+        "prefix-cache",
     ] {
         assert!(output.contains(id), "{id} missing from:\n{output}");
     }

@@ -241,6 +241,8 @@ mod tests {
                 .iter()
                 .map(|request| QueuedRequest {
                     request_id: RequestId::new(request.id),
+                    cached_prefix_tokens: 0,
+                    cached_prefix_evictable_blocks: 0,
                     model_id: ModelId::from("tiny"),
                     prompt_tokens: Ok(request.prompt),
                     max_new_tokens: request.max_new,
