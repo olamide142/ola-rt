@@ -18,14 +18,17 @@ use serde::{Deserialize, Serialize};
 
 /// Current schema version for serialized execution plans.
 ///
-/// Version 2 added [`PlanReport::decision`].
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 2;
+/// Version 2 added [`PlanReport::decision`]; version 3 added
+/// [`PlanReport::iteration`].
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 3;
 
 /// One iteration's validated plan and observed divergences.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PlanReport {
     /// Version of this record layout.
     pub schema_version: u32,
+    /// Iteration that committed the plan; correlates with traces.
+    pub iteration: u64,
     /// Executor state generation the plan was built from.
     pub generation: u64,
     /// Iteration timestamp in microseconds.
@@ -411,6 +414,7 @@ impl PlanReport {
     ) -> Self {
         Self {
             schema_version: PLAN_REPORT_SCHEMA_VERSION,
+            iteration: plan.iteration.get(),
             generation: plan.generation,
             at_micros: plan.at.as_micros(),
             lifecycle: plan.lifecycle.iter().map(lifecycle).collect(),
@@ -748,6 +752,7 @@ mod tests {
 
     fn plan() -> ExecutionPlan {
         ExecutionPlan {
+            iteration: ola_runtime::IterationId::new(5),
             generation: 3,
             at: Timestamp::from_micros(40),
             lifecycle: vec![
@@ -820,6 +825,7 @@ mod tests {
         let report = PlanReport::new(&plan(), &decision, &divergences);
 
         assert_eq!(report.schema_version, PLAN_REPORT_SCHEMA_VERSION);
+        assert_eq!(report.iteration, 5);
         assert_eq!(report.estimates.input_tokens, 4);
         assert_eq!(report.estimates.admitted_kv_bytes, 64);
         let json = report.to_json_pretty().unwrap();

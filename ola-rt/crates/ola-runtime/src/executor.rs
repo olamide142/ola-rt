@@ -16,10 +16,10 @@ use ola_model::{
 
 use crate::{
     AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecisionRecord, DecodeView,
-    ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, LifecycleAction, ModelSnapshot,
-    PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase, PlanningSnapshot,
-    PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements, PrefillView, QueuedRequest,
-    ReleaseReason, RequestRecord, Runtime, RuntimeError, RuntimeState,
+    ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, IterationId, LifecycleAction,
+    ModelSnapshot, PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase,
+    PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements,
+    PrefillView, QueuedRequest, ReleaseReason, RequestRecord, Runtime, RuntimeError, RuntimeState,
     composed::is_complete_prompt,
 };
 
@@ -116,6 +116,9 @@ pub enum ExecutorEvent {
 /// Observable result of one iteration-level scheduling boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutorIteration {
+    /// Correlation ID shared with `execution_plan` and the iteration's
+    /// invocations, events, and traces.
+    pub id: IterationId,
     /// Caller-supplied monotonic iteration timestamp.
     pub at: Timestamp,
     /// Per-request outcomes in deterministic execution order.
@@ -293,6 +296,7 @@ pub struct Executor {
     measurements: PolicyMeasurements,
     generation: u64,
     clock: Option<Arc<dyn Clock>>,
+    iterations: u64,
 }
 
 impl Default for Executor {
@@ -319,6 +323,7 @@ impl Executor {
             measurements: PolicyMeasurements::default(),
             generation: 0,
             clock: None,
+            iterations: 0,
         }
     }
 
@@ -476,13 +481,17 @@ impl Executor {
         self.prepare_queued();
         let snapshot = self.snapshot(at);
         let PolicyDecision {
-            plan: execution_plan,
+            plan: mut execution_plan,
             record: decision,
         } = self.policy.plan(&snapshot).map_err(ExecutorError::Policy)?;
+        // Numbered only once a plan exists, so failed planning consumes no ID.
+        let id = IterationId::new(self.iterations + 1);
+        execution_plan.iteration = id;
         execution_plan
             .validate(&snapshot, self.policy.enforces_model_kv_capacity())
             .map_err(ExecutorError::InvalidPlan)?;
         let committed = self.commit_plan(&execution_plan, at)?;
+        self.iterations = id.get();
         let mut events = committed
             .indexed_events
             .into_iter()
@@ -494,6 +503,7 @@ impl Executor {
         self.bump_generation();
 
         let iteration = ExecutorIteration {
+            id,
             at,
             events,
             execution_plan,
@@ -1861,6 +1871,32 @@ mod tests {
             executor.state().request(first).unwrap().timing.completed_at,
             Some(finished)
         );
+    }
+
+    #[test]
+    fn iterations_and_their_plans_share_consecutive_ids() {
+        let mut executor = Executor::default();
+        executor
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        executor.submit(request("1 2", 5), Timestamp::ZERO).unwrap();
+
+        let ids = (1..=3)
+            .map(|step| {
+                let iteration = executor
+                    .step_iteration(Timestamp::from_micros(step))
+                    .unwrap();
+                assert_eq!(iteration.execution_plan.iteration, iteration.id);
+                iteration.id.get()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, [1, 2, 3]);
+
+        // A rejected step (time went backwards with a live session)
+        // consumes no ID.
+        assert!(executor.step_iteration(Timestamp::ZERO).is_err());
+        let next = executor.step_iteration(Timestamp::from_micros(4)).unwrap();
+        assert_eq!(next.id.get(), 4);
     }
 
     #[test]

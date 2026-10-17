@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 ola-core.workspace = true
 ola-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 ola-model.workspace = true

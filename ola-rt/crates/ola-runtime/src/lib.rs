@@ -40,8 +40,9 @@ pub use kv_cache::{
 };
 pub use model_registry::ModelRegistry;
 pub use plan::{
-    DecodeView, ExecutionPlan, LifecycleAction, PlanDivergence, PlanError, PlanEstimates,
-    PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PrefillView, ReleaseReason,
+    DecodeView, ExecutionPlan, IterationId, LifecycleAction, PlanDivergence, PlanError,
+    PlanEstimates, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PrefillView,
+    ReleaseReason,
 };
 pub use policy::{ExecutionPolicy, PolicyDecision, PolicyDescriptor, PolicyError};
 pub use runtime::Runtime;

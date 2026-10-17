@@ -1,7 +1,7 @@
 # Observability design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P6. Steps 1–2 are implemented.
+Covers `todo.md` P6. Steps 1–3 are implemented.
 
 ## Goal
 
@@ -82,8 +82,15 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
    every field: the stall shows at p99 and max, not p50. Writing it exposed
    a race in the test gate (a just-permitted caller still counted as
    blocked); after fixing it the serving suites passed 990 runs.
-3. Iteration and batch correlation IDs; the per-request trace builder and
-   JSON Lines output.
+3. **Correlation IDs and traces.** **Done.** `IterationId`, numbered from 1
+   by the executor and stamped on both `ExecutorIteration` and its
+   `ExecutionPlan` before validation, so a policy cannot forge it; a
+   rejected step consumes none. `PlanReport` schema 3 records it.
+   Invocations are addressed by iteration and index. `ola_observe::trace`
+   builds per-request records and writes JSON Lines. A real executor run
+   traces queueing behind a full slot, admission into a predicted release,
+   completion, and cancellation before any iteration, with times and
+   iteration IDs checked, and the JSON Lines round trip exact.
 4. Traces in the server and in executor-driven experiments.
 5. Device telemetry and busy fraction; read-only tests; an end-to-end trace
    test on the fixture; docs; close P6.

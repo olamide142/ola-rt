@@ -233,9 +233,38 @@ pub struct PlanEstimates {
     pub predicted_releases: usize,
 }
 
+/// Correlates an executor iteration, its plan, its invocations, and the
+/// events and traces it produced.
+///
+/// The executor numbers committed iterations from 1; 0 means "not yet
+/// assigned", as in a plan a policy has just built.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IterationId(u64);
+
+impl IterationId {
+    /// Wraps a raw iteration number.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw iteration number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for IterationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 /// Complete, validated description of one executor iteration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExecutionPlan {
+    /// Iteration that committed the plan. Assigned by the executor before
+    /// validation, overwriting whatever the policy set.
+    pub iteration: IterationId,
     /// Executor state generation the plan was built from.
     pub generation: u64,
     /// Caller-supplied iteration timestamp.
@@ -964,6 +993,7 @@ mod tests {
 
     fn plan() -> ExecutionPlan {
         ExecutionPlan {
+            iteration: IterationId::default(),
             generation: 7,
             at: Timestamp::from_micros(10),
             lifecycle: vec![LifecycleAction::Admit {

@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-16 22:40 BST (Europe/London)
+**Last updated:** 2026-10-17 12:31 BST (Europe/London)
 
-**Source revision:** working tree based on `748ebfb` on `master`
+**Source revision:** working tree based on `898789c` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -14,7 +14,8 @@ cancellation, backpressure, health, and draining shutdown, and its outputs
 match direct execution on tiny Llama. P6 (observability) is in progress:
 tokens and lifecycle events are now stamped when the model call producing
 them finishes, which corrected one P3 finding, and inter-token latency is
-reported as a real per-gap distribution. Current
+reported as a real per-gap distribution; iterations carry correlation IDs
+and `ola-observe` builds per-request traces. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -389,6 +390,9 @@ performance claim.
   service latency, end-to-end latency, and decode span.
 - Inter-token gap distributions (`TokenGaps`: mean, p50/p90/p99, max) for
   terminal requests with at least two observed tokens.
+- `Tracer`: per-request JSON Lines traces of arrival, ranking, admission,
+  backfill, batch selection, invocations, tokens, and outcome, keyed by
+  request and iteration ID.
 - Selected prefill/decode work, input-token cost, policy deferrals, emitted
   tokens, terminal outcomes, live request counts, and KV snapshots per
   iteration.
@@ -461,7 +465,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 253 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 255 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 10
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -701,6 +705,10 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 12:31 BST — working tree on `898789c`:** P6 step 3: `IterationId`
+  correlation IDs on iterations, plans, and `PlanReport` (schema 3), and
+  the `ola-observe` trace builder with JSON Lines output.
 
 - **2026-10-16 22:40 BST — working tree on `748ebfb`:** P6 step 2: `TokenGaps` per-gap
   inter-token distributions replace the span average in `ola-observe`;

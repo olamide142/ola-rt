@@ -4892,6 +4892,8 @@ dependencies = [
  "ola-core",
  "ola-model",
  "ola-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

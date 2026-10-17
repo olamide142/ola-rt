@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
 
 mod tokens;
+pub mod trace;
 
 pub use tokens::TokenGaps;
+pub use trace::{TraceEvent, TraceRecord, Tracer};
 
 use std::{collections::BTreeMap, error::Error, fmt};
 
@@ -532,6 +534,7 @@ mod tests {
     fn token_times_accumulate_across_iterations_and_are_dropped_when_summarized() {
         let (runtime, request_id) = completed_runtime();
         let token = |generated_tokens, at, finished| ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(at),
             events: vec![ExecutorEvent::Token {
                 request_id,
@@ -572,6 +575,7 @@ mod tests {
     fn observes_iteration_work_rates_totals_and_terminal_output() {
         let (runtime, request_id) = completed_runtime();
         let iteration = ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(70),
             events: vec![ExecutorEvent::Token {
                 request_id,
@@ -625,6 +629,7 @@ mod tests {
         assert_eq!(observer.request(request_id).unwrap().output_tokens, 3);
 
         let later = ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(170),
             events: vec![ExecutorEvent::Idle],
             execution_plan: ExecutionPlan::default(),
@@ -658,6 +663,7 @@ mod tests {
         let runtime = Runtime::default();
         let mut observer = ExecutionObserver::default();
         let iteration = |at| ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(at),
             events: vec![ExecutorEvent::Idle],
             execution_plan: ExecutionPlan::default(),
@@ -691,6 +697,7 @@ mod tests {
     fn observes_dense_prefill_padding_and_efficiency() {
         let runtime = Runtime::default();
         let iteration = ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(10),
             events: Vec::new(),
             execution_plan: ExecutionPlan::default(),
@@ -729,6 +736,7 @@ mod tests {
         let runtime = Runtime::default();
         let request_id = RequestId::new(99);
         let iteration = ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
             at: Timestamp::from_micros(10),
             events: vec![ExecutorEvent::Token {
                 request_id,

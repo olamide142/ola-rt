@@ -71,3 +71,29 @@ println!("padding positions: {}", measurement.padding_input_tokens);
 
 # Ok::<(), ola_observe::ObservationError>(())
 ```
+
+## Request traces
+
+`Tracer` turns executor iterations into one record stream per request,
+reading the iteration and the runtime state after it and changing neither.
+Each `TraceRecord` carries the request ID, the iteration ID (shared with the
+iteration's `ExecutionPlan` and plan reports), the time the fact became
+true, and one `TraceEvent`:
+
+| Event | When | Time |
+| --- | --- | --- |
+| `arrived` | first seen (model, limit, priority, deadline) | queued |
+| `ranked` | ranked by the scheduler (rank of n) | planning |
+| `admission` | `admitted` (reserved KV, budget fit), `deferred` or `rejected` (reason), `no_slot`, `preparation_failed` | planning |
+| `backfill_skipped` | later work admitted past it | planning |
+| `selection` | the batch policy selected or deferred its next operation (stage, token cost) | planning |
+| `invocation` | it ran in a model call (index, phase, tensor or individual, rows, tokens, padding, finish) | call start |
+| `prefill_progress` | a prompt segment ran | call finish |
+| `token` | a token was produced (index, ID, phase) | call finish |
+| `completed`, `failed`, `rejected`, `cancelled` | terminal | terminal |
+
+Within an iteration, decisions come first, then each invocation in
+execution order followed by what it produced. Cancellations happen between
+iterations: report them with `Tracer::observe_cancellation`. Feed the
+tracer before terminal runtime records are forgotten. `trace::write_jsonl`
+and `trace::read_jsonl` use JSON Lines, one record per line.

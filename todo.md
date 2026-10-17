@@ -140,11 +140,11 @@ Design: `ola-rt/crates/ola-observe/OBSERVABILITY.md`.
 
 - [x] Retain per-token timestamps. (Stamped when the producing invocation finishes.)
 - [x] Report real TPOT distributions instead of a terminal-span average.
-- [ ] Record scheduler, admission, batching, and memory choices.
+- [x] Record scheduler, admission, batching, and memory choices. (Per request, in traces.)
 - [ ] Record model-operation latency with documented boundaries.
 - [ ] Add automatic GPU memory telemetry.
 - [ ] Add GPU utilization and device-activity telemetry.
-- [ ] Add stable request, iteration, and plan correlation IDs.
+- [x] Add stable request, iteration, and plan correlation IDs.
 - [ ] Add structured tracing for CLI, server, and experiments.
 - [ ] Keep observation read-only with respect to policy and runtime state.
 
