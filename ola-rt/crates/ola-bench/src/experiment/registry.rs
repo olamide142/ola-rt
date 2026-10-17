@@ -1,8 +1,16 @@
 //! Experiments as data: descriptors, parameters, and the registry.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    fmt,
+    io::Write,
+    sync::{Arc, Mutex},
+};
 
 use ola_model::CausalLanguageModel;
+use ola_observe::{Tracer, trace::write_jsonl};
+use ola_runtime::{ExecutorIteration, RuntimeState};
 
 use super::{ExperimentKind, ExperimentReport, ReportError, TimeDomain};
 
@@ -194,6 +202,78 @@ pub struct ExperimentContext {
     pub model_label: Option<String>,
     /// Backend and device identity for reports.
     pub device: Option<String>,
+    /// Where traceable experiments write request traces.
+    pub trace: Option<ExperimentTrace>,
+}
+
+/// A shared JSON Lines destination for request traces.
+///
+/// An experiment may run many executors (policies, seeds, repetitions);
+/// each writes its records labelled with a distinct `run`.
+#[derive(Clone)]
+pub struct ExperimentTrace(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl ExperimentTrace {
+    /// Writes traces to `writer`.
+    pub fn new(writer: impl Write + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Box::new(writer))))
+    }
+
+    /// Flushes buffered records.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from the writer.
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("trace writer poisoned"))?
+            .flush()
+    }
+
+    /// Starts tracing one executor run labelled `run`.
+    pub(crate) fn run(&self, run: impl Into<String>) -> TraceRun {
+        TraceRun {
+            tracer: Tracer::default(),
+            run: run.into(),
+            output: self.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for ExperimentTrace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExperimentTrace")
+    }
+}
+
+/// Traces one executor run inside an experiment.
+pub(crate) struct TraceRun {
+    tracer: Tracer,
+    run: String,
+    output: ExperimentTrace,
+}
+
+impl TraceRun {
+    /// Writes the records of one iteration; call with the state right after
+    /// it.
+    pub(crate) fn observe(
+        &mut self,
+        iteration: &ExecutorIteration,
+        state: &RuntimeState,
+    ) -> Result<(), ExperimentError> {
+        let mut records = self.tracer.observe_iteration(iteration, state);
+        for record in &mut records {
+            record.run = Some(self.run.clone());
+        }
+        let mut writer = self
+            .output
+            .0
+            .lock()
+            .map_err(|_| ExperimentError::Run("trace writer poisoned".into()))?;
+        write_jsonl(&records, &mut *writer)
+            .map_err(|error| ExperimentError::Run(format!("could not write trace: {error}")))
+    }
 }
 
 /// A finished run.
@@ -209,6 +289,13 @@ pub struct ExperimentOutcome {
 pub trait Experiment: Send + Sync {
     /// Returns the experiment's identity, requirements, and parameters.
     fn descriptor(&self) -> ExperimentDescriptor;
+
+    /// Whether the experiment writes request traces to
+    /// [`ExperimentContext::trace`]. Only experiments that drive an
+    /// executor can.
+    fn traceable(&self) -> bool {
+        false
+    }
 
     /// Runs the experiment.
     ///
@@ -283,6 +370,9 @@ impl ExperimentRegistry {
             .ok_or_else(|| ExperimentError::UnknownExperiment(id.to_owned()))?;
         let descriptor = experiment.descriptor();
         let parameters = Parameters::resolve(&descriptor, overrides)?;
+        if context.trace.is_some() && !experiment.traceable() {
+            return Err(ExperimentError::NotTraceable(id.to_owned()));
+        }
         if descriptor.requirements.contains(&Requirement::LoadedModel) && context.model.is_none() {
             return Err(ExperimentError::MissingRequirement(
                 Requirement::LoadedModel,
@@ -291,6 +381,12 @@ impl ExperimentRegistry {
         let outcome = experiment.run(context, &parameters)?;
         conforms(&descriptor, &outcome.report)?;
         Ok(outcome)
+    }
+
+    /// Returns whether experiment `id` exists and can write traces.
+    pub fn traceable(&self, id: &str) -> bool {
+        self.find(id)
+            .is_some_and(|experiment| experiment.traceable())
     }
 
     fn find(&self, id: &str) -> Option<&dyn Experiment> {
@@ -347,6 +443,8 @@ pub enum ExperimentError {
     },
     /// The frontend did not supply something the experiment needs.
     MissingRequirement(Requirement),
+    /// A trace was requested from an experiment that cannot write one.
+    NotTraceable(String),
     /// The experiment itself failed.
     Run(String),
     /// The report does not match the descriptor or its kind's protocol.
@@ -365,6 +463,10 @@ impl fmt::Display for ExperimentError {
             Self::MissingRequirement(Requirement::LoadedModel) => {
                 formatter.write_str("this experiment needs a loaded model")
             }
+            Self::NotTraceable(id) => write!(
+                formatter,
+                "experiment `{id}` does not drive an executor, so it cannot write traces"
+            ),
             Self::Run(message) => formatter.write_str(message),
             Self::Nonconforming(reason) => write!(formatter, "nonconforming report: {reason}"),
             Self::Report(error) => error.fmt(formatter),

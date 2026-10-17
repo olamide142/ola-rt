@@ -58,9 +58,74 @@ fn list_shows_every_experiment_with_requirements_and_parameters() {
         assert!(output.contains(id), "{id} missing from:\n{output}");
     }
     assert!(output.contains(
-        "llama-generation  [benchmark, probe, not for publication, host time, needs --model]"
+        "llama-generation  [benchmark, probe, not for publication, host time, needs --model, traceable]"
     ));
     assert!(output.contains("--set seeds=5"));
+    assert!(output.contains("scheduler-comparison  [experiment, study, virtual time, traceable]"));
+    assert!(
+        output.contains("prefill-bucketing  [experiment, probe, not for publication, untimed]")
+    );
+}
+
+#[test]
+fn traceable_experiments_write_labelled_json_lines_traces() {
+    let directory = scratch("trace");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("trace.jsonl");
+    let path_text = path.to_str().unwrap();
+
+    let (code, output) = ola(&[
+        "experiment",
+        "run",
+        "scheduler-comparison",
+        "--set",
+        "requests=12",
+        "--set",
+        "seeds=3",
+        "--trace",
+        path_text,
+    ]);
+    assert_eq!(code, EXIT_OK, "{output}");
+    let records = ola_observe::trace::read_jsonl(std::io::BufReader::new(
+        std::fs::File::open(&path).unwrap(),
+    ))
+    .unwrap();
+    let runs = records
+        .iter()
+        .map(|record| record.run.clone().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    // Five policies, three seeds: one run each.
+    assert_eq!(runs.len(), 15, "{runs:?}");
+    assert!(runs.contains("fifo/seed=1"));
+    // Every request in every run reaches an outcome.
+    let completed = records
+        .iter()
+        .filter(|record| record.event.is_terminal())
+        .count();
+    assert_eq!(completed, 15 * 12);
+
+    // The file is never overwritten, and untraceable experiments refuse.
+    let (code, output) = ola(&[
+        "experiment",
+        "run",
+        "scheduler-comparison",
+        "--trace",
+        path_text,
+    ]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(output.contains("could not create trace"), "{output}");
+    let other = directory.join("other.jsonl");
+    let (code, output) = ola(&[
+        "experiment",
+        "run",
+        "fifo-workload",
+        "--trace",
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(output.contains("cannot write traces"), "{output}");
+    assert!(!other.exists());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

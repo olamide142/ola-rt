@@ -16,8 +16,8 @@ use std::{
 use ola_core::Input;
 use ola_core::{ModelDescriptor, Priority, RequestId, RequestSpec, Timestamp};
 use ola_runtime::{
-    ExecutionBatch, ExecutionPolicy, Executor, ExecutorError, ExecutorEvent, PlannedDeferral,
-    PolicyDescriptor, RequestStatus, Runtime,
+    ExecutionBatch, ExecutionPolicy, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
+    PlannedDeferral, PolicyDescriptor, RequestStatus, Runtime, RuntimeState,
 };
 
 use crate::{KvGeometry, SchedulingTrace, synthetic_artifact, synthetic_prompt};
@@ -317,6 +317,30 @@ pub fn run_perturbed_trial<P>(
 where
     P: ExecutionPolicy + 'static,
 {
+    run_observed_trial(trace, policy, config, perturbations, &mut |_, _| {})
+}
+
+/// Like [`run_perturbed_trial`], calling `observe` with every iteration and
+/// the runtime state right after it, for tracing.
+///
+/// Iteration times are virtual. Executor times stay at each iteration's
+/// start, because the simulated executor has no clock; the summary's
+/// corrected virtual times are not reflected in what `observe` sees.
+/// Cancellation perturbations are not iterations and are not observed.
+///
+/// # Errors
+///
+/// Returns [`SimulationError`] as [`run_perturbed_trial`] does.
+pub fn run_observed_trial<P>(
+    trace: &SchedulingTrace,
+    policy: P,
+    config: &SimulationConfig,
+    perturbations: &[Perturbation],
+    observe: &mut dyn FnMut(&ExecutorIteration, &RuntimeState),
+) -> Result<SchedulingRun, SimulationError>
+where
+    P: ExecutionPolicy + 'static,
+{
     let mut pending = perturbations.to_vec();
     pending.sort_by_key(|perturbation| perturbation.at_micros());
     let mut pending = pending.into_iter().peekable();
@@ -390,6 +414,7 @@ where
         }
 
         let iteration = executor.step_iteration(Timestamp::from_micros(clock))?;
+        observe(&iteration, executor.state());
         let finishes = config
             .cost
             .batch_finish_offsets(&iteration.execution_batches);

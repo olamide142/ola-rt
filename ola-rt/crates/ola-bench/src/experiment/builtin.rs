@@ -16,7 +16,8 @@ use super::{
 };
 use crate::{
     DEFAULT_STARVATION_FACTOR, FixedWorkload, KvGeometry, SchedulingTrace, SimulationConfig,
-    TraceParameters, analyze_cost_aware_prefill, compare_prefill_batching, compare_schedulers,
+    TraceParameters, analyze_cost_aware_prefill, compare_prefill_batching,
+    compare_schedulers_observed,
 };
 
 impl ExperimentRegistry {
@@ -531,6 +532,10 @@ impl Experiment for SchedulerComparison {
         }
     }
 
+    fn traceable(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         context: &ExperimentContext,
@@ -590,7 +595,19 @@ impl Experiment for SchedulerComparison {
             for request in &trace.requests {
                 content.push_str(&format!("{request:?};"));
             }
-            let comparison = compare_schedulers(
+            // One trace run per policy and seed; the first write error is
+            // kept and reported after the trial.
+            let mut runs = labels
+                .iter()
+                .map(|(label, _)| {
+                    context
+                        .trace
+                        .as_ref()
+                        .map(|trace| trace.run(format!("{label}/seed={seed}")))
+                })
+                .collect::<Vec<_>>();
+            let mut trace_error = None;
+            let comparison = compare_schedulers_observed(
                 &trace,
                 &config,
                 Self::policies()
@@ -598,8 +615,19 @@ impl Experiment for SchedulerComparison {
                     .map(|(_, policy)| policy)
                     .collect(),
                 DEFAULT_STARVATION_FACTOR,
+                &mut |index, iteration, state| {
+                    if let Some(Some(run)) = runs.get_mut(index)
+                        && trace_error.is_none()
+                        && let Err(error) = run.observe(iteration, state)
+                    {
+                        trace_error = Some(error);
+                    }
+                },
             )
             .map_err(run_error)?;
+            if let Some(error) = trace_error {
+                return Err(error);
+            }
             for (variant, summary) in samples.iter_mut().zip(&comparison.summaries) {
                 variant.push(values(&[
                     ("completion_p50", as_f64(summary.completion.p50_micros)),

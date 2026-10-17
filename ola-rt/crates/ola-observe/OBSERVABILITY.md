@@ -1,7 +1,7 @@
 # Observability design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P6. Steps 1–3 are implemented.
+Covers `todo.md` P6. Steps 1–4 are implemented.
 
 ## Goal
 
@@ -91,7 +91,18 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
    traces queueing behind a full slot, admission into a predicted release,
    completion, and cancellation before any iteration, with times and
    iteration IDs checked, and the JSON Lines round trip exact.
-4. Traces in the server and in executor-driven experiments.
+4. **Traces in the server and experiments.** **Done.**
+   `DriverConfig::trace` keeps traces bounded by the retention table;
+   `Driver::spawn_with_trace_sink` streams them; a failing sink is dropped
+   and reported in health. `GET /v1/requests/{id}/trace` (404
+   `tracing_disabled` when off). `ola serve --trace FILE` and
+   `ola experiment run --trace FILE`; `Experiment::traceable` marks
+   `llama-generation` and `scheduler-comparison`, whose simulator gained an
+   observation hook (`run_observed_trial`, `compare_schedulers_observed`).
+   Records carry a `run` label so one file holds many executor runs. Live
+   on tiny Llama, a trace shows 0.4 ms from admission to the first call,
+   a 15 ms prefill, and 12.5 ms decodes; the server's endpoint and sink
+   held the same 13 records.
 5. Device telemetry and busy fraction; read-only tests; an end-to-end trace
    test on the fixture; docs; close P6.
 

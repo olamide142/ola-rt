@@ -66,6 +66,10 @@ impl Experiment for LlamaGeneration {
         }
     }
 
+    fn traceable(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         context: &ExperimentContext,
@@ -87,9 +91,13 @@ impl Experiment for LlamaGeneration {
             seed: Some(0),
         };
         let request_id = executor.submit(request, clock.now()).map_err(run_error)?;
+        let mut trace = context.trace.as_ref().map(|trace| trace.run("greedy"));
         let started = Instant::now();
         'generation: for _ in 0..10_000 {
             let iteration = executor.step_iteration(clock.now()).map_err(run_error)?;
+            if let Some(trace) = &mut trace {
+                trace.observe(&iteration, executor.state())?;
+            }
             for event in iteration.events {
                 match event {
                     ExecutorEvent::Token { finished: true, .. } => break 'generation,

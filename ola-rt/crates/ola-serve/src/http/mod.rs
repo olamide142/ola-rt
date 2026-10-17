@@ -40,6 +40,7 @@ use crate::{
 /// | `POST /v1/generate` | Generate; JSON, or server-sent events with `stream` |
 /// | `GET /v1/requests/{id}` | A live or recently finished request's state |
 /// | `DELETE /v1/requests/{id}` | Cancel a request |
+/// | `GET /v1/requests/{id}/trace` | The request's trace, when tracing is on |
 /// | `POST /v1/completions` | OpenAI-compatible completions (greedy only) |
 pub fn router(runtime: RuntimeHandle) -> Router {
     Router::new()
@@ -48,6 +49,7 @@ pub fn router(runtime: RuntimeHandle) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/generate", post(generate))
         .route("/v1/requests/{id}", get(status).delete(cancel))
+        .route("/v1/requests/{id}/trace", get(trace))
         .route("/v1/completions", post(openai::completions))
         .with_state(runtime)
 }
@@ -223,6 +225,7 @@ struct HealthJson {
     kv_cache_bytes: u64,
     reserved_kv_bytes: u64,
     iterations: u64,
+    trace_write_failed: bool,
 }
 
 impl From<Health> for HealthJson {
@@ -241,6 +244,7 @@ impl From<Health> for HealthJson {
             kv_cache_bytes: health.kv_cache_bytes,
             reserved_kv_bytes: health.reserved_kv_bytes,
             iterations: health.iterations,
+            trace_write_failed: health.trace_write_failed,
         }
     }
 }
@@ -342,6 +346,7 @@ const fn classify(error: &ServeError) -> (StatusCode, &'static str) {
         ServeError::Execution(_) => (StatusCode::INTERNAL_SERVER_ERROR, "execution_failed"),
         ServeError::Cancelled => (StatusCode::CONFLICT, "cancelled"),
         ServeError::NotReady => (StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
+        ServeError::TracingDisabled => (StatusCode::NOT_FOUND, "tracing_disabled"),
         ServeError::ShuttingDown => (StatusCode::SERVICE_UNAVAILABLE, "shutting_down"),
         ServeError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     }
@@ -386,6 +391,23 @@ async fn status(
     Path(id): Path<u64>,
 ) -> Result<Json<RequestJson>, ApiError> {
     Ok(Json(runtime.status(RequestId::new(id)).await?.into()))
+}
+
+#[derive(Debug, Serialize)]
+struct TraceJson {
+    request: u64,
+    records: Vec<ola_observe::TraceRecord>,
+}
+
+async fn trace(
+    State(runtime): State<RuntimeHandle>,
+    Path(id): Path<u64>,
+) -> Result<Json<TraceJson>, ApiError> {
+    let records = runtime.trace(RequestId::new(id)).await?;
+    Ok(Json(TraceJson {
+        request: id,
+        records,
+    }))
 }
 
 async fn cancel(

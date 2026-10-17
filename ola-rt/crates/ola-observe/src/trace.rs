@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 /// One fact about one request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TraceRecord {
+    /// Independent executor run the record belongs to, when one output
+    /// holds several (for example one per policy and seed in an
+    /// experiment). Request IDs are unique only within a run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     /// Request the record is about.
     pub request: u64,
     /// Iteration that produced the record; absent for facts outside any
@@ -408,6 +413,7 @@ fn record(
     event: TraceEvent,
 ) -> TraceRecord {
     TraceRecord {
+        run: None,
         request: request.get(),
         iteration: iteration.map(IterationId::get),
         at_us: at.as_micros(),

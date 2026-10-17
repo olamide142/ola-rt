@@ -25,6 +25,7 @@ ola-serve.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]
+ola-observe.workspace = true
 ola-ui.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }

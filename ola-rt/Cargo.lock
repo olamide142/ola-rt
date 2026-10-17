@@ -4858,6 +4858,7 @@ dependencies = [
  "ola-burn",
  "ola-core",
  "ola-model",
+ "ola-observe",
  "ola-runtime",
  "ola-serve",
  "ola-ui",

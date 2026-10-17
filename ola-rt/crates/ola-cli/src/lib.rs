@@ -12,7 +12,8 @@ use std::{io::Write, path::PathBuf};
 use burn::tensor::Device;
 use ola_bench::{
     Change, CompareOptions, ExperimentCategory, ExperimentContext, ExperimentKind,
-    ExperimentRegistry, ExperimentReport, ParameterValue, Requirement, TimeDomain, compare_reports,
+    ExperimentRegistry, ExperimentReport, ExperimentTrace, ParameterValue, Requirement, TimeDomain,
+    compare_reports,
 };
 use ola_burn::llama::LlamaFactory;
 use ola_model::CausalLanguageModel;
@@ -27,11 +28,11 @@ pub const EXIT_ERROR: u8 = 2;
 const USAGE: &str = "usage:
   ola experiment list
   ola experiment run <id> [--model DIR] [--backend cpu|wgpu|cuda] [--set KEY=VALUE]...
-                         [--results-dir DIR] [--json]
+                         [--results-dir DIR] [--json] [--trace FILE]
   ola experiment compare <baseline.json> <candidate.json>
                          [--threshold FRACTION] [--allow-workload-mismatch]
   ola serve --model DIR [--backend cpu|wgpu|cuda] [--name ID] [--addr HOST:PORT]
-            [--max-active N] [--max-in-flight N] [--drain-secs S]
+            [--max-active N] [--max-in-flight N] [--drain-secs S] [--trace FILE]
 
 Exit codes: 0 success, 1 regression found by compare, 2 error.";
 
@@ -67,7 +68,8 @@ pub fn run(args: impl IntoIterator<Item = String>, out: &mut impl Write) -> u8 {
 }
 
 fn list(out: &mut impl Write) -> Result<u8, String> {
-    for descriptor in ExperimentRegistry::builtin().descriptors() {
+    let registry = ExperimentRegistry::builtin();
+    for descriptor in registry.descriptors() {
         let category = match descriptor.category {
             ExperimentCategory::Benchmark => "benchmark",
             ExperimentCategory::Experiment => "experiment",
@@ -77,10 +79,15 @@ fn list(out: &mut impl Write) -> Result<u8, String> {
         } else {
             ""
         };
+        let traceable = if registry.traceable(descriptor.id) {
+            ", traceable"
+        } else {
+            ""
+        };
         write_line(
             out,
             format!(
-                "{}  [{category}, {}, {}{model}]\n    {}",
+                "{}  [{category}, {}, {}{model}{traceable}]\n    {}",
                 descriptor.id,
                 kind(descriptor.kind),
                 domain(descriptor.domain),
@@ -110,6 +117,7 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
     let mut overrides = Vec::new();
     let mut results_directory = None;
     let mut json = false;
+    let mut trace_path = None;
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
         let mut value = || {
@@ -129,11 +137,19 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
             }
             "--results-dir" => results_directory = Some(PathBuf::from(value()?)),
             "--json" => json = true,
+            "--trace" => trace_path = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
 
-    let context = match &model_directory {
+    let registry = ExperimentRegistry::builtin();
+    // Checked before the file is created, so a refused run leaves nothing.
+    if trace_path.is_some() && !registry.traceable(id) {
+        return Err(format!(
+            "experiment `{id}` cannot write traces; see `ola experiment list`"
+        ));
+    }
+    let mut context = match &model_directory {
         Some(directory) => ExperimentContext {
             model: Some(load_model(directory, &backend)?),
             model_label: Some(
@@ -147,12 +163,26 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
                 std::env::var("OLA_BENCH_DEVICE_LABEL")
                     .unwrap_or_else(|_| format!("ola-cli / Burn / {backend}")),
             ),
+            trace: None,
         },
         None => ExperimentContext::default(),
     };
-    let outcome = ExperimentRegistry::builtin()
+    if let Some(path) = &trace_path {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("could not create trace {}: {error}", path.display()))?;
+        context.trace = Some(ExperimentTrace::new(std::io::BufWriter::new(file)));
+    }
+    let outcome = registry
         .run(id, &context, &overrides)
         .map_err(|error| error.to_string())?;
+    if let Some(trace) = &context.trace {
+        trace
+            .flush()
+            .map_err(|error| format!("could not write trace: {error}"))?;
+    }
     let report = &outcome.report;
     if json {
         write_line(

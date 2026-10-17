@@ -40,6 +40,12 @@ while let Some(event) = request.next().await {           // or blocking_next()
   with `NotReady`), `Draining`, or `Stopped`; a driver thread that panics
   reports `Stopped`. `models` lists registered models and whether each is
   executable.
+- **Tracing.** With `DriverConfig::trace`, the driver keeps each request's
+  trace (see `ola-observe`) while it is live and for as long as its final
+  status is retained; `RuntimeHandle::trace` returns it.
+  `Driver::spawn_with_trace_sink` also writes every record as JSON Lines,
+  flushing after each iteration. A failing sink is dropped and reported as
+  `Health::trace_write_failed`; requests are unaffected.
 - **Shutdown.** `Driver::drain(grace)` refuses new work and lets accepted
   requests finish until the grace period ends on the driver's clock.
   `Driver::shutdown`, or dropping the driver, stops at once. Either way
@@ -63,6 +69,7 @@ or `make serve MODEL=…` runs it.
 | `POST /v1/generate` | The result as JSON, or server-sent events with `"stream": true` |
 | `GET /v1/requests/{id}` | A live or recently finished request's status and timing |
 | `DELETE /v1/requests/{id}` | Cancel; 204, also for a request that already ended |
+| `GET /v1/requests/{id}/trace` | The request's trace records (`ola_observe::TraceRecord`) |
 | `POST /v1/completions` | OpenAI-compatible completions, JSON or streamed |
 
 ```text
@@ -89,7 +96,7 @@ Errors are `{"error": {"kind", "message"}}`:
 | Status | Kind |
 | --- | --- |
 | 400 | `bad_request` (malformed body, never reaches the runtime), `invalid_request` |
-| 404 | `unknown_model`, `unknown_request` |
+| 404 | `unknown_model`, `unknown_request`, `tracing_disabled` |
 | 409 | `cancelled` |
 | 422 | `rejected` (admission: can never fit) |
 | 429 | `overloaded`, with `Retry-After: 1` |

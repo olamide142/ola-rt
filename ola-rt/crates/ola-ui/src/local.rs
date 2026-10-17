@@ -390,6 +390,7 @@ fn worker_loop(
         device: model.as_ref().map(|_| {
             std::env::var("OLA_BENCH_DEVICE_LABEL").unwrap_or_else(|_| device.label().to_owned())
         }),
+        trace: None,
     };
     while let Ok(command) = commands.recv() {
         let event = match command {
@@ -795,6 +796,7 @@ mod tests {
             ),
             model_label: Some("ola-rt-tiny-random-llama".into()),
             device: Some("cpu".into()),
+            trace: None,
         };
         let registry = ExperimentRegistry::builtin();
 

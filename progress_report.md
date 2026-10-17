@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 12:31 BST (Europe/London)
+**Last updated:** 2026-10-17 13:05 BST (Europe/London)
 
-**Source revision:** working tree based on `898789c` on `master`
+**Source revision:** working tree based on `c807fea` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -15,7 +15,8 @@ match direct execution on tiny Llama. P6 (observability) is in progress:
 tokens and lifecycle events are now stamped when the model call producing
 them finishes, which corrected one P3 finding, and inter-token latency is
 reported as a real per-gap distribution; iterations carry correlation IDs
-and `ola-observe` builds per-request traces. Current
+and per-request traces are served by `ola serve` and written by
+traceable experiments. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -376,6 +377,9 @@ performance claim.
 
 - `llama-generation` reports TTFT and inter-token p50/p90/max in host time
   (fixture: TTFT 11.4 ms, gaps ~10 ms, consistent with 243.5 ms elapsed).
+- `ola experiment run --trace FILE` for traceable experiments
+  (`llama-generation`, `scheduler-comparison`), one labelled run per
+  executor.
 - `ola serve --model DIR`: loads a Llama artifact with memory-aware
   admission and serves the HTTP API, draining on Ctrl-C (`make serve`).
 - `ola` binary: `experiment list`, `experiment run` (model, backend,
@@ -428,6 +432,9 @@ performance claim.
   server-sent events), and `GET`/`DELETE /v1/requests/{id}`; malformed
   bodies are transport errors; each serving error has its own status and
   stable kind; closing a connection cancels, streaming or not.
+- Request traces: kept per request (bounded by retention) and served at
+  `GET /v1/requests/{id}/trace`; `ola serve --trace FILE` streams them as
+  JSON Lines; a failing sink is reported in health.
 - `POST /v1/completions` (OpenAI-compatible, streamed or not) refuses
   anything greedy decoding cannot honour instead of ignoring it.
 
@@ -465,7 +472,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 255 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 261 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 10
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -652,6 +659,9 @@ and `TOKENS` variables.
   and serves one model per process. OpenAI compatibility covers greedy
   `/v1/completions` only.
 - Benchmark probes are foundations, not publication-quality performance claims.
+- Traces of simulated runs carry iteration-start times: the simulator's
+  executor has no clock, and only its summaries use the corrected virtual
+  finish times. Cancellation perturbations in simulations are not traced.
 - Scheduling comparisons default to an illustrative cost model and a
   synthetic model. `cost-calibration` can now supply a measured cost model,
   but the scheduling conclusions have not yet been re-run against one.
@@ -705,6 +715,10 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 13:05 BST — working tree on `c807fea`:** P6 step 4: traces kept by the
+  driver and served over HTTP, `--trace` JSON Lines sinks for `ola serve`
+  and traceable experiments, and a simulator observation hook.
 
 - **2026-10-17 12:31 BST — working tree on `898789c`:** P6 step 3: `IterationId`
   correlation IDs on iterations, plans, and `PlanReport` (schema 3), and

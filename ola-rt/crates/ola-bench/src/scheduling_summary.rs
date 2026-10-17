@@ -21,11 +21,13 @@
 
 use std::time::Duration;
 
-use ola_runtime::{ComposedPolicy, ExecutionPolicy, MemoryAwareAdmission};
+use ola_runtime::{
+    ComposedPolicy, ExecutionPolicy, ExecutorIteration, MemoryAwareAdmission, RuntimeState,
+};
 
 use crate::{
     LatencySummary, SchedulingRun, SchedulingTrace, SimulationConfig, SimulationError,
-    TraceParameters, TrialOutcome, run_scheduling_trial, summarize_latencies,
+    TraceParameters, TrialOutcome, run_observed_trial, run_scheduling_trial, summarize_latencies,
 };
 
 /// Default multiple of isolated time a queue wait may reach before the
@@ -203,11 +205,37 @@ pub fn compare_schedulers(
     policies: Vec<Box<dyn ExecutionPolicy>>,
     starvation_factor: u64,
 ) -> Result<SchedulingComparison, SimulationError> {
+    compare_schedulers_observed(
+        trace,
+        config,
+        policies,
+        starvation_factor,
+        &mut |_, _, _| {},
+    )
+}
+
+/// Like [`compare_schedulers`], calling `observe` with each policy's index,
+/// every iteration of its trial, and the state after it. The isolated
+/// single-request baselines are not observed.
+///
+/// # Errors
+///
+/// Returns [`SimulationError`] if any trial fails to run.
+pub fn compare_schedulers_observed(
+    trace: &SchedulingTrace,
+    config: &SimulationConfig,
+    policies: Vec<Box<dyn ExecutionPolicy>>,
+    starvation_factor: u64,
+    observe: &mut dyn FnMut(usize, &ExecutorIteration, &RuntimeState),
+) -> Result<SchedulingComparison, SimulationError> {
     let isolated_micros = isolated_end_to_end(trace, config)?;
     let summaries = policies
         .into_iter()
-        .map(|policy| {
-            let run = run_scheduling_trial(trace, policy, config)?;
+        .enumerate()
+        .map(|(index, policy)| {
+            let run = run_observed_trial(trace, policy, config, &[], &mut |iteration, state| {
+                observe(index, iteration, state);
+            })?;
             Ok(summarize_run(&run, &isolated_micros, starvation_factor))
         })
         .collect::<Result<Vec<_>, SimulationError>>()?;

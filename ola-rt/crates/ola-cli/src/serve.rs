@@ -1,6 +1,13 @@
 //! `ola serve`: load a model and serve it over HTTP until Ctrl-C.
 
-use std::{io::Write, path::PathBuf, sync::mpsc, thread, time::Duration};
+use std::{
+    fs::OpenOptions,
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
@@ -16,6 +23,7 @@ struct Options {
     max_active: usize,
     max_in_flight: usize,
     drain: Duration,
+    trace: Option<PathBuf>,
 }
 
 fn parse(rest: &[&str]) -> Result<Options, String> {
@@ -28,6 +36,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
         max_active: 4,
         max_in_flight: DriverConfig::default().max_in_flight,
         drain: Duration::from_secs(30),
+        trace: None,
     };
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
@@ -49,6 +58,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             "--addr" => options.address = value()?,
             "--max-active" => options.max_active = number(value()?)?,
             "--max-in-flight" => options.max_in_flight = number(value()?)?,
+            "--trace" => options.trace = Some(PathBuf::from(value()?)),
             "--drain-secs" => {
                 let text = value()?;
                 let seconds = text
@@ -82,14 +92,29 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
     executor
         .register_model(ModelDescriptor::language(name.as_str(), "llama"), model)
         .map_err(|error| error.to_string())?;
-    let driver = Driver::spawn(
-        executor,
-        MonotonicClock::start(),
-        DriverConfig {
-            max_in_flight: options.max_in_flight,
-            ..DriverConfig::default()
-        },
-    )
+    // Traces of live and recently finished requests are always kept for
+    // `GET /v1/requests/{id}/trace`; `--trace` also writes every record.
+    let config = DriverConfig {
+        max_in_flight: options.max_in_flight,
+        trace: true,
+        ..DriverConfig::default()
+    };
+    let driver = match &options.trace {
+        Some(path) => {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| format!("could not create trace {}: {error}", path.display()))?;
+            Driver::spawn_with_trace_sink(
+                executor,
+                MonotonicClock::start(),
+                config,
+                BufWriter::new(file),
+            )
+        }
+        None => Driver::spawn(executor, MonotonicClock::start(), config),
+    }
     .map_err(|error| format!("could not start the driver: {error}"))?;
     let handle = driver.handle();
 

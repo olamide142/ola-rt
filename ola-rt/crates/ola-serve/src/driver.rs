@@ -3,12 +3,12 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
-    io,
+    io::{self, Write},
     ops::ControlFlow,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
     },
     task::{Context, Poll},
@@ -18,6 +18,7 @@ use std::{
 
 use ola_core::{Clock, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp};
 use ola_model::{IncrementalDecoder, KvCacheProfile, SessionMetrics};
+use ola_observe::{TraceRecord, Tracer, trace::write_jsonl};
 use ola_runtime::{
     ExecutionPhase, Executor, ExecutorError, ExecutorEvent, RequestStatus, RequestTiming,
 };
@@ -37,6 +38,9 @@ pub struct DriverConfig {
     /// Most finished requests whose final status stays queryable. Older
     /// ones are forgotten, oldest first, and look unknown afterwards.
     pub retain_finished: usize,
+    /// Keep each request's trace for [`RuntimeHandle::trace`], for live
+    /// requests and as long as a finished one's status is retained.
+    pub trace: bool,
 }
 
 impl Default for DriverConfig {
@@ -45,6 +49,7 @@ impl Default for DriverConfig {
             max_in_flight: 256,
             stall_backoff: Duration::from_millis(1),
             retain_finished: 1024,
+            trace: false,
         }
     }
 }
@@ -180,6 +185,9 @@ pub struct Health {
     pub reserved_kv_bytes: u64,
     /// Executor iterations completed since the driver started.
     pub iterations: u64,
+    /// Whether writing to the trace sink failed; the driver then stops
+    /// writing to it, and requests are unaffected.
+    pub trace_write_failed: bool,
 }
 
 impl Health {
@@ -222,6 +230,10 @@ enum Command {
         id: RequestId,
         reply: Responder<RequestSnapshot>,
     },
+    Trace {
+        id: RequestId,
+        reply: Responder<Vec<TraceRecord>>,
+    },
     Stop {
         /// Finish accepted work until this time, or stop at once when `None`.
         drain_until: Option<Timestamp>,
@@ -238,6 +250,7 @@ struct Shared {
     kv_cache_bytes: AtomicU64,
     reserved_kv_bytes: AtomicU64,
     iterations: AtomicU64,
+    trace_write_failed: AtomicBool,
     models: Vec<ModelStatus>,
 }
 
@@ -274,7 +287,26 @@ impl Driver {
         clock: impl Clock + 'static,
         config: DriverConfig,
     ) -> io::Result<Self> {
-        let clock: Arc<dyn Clock> = Arc::new(clock);
+        Self::start(executor, Arc::new(clock), config, None)
+    }
+
+    /// Like [`spawn`](Self::spawn), and also writes every request's trace to
+    /// `sink` as JSON Lines as it happens, flushing after each iteration.
+    pub fn spawn_with_trace_sink(
+        executor: Executor,
+        clock: impl Clock + 'static,
+        config: DriverConfig,
+        sink: impl Write + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::start(executor, Arc::new(clock), config, Some(Box::new(sink)))
+    }
+
+    fn start(
+        executor: Executor,
+        clock: Arc<dyn Clock>,
+        config: DriverConfig,
+        sink: Option<Box<dyn Write + Send>>,
+    ) -> io::Result<Self> {
         let executor = executor.with_clock(Arc::clone(&clock));
         let (commands, receiver) = mpsc::channel();
         let models = executor
@@ -305,6 +337,7 @@ impl Driver {
             kv_cache_bytes: AtomicU64::new(0),
             reserved_kv_bytes: AtomicU64::new(0),
             iterations: AtomicU64::new(0),
+            trace_write_failed: AtomicBool::new(false),
             models,
         });
         let worker = Worker {
@@ -317,6 +350,9 @@ impl Driver {
             retain_finished: config.retain_finished,
             stall_backoff: config.stall_backoff,
             drain_until: None,
+            tracer: (config.trace || sink.is_some()).then(Tracer::default),
+            traces: config.trace.then(BTreeMap::new),
+            sink,
         };
         worker.publish();
         let thread = thread::Builder::new()
@@ -465,7 +501,16 @@ impl RuntimeHandle {
             kv_cache_bytes: shared.kv_cache_bytes.load(Ordering::SeqCst),
             reserved_kv_bytes: shared.reserved_kv_bytes.load(Ordering::SeqCst),
             iterations: shared.iterations.load(Ordering::SeqCst),
+            trace_write_failed: shared.trace_write_failed.load(Ordering::SeqCst),
         }
+    }
+
+    /// Returns a live or retained request's trace so far.
+    ///
+    /// Fails with [`ServeError::TracingDisabled`] unless the driver was
+    /// configured with [`DriverConfig::trace`].
+    pub fn trace(&self, id: RequestId) -> Reply<Vec<TraceRecord>> {
+        self.request(|reply| Command::Trace { id, reply })
     }
 
     /// Returns every registered model in stable identifier order.
@@ -708,6 +753,11 @@ struct Worker {
     stall_backoff: Duration,
     /// Set while draining: accepted work may run until this time.
     drain_until: Option<Timestamp>,
+    /// Present when traces are kept or written.
+    tracer: Option<Tracer>,
+    /// Kept traces of live and retained requests, when configured.
+    traces: Option<BTreeMap<RequestId, Vec<TraceRecord>>>,
+    sink: Option<Box<dyn Write + Send>>,
 }
 
 /// Marks the service stopped however the driver thread exits, including by
@@ -852,6 +902,16 @@ impl Worker {
             Command::Status { id, reply } => {
                 let _ = reply.send(self.snapshot(id));
             }
+            Command::Trace { id, reply } => {
+                let trace = match &self.traces {
+                    None => Err(ServeError::TracingDisabled),
+                    Some(traces) => traces
+                        .get(&id)
+                        .cloned()
+                        .ok_or(ServeError::UnknownRequest(id)),
+                };
+                let _ = reply.send(trace);
+            }
             Command::Stop { drain_until: None } => return ControlFlow::Break(()),
             Command::Stop {
                 drain_until: Some(until),
@@ -870,6 +930,7 @@ impl Worker {
         }
         match self.executor.cancel(id, self.shared.clock.now()) {
             Ok(()) => {
+                self.trace_cancellation(id);
                 self.end(id, RequestEvent::Cancelled);
                 Ok(())
             }
@@ -882,6 +943,12 @@ impl Worker {
         let iteration = match self.executor.step_iteration(self.shared.clock.now()) {
             Ok(iteration) => {
                 self.shared.iterations.fetch_add(1, Ordering::SeqCst);
+                // Traced before events are routed, while every terminal
+                // request's runtime record still exists.
+                if let Some(tracer) = &mut self.tracer {
+                    let records = tracer.observe_iteration(&iteration, self.executor.state());
+                    self.record(records);
+                }
                 iteration
             }
             Err(error) => {
@@ -1006,13 +1073,14 @@ impl Worker {
             return;
         };
         self.shared.release();
-        if let Ok((record, _)) = self.executor.forget(id) {
-            self.retain(RequestSnapshot {
+        match self.executor.forget(id) {
+            Ok((record, _)) if self.retain_finished > 0 => self.retain(RequestSnapshot {
                 id,
                 status: record.status,
                 timing: record.timing,
                 generated_tokens: live.decoder.tokens().len(),
-            });
+            }),
+            _ => self.drop_trace(id),
         }
         // Gauges are republished first, so a client that has seen the
         // terminal event never reads health that still counts the request.
@@ -1027,6 +1095,7 @@ impl Worker {
         while self.finished_order.len() >= self.retain_finished {
             if let Some(oldest) = self.finished_order.pop_front() {
                 self.finished.remove(&oldest);
+                self.drop_trace(oldest);
             }
         }
         self.finished_order.push_back(snapshot.id);
@@ -1055,8 +1124,47 @@ impl Worker {
     fn abort_all(&mut self, terminal: impl Fn() -> RequestEvent) {
         let now = self.shared.clock.now();
         for id in self.live.keys().copied().collect::<Vec<_>>() {
-            let _ = self.executor.cancel(id, now);
+            if self.executor.cancel(id, now).is_ok() {
+                self.trace_cancellation(id);
+            }
             self.end(id, terminal());
+        }
+    }
+
+    fn trace_cancellation(&mut self, id: RequestId) {
+        if let Some(tracer) = &mut self.tracer {
+            let records = tracer.observe_cancellation(id, self.executor.state());
+            self.record(records);
+        }
+    }
+
+    /// Writes records to the sink and keeps them, as configured. A sink
+    /// that fails is dropped and reported in health; serving continues.
+    fn record(&mut self, records: Vec<TraceRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        if let Some(sink) = &mut self.sink
+            && write_jsonl(&records, &mut *sink)
+                .and_then(|()| sink.flush())
+                .is_err()
+        {
+            self.sink = None;
+            self.shared.trace_write_failed.store(true, Ordering::SeqCst);
+        }
+        if let Some(traces) = &mut self.traces {
+            for record in records {
+                traces
+                    .entry(RequestId::new(record.request))
+                    .or_default()
+                    .push(record);
+            }
+        }
+    }
+
+    fn drop_trace(&mut self, id: RequestId) {
+        if let Some(traces) = &mut self.traces {
+            traces.remove(&id);
         }
     }
 }

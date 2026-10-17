@@ -553,3 +553,53 @@ fn results_report_each_token_time_and_the_gap_distribution() {
     );
     assert_eq!(result["timing"]["first_token_us"], 100);
 }
+
+#[test]
+fn a_request_trace_is_served_when_tracing_is_on() {
+    let gate = Gate::open();
+    let config = DriverConfig {
+        trace: true,
+        ..DriverConfig::default()
+    };
+    let (driver, _) = driver(&gate, 1, config);
+    let server = Server::start(driver.handle());
+
+    let id = server
+        .call("POST", "/v1/generate", Some(generate("hi", false)))
+        .json()["id"]
+        .as_u64()
+        .unwrap();
+    let response = server.call("GET", &format!("/v1/requests/{id}/trace"), None);
+    assert_eq!(response.status, 200, "{}", response.body);
+    let trace = response.json();
+    assert_eq!(trace["request"], id);
+    let records = trace["records"].as_array().unwrap();
+    assert_eq!(records[0]["event"], "arrived");
+    assert_eq!(records[0]["model"], "script");
+    assert_eq!(records.last().unwrap()["event"], "completed");
+    assert!(records.iter().all(|record| record["request"] == id));
+
+    let missing = server.call("GET", "/v1/requests/99/trace", None);
+    assert_eq!(
+        (missing.status, missing.error_kind().as_str()),
+        (404, "unknown_request")
+    );
+}
+
+#[test]
+fn traces_are_not_found_when_tracing_is_off() {
+    let gate = Gate::open();
+    let (driver, _) = driver(&gate, 1, DriverConfig::default());
+    let server = Server::start(driver.handle());
+    server.call("POST", "/v1/generate", Some(generate("hi", false)));
+
+    let response = server.call("GET", "/v1/requests/1/trace", None);
+    assert_eq!(
+        (response.status, response.error_kind().as_str()),
+        (404, "tracing_disabled")
+    );
+    assert_eq!(
+        server.call("GET", "/health", None).json()["trace_write_failed"],
+        false
+    );
+}

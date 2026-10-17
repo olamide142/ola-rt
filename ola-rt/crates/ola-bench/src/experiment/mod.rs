@@ -21,8 +21,9 @@ pub use metric::{Direction, MetricSpec, TimeDomain, Unit};
 pub use model::{ChunkedPrefill, CostCalibration, LlamaGeneration, PrefillStrategies};
 pub use registry::{
     Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
-    ExperimentOutcome, ExperimentRegistry, HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS,
-    ParameterSpec, ParameterValue, Parameters, Requirement, STUDY_MIN_REPETITIONS,
+    ExperimentOutcome, ExperimentRegistry, ExperimentTrace, HOST_STUDY_MIN_REPETITIONS,
+    HOST_STUDY_MIN_WARMUPS, ParameterSpec, ParameterValue, Parameters, Requirement,
+    STUDY_MIN_REPETITIONS,
 };
 pub use report::{
     BuildInfo, EXPERIMENT_SCHEMA, Estimate, ExperimentIdentity, ExperimentKind, ExperimentReport,

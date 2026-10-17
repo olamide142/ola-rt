@@ -145,7 +145,7 @@ Design: `ola-rt/crates/ola-observe/OBSERVABILITY.md`.
 - [ ] Add automatic GPU memory telemetry.
 - [ ] Add GPU utilization and device-activity telemetry.
 - [x] Add stable request, iteration, and plan correlation IDs.
-- [ ] Add structured tracing for CLI, server, and experiments.
+- [x] Add structured tracing for CLI, server, and experiments.
 - [ ] Keep observation read-only with respect to policy and runtime state.
 
 Kernel, prefix-cache, and model-residency instrumentation belong to the milestones that create those capabilities (kernel track, P7, P8).
