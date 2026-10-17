@@ -169,6 +169,11 @@ fn health_readiness_and_models_describe_the_service() {
     assert_eq!(health.status, 200);
     assert_eq!(health.json()["state"], "ready");
     assert_eq!(health.json()["max_in_flight"], 256);
+    assert!(health.json()["busy_us"].is_u64());
+    assert!(
+        health.json().get("device").is_none(),
+        "no telemetry configured"
+    );
     assert_eq!(server.call("GET", "/ready", None).status, 200);
     let models = server.call("GET", "/v1/models", None).json();
     assert_eq!(

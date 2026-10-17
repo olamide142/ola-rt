@@ -4,14 +4,15 @@ use std::{
     fs::OpenOptions,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 
 use ola_core::{ModelDescriptor, MonotonicClock};
+use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
-use ola_serve::{Driver, DriverConfig, http};
+use ola_serve::{Driver, DriverConfig, Instruments, http};
 
 use crate::{EXIT_OK, USAGE, load_model, write_line};
 
@@ -73,6 +74,19 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
     Ok(options)
 }
 
+/// Device memory and utilization for `/health` on accelerator backends;
+/// the CPU backend reports none.
+fn telemetry(backend: &str) -> Option<Arc<dyn DeviceTelemetry>> {
+    match backend {
+        #[cfg(feature = "wgpu")]
+        "wgpu" => Some(Arc::new(ola_kernel::wgpu_telemetry())),
+        #[cfg(feature = "cuda")]
+        "cuda" => ola_kernel::cuda_telemetry(0)
+            .map(|telemetry| Arc::new(telemetry) as Arc<dyn DeviceTelemetry>),
+        _ => None,
+    }
+}
+
 /// Serves one model until Ctrl-C, then drains: new work is refused and
 /// accepted requests finish for up to `--drain-secs` before the rest end.
 pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
@@ -99,22 +113,26 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
         trace: true,
         ..DriverConfig::default()
     };
-    let driver = match &options.trace {
+    let trace_sink = match &options.trace {
         Some(path) => {
             let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(path)
                 .map_err(|error| format!("could not create trace {}: {error}", path.display()))?;
-            Driver::spawn_with_trace_sink(
-                executor,
-                MonotonicClock::start(),
-                config,
-                BufWriter::new(file),
-            )
+            Some(Box::new(BufWriter::new(file)) as Box<dyn Write + Send>)
         }
-        None => Driver::spawn(executor, MonotonicClock::start(), config),
-    }
+        None => None,
+    };
+    let driver = Driver::spawn_instrumented(
+        executor,
+        MonotonicClock::start(),
+        config,
+        Instruments {
+            trace_sink,
+            telemetry: telemetry(&options.backend),
+        },
+    )
     .map_err(|error| format!("could not start the driver: {error}"))?;
     let handle = driver.handle();
 

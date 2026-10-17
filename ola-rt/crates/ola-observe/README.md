@@ -97,3 +97,18 @@ execution order followed by what it produced. Cancellations happen between
 iterations: report them with `Tracer::observe_cancellation`. Feed the
 tracer before terminal runtime records are forgotten. `trace::write_jsonl`
 and `trace::read_jsonl` use JSON Lines, one record per line.
+
+## Device activity and telemetry
+
+Every `ExecutionBatch` records when its model invocation started and
+finished (with an executor clock). `IterationMeasurement::invocation_micros`
+sums an iteration's invocation latency, and `busy_fraction` is the share of
+the interval since the previous iteration started that the previous
+iteration's invocations occupied: a backend-independent proxy for device
+activity. `ObservationTotals::invocation_micros` accumulates it.
+
+`DeviceTelemetry` is the backend-neutral interface for device readings:
+`memory` (bytes in use and reserved by the allocator) and `busy_percent`
+(utilization from the device's own counter). `ola-kernel` implements it for
+CubeCL devices. Readings may wait for the device, so drivers sample them on
+the thread that runs execution, never on request paths.

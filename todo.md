@@ -141,16 +141,16 @@ Design: `ola-rt/crates/ola-observe/OBSERVABILITY.md`.
 - [x] Retain per-token timestamps. (Stamped when the producing invocation finishes.)
 - [x] Report real TPOT distributions instead of a terminal-span average.
 - [x] Record scheduler, admission, batching, and memory choices. (Per request, in traces.)
-- [ ] Record model-operation latency with documented boundaries.
-- [ ] Add automatic GPU memory telemetry.
-- [ ] Add GPU utilization and device-activity telemetry.
+- [x] Record model-operation latency with documented boundaries.
+- [x] Add automatic GPU memory telemetry. (CubeCL allocator; validated on CubeCL's CPU runtime, GPU unobserved here.)
+- [x] Add GPU utilization and device-activity telemetry. (CubeCL utilization counters and a portable busy fraction.)
 - [x] Add stable request, iteration, and plan correlation IDs.
 - [x] Add structured tracing for CLI, server, and experiments.
-- [ ] Keep observation read-only with respect to policy and runtime state.
+- [x] Keep observation read-only with respect to policy and runtime state.
 
 Kernel, prefix-cache, and model-residency instrumentation belong to the milestones that create those capabilities (kernel track, P7, P8).
 
-Done when a request can be traced from arrival through every decision, execution batch, token, and terminal result, with per-token timestamps and correlation IDs, and the traces are covered by tests.
+Done when a request can be traced from arrival through every decision, execution batch, token, and terminal result, with per-token timestamps and correlation IDs, and the traces are covered by tests. **Met 2026-10-17.**
 
 ## P7: Memory and cache policy
 

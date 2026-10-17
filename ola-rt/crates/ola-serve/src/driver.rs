@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
     },
     task::{Context, Poll},
@@ -18,7 +18,7 @@ use std::{
 
 use ola_core::{Clock, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp};
 use ola_model::{IncrementalDecoder, KvCacheProfile, SessionMetrics};
-use ola_observe::{TraceRecord, Tracer, trace::write_jsonl};
+use ola_observe::{DeviceMemory, DeviceTelemetry, TraceRecord, Tracer, trace::write_jsonl};
 use ola_runtime::{
     ExecutionPhase, Executor, ExecutorError, ExecutorEvent, RequestStatus, RequestTiming,
 };
@@ -167,7 +167,7 @@ impl ServiceState {
 ///
 /// Gauges are published after every command batch and iteration, so they
 /// stay readable, if slightly stale, while a long iteration runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Health {
     /// Whether the driver is taking work.
     pub state: ServiceState,
@@ -188,6 +188,29 @@ pub struct Health {
     /// Whether writing to the trace sink failed; the driver then stops
     /// writing to it, and requests are unaffected.
     pub trace_write_failed: bool,
+    /// Device memory at the last sample, when telemetry is configured and
+    /// the backend reports it. Sampled on the driver thread after each
+    /// iteration.
+    pub device_memory: Option<DeviceMemory>,
+    /// Device utilization at the last sample, from the counter its driver or
+    /// platform keeps, when telemetry reports one.
+    pub device_busy_percent: Option<f32>,
+    /// Total time spent inside model invocations since the driver started.
+    /// Its rate of change against `uptime_micros` is the device busy
+    /// fraction.
+    pub busy_micros: u64,
+    /// Driver clock reading when health was read.
+    pub uptime_micros: u64,
+}
+
+/// Optional instrumentation for a [`Driver`].
+#[derive(Default)]
+pub struct Instruments {
+    /// Receives every request's trace as JSON Lines, flushed after each
+    /// iteration.
+    pub trace_sink: Option<Box<dyn Write + Send>>,
+    /// Reports device memory and utilization for health.
+    pub telemetry: Option<Arc<dyn DeviceTelemetry>>,
 }
 
 impl Health {
@@ -251,6 +274,13 @@ struct Shared {
     reserved_kv_bytes: AtomicU64,
     iterations: AtomicU64,
     trace_write_failed: AtomicBool,
+    device_label: Option<String>,
+    device_memory_known: AtomicBool,
+    device_bytes_in_use: AtomicU64,
+    device_bytes_reserved: AtomicU64,
+    device_busy_known: AtomicBool,
+    device_busy_percent_bits: AtomicU32,
+    busy_micros: AtomicU64,
     models: Vec<ModelStatus>,
 }
 
@@ -287,7 +317,7 @@ impl Driver {
         clock: impl Clock + 'static,
         config: DriverConfig,
     ) -> io::Result<Self> {
-        Self::start(executor, Arc::new(clock), config, None)
+        Self::spawn_instrumented(executor, clock, config, Instruments::default())
     }
 
     /// Like [`spawn`](Self::spawn), and also writes every request's trace to
@@ -298,15 +328,29 @@ impl Driver {
         config: DriverConfig,
         sink: impl Write + Send + 'static,
     ) -> io::Result<Self> {
-        Self::start(executor, Arc::new(clock), config, Some(Box::new(sink)))
+        Self::spawn_instrumented(
+            executor,
+            clock,
+            config,
+            Instruments {
+                trace_sink: Some(Box::new(sink)),
+                ..Instruments::default()
+            },
+        )
     }
 
-    fn start(
+    /// Like [`spawn`](Self::spawn), with a trace sink and device telemetry.
+    pub fn spawn_instrumented(
         executor: Executor,
-        clock: Arc<dyn Clock>,
+        clock: impl Clock + 'static,
         config: DriverConfig,
-        sink: Option<Box<dyn Write + Send>>,
+        instruments: Instruments,
     ) -> io::Result<Self> {
+        let clock: Arc<dyn Clock> = Arc::new(clock);
+        let Instruments {
+            trace_sink: sink,
+            telemetry,
+        } = instruments;
         let executor = executor.with_clock(Arc::clone(&clock));
         let (commands, receiver) = mpsc::channel();
         let models = executor
@@ -338,6 +382,13 @@ impl Driver {
             reserved_kv_bytes: AtomicU64::new(0),
             iterations: AtomicU64::new(0),
             trace_write_failed: AtomicBool::new(false),
+            device_label: telemetry.as_ref().map(|telemetry| telemetry.label()),
+            device_memory_known: AtomicBool::new(false),
+            device_bytes_in_use: AtomicU64::new(0),
+            device_bytes_reserved: AtomicU64::new(0),
+            device_busy_known: AtomicBool::new(false),
+            device_busy_percent_bits: AtomicU32::new(0),
+            busy_micros: AtomicU64::new(0),
             models,
         });
         let worker = Worker {
@@ -353,8 +404,10 @@ impl Driver {
             tracer: (config.trace || sink.is_some()).then(Tracer::default),
             traces: config.trace.then(BTreeMap::new),
             sink,
+            telemetry,
         };
         worker.publish();
+        worker.sample_device();
         let thread = thread::Builder::new()
             .name("ola-driver".into())
             .spawn(move || worker.run())?;
@@ -502,7 +555,24 @@ impl RuntimeHandle {
             reserved_kv_bytes: shared.reserved_kv_bytes.load(Ordering::SeqCst),
             iterations: shared.iterations.load(Ordering::SeqCst),
             trace_write_failed: shared.trace_write_failed.load(Ordering::SeqCst),
+            device_memory: shared.device_memory_known.load(Ordering::SeqCst).then(|| {
+                DeviceMemory {
+                    bytes_in_use: shared.device_bytes_in_use.load(Ordering::SeqCst),
+                    bytes_reserved: shared.device_bytes_reserved.load(Ordering::SeqCst),
+                }
+            }),
+            device_busy_percent: shared
+                .device_busy_known
+                .load(Ordering::SeqCst)
+                .then(|| f32::from_bits(shared.device_busy_percent_bits.load(Ordering::SeqCst))),
+            busy_micros: shared.busy_micros.load(Ordering::SeqCst),
+            uptime_micros: shared.clock.now().as_micros(),
         }
+    }
+
+    /// Returns the telemetry device's label, when telemetry is configured.
+    pub fn device_label(&self) -> Option<&str> {
+        self.shared.device_label.as_deref()
     }
 
     /// Returns a live or retained request's trace so far.
@@ -758,6 +828,7 @@ struct Worker {
     /// Kept traces of live and retained requests, when configured.
     traces: Option<BTreeMap<RequestId, Vec<TraceRecord>>>,
     sink: Option<Box<dyn Write + Send>>,
+    telemetry: Option<Arc<dyn DeviceTelemetry>>,
 }
 
 /// Marks the service stopped however the driver thread exits, including by
@@ -943,6 +1014,13 @@ impl Worker {
         let iteration = match self.executor.step_iteration(self.shared.clock.now()) {
             Ok(iteration) => {
                 self.shared.iterations.fetch_add(1, Ordering::SeqCst);
+                let busy = iteration
+                    .execution_batches
+                    .iter()
+                    .map(ola_runtime::ExecutionBatch::latency_micros)
+                    .sum::<u64>();
+                self.shared.busy_micros.fetch_add(busy, Ordering::SeqCst);
+                self.sample_device();
                 // Traced before events are routed, while every terminal
                 // request's runtime record still exists.
                 if let Some(tracer) = &mut self.tracer {
@@ -1129,6 +1207,32 @@ impl Worker {
             }
             self.end(id, terminal());
         }
+    }
+
+    /// Publishes device readings; they may wait for queued device work,
+    /// which is why only the driver thread takes them. A missing reading
+    /// leaves the previous one in place.
+    fn sample_device(&self) {
+        let Some(telemetry) = &self.telemetry else {
+            return;
+        };
+        let shared = &self.shared;
+        if let Some(busy) = telemetry.busy_percent() {
+            shared
+                .device_busy_percent_bits
+                .store(busy.to_bits(), Ordering::SeqCst);
+            shared.device_busy_known.store(true, Ordering::SeqCst);
+        }
+        let Some(memory) = telemetry.memory() else {
+            return;
+        };
+        shared
+            .device_bytes_in_use
+            .store(memory.bytes_in_use, Ordering::SeqCst);
+        shared
+            .device_bytes_reserved
+            .store(memory.bytes_reserved, Ordering::SeqCst);
+        shared.device_memory_known.store(true, Ordering::SeqCst);
     }
 
     fn trace_cancellation(&mut self, id: RequestId) {

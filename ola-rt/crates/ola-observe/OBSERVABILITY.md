@@ -1,7 +1,7 @@
 # Observability design
 
 Status: **accepted** (2026-10-16) with all recommended decisions.
-Covers `todo.md` P6. Steps 1–4 are implemented.
+Covers `todo.md` P6. All five steps are implemented; P6 is complete.
 
 ## Goal
 
@@ -46,9 +46,10 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
    `ola experiment run --trace FILE` for executor-driven experiments. The
    `tracing` crate is not used: tests must assert on traces.
 5. **Device telemetry.** A `DeviceTelemetry` trait: CubeCL allocator memory
-   (compile-checked only here), none on CPU, and a portable busy fraction
-   from measured batch intervals, reported by `/health`. NVML utilization is
-   deferred.
+   and utilization, none on the CPU backend, and a portable busy fraction
+   from measured batch intervals, reported by `/health`. (Revised in step
+   5: CubeCL 0.11 reads utilization itself, through NVML on NVIDIA cards,
+   so it is not deferred.)
 6. **Read-only.** Tests show tracing and telemetry leave plans, outputs, and
    lifecycle unchanged.
 
@@ -103,8 +104,24 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
    on tiny Llama, a trace shows 0.4 ms from admission to the first call,
    a 15 ms prefill, and 12.5 ms decodes; the server's endpoint and sink
    held the same 13 records.
-5. Device telemetry and busy fraction; read-only tests; an end-to-end trace
-   test on the fixture; docs; close P6.
+5. **Telemetry, read-only guarantees, end-to-end trace.** **Done.**
+   `ola_observe::DeviceTelemetry` (memory, utilization) and
+   `ola_kernel::CubeclTelemetry` on CubeCL's runtime-erased `Device`, with
+   `wgpu_telemetry` and `cuda_telemetry`. The driver samples telemetry on
+   its own thread after every iteration and publishes it, with cumulative
+   invocation time, in `Health` and `/health`; `ola serve` attaches it on
+   WGPU and CUDA builds. `IterationMeasurement` gained `invocation_micros`
+   and `busy_fraction`, which pairs each interval with the previous
+   iteration's calls. Evidence: on CubeCL's CPU runtime a 1 MiB allocation
+   shows in the reported memory and utilization reads in range; the WGPU
+   build compiles, but this machine's NVIDIA driver is unusable, so no GPU
+   reading has been observed. Read-only: a workload run plain and with the
+   tracer and observer on every iteration produces identical iterations
+   (plans, decisions, events, invocations) and results, and the scheduler
+   study reports identical samples with and without `--trace`. On the
+   fixture, a served request's trace runs from arrival to completion, each
+   token carrying the finish time of the invocation before it, together
+   equal to the response's token times.
 
 ## Out of scope
 

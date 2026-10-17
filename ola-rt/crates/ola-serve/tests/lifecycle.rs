@@ -179,3 +179,76 @@ fn a_panicking_driver_reports_stopped_and_ends_every_stream() {
     );
     assert!(matches!(driver.shutdown(), Err(ServeError::Internal(_))));
 }
+
+/// Reports memory that grows with each reading.
+struct CountingDevice(std::sync::atomic::AtomicU64);
+
+impl ola_observe::DeviceTelemetry for CountingDevice {
+    fn label(&self) -> String {
+        "test:0".into()
+    }
+
+    fn memory(&self) -> Option<ola_observe::DeviceMemory> {
+        let readings = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Some(ola_observe::DeviceMemory {
+            bytes_in_use: readings * 100,
+            bytes_reserved: 4_096,
+        })
+    }
+
+    fn busy_percent(&self) -> Option<f32> {
+        Some(42.5)
+    }
+}
+
+#[test]
+fn health_reports_device_memory_and_time_spent_in_model_calls() {
+    let gate = Gate::closed();
+    let clock = ManualClock::new(Timestamp::ZERO);
+    let driver = Driver::spawn_instrumented(
+        support::executor(&gate, 1),
+        clock.clone(),
+        DriverConfig::default(),
+        ola_serve::Instruments {
+            telemetry: Some(std::sync::Arc::new(CountingDevice(Default::default()))),
+            ..ola_serve::Instruments::default()
+        },
+    )
+    .unwrap();
+    let runtime = driver.handle();
+    assert_eq!(runtime.device_label(), Some("test:0"));
+    assert_eq!(runtime.health().device_busy_percent, Some(42.5));
+    // Sampled once at start.
+    assert_eq!(
+        runtime
+            .health()
+            .device_memory
+            .map(|memory| memory.bytes_in_use),
+        Some(100)
+    );
+
+    let mut handle = runtime.submit(request("hi")).wait().unwrap();
+    // Every model call takes exactly 100 µs on the driver's clock.
+    for _ in 0..=REPLY.len() {
+        gate.wait_until_blocked();
+        clock.advance(Duration::from_micros(100));
+        gate.permit(1);
+        assert!(matches!(
+            handle.blocking_next(),
+            Some(RequestEvent::Token { .. })
+        ));
+    }
+    assert!(matches!(
+        handle.blocking_next(),
+        Some(RequestEvent::Finished(_))
+    ));
+
+    let health = runtime.health();
+    assert_eq!(health.busy_micros, 100 * (REPLY.len() as u64 + 1));
+    assert_eq!(health.uptime_micros, 100 * (REPLY.len() as u64 + 1));
+    // One more reading per iteration.
+    assert_eq!(
+        health.device_memory.unwrap().bytes_in_use,
+        100 * (1 + health.iterations)
+    );
+}

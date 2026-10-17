@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
 
+mod device;
 mod tokens;
 pub mod trace;
 
+pub use device::{DeviceMemory, DeviceTelemetry};
 pub use tokens::TokenGaps;
 pub use trace::{TraceEvent, TraceRecord, Tracer};
 
@@ -97,7 +99,7 @@ impl RequestMeasurement {
 }
 
 /// Measurements for one observed executor iteration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IterationMeasurement {
     /// Timestamp supplied to the executor iteration.
     pub at: Timestamp,
@@ -123,6 +125,13 @@ pub struct IterationMeasurement {
     pub executed_input_tokens: usize,
     /// Artificial input positions computed because prefill rows were padded.
     pub padding_input_tokens: usize,
+    /// Summed latency of the iteration's model invocations; zero without an
+    /// executor clock.
+    pub invocation_micros: u64,
+    /// Share of the interval since the previous iteration started that the
+    /// previous iteration's invocations occupied: a portable proxy for
+    /// device activity. `None` for the first sample or a zero interval.
+    pub busy_fraction: Option<f64>,
     /// Generated tokens emitted during the iteration.
     pub emitted_output_tokens: usize,
     /// Successfully completed requests.
@@ -207,12 +216,15 @@ pub struct ObservationTotals {
     pub executed_input_tokens: usize,
     /// Artificial prefill positions computed due to right padding.
     pub padding_input_tokens: usize,
+    /// Summed model-invocation latency.
+    pub invocation_micros: u64,
 }
 
 /// Stateful collector for deterministic executor observations.
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionObserver {
     previous_iteration_at: Option<Timestamp>,
+    previous_invocation_micros: u64,
     observed_output_tokens: BTreeMap<RequestId, usize>,
     /// Token times of requests not yet terminal; dropped once summarized.
     token_times: BTreeMap<RequestId, Vec<Timestamp>>,
@@ -279,6 +291,14 @@ impl ExecutionObserver {
                 .iter()
                 .map(|batch| batch.padding_tokens)
                 .sum(),
+            invocation_micros: iteration
+                .execution_batches
+                .iter()
+                .map(ola_runtime::ExecutionBatch::latency_micros)
+                .sum(),
+            busy_fraction: elapsed_micros
+                .filter(|elapsed| *elapsed > 0)
+                .map(|elapsed| self.previous_invocation_micros as f64 / elapsed as f64),
             emitted_output_tokens: 0,
             completed_requests: 0,
             failed_requests: 0,
@@ -375,6 +395,8 @@ impl ExecutionObserver {
         }
 
         self.previous_iteration_at = Some(iteration.at);
+        self.previous_invocation_micros = measurement.invocation_micros;
+        self.totals.invocation_micros += measurement.invocation_micros;
         self.totals.iterations += 1;
         self.totals.scheduled_input_tokens += measurement.scheduled_input_tokens;
         self.totals.emitted_output_tokens += measurement.emitted_output_tokens;
@@ -528,6 +550,53 @@ mod tests {
             .inter_token,
             None
         );
+    }
+
+    #[test]
+    fn busy_fraction_pairs_each_interval_with_the_previous_iterations_calls() {
+        let (runtime, _) = completed_runtime();
+        let iteration = |at: u64, calls: &[(u64, u64)]| ExecutorIteration {
+            id: ola_runtime::IterationId::default(),
+            at: Timestamp::from_micros(at),
+            events: Vec::new(),
+            execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
+            divergences: Vec::new(),
+            execution_batches: calls
+                .iter()
+                .map(|(start, finish)| ola_runtime::ExecutionBatch {
+                    phase: BatchPhase::Decode,
+                    request_ids: Vec::new(),
+                    mode: BatchExecutionMode::Individual,
+                    input_tokens: 1,
+                    padding_tokens: 0,
+                    started_at: Timestamp::from_micros(*start),
+                    finished_at: Timestamp::from_micros(*finish),
+                })
+                .collect(),
+            active_requests: 0,
+            queued_requests: 0,
+            kv_cache_bytes: 0,
+            reserved_kv_bytes: 0,
+        };
+        let mut observer = ExecutionObserver::default();
+
+        // Iteration at 0 runs calls for 60 µs; the next starts at 100.
+        let first = observer
+            .observe_iteration(&iteration(0, &[(0, 20), (20, 60)]), runtime.state())
+            .unwrap();
+        let second = observer
+            .observe_iteration(&iteration(100, &[(100, 125)]), runtime.state())
+            .unwrap();
+        let third = observer
+            .observe_iteration(&iteration(150, &[]), runtime.state())
+            .unwrap();
+
+        assert_eq!((first.invocation_micros, first.busy_fraction), (60, None));
+        assert_eq!(second.invocation_micros, 25);
+        assert_eq!(second.busy_fraction, Some(0.6));
+        assert_eq!(third.busy_fraction, Some(0.5));
+        assert_eq!(observer.totals().invocation_micros, 85);
     }
 
     #[test]

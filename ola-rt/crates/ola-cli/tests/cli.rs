@@ -104,6 +104,29 @@ fn traceable_experiments_write_labelled_json_lines_traces() {
         .count();
     assert_eq!(completed, 15 * 12);
 
+    // Tracing is read-only: the same study without a trace reports the
+    // same samples.
+    let study = |trace: Option<&str>| {
+        let mut args = vec![
+            "experiment",
+            "run",
+            "scheduler-comparison",
+            "--set",
+            "requests=12",
+            "--set",
+            "seeds=3",
+            "--json",
+        ];
+        if let Some(trace) = trace {
+            args.extend(["--trace", trace]);
+        }
+        let (code, output) = ola(&args);
+        assert_eq!(code, EXIT_OK, "{output}");
+        ExperimentReport::from_json(&output).unwrap().samples
+    };
+    let traced_again = directory.join("again.jsonl");
+    assert_eq!(study(Some(traced_again.to_str().unwrap())), study(None));
+
     // The file is never overwritten, and untraceable experiments refuse.
     let (code, output) = ola(&[
         "experiment",

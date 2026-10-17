@@ -11,21 +11,22 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["burn/cuda", "ola-burn/cuda"]
-wgpu = ["burn/wgpu", "ola-burn/wgpu"]
+cuda = ["burn/cuda", "ola-burn/cuda", "ola-kernel/cuda"]
+wgpu = ["burn/wgpu", "ola-burn/wgpu", "ola-kernel/wgpu"]
 
 [dependencies]
 burn.workspace = true
 ola-bench.workspace = true
 ola-burn.workspace = true
 ola-core.workspace = true
+ola-kernel.workspace = true
 ola-model.workspace = true
+ola-observe.workspace = true
 ola-runtime.workspace = true
 ola-serve.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
 
 [dev-dependencies]
-ola-observe.workspace = true
 ola-ui.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }

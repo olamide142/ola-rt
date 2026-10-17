@@ -4857,6 +4857,7 @@ dependencies = [
  "ola-bench",
  "ola-burn",
  "ola-core",
+ "ola-kernel",
  "ola-model",
  "ola-observe",
  "ola-runtime",
@@ -4877,6 +4878,7 @@ dependencies = [
  "burn",
  "burn-backend 0.22.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "burn-cubecl",
+ "ola-observe",
 ]
 
 [[package]]

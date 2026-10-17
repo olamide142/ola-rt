@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 13:05 BST (Europe/London)
+**Last updated:** 2026-10-17 14:14 BST (Europe/London)
 
-**Source revision:** working tree based on `c807fea` on `master`
+**Source revision:** working tree based on `81513d9` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -11,12 +11,12 @@ benchmark and experiment is a registered experiment with a versioned,
 interval-carrying report; `ola serve` serves a model over a native HTTP API
 and an OpenAI-compatible completions endpoint, with streaming,
 cancellation, backpressure, health, and draining shutdown, and its outputs
-match direct execution on tiny Llama. P6 (observability) is in progress:
-tokens and lifecycle events are now stamped when the model call producing
-them finishes, which corrected one P3 finding, and inter-token latency is
-reported as a real per-gap distribution; iterations carry correlation IDs
-and per-request traces are served by `ola serve` and written by
-traceable experiments. Current
+match direct execution on tiny Llama. P6 (observability) is complete:
+tokens and lifecycle events are stamped when the model call producing them
+finishes (which corrected one P3 finding), inter-token latency is a real
+per-gap distribution, iterations carry correlation IDs, every request can
+be traced from arrival to outcome over HTTP or JSON Lines, and health
+reports device memory, utilization, and time spent in model calls. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -165,7 +165,7 @@ performance claim.
 | Execution policy | Working | `ExecutionPolicy` plans from an immutable snapshot through `&self`; `ComposedPolicy` combines replaceable scheduler, admission, batch, and grouping components with stable descriptors and full decision records |
 | Execution planning | Working | Each iteration is a validated `ExecutionPlan` (admissions, invocations, deferrals, predicted releases) committed atomically; divergences recorded; versioned `PlanReport` JSON |
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
-| Observability | Foundation working | Request latency, iteration work/rates, padding efficiency, terminal measurements, cumulative counters |
+| Observability | Working | Model-call timing, per-token timestamps and inter-token distributions, iteration correlation IDs, per-request traces (HTTP endpoint, JSON Lines for the server and traceable experiments), device memory and utilization via CubeCL, busy fraction; shown not to change execution |
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
 | Experiment framework | Working | `ExperimentRegistry` of nine experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
 | Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
@@ -472,8 +472,8 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 261 tests, Clippy
-  with warnings denied, and documentation) with zero compiler warnings; 10
+- `make verify`: **passed** (formatting, workspace checks, 264 tests, Clippy
+  with warnings denied, and documentation) with zero compiler warnings; 11
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
   time) for prefill bucketing and the five-seed scheduler study; `ola
@@ -488,7 +488,9 @@ At the working tree recorded above:
 - A live `ola serve` run on the tiny-Llama fixture answered health, models,
   JSON and streamed generation (deltas equal to the final text), and
   drained cleanly on Ctrl-C.
-- `make test-fixture` against the pinned artifact: **10 passed**. The five
+- `make test-fixture` against the pinned artifact: **11 passed**, including
+  a served request traced from arrival to completion with each token
+  carrying its invocation's finish time. The five
   serving tests drive `ola-serve` over real sockets and compare every output
   with direct execution: JSON, streamed, and OpenAI outputs agree; four
   concurrent clients each get their single-request output; HTTP
@@ -641,7 +643,11 @@ and `TOKENS` variables.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
   reclaim part of a reservation as a sequence approaches completion.
 - Device-wide admission is enforced only when a caller supplies a capacity and
-  non-KV accounting; automatic GPU-memory telemetry is not wired in yet.
+  non-KV accounting. GPU memory is now reported for health, but admission
+  does not yet consume it.
+- CubeCL device telemetry was validated on CubeCL's CPU runtime and compiles
+  for WGPU; this machine's NVIDIA driver is unusable, so no GPU memory or
+  utilization reading has been observed.
 - Slots freed by EOS or failure are refilled on the next iteration because
   plans are built before execution; only limit-reaching completions are reused
   in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
@@ -697,11 +703,10 @@ and `TOKENS` variables.
      selected accelerator backend permits;
    - retain per-step numerical comparison with the full-sequence oracle.
 
-4. **Observability (P6, next)**
-   - retain per-token timestamps and report real TPOT distributions;
-   - add correlation IDs and structured tracing across CLI, server, and
-     experiments, so a served request can be traced through every decision
-     and batch.
+4. **Memory and cache policy (P7, next)**
+   - reclaim worst-case reservations, add eviction and preemption with
+     recorded reasons, then prefix reuse, using traces to explain each
+     action.
 
 ## Update protocol
 
@@ -715,6 +720,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 14:14 BST — working tree on `81513d9`:** Completed P6: `DeviceTelemetry`
+  with CubeCL memory and utilization (validated on CubeCL's CPU runtime,
+  WGPU compiles), busy time and busy fraction, telemetry in `/health` and
+  `ola serve`, read-only equivalence tests, and an end-to-end trace test on
+  the fixture.
 
 - **2026-10-17 13:05 BST — working tree on `c807fea`:** P6 step 4: traces kept by the
   driver and served over HTTP, `--trace` JSON Lines sinks for `ola serve`

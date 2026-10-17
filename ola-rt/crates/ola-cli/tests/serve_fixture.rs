@@ -361,3 +361,46 @@ fn dechunk_tail(rest: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+#[test]
+#[ignore = "requires OLA_LLAMA_CONFORMANCE_DIR"]
+fn a_served_request_is_traced_from_arrival_to_completion() {
+    let model = fixture();
+    let config = DriverConfig {
+        trace: true,
+        ..DriverConfig::default()
+    };
+    let server = Server::start(&model, 2, config);
+
+    let (status, result) = server.json("POST", "/v1/generate", Some(generate("Hello", 6, false)));
+    assert_eq!(status, 200);
+    let id = result["id"].as_u64().unwrap();
+    let (status, trace) = server.json("GET", &format!("/v1/requests/{id}/trace"), None);
+    assert_eq!(status, 200);
+    let records = trace["records"].as_array().unwrap();
+    let events = records
+        .iter()
+        .map(|record| record["event"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(events.first(), Some(&"arrived"));
+    assert_eq!(events.last(), Some(&"completed"));
+    assert!(events.contains(&"admission"));
+    // Each token follows the invocation that produced it and carries its
+    // finish time; together they are the response's token times.
+    let mut token_times = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if record["event"] == "token" {
+            let invocation = &records[index - 1];
+            assert_eq!(invocation["event"], "invocation", "{records:?}");
+            assert_eq!(record["at_us"], invocation["finished_us"]);
+            assert!(invocation["at_us"].as_u64() < invocation["finished_us"].as_u64());
+            assert_eq!(record["iteration"], invocation["iteration"]);
+            token_times.push(record["at_us"].as_u64().unwrap());
+        }
+    }
+    assert_eq!(json!(token_times), result["token_us"]);
+    assert!(token_times.windows(2).all(|pair| pair[0] < pair[1]));
+    let (_, health) = server.json("GET", "/health", None);
+    assert!(health["busy_us"].as_u64().unwrap() > 0);
+}

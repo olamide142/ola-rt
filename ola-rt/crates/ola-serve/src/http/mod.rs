@@ -226,11 +226,45 @@ struct HealthJson {
     reserved_kv_bytes: u64,
     iterations: u64,
     trace_write_failed: bool,
+    busy_us: u64,
+    uptime_us: u64,
+    /// Present when device telemetry is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<DeviceJson>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceJson {
+    label: String,
+    /// Absent until the backend reports memory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_in_use: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_reserved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    busy_percent: Option<f32>,
+}
+
+impl HealthJson {
+    fn of(runtime: &RuntimeHandle) -> Self {
+        let health = runtime.health();
+        let mut json = Self::from(health);
+        json.device = runtime.device_label().map(|label| DeviceJson {
+            label: label.to_owned(),
+            bytes_in_use: health.device_memory.map(|memory| memory.bytes_in_use),
+            bytes_reserved: health.device_memory.map(|memory| memory.bytes_reserved),
+            busy_percent: health.device_busy_percent,
+        });
+        json
+    }
 }
 
 impl From<Health> for HealthJson {
     fn from(health: Health) -> Self {
         Self {
+            busy_us: health.busy_micros,
+            uptime_us: health.uptime_micros,
+            device: None,
             state: match health.state {
                 ServiceState::Ready => "ready",
                 ServiceState::NoModels => "no_models",
@@ -353,17 +387,17 @@ const fn classify(error: &ServeError) -> (StatusCode, &'static str) {
 }
 
 async fn health(State(runtime): State<RuntimeHandle>) -> Json<HealthJson> {
-    Json(runtime.health().into())
+    Json(HealthJson::of(&runtime))
 }
 
 async fn ready(State(runtime): State<RuntimeHandle>) -> (StatusCode, Json<HealthJson>) {
-    let health = runtime.health();
-    let status = if health.is_ready() {
+    let health = HealthJson::of(&runtime);
+    let status = if health.state == "ready" {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(health.into()))
+    (status, Json(health))
 }
 
 async fn models(

@@ -205,3 +205,72 @@ fn traces_follow_each_request_from_arrival_to_its_outcome() {
     let first_line = first_line.lines().next().unwrap();
     assert!(first_line.starts_with(r#"{"request":3,"at_us":3,"event":"arrived""#));
 }
+
+/// Runs a fixed workload to completion, optionally tracing and observing
+/// every iteration, and returns every iteration and final result.
+fn run_workload(
+    instrumented: bool,
+) -> (
+    Vec<ola_runtime::ExecutorIteration>,
+    Vec<Option<ola_runtime::ExecutionResult>>,
+) {
+    let mut executor = Executor::with_max_active_requests(Runtime::default(), 2).unwrap();
+    executor
+        .register_model(
+            ModelDescriptor::language("counting", "counting"),
+            CausalLanguageModel::new(Numbers, Counting),
+        )
+        .unwrap();
+    let ids = [("1 2 3", 4), ("5", 2), ("7 8", 3), ("9", 1), ("4 4 4 4", 2)]
+        .iter()
+        .enumerate()
+        .map(|(index, (prompt, tokens))| {
+            executor
+                .submit(
+                    request(prompt, *tokens),
+                    Timestamp::from_micros(index as u64),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut tracer = Tracer::default();
+    let mut observer = ola_observe::ExecutionObserver::default();
+    let mut iterations = Vec::new();
+    for step in 1..=50 {
+        let iteration = executor
+            .step_iteration(Timestamp::from_micros(step * 10))
+            .unwrap();
+        if instrumented {
+            assert!(
+                !tracer
+                    .observe_iteration(&iteration, executor.state())
+                    .is_empty()
+                    || iteration.is_idle()
+            );
+            observer
+                .observe_iteration(&iteration, executor.state())
+                .unwrap();
+        }
+        let idle = iteration.is_idle();
+        iterations.push(iteration);
+        if idle {
+            break;
+        }
+    }
+    let results = ids.iter().map(|id| executor.result(*id).cloned()).collect();
+    (iterations, results)
+}
+
+#[test]
+fn tracing_and_observing_change_no_plan_decision_event_or_result() {
+    let (plain_iterations, plain_results) = run_workload(false);
+    let (traced_iterations, traced_results) = run_workload(true);
+
+    assert!(
+        plain_iterations.len() > 3,
+        "the workload should take several iterations"
+    );
+    assert!(plain_results.iter().all(Option::is_some));
+    assert_eq!(traced_iterations, plain_iterations);
+    assert_eq!(traced_results, plain_results);
+}

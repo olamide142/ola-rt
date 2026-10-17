@@ -303,16 +303,20 @@ fn load_model(directory: &PathBuf, backend: &str) -> Result<CausalLanguageModel,
         "wgpu" => LlamaFactory::new(Device::wgpu(Default::default())),
         #[cfg(feature = "cuda")]
         "cuda" => LlamaFactory::new(Device::cuda(0)),
-        "wgpu" | "cuda" => {
-            return Err(format!(
-                "{backend} support is not compiled; rebuild ola-cli with --features {backend}"
-            ));
-        }
+        #[cfg(not(feature = "wgpu"))]
+        "wgpu" => return Err(not_compiled(backend)),
+        #[cfg(not(feature = "cuda"))]
+        "cuda" => return Err(not_compiled(backend)),
         other => return Err(format!("unknown backend `{other}`; use cpu, wgpu, or cuda")),
     };
     factory
         .load_local(directory)
         .map_err(|error| format!("could not load {}: {error}", directory.display()))
+}
+
+#[cfg(any(not(feature = "wgpu"), not(feature = "cuda")))]
+fn not_compiled(backend: &str) -> String {
+    format!("{backend} support is not compiled; rebuild ola-cli with --features {backend}")
 }
 
 const fn kind(kind: ExperimentKind) -> &'static str {
