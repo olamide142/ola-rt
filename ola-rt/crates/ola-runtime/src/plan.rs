@@ -210,6 +210,11 @@ pub enum PlanDivergence {
         /// Observed cause.
         reason: ReleaseReason,
     },
+    /// A planned row failed because the model's KV pool ran out of blocks.
+    KvCapacityExhausted {
+        /// Request whose allocation failed.
+        request_id: RequestId,
+    },
 }
 
 /// Deterministic work estimates derived from a plan.
@@ -974,6 +979,7 @@ mod tests {
                     batch: BatchCapabilities::ALL,
                     chunked_prefill: true,
                     kv_cache: KvCacheProfile::new(1, 1, 400),
+                    kv_pool: None,
                 },
             )]),
             memory: MemoryState::default(),

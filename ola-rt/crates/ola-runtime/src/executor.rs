@@ -128,9 +128,10 @@ pub struct ExecutorIteration {
     /// Why the policy planned it: ranking, admission inputs and outcomes,
     /// batch selections, grouping alternatives, and capability fallbacks.
     pub decision: DecisionRecord,
-    /// Ways execution differed from `execution_plan`: lifecycle failures,
-    /// then tensor fallbacks in batch order, then unpredicted releases in
-    /// event order. Empty when execution matched the plan exactly.
+    /// Ways execution differed from `execution_plan`: lifecycle failures;
+    /// then, batch by batch, a tensor fallback followed by KV-capacity
+    /// failures in row order; then unpredicted releases in event order.
+    /// Empty when execution matched the plan exactly.
     pub divergences: Vec<PlanDivergence>,
     /// Model invocations used to execute the selected plan.
     pub execution_batches: Vec<ExecutionBatch>,
@@ -687,6 +688,7 @@ impl Executor {
                                 batch: model.batch_capabilities(),
                                 chunked_prefill: model.supports_chunked_prefill(),
                                 kv_cache: model.kv_cache_profile(),
+                                kv_pool: model.kv_pool_status(),
                             });
                     (descriptor.id.clone(), snapshot)
                 })
@@ -988,6 +990,16 @@ impl Executor {
                 if result.is_ok() {
                     pending.cursor = pending.cursor.saturating_add(prompt.len());
                 }
+                if result
+                    .as_ref()
+                    .is_err_and(ModelExecutionError::is_kv_capacity_exhausted)
+                {
+                    outcome
+                        .divergences
+                        .push(PlanDivergence::KvCapacityExhausted {
+                            request_id: pending.request_id,
+                        });
+                }
                 let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
@@ -1005,6 +1017,16 @@ impl Executor {
                     started_at,
                     finished_at,
                 });
+                if result
+                    .as_ref()
+                    .is_err_and(ModelExecutionError::is_kv_capacity_exhausted)
+                {
+                    outcome
+                        .divergences
+                        .push(PlanDivergence::KvCapacityExhausted {
+                            request_id: pending.request_id,
+                        });
+                }
                 let event = self.finish_prefill(pending, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
@@ -1132,6 +1154,16 @@ impl Executor {
                 finished_at,
             });
             for ((row, active), result) in batch.rows.iter().zip(members).zip(results) {
+                if result
+                    .as_ref()
+                    .is_err_and(ModelExecutionError::is_kv_capacity_exhausted)
+                {
+                    outcome
+                        .divergences
+                        .push(PlanDivergence::KvCapacityExhausted {
+                            request_id: active.request_id,
+                        });
+                }
                 let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }
@@ -1149,6 +1181,16 @@ impl Executor {
                     started_at,
                     finished_at,
                 });
+                if result
+                    .as_ref()
+                    .is_err_and(ModelExecutionError::is_kv_capacity_exhausted)
+                {
+                    outcome
+                        .divergences
+                        .push(PlanDivergence::KvCapacityExhausted {
+                            request_id: active.request_id,
+                        });
+                }
                 let event = self.finish_decode(active, result, finished_at)?;
                 outcome.indexed_events.push((row.event_index, event));
             }

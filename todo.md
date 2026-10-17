@@ -154,6 +154,8 @@ Done when a request can be traced from arrival through every decision, execution
 
 ## P7: Memory and cache policy
 
+Design: `ola-rt/crates/ola-runtime/MEMORY_POLICY.md`.
+
 - [ ] Reclaim unused worst-case reservations as requests approach completion.
 - [ ] Define cache eviction policy and observable reasons.
 - [ ] Add safe request preemption.

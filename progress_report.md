@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 14:14 BST (Europe/London)
+**Last updated:** 2026-10-17 14:41 BST (Europe/London)
 
-**Source revision:** working tree based on `81513d9` on `master`
+**Source revision:** working tree based on `a93f220` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -16,7 +16,9 @@ tokens and lifecycle events are stamped when the model call producing them
 finishes (which corrected one P3 finding), inter-token latency is a real
 per-gap distribution, iterations carry correlation IDs, every request can
 be traced from arrival to outcome over HTTP or JSON Lines, and health
-reports device memory, utilization, and time spent in model calls. Current
+reports device memory, utilization, and time spent in model calls. P7
+(memory and cache policy) has started: models report KV-pool occupancy to
+the planner and pool exhaustion is a typed, recorded failure. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -472,7 +474,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 264 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 266 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 11
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -642,6 +644,8 @@ and `TOKENS` variables.
   page attention is not yet a fused ragged multi-request kernel.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
   reclaim part of a reservation as a sequence approaches completion.
+- Running out of KV blocks (possible without memory-aware admission) still
+  fails the request; P7 step 3 turns it into preemption.
 - Device-wide admission is enforced only when a caller supplies a capacity and
   non-KV accounting. GPU memory is now reported for health, but admission
   does not yet consume it.
@@ -720,6 +724,11 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-17 14:41 BST — working tree on `a93f220`:** P7 step 1: `KvPoolStatus` from
+  models into the planning snapshot, typed KV-capacity exhaustion recorded
+  as a plan divergence (`PlanReport` schema 4), and a real block pool in
+  the synthetic model; the scheduler study's samples are unchanged.
 
 - **2026-10-17 14:14 BST — working tree on `81513d9`:** Completed P6: `DeviceTelemetry`
   with CubeCL memory and utilization (validated on CubeCL's CPU runtime,

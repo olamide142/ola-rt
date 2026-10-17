@@ -721,6 +721,7 @@ mod tests {
                     batch,
                     chunked_prefill: true,
                     kv_cache: KvCacheProfile::new(8, 4, kv_capacity_bytes),
+                    kv_pool: None,
                 },
             )]),
             memory: MemoryState::default(),

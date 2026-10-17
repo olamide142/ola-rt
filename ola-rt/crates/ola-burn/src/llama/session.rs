@@ -43,6 +43,15 @@ impl CausalModel for BurnLlamaModel {
         true
     }
 
+    fn kv_pool_status(&self) -> Option<ola_model::KvPoolStatus> {
+        Some(
+            self.cache_pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status(),
+        )
+    }
+
     fn batch_capabilities(&self) -> BatchCapabilities {
         BatchCapabilities::ALL
     }
@@ -732,7 +741,14 @@ impl GenerationSession for LlamaSession {
 }
 
 fn cache_error(stage: ExecutionStage, error: KvBlockError) -> ModelExecutionError {
-    ModelExecutionError::new(stage, format!("KV cache: {error}"))
+    let message = format!("KV cache: {error}");
+    match error {
+        KvBlockError::InsufficientCapacity { .. }
+        | KvBlockError::BatchInsufficientCapacity { .. } => {
+            ModelExecutionError::kv_capacity_exhausted(stage, message)
+        }
+        _ => ModelExecutionError::new(stage, message),
+    }
 }
 
 fn batch_error<T>(
@@ -940,9 +956,20 @@ mod tests {
         );
         let before = session.metrics();
 
+        let status = model.kv_pool_status().unwrap();
+        assert_eq!(
+            (
+                status.total_blocks,
+                status.allocated_blocks,
+                status.free_blocks
+            ),
+            (2, 1, 1)
+        );
+
         let error = session.prefill_chunk(&[4, 5], true).unwrap_err();
 
         assert!(error.message().contains("KV cache"));
+        assert!(error.is_kv_capacity_exhausted());
         assert_eq!(session.metrics(), before);
         assert!(matches!(
             session.prefill_chunk(&[4], true).unwrap(),
@@ -953,6 +980,8 @@ mod tests {
         ));
         assert_eq!(session.metrics().prompt_tokens, 2);
         assert_eq!(session.metrics().generated_tokens, 1);
+        drop(session);
+        assert_eq!(model.kv_pool_status().unwrap().free_blocks, 2);
     }
 
     #[test]

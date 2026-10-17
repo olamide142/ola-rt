@@ -218,6 +218,18 @@ struct LlamaLayerPages {
 }
 
 impl LlamaKvPool {
+    pub(crate) fn status(&self) -> ola_model::KvPoolStatus {
+        let metrics = self.manager.metrics();
+        ola_model::KvPoolStatus {
+            total_blocks: metrics.total_blocks,
+            free_blocks: metrics.free_blocks,
+            allocated_blocks: metrics.allocated_blocks,
+            cached_blocks: 0,
+            tokens_per_block: self.manager.tokens_per_block(),
+            live_sequences: metrics.live_sequences,
+        }
+    }
+
     pub(crate) fn new(
         model: &LlamaConfig,
         config: LlamaKvCacheConfig,

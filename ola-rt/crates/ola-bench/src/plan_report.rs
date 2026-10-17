@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 /// Current schema version for serialized execution plans.
 ///
 /// Version 2 added [`PlanReport::decision`]; version 3 added
-/// [`PlanReport::iteration`].
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 3;
+/// [`PlanReport::iteration`]; version 4 added the KV-exhaustion divergence.
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 4;
 
 /// One iteration's validated plan and observed divergences.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -381,6 +381,11 @@ pub enum PlanReportDivergence {
         /// Observed cause.
         reason: PlanReportReleaseReason,
     },
+    /// A planned row failed because the KV pool ran out of blocks.
+    KvCapacityExhausted {
+        /// Request identifier.
+        request_id: u64,
+    },
 }
 
 /// Serialized [`PlanEstimates`].
@@ -687,6 +692,11 @@ fn divergence(divergence: &PlanDivergence) -> PlanReportDivergence {
                     ReleaseReason::OutputLimit => PlanReportReleaseReason::OutputLimit,
                     ReleaseReason::Failure => PlanReportReleaseReason::Failure,
                 },
+            }
+        }
+        PlanDivergence::KvCapacityExhausted { request_id } => {
+            PlanReportDivergence::KvCapacityExhausted {
+                request_id: request_id.get(),
             }
         }
     }

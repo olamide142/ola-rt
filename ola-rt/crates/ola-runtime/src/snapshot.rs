@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use ola_core::{ModelId, Priority, RequestId, Timestamp};
-use ola_model::{BatchCapabilities, KvCacheProfile};
+use ola_model::{BatchCapabilities, KvCacheProfile, KvPoolStatus};
 
 use crate::{BatchPressure, DecodeView, MemoryState, PrefillView};
 
@@ -50,6 +50,9 @@ pub struct ModelSnapshot {
     pub chunked_prefill: bool,
     /// Physical KV-pool geometry, when published.
     pub kv_cache: Option<KvCacheProfile>,
+    /// Physical KV-pool occupancy at the iteration boundary, when the model
+    /// allocates from a shared pool.
+    pub kv_pool: Option<KvPoolStatus>,
 }
 
 impl ModelSnapshot {
@@ -59,6 +62,7 @@ impl ModelSnapshot {
         batch: BatchCapabilities::NONE,
         chunked_prefill: false,
         kv_cache: None,
+        kv_pool: None,
     };
 }
 

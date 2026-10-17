@@ -25,6 +25,7 @@ pub enum ExecutionStage {
 pub struct ModelExecutionError {
     stage: ExecutionStage,
     message: String,
+    kv_capacity_exhausted: bool,
 }
 
 impl ModelExecutionError {
@@ -33,7 +34,23 @@ impl ModelExecutionError {
         Self {
             stage,
             message: message.into(),
+            kv_capacity_exhausted: false,
         }
+    }
+
+    /// Creates an error for a KV-cache allocation the pool could not
+    /// satisfy. The runtime can recover from this one, for example by
+    /// preempting other work, unlike other execution failures.
+    pub fn kv_capacity_exhausted(stage: ExecutionStage, message: impl Into<String>) -> Self {
+        Self {
+            kv_capacity_exhausted: true,
+            ..Self::new(stage, message)
+        }
+    }
+
+    /// Returns whether the failure was a KV-cache pool running out of blocks.
+    pub const fn is_kv_capacity_exhausted(&self) -> bool {
+        self.kv_capacity_exhausted
     }
 
     /// Returns the failed execution stage.
@@ -79,6 +96,23 @@ pub trait Tokenizer: Send + Sync {
     ) -> Result<String, ModelExecutionError>;
 }
 
+/// Occupancy of a model's shared, block-granular KV-cache pool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KvPoolStatus {
+    /// Blocks the pool can hold.
+    pub total_blocks: usize,
+    /// Blocks immediately available for allocation.
+    pub free_blocks: usize,
+    /// Blocks held by live sessions.
+    pub allocated_blocks: usize,
+    /// Blocks held only by a prefix cache, evictable on demand.
+    pub cached_blocks: usize,
+    /// Token positions per block.
+    pub tokens_per_block: usize,
+    /// Sessions currently holding a cache sequence.
+    pub live_sequences: usize,
+}
+
 /// Shared weights and immutable configuration for a causal language model.
 ///
 /// Implementations may internally share device buffers. Mutable request state
@@ -111,6 +145,12 @@ pub trait CausalModel: Send + Sync {
     /// records the divergence. The default declares no batched paths.
     fn batch_capabilities(&self) -> BatchCapabilities {
         BatchCapabilities::NONE
+    }
+
+    /// Returns the shared KV pool's current occupancy, when the model
+    /// allocates its cache from one.
+    fn kv_pool_status(&self) -> Option<KvPoolStatus> {
+        None
     }
 
     /// Attempts one tensor-batched prefill across compatible sessions.
@@ -374,6 +414,11 @@ impl CausalLanguageModel {
     /// Returns the tensor-batched paths the model declares.
     pub fn batch_capabilities(&self) -> BatchCapabilities {
         self.model.batch_capabilities()
+    }
+
+    /// Returns the shared KV pool's occupancy, when the model has one.
+    pub fn kv_pool_status(&self) -> Option<KvPoolStatus> {
+        self.model.kv_pool_status()
     }
 
     /// Returns the artifact-compatible tokenizer.

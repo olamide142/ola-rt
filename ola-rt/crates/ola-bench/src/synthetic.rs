@@ -5,12 +5,15 @@
 //! The first prompt token encodes an optional end-of-sequence step: `0` means
 //! no early EOS, and `k` ends the request on its `k`-th generated token.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use ola_core::GenerationConfig;
 use ola_model::{
     BatchCapabilities, CausalLanguageModel, CausalModel, ExecutionStage, GeneratedToken,
-    GenerationSession, KvCacheProfile, ModelExecutionError, PrefillOutcome, SessionMetrics,
-    Tokenizer,
+    GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionError, PrefillOutcome,
+    SessionMetrics, Tokenizer,
 };
+use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
 
 /// Physical KV-pool geometry published by the synthetic model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,19 +63,42 @@ pub fn synthetic_token(prompt_tokens: usize, step: usize) -> u32 {
 
 /// Returns a deterministic executable with every batch hook and a KV profile.
 ///
+/// Sessions allocate their cache from one shared block pool of the given
+/// geometry, as a real model does: a prefill appends its prompt, each decode
+/// appends the token fed back in, and growth the pool cannot satisfy fails
+/// with a KV-capacity error. The pool reports its occupancy to the planner.
+///
 /// # Panics
 ///
 /// Panics if `kv` has a zero field, which is a configuration error.
 pub fn synthetic_artifact(kv: KvGeometry) -> CausalLanguageModel {
     let profile = KvCacheProfile::new(kv.bytes_per_token, kv.tokens_per_block, kv.capacity_bytes)
         .expect("KV geometry fields must be positive");
+    let pool = KvBlockManager::new(kv.capacity_bytes, kv.tokens_per_block, kv.bytes_per_token)
+        .expect("KV geometry must hold at least one block");
     CausalLanguageModel::new(
         SyntheticTokenizer,
         SyntheticModel {
             bytes_per_token: kv.bytes_per_token,
+            pool: Arc::new(Mutex::new(pool)),
         },
     )
     .with_kv_cache_profile(profile)
+}
+
+fn lock(pool: &Mutex<KvBlockManager>) -> std::sync::MutexGuard<'_, KvBlockManager> {
+    pool.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn pool_error(stage: ExecutionStage, error: KvBlockError) -> ModelExecutionError {
+    let message = format!("KV cache: {error}");
+    match error {
+        KvBlockError::InsufficientCapacity { .. }
+        | KvBlockError::BatchInsufficientCapacity { .. } => {
+            ModelExecutionError::kv_capacity_exhausted(stage, message)
+        }
+        _ => ModelExecutionError::new(stage, message),
+    }
 }
 
 struct SyntheticTokenizer;
@@ -104,11 +130,25 @@ impl Tokenizer for SyntheticTokenizer {
 
 struct SyntheticModel {
     bytes_per_token: u64,
+    pool: Arc<Mutex<KvBlockManager>>,
 }
 
 impl CausalModel for SyntheticModel {
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+
+    fn kv_pool_status(&self) -> Option<KvPoolStatus> {
+        let pool = lock(&self.pool);
+        let metrics = pool.metrics();
+        Some(KvPoolStatus {
+            total_blocks: metrics.total_blocks,
+            free_blocks: metrics.free_blocks,
+            allocated_blocks: metrics.allocated_blocks,
+            cached_blocks: 0,
+            tokens_per_block: pool.tokens_per_block(),
+            live_sequences: metrics.live_sequences,
+        })
     }
 
     fn batch_capabilities(&self) -> BatchCapabilities {
@@ -119,7 +159,12 @@ impl CausalModel for SyntheticModel {
         &self,
         _generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
+        let sequence = lock(&self.pool)
+            .allocate()
+            .map_err(|error| pool_error(ExecutionStage::SessionCreation, error))?;
         Ok(Box::new(SyntheticSession {
+            pool: Arc::clone(&self.pool),
+            sequence,
             bytes_per_token: self.bytes_per_token,
             prompt: Vec::new(),
             generated: 0,
@@ -173,6 +218,8 @@ impl CausalModel for SyntheticModel {
 }
 
 struct SyntheticSession {
+    pool: Arc<Mutex<KvBlockManager>>,
+    sequence: KvSequenceId,
     bytes_per_token: u64,
     prompt: Vec<u32>,
     generated: usize,
@@ -216,6 +263,9 @@ impl GenerationSession for SyntheticSession {
                 "prompt chunk cannot be empty",
             ));
         }
+        lock(&self.pool)
+            .append(self.sequence, prompt_tokens.len())
+            .map_err(|error| pool_error(ExecutionStage::Prefill, error))?;
         self.prompt.extend_from_slice(prompt_tokens);
         if !is_final {
             return Ok(PrefillOutcome::Pending);
@@ -231,6 +281,9 @@ impl GenerationSession for SyntheticSession {
                 "decode requires prefill",
             ));
         }
+        lock(&self.pool)
+            .append(self.sequence, 1)
+            .map_err(|error| pool_error(ExecutionStage::Decode, error))?;
         Ok(self.emit())
     }
 
@@ -253,6 +306,12 @@ impl GenerationSession for SyntheticSession {
     }
 }
 
+impl Drop for SyntheticSession {
+    fn drop(&mut self) {
+        let _ = lock(&self.pool).free(self.sequence);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +329,126 @@ mod tests {
         assert_eq!(second.id, synthetic_token(3, 2));
         assert!(second.is_end_of_sequence);
         assert_eq!(session.metrics().kv_cache_bytes, 4 * 64);
+    }
+
+    #[test]
+    fn sessions_share_one_block_pool_and_fail_typed_when_it_is_full() {
+        // Four 4-token blocks.
+        let model = synthetic_artifact(KvGeometry {
+            bytes_per_token: 8,
+            tokens_per_block: 4,
+            capacity_bytes: 4 * 4 * 8,
+        });
+        let mut first = model.create_session(GenerationConfig::default()).unwrap();
+        let mut second = model.create_session(GenerationConfig::default()).unwrap();
+
+        let token = first.prefill(&synthetic_prompt(9, None)).unwrap();
+        let status = model.kv_pool_status().unwrap();
+        assert_eq!(
+            (
+                status.allocated_blocks,
+                status.free_blocks,
+                status.live_sequences
+            ),
+            (3, 1, 2)
+        );
+        let error = second.prefill(&synthetic_prompt(5, None)).unwrap_err();
+        assert!(error.is_kv_capacity_exhausted(), "{error}");
+
+        // Three decodes fill the third block; the fourth needs a new one.
+        let mut input = token.id;
+        for _ in 0..3 {
+            input = first.decode(input).unwrap().id;
+        }
+        assert!(first.decode(input).is_ok());
+        assert_eq!(model.kv_pool_status().unwrap().free_blocks, 0);
+
+        drop(first);
+        drop(second);
+        let status = model.kv_pool_status().unwrap();
+        assert_eq!((status.free_blocks, status.live_sequences), (4, 0));
+    }
+
+    /// Records the pool status each plan saw.
+    struct Recording {
+        inner: ola_runtime::ComposedPolicy,
+        seen: Arc<Mutex<Vec<Option<KvPoolStatus>>>>,
+    }
+
+    impl ola_runtime::ExecutionPolicy for Recording {
+        fn descriptor(&self) -> ola_runtime::PolicyDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn plan(
+            &self,
+            snapshot: &ola_runtime::PlanningSnapshot,
+        ) -> Result<ola_runtime::PolicyDecision, ola_runtime::PolicyError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(snapshot.model(&"synthetic".into()).kv_pool);
+            self.inner.plan(snapshot)
+        }
+
+        fn enforces_model_kv_capacity(&self) -> bool {
+            self.inner.enforces_model_kv_capacity()
+        }
+    }
+
+    #[test]
+    fn running_out_of_kv_blocks_is_a_typed_divergence_the_planner_can_see() {
+        use ola_core::{ModelDescriptor, RequestSpec, Timestamp};
+        use ola_runtime::{Executor, ExecutorEvent, PlanDivergence, Runtime};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // Unconstrained admission: nothing stops both prompts starting.
+        let policy = Recording {
+            inner: ola_runtime::ComposedPolicy::default(),
+            seen: Arc::clone(&seen),
+        };
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_policy(policy);
+        executor
+            .register_model(
+                ModelDescriptor::language("synthetic", "synthetic"),
+                synthetic_artifact(KvGeometry {
+                    bytes_per_token: 8,
+                    tokens_per_block: 4,
+                    capacity_bytes: 4 * 4 * 8,
+                }),
+            )
+            .unwrap();
+        let request = || {
+            let mut spec = RequestSpec::text("synthetic", "");
+            spec.inputs = vec![ola_core::Input::Tokens(synthetic_prompt(9, None))];
+            spec.generation.max_new_tokens = 2;
+            spec
+        };
+        let first = executor.submit(request(), Timestamp::ZERO).unwrap();
+        let second = executor.submit(request(), Timestamp::ZERO).unwrap();
+
+        let iteration = executor.step_iteration(Timestamp::from_micros(1)).unwrap();
+
+        assert!(matches!(
+            iteration.events.as_slice(),
+            [
+                ExecutorEvent::Token { request_id, .. },
+                ExecutorEvent::Failed { request_id: failed, .. },
+            ] if *request_id == first && *failed == second
+        ));
+        assert!(
+            iteration
+                .divergences
+                .contains(&PlanDivergence::KvCapacityExhausted { request_id: second })
+        );
+        executor.step_iteration(Timestamp::from_micros(2)).unwrap();
+        let seen = seen.lock().unwrap();
+        // The first plan saw an empty pool; the second saw the first
+        // request's three blocks.
+        assert_eq!(seen[0].map(|status| status.free_blocks), Some(4));
+        assert_eq!(seen[1].map(|status| status.allocated_blocks), Some(3));
     }
 
     #[test]
