@@ -159,16 +159,16 @@ Design: `ola-rt/crates/ola-runtime/MEMORY_POLICY.md`.
 - [x] Reclaim unused worst-case reservations as requests approach completion. (By not reserving them: watermark admission with preemption.)
 - [x] Define cache eviction policy and observable reasons. (LRU of unreferenced cached blocks, only when an allocation needs space; counted.)
 - [x] Add safe request preemption. (Recompute; outputs identical to uninterrupted runs on the synthetic model and tiny Llama.)
-- [ ] Evaluate swapping after eviction and preemption semantics stabilize.
+- [x] Evaluate swapping after eviction and preemption semantics stabilize. (Recompute kept; cost model recorded; revisit on a GPU.)
 - [x] Add prefix detection and prefix-cache reuse.
 - [x] Add prefix-cache hit, reuse, and eviction metrics.
 - [x] Track prefix ownership, lifetime, accounting, and isolation. (Reference counts, LRU lifetime, verified matches, full immutable blocks; reservations stay conservative.)
 - [x] Define recovery when a planned batch cannot obtain its KV allocation. (Requeue as a preemption unless the request can never fit.)
-- [ ] Add fragmentation-aware admission or placement experiments.
-- [ ] Test cache pressure, preemption, cancellation, and recovery.
-- [ ] Preserve deterministic policies for workload replay.
+- [x] Add fragmentation-aware admission or placement experiments. (`kv-page-size`; fixed pages have no external fragmentation.)
+- [x] Test cache pressure, preemption, cancellation, and recovery.
+- [x] Preserve deterministic policies for workload replay.
 
-Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, or preempts with recorded reasons instead of deferring indefinitely or rejecting; prefix reuse produces identical outputs with measured savings; and the pressure, preemption, cancellation, and recovery tests are deterministic.
+Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, or preempts with recorded reasons instead of deferring indefinitely or rejecting; prefix reuse produces identical outputs with measured savings; and the pressure, preemption, cancellation, and recovery tests are deterministic. **Met 2026-10-18.**
 
 ## P8: Model and runtime usability
 
@@ -220,6 +220,7 @@ Done when policy selects an optimized paged-attention kernel with a portable fal
 - [ ] VLM and multimodal execution
 - [ ] Vision and OlaDetection workloads
 - [ ] Persistent request results
+- [ ] KV swapping to host memory as a per-preemption alternative to recompute
 - [ ] Learned cost models and policies
 - [ ] Model-independent graph/model IR and compiler passes
 

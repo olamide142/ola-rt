@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-17 21:31 BST (Europe/London)
+**Last updated:** 2026-10-18 10:00 BST (Europe/London)
 
-**Source revision:** working tree based on `e278b3d` on `master`
+**Source revision:** working tree based on `2248703` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -17,13 +17,17 @@ finishes (which corrected one P3 finding), inter-token latency is a real
 per-gap distribution, iterations carry correlation IDs, every request can
 be traced from arrival to outcome over HTTP or JSON Lines, and health
 reports device memory, utilization, and time spent in model calls. P7
-(memory and cache policy) is in progress: models report KV-pool occupancy
+(memory and cache policy) is complete: models report KV-pool occupancy
 to the planner, pool exhaustion is a typed failure, and live requests can be
 preempted and resumed by recompute with output identical to uninterrupted
 runs. Watermark admission with preemption cut completion p95 by 47% and
 raised throughput 58% on an early-stopping workload in virtual time, with no
 measurable cost where requests run to their limit. A block-level prefix
-cache reuses shared prompt prefixes with output identical to recomputation. Current
+cache reuses shared prompt prefixes with output identical to recomputation.
+Swapping was evaluated and deferred in favour of recompute, a page-size
+sweep found 8–16-token pages the best trade-off between waste and reuse,
+and replay under pressure, preemption, eviction, and cancellation is
+deterministic. Current
 branch commits are not pushed
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
@@ -174,7 +178,7 @@ performance claim.
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
 | Observability | Working | Model-call timing, per-token timestamps and inter-token distributions, iteration correlation IDs, per-request traces (HTTP endpoint, JSON Lines for the server and traceable experiments), device memory and utilization via CubeCL, busy fraction; shown not to change execution |
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
-| Experiment framework | Working | `ExperimentRegistry` of nine experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
+| Experiment framework | Working | `ExperimentRegistry` of twelve experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
 | Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
 | Kernel abstraction | First vertical slice | Validated paged-attention contract, stable metadata, and portable Burn reference used by Llama decode |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
@@ -479,7 +483,7 @@ performance claim.
 
 At the working tree recorded above:
 
-- `make verify`: **passed** (formatting, workspace checks, 287 tests, Clippy
+- `make verify`: **passed** (formatting, workspace checks, 289 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 13
   fixture tests ignored by default.
 - The CLI and the workbench produce identical reports (apart from recording
@@ -658,8 +662,13 @@ and `TOKENS` variables.
   virtual-time results on the synthetic model and need confirming on a real
   model under load. Without preemption, running out of KV blocks still fails
   the request.
-- Preemption recomputes: a resumed request re-prefills its prompt and output.
-  Swapping KV to host memory is not implemented.
+- Preemption recomputes: a resumed request re-prefills its prompt and output
+  (15.7% more input tokens in `kv-pressure`). Swapping KV to host memory was
+  evaluated and deferred; its estimated advantage on large models needs a
+  GPU to measure.
+- The page-size sweep is a virtual-time result on one shared-prefix
+  workload; the best page size on a real model also depends on kernel
+  efficiency per page.
 - Device-wide admission is enforced only when a caller supplies a capacity and
   non-KV accounting. GPU memory is now reported for health, but admission
   does not yet consume it.
@@ -715,16 +724,16 @@ and `TOKENS` variables.
    - re-run the scheduler and budget studies against a measured cost model;
    - gate regressions in CI with `ola experiment compare`.
 
-3. **Paged-attention optimization**
-   - benchmark page size and fragmentation tradeoffs;
+3. **Paged-attention optimization (Kernel track, next)**
+   - re-run the page-size sweep with real kernel cost per page;
    - fuse page traversal, score reduction, and value accumulation where the
      selected accelerator backend permits;
    - retain per-step numerical comparison with the full-sequence oracle.
 
-4. **Memory and cache policy (P7, next)**
-   - reclaim worst-case reservations, add eviction and preemption with
-     recorded reasons, then prefix reuse, using traces to explain each
-     action.
+4. **Model and runtime usability (P8, after the Kernel track)**
+   - broaden model and checkpoint support;
+   - confirm the P7 virtual-time results (watermark admission, prefix
+     reuse, page size) on a real model under load.
 
 ## Update protocol
 
@@ -738,6 +747,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-18 10:00 BST — working tree on `2248703`:** P7 step 5 closes P7:
+  swapping evaluated with a cost model and deferred (recompute costs 15.7%
+  more input tokens in `kv-pressure`); the `kv-page-size` study
+  (fragmentation 1.1% at 4-token pages to 19.9% at 64; reuse and p95 hold
+  through 32 and degrade at 64); replay determinism under pressure,
+  preemption, prefix eviction, and cancellation.
 
 - **2026-10-17 21:31 BST — working tree on `e278b3d`:** P7 step 4: block-level prefix
   cache (reference counts, verified chained hashes, LRU eviction), planned

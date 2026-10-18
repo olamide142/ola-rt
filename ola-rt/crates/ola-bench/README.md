@@ -138,7 +138,13 @@ The `prefix-cache` study compares the pool with and without the cache.
 The `kv-pressure` study compares worst-case reservation
 (`MemoryAwareAdmission`) with `WatermarkAdmission` plus newest-first
 preemption over seeded traces in virtual time, reporting latency,
-throughput, peak KV, preemptions, failures, and unfinished requests.
+throughput, peak KV, preemptions, failures, unfinished requests, and input
+tokens (which include recompute after preemption).
+
+The `kv-page-size` study sweeps tokens per page over a shared-prefix trace,
+reporting internal fragmentation without the prefix cache (from
+`SchedulingSummary::kv_internal_fragmentation`) and prefix reuse and latency
+with it.
 
 ## Scheduling comparisons
 

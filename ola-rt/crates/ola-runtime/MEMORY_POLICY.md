@@ -1,7 +1,7 @@
 # Memory and cache policy design
 
 Status: **accepted** (2026-10-17) with all recommended decisions.
-Covers `todo.md` P7. Steps 1–4 are implemented.
+Covers `todo.md` P7. All five steps are implemented; P7 is complete.
 
 ## Goal
 
@@ -166,8 +166,53 @@ deterministic. That is P7's completion criterion.
    it computed 45% fewer input tokens and cut completion p95 from 23.2 to
    20.6 ms (separated), while TTFT and throughput were not distinguishable
    because load did not saturate.
-5. A swap evaluation, a page-size and fragmentation experiment,
-   replay-determinism tests, docs, and closing P7.
+5. **Swap evaluation, page size, replay.** **Done.**
+
+   *Swapping: evaluated, not implemented.* Recompute's cost was measured:
+   in `kv-pressure` (payload 2, which adds input tokens), watermark
+   admission computed 15.7% more input tokens than worst-case reservation
+   (15,320 vs 13,236), about 64 re-prefilled tokens per preemption, and
+   still delivered 58% more throughput. Swapping would replace that
+   recompute with copying the request's KV out and back. Per token,
+   recompute costs about 2 × parameters FLOPs; a swap round trip moves
+   2 × (KV bytes per token). For a Llama-2-7B-class model in FP16
+   (512 KiB of KV per token, 14 GFLOP per token), 64 tokens is 64 MiB over
+   PCIe 4.0 (~25 GB/s, about 2.7 ms) against 0.9 TFLOP of prefill (about
+   6 ms at 150 TFLOP/s): swapping could be roughly twice as fast per
+   preemption on such hardware, and more so with grouped-query attention's
+   smaller KV. But recompute batches with other prefill work, while swaps
+   need a host-memory tier, asynchronous copies, and resume ordering, and
+   none of this can be measured here (no usable GPU). Decision: keep
+   recompute; revisit swapping as a policy choice per preemption, using
+   this cost model, once a GPU can measure both. Recorded under later
+   work.
+
+   *Page size* (`kv-page-size`): a shared-prefix trace (100-token prefix)
+   at 4, 8, 16, 32, and 64 tokens per page. Internal fragmentation without
+   the cache grew 1.1%, 2.5%, 5.4%, 10.4%, 19.9%. Prefix reuse with the
+   cache was 11,886 tokens at 4, 11,411 at 8–32 (the prefix rounds down to
+   96), and 7,616 at 64, where completion p95 rose from 20.8 to 25.2 ms
+   (separated intervals). On this workload 8–16-token pages balance waste
+   and reuse; 64 loses both. Placement-aware admission does not apply:
+   pages are fixed size, so any free page serves any request and there is
+   no external fragmentation, only the internal kind measured here.
+
+   *Replay*: identical trials produce identical iterations, events, and
+   outcomes under worst-case-exceeding pressure with preemption, with the
+   prefix cache (including evictions and reuse during preemption), and
+   with mid-run cancellations. Writing the test confirmed that
+   reservations, which count a shared prefix per request, keep a shared
+   workload from over-committing the pool at all.
+
+## Outcome
+
+The P7 completion criterion is met. Under replayed cache-pressure traces
+the runtime preempts (and recovers failed allocations) with recorded
+reasons instead of deferring indefinitely or failing; prefix reuse produces
+identical outputs with measured savings; and the pressure, preemption,
+cancellation, and recovery tests are deterministic. Defaults stay
+conservative (worst-case reservation, no preemption, no prefix cache)
+until real-model studies agree with the virtual-time results.
 
 ## Out of scope
 

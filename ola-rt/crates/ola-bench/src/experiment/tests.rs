@@ -393,6 +393,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             "scheduler-comparison",
             "kv-pressure",
             "prefix-cache",
+            "kv-page-size",
         ]
     );
     for descriptor in descriptors {
@@ -577,4 +578,43 @@ fn the_prefix_cache_cuts_prefill_work_on_shared_system_prompts() {
     );
     assert_eq!(estimate("no-cache", "completed").mean, 40.0);
     assert_eq!(estimate("prefix-cache", "completed").mean, 40.0);
+}
+
+#[test]
+fn larger_pages_waste_more_and_reuse_less() {
+    let outcome = run(
+        "kv-page-size",
+        &[
+            ("page_sizes", "4,16,64"),
+            ("requests", "40"),
+            ("seeds", "3"),
+        ],
+    )
+    .unwrap();
+    let mean = |variant: &str, metric: &str| {
+        outcome
+            .report
+            .summaries
+            .iter()
+            .find(|summary| summary.variant == variant)
+            .unwrap()
+            .estimates[metric]
+            .mean
+    };
+
+    let waste = ["page=4", "page=16", "page=64"].map(|page| mean(page, "kv_fragmentation"));
+    assert!(waste[0] < waste[1] && waste[1] < waste[2], "{waste:?}");
+    // A 100-token prefix: 4-token pages can reuse all of it and 64-token
+    // pages only one page, for each of the 39 requests after the first. A
+    // request admitted while an earlier one is mid-prefill finds only the
+    // blocks written so far, so reuse can fall slightly short of the bound.
+    let (small, large) = (
+        mean("page=4", "prefix_hit_tokens"),
+        mean("page=64", "prefix_hit_tokens"),
+    );
+    assert!(
+        small <= 39.0 * 100.0 && small > 0.95 * 39.0 * 100.0,
+        "{small}"
+    );
+    assert!(large <= 39.0 * 64.0 && large < small, "{large}");
 }

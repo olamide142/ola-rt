@@ -110,6 +110,12 @@ pub struct SchedulingSummary {
     pub peak_kv_cache_bytes: u64,
     /// Highest KV reservation after any iteration.
     pub peak_reserved_kv_bytes: u64,
+    /// Sum over iterations of KV bytes live sessions occupy.
+    pub kv_used_byte_iterations: u64,
+    /// Sum over iterations of whole-page KV bytes held for them.
+    pub kv_allocated_byte_iterations: u64,
+    /// Prompt tokens reused from the prefix cache during the trial.
+    pub prefix_hit_tokens: u64,
     /// Admission deferrals across iterations.
     pub admission_deferrals: usize,
     /// Token-budget deferrals across iterations.
@@ -138,6 +144,17 @@ pub struct SchedulingSummary {
 }
 
 impl SchedulingSummary {
+    /// Share of held KV page bytes that live sessions did not occupy,
+    /// averaged over iterations: internal fragmentation from partly filled
+    /// last pages. Meaningful only without prefix sharing, where a shared
+    /// page counts once in pages but once per session in occupancy.
+    pub fn kv_internal_fragmentation(&self) -> f64 {
+        if self.kv_allocated_byte_iterations == 0 {
+            return 0.0;
+        }
+        1.0 - self.kv_used_byte_iterations as f64 / self.kv_allocated_byte_iterations as f64
+    }
+
     /// Returns generated tokens per virtual second, if any time elapsed.
     pub fn output_tokens_per_second(&self) -> Option<f64> {
         (self.makespan_micros > 0)
@@ -369,6 +386,21 @@ pub fn summarize_run(
         slot_deferrals: total(|iteration| iteration.slot_deferrals),
         backfill_skips: total(|iteration| iteration.backfill_skips),
         preemptions: total(|iteration| iteration.preemptions),
+        kv_used_byte_iterations: run
+            .iterations
+            .iter()
+            .filter(|iteration| iteration.kv_allocated_bytes > 0)
+            .map(|iteration| iteration.kv_cache_bytes)
+            .sum(),
+        kv_allocated_byte_iterations: run
+            .iterations
+            .iter()
+            .map(|iteration| iteration.kv_allocated_bytes)
+            .sum(),
+        prefix_hit_tokens: run
+            .iterations
+            .last()
+            .map_or(0, |iteration| iteration.prefix_hit_tokens),
         input_tokens: total(|iteration| iteration.input_tokens),
         capability_fallbacks: total(|iteration| iteration.capability_fallbacks),
         slowdown: metrics.slowdown,

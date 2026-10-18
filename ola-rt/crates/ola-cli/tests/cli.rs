@@ -56,6 +56,7 @@ fn list_shows_every_experiment_with_requirements_and_parameters() {
         "scheduler-comparison",
         "kv-pressure",
         "prefix-cache",
+        "kv-page-size",
     ] {
         assert!(output.contains(id), "{id} missing from:\n{output}");
     }

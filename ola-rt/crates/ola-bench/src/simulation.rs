@@ -190,6 +190,11 @@ pub struct TrialIteration {
     pub kv_cache_bytes: u64,
     /// KV bytes reserved after the iteration.
     pub reserved_kv_bytes: u64,
+    /// Bytes of pool blocks held by live sessions after the iteration,
+    /// whole pages, each shared block counted once.
+    pub kv_allocated_bytes: u64,
+    /// Prompt tokens reused from the prefix cache since the trial began.
+    pub prefix_hit_tokens: u64,
 }
 
 /// Everything one policy did with one trace.
@@ -478,6 +483,9 @@ where
                 .filter(|deferral| kind(deferral))
                 .count()
         };
+        let pool = executor
+            .model(&MODEL_ID.into())
+            .and_then(ola_model::CausalLanguageModel::kv_pool_status);
         iterations.push(TrialIteration {
             at_micros: clock,
             duration_micros: duration,
@@ -508,6 +516,12 @@ where
             live_requests: iteration.active_requests,
             kv_cache_bytes: iteration.kv_cache_bytes,
             reserved_kv_bytes: iteration.reserved_kv_bytes,
+            kv_allocated_bytes: pool.map_or(0, |pool| {
+                (pool.allocated_blocks as u64)
+                    .saturating_mul(config.kv.tokens_per_block as u64)
+                    .saturating_mul(config.kv.bytes_per_token)
+            }),
+            prefix_hit_tokens: pool.map_or(0, |pool| pool.prefix_hit_tokens),
         });
 
         if iteration.execution_batches.is_empty() {

@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     DEFAULT_STARVATION_FACTOR, FixedWorkload, KvGeometry, SchedulingTrace, SimulationConfig,
-    TraceParameters, analyze_cost_aware_prefill, compare_prefill_batching,
+    TraceParameters, analyze_cost_aware_prefill, compare_prefill_batching, compare_schedulers,
     compare_schedulers_observed,
 };
 
@@ -36,6 +36,7 @@ impl ExperimentRegistry {
             Box::new(SchedulerComparison),
             Box::new(KvPressure),
             Box::new(PrefixCache),
+            Box::new(KvPageSize),
         ])
     }
 }
@@ -752,7 +753,8 @@ impl Experiment for KvPressure {
             category: ExperimentCategory::Experiment,
             kind: ExperimentKind::Study,
             domain: TimeDomain::Virtual,
-            payload_version: 1,
+            // 2: input tokens, to measure recompute overhead.
+            payload_version: 2,
             requirements: Vec::new(),
             parameters: vec![
                 ParameterSpec::text(
@@ -877,6 +879,7 @@ impl Experiment for KvPressure {
                     ),
                     ("peak_kv_cache_bytes", as_f64(summary.peak_kv_cache_bytes)),
                     ("preemptions", as_f64(summary.preemptions)),
+                    ("input_tokens", as_f64(summary.input_tokens)),
                     ("failed", as_f64(summary.failed + summary.rejected)),
                     ("unfinished", as_f64(summary.unfinished)),
                 ]));
@@ -908,6 +911,12 @@ impl Experiment for KvPressure {
                     Direction::Neither,
                 ),
                 count("preemptions", Direction::Neither),
+                metric(
+                    "input_tokens",
+                    Unit::Tokens,
+                    TimeDomain::Untimed,
+                    Direction::Neither,
+                ),
                 count("failed", Direction::Lower),
                 count("unfinished", Direction::Lower),
             ],
@@ -1121,6 +1130,185 @@ impl Experiment for PrefixCache {
             estimate("prefix-cache", "input_tokens"),
             estimate("no-cache", "throughput"),
             estimate("prefix-cache", "throughput"),
+        );
+        Ok(ExperimentOutcome { summary, ..outcome })
+    }
+}
+
+/// KV page size: internal fragmentation against prefix-cache reuse.
+pub struct KvPageSize;
+
+impl Experiment for KvPageSize {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "kv-page-size",
+            name: "KV page size",
+            description: "Internal fragmentation and prefix reuse across KV page sizes",
+            category: ExperimentCategory::Experiment,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Virtual,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::text("page_sizes", "Tokens per page to compare", "4,8,16,32,64"),
+                ParameterSpec::integer("seeds", "Trace seeds, one per repetition", 5),
+                ParameterSpec::integer("requests", "Requests per trace", 120),
+                ParameterSpec::integer(
+                    "mean_interarrival_micros",
+                    "Mean arrival gap in virtual microseconds",
+                    2_000,
+                ),
+                ParameterSpec::integer(
+                    "prefix_tokens",
+                    "Shared prompt prefix length; not a multiple of most page sizes",
+                    100,
+                ),
+                ParameterSpec::integer("max_active_requests", "Executor slots", 8),
+                ParameterSpec::integer("kv_capacity_tokens", "KV pool size in tokens", 4_096),
+            ],
+        }
+    }
+
+    fn traceable(&self) -> bool {
+        false
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let page_sizes = lengths(parameters, "page_sizes")?;
+        let seeds = (1..=parameters.integer("seeds")?).collect::<Vec<_>>();
+        let capacity_tokens = parameters.integer("kv_capacity_tokens")?;
+        let prefix_tokens = parameters.size("prefix_tokens")?;
+        let base = TraceParameters {
+            seed: 0,
+            requests: parameters.size("requests")?,
+            mean_interarrival_micros: parameters.integer("mean_interarrival_micros")?,
+        };
+        let max_active_requests = parameters.size("max_active_requests")?;
+        let policy = || ComposedPolicy::default().with_admission(MemoryAwareAdmission);
+        let descriptor = policy().descriptor().to_string();
+        let mut samples = page_sizes
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<BTreeMap<String, f64>>>>();
+        let mut content = String::new();
+        for &seed in &seeds {
+            let trace =
+                SchedulingTrace::shared_prefix(TraceParameters { seed, ..base }, prefix_tokens);
+            for request in &trace.requests {
+                content.push_str(&format!("{request:?};"));
+            }
+            for (&page, samples) in page_sizes.iter().zip(&mut samples) {
+                let geometry = KvGeometry::default();
+                let config = SimulationConfig {
+                    max_active_requests,
+                    kv: KvGeometry {
+                        tokens_per_block: page,
+                        capacity_bytes: capacity_tokens.saturating_mul(geometry.bytes_per_token),
+                        ..geometry
+                    },
+                    ..SimulationConfig::default()
+                };
+                let trial = |prefix_cache| {
+                    compare_schedulers(
+                        &trace,
+                        &SimulationConfig {
+                            prefix_cache,
+                            ..config
+                        },
+                        vec![Box::new(policy())],
+                        DEFAULT_STARVATION_FACTOR,
+                    )
+                    .map(|comparison| comparison.summaries[0].clone())
+                    .map_err(run_error)
+                };
+                let plain = trial(false)?;
+                let cached = trial(true)?;
+                samples.push(values(&[
+                    ("kv_fragmentation", plain.kv_internal_fragmentation()),
+                    ("prefix_hit_tokens", as_f64(cached.prefix_hit_tokens)),
+                    ("input_tokens", as_f64(cached.input_tokens)),
+                    ("completion_p95", as_f64(cached.completion.p95_micros)),
+                    ("ttft_p95", as_f64(cached.time_to_first_token.p95_micros)),
+                ]));
+            }
+        }
+
+        let outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            "shared_prefix",
+            seeds.clone(),
+            vec![
+                metric(
+                    "kv_fragmentation",
+                    Unit::Ratio,
+                    TimeDomain::Untimed,
+                    Direction::Lower,
+                ),
+                metric(
+                    "prefix_hit_tokens",
+                    Unit::Tokens,
+                    TimeDomain::Untimed,
+                    Direction::Higher,
+                ),
+                metric(
+                    "input_tokens",
+                    Unit::Tokens,
+                    TimeDomain::Untimed,
+                    Direction::Lower,
+                ),
+                metric(
+                    "completion_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+                metric(
+                    "ttft_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+            ],
+            page_sizes
+                .iter()
+                .zip(samples)
+                .map(|(page, samples)| {
+                    (
+                        Variant::policy(
+                            format!("page={page}"),
+                            format!("{descriptor} tokens_per_block={page}"),
+                        ),
+                        samples,
+                    )
+                })
+                .collect(),
+            String::new(),
+        )?
+        .with_content_digest(&content);
+        let summary = format!(
+            "shared_prefix ({prefix_tokens} tokens), {} seeds × {} requests · {}",
+            seeds.len(),
+            base.requests,
+            outcome
+                .report
+                .summaries
+                .iter()
+                .map(|summary| {
+                    format!(
+                        "{}: waste {:.1}%, reused {:.0} tokens",
+                        summary.variant,
+                        summary.estimates["kv_fragmentation"].mean * 100.0,
+                        summary.estimates["prefix_hit_tokens"].mean
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
         );
         Ok(ExperimentOutcome { summary, ..outcome })
     }
