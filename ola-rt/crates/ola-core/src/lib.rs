@@ -1,12 +1,14 @@
 #![doc = include_str!("../README.md")]
 
 mod compute;
+mod device;
 mod id;
 mod model;
 mod request;
 mod time;
 
 pub use compute::ComputeBackend;
+pub use device::{DeviceMemory, DeviceTelemetry};
 pub use id::{ArchitectureId, ModelId, RequestId};
 pub use model::{ModelDescriptor, ModelDescriptorError, ModelKind};
 pub use request::{

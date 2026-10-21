@@ -32,6 +32,10 @@ The public building blocks are:
 
 - `KernelDescriptor`, `KernelOperation`, and `KernelTarget` for stable
   diagnostic and benchmark metadata;
+- `KernelRequirements` and `KernelCapability` for backend-neutral target,
+  dtype, head-dimension, GQA-ratio, and page-count constraints;
+- `PagedAttentionProvider`, `KernelRegistry`, and `KernelSelection` for
+  deterministic provider choice and typed portable-fallback reasons;
 - `PagedAttentionConfig` for the shape invariants shared by every
   implementation;
 - `PagedKvPage` and `PagedAttentionInput` for an explicit operator boundary;
@@ -39,10 +43,11 @@ The public building blocks are:
 - `PortablePagedAttention` as the initial reference implementation;
 - `KernelError` for configuration, input, and implementation failures.
 
-The Llama decoder selects the CubeCL provider for matching WGPU/CUDA devices
-when those features are enabled, and otherwise uses `PortablePagedAttention`.
-Keep runtime selection explicit at the `ola-burn` boundary; do not introduce a
-global kernel registry before there are multiple supported implementations.
+The registry always contains the portable provider. Feature-gated CubeCL
+implementations publish f32 target capabilities and a higher preference; equal
+priorities are ordered by stable provider name, so registration order cannot
+change a plan. The Llama decoder still selects its implementation locally until
+execution-plan integration is complete.
 
 ## Invariants
 
@@ -83,12 +88,13 @@ Before an optimized implementation is selected by the model path:
 
 ## Next integration step
 
-Tune the existing CubeCL kernel against the portable path, validate it across
-page boundaries and grouped-query attention, then benchmark it through WGPU and
-CUDA. It currently concatenates page tensors before dispatch and recomputes
-each query/key score for every output dimension, so first focus on device-side
-page layout and reducing redundant arithmetic. Keep explicit device/dtype
-capability checks and the portable fallback.
+Carry `KernelSelection` through the runtime execution plan and policy, then let
+the Llama execution context resolve that selection instead of instantiating a
+CubeCL kernel behind compile-time feature checks. Tune the existing CubeCL
+kernel against the portable path after that boundary is observable. It
+currently concatenates page tensors before dispatch and recomputes each
+query/key score for every output dimension, so optimization should focus on
+device-side page layout and reducing redundant arithmetic.
 
 The current `Vec` of page tensors is a correctness-friendly interface, but the
 GPU implementation must be checked for launch and data-layout costs. If one

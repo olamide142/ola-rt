@@ -10,8 +10,8 @@ use burn_cubecl::{
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 
 use crate::{
-    KernelDescriptor, KernelError, KernelOperation, KernelTarget, PagedAttentionInput,
-    PagedAttentionKernel,
+    KernelCapability, KernelDType, KernelDescriptor, KernelError, KernelOperation, KernelTarget,
+    PagedAttentionInput, PagedAttentionKernel, PagedAttentionProvider,
 };
 
 /// Backend extension routed through Burn's CubeCL and Fusion backends.
@@ -116,6 +116,20 @@ impl PagedAttentionKernel for CubePagedAttention {
             config.groups(),
         );
         Ok(BurnTensor::<4>::from_dispatch(output))
+    }
+}
+
+impl PagedAttentionProvider for CubePagedAttention {
+    fn capability(&self) -> KernelCapability {
+        KernelCapability::new(self.descriptor(), [self.target], [KernelDType::F32])
+    }
+
+    fn priority(&self) -> u16 {
+        100
+    }
+
+    fn create(&self) -> Box<dyn PagedAttentionKernel> {
+        Box::new(*self)
     }
 }
 

@@ -107,7 +107,8 @@ the interval since the previous iteration started that the previous
 iteration's invocations occupied: a backend-independent proxy for device
 activity. `ObservationTotals::invocation_micros` accumulates it.
 
-`DeviceTelemetry` is the backend-neutral interface for device readings:
+`ola-core` owns and `ola-observe` re-exports the backend-neutral
+`DeviceTelemetry` interface for device readings:
 `memory` (bytes in use and reserved by the allocator) and `busy_percent`
 (utilization from the device's own counter). `ola-kernel` implements it for
 CubeCL devices. Readings may wait for the device, so drivers sample them on

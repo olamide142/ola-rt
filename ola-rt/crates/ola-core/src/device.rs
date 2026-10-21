@@ -13,9 +13,8 @@ pub struct DeviceMemory {
 /// Reads a device's state for health reporting.
 ///
 /// Implementations live with their backend (for example CubeCL's allocator
-/// in `ola-kernel`); this crate only defines what is reported. Readings may
-/// wait for the device's work queue, so callers sample on the thread that
-/// drives execution rather than on request paths.
+/// in `ola-kernel`). Readings may wait for the device's work queue, so callers
+/// sample on the thread that drives execution rather than on request paths.
 pub trait DeviceTelemetry: Send + Sync {
     /// Stable description of the device, such as `wgpu:0`.
     fn label(&self) -> String;

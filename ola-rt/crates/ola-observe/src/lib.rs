@@ -1,10 +1,9 @@
 #![doc = include_str!("../README.md")]
 
-mod device;
 mod tokens;
 pub mod trace;
 
-pub use device::{DeviceMemory, DeviceTelemetry};
+pub use ola_core::{DeviceMemory, DeviceTelemetry};
 pub use tokens::TokenGaps;
 pub use trace::{TraceEvent, TraceRecord, Tracer};
 

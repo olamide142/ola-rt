@@ -189,12 +189,13 @@ Done when a second architecture and a sharded checkpoint load through the regist
 ## Kernel follow-up track
 
 Route kernel choices through framework plan, policy, capability, and benchmark boundaries rather than embedding them directly in Llama.
+Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 
 - [ ] Finish and validate the CubeCL paged-attention extension.
-- [ ] Define kernel capabilities and selection constraints.
+- [x] Define kernel capabilities and selection constraints.
 - [ ] Represent backend/device and kernel selections in `ExecutionPlan`.
 - [ ] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
-- [ ] Add provider selection and portable fallback.
+- [x] Add provider selection and portable fallback.
 - [ ] Compare every optimized implementation with the portable reference.
 - [ ] Fuse page traversal, score reduction, and value accumulation.
 - [ ] Optimize request-local tensor-batched decode attention.

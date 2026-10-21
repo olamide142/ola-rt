@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-18 10:00 BST (Europe/London)
+**Last updated:** 2026-10-20 12:02 BST (Europe/London)
 
-**Source revision:** working tree based on `2248703` on `master`
+**Source revision:** working tree based on `6f24463` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -27,8 +27,11 @@ cache reuses shared prompt prefixes with output identical to recomputation.
 Swapping was evaluated and deferred in favour of recompute, a page-size
 sweep found 8–16-token pages the best trade-off between waste and reuse,
 and replay under pressure, preemption, eviction, and cancellation is
-deterministic. Current
-branch commits are not pushed
+deterministic. Current kernel-track work adds a backend-neutral capability
+contract and deterministic provider registry. It selects optimized providers
+by declared constraints and stable priority, or records a typed reason for
+portable fallback. Current branch commits are pushed through `6f24463`; the
+kernel-track work is uncommitted.
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -180,7 +183,7 @@ performance claim.
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
 | Experiment framework | Working | `ExperimentRegistry` of twelve experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
 | Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
-| Kernel abstraction | First vertical slice | Validated paged-attention contract, stable metadata, and portable Burn reference used by Llama decode |
+| Kernel abstraction | Capability selection working | Validated paged-attention contract, target/dtype/shape/page constraints, deterministic provider registry, typed portable fallback, and portable Burn reference used by Llama decode |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -332,7 +335,7 @@ performance claim.
 
 ### `ola-kernel`
 
-- Fine-grained `PagedAttentionKernel<B>` contract without scheduler, model, or
+- Fine-grained `PagedAttentionKernel` contract without scheduler, model, or
   allocation ownership.
 - Validated single-sequence decode inputs with explicit GQA dimensions and
   populated logical KV pages.
@@ -341,8 +344,13 @@ performance claim.
 - Portable Burn online-softmax implementation extracted from the Llama model
   and retained as the numerical baseline.
 - Direct use by Llama cached decode and resumable-prefill attention.
-- Documented handoff for adding a second implementation, capability checks,
-  provider selection, fallback, conformance, and benchmarking.
+- Backend-neutral kernel requirements covering target, dtype, attention head
+  width, GQA ratio, and logical page count.
+- Validated provider capability declarations with deterministic priority and
+  stable-name tie-breaking independent of registration order.
+- An unconditional portable provider and typed rejection records explaining
+  fallback when no optimized provider satisfies every constraint.
+- Feature-gated CubeCL providers for CPU, WGPU, and CUDA selection targets.
 
 ### `ola-bench`
 
@@ -701,8 +709,8 @@ and `TOKENS` variables.
 - The in-executor adaptive prefill policy still calibrates from two points;
   the least-squares fit is available to experiments but not yet wired into
   the default policy.
-- Reports have a kernel-identity field, but no experiment sets it until the
-  kernel track exists.
+- Reports have a kernel-identity field, but no experiment populates it until
+  runtime plans carry the selected provider.
 - Report comparison treats overlapping intervals as inconclusive; it does
   not yet run a paired test, so small real changes need more repetitions.
 
@@ -725,6 +733,9 @@ and `TOKENS` variables.
    - gate regressions in CI with `ola experiment compare`.
 
 3. **Paged-attention optimization (Kernel track, next)**
+   - carry deterministic kernel selection through execution plans and policy;
+   - make Llama consume the planned provider instead of compile-time target
+     checks;
    - re-run the page-size sweep with real kernel cost per page;
    - fuse page traversal, score reduction, and value accumulation where the
      selected accelerator backend permits;
@@ -747,6 +758,15 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-20 12:02 BST — working tree on `6f24463`:** Accepted the kernel
+  routing design and completed kernel-track step 1: backend-neutral invocation
+  requirements, validated provider capabilities, deterministic registry
+  selection, typed portable-fallback reasons, portable and CubeCL provider
+  adapters, and removal of the kernel/observation/runtime dependency cycle by
+  moving backend-neutral telemetry to `ola-core`. Core, kernel, and observation
+  tests pass; all 13 CubeCL CPU kernel tests pass, including numerical
+  conformance and live allocator telemetry.
 
 - **2026-10-18 10:00 BST — working tree on `2248703`:** P7 step 5 closes P7:
   swapping evaluated with a cost model and deferred (recompute costs 15.7%

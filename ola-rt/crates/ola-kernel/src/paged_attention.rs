@@ -1,6 +1,9 @@
 use burn::tensor::{DType, Tensor};
 
-use crate::{KernelDescriptor, KernelError, KernelOperation, KernelTarget};
+use crate::{
+    KernelCapability, KernelDType, KernelDescriptor, KernelError, KernelOperation, KernelTarget,
+    PagedAttentionProvider,
+};
 
 /// Dimensions shared by paged decode-attention implementations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -248,6 +251,30 @@ impl PagedAttentionKernel for PortablePagedAttention {
         }
 
         Ok(running_output / running_sum)
+    }
+}
+
+impl PagedAttentionProvider for PortablePagedAttention {
+    fn capability(&self) -> KernelCapability {
+        KernelCapability::new(
+            self.descriptor(),
+            [
+                KernelTarget::Portable,
+                KernelTarget::Cpu,
+                KernelTarget::Wgpu,
+                KernelTarget::Cuda,
+            ],
+            [
+                KernelDType::F32,
+                KernelDType::Flex32,
+                KernelDType::F16,
+                KernelDType::Bf16,
+            ],
+        )
+    }
+
+    fn create(&self) -> Box<dyn PagedAttentionKernel> {
+        Box::new(*self)
     }
 }
 

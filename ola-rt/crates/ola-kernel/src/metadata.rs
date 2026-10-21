@@ -1,5 +1,5 @@
 /// Stable operation family implemented by a kernel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum KernelOperation {
     /// Single-token attention over logical KV-cache pages.
@@ -7,7 +7,7 @@ pub enum KernelOperation {
 }
 
 /// Hardware family targeted by a kernel implementation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum KernelTarget {
     /// Backend-portable tensor operations used as a correctness baseline.

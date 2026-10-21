@@ -1,7 +1,7 @@
 //! Device memory and utilization through CubeCL.
 
 use burn_cubecl::cubecl::{Device, MemoryScope};
-use ola_observe::{DeviceMemory, DeviceTelemetry};
+use ola_core::{DeviceMemory, DeviceTelemetry};
 
 /// Reports one CubeCL device's allocator memory and utilization.
 ///

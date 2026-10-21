@@ -4,8 +4,8 @@
 
 It owns model and architecture identifiers, monotonic timestamps, request
 inputs, generation parameters, model descriptors, and the smallest useful
-compute-backend boundary. It intentionally contains no queue, scheduler, HTTP,
-or Burn types.
+compute-backend and device-telemetry boundaries. It intentionally contains no
+queue, scheduler, HTTP, or Burn types.
 Keeping those dependencies out prevents research code from coupling every
 experiment to one execution backend.
 
@@ -19,3 +19,5 @@ Important semantics:
   every request is a single text prompt.
 - `ComputeBackend` exposes identity and device ownership only. Tensor execution
   will be added after a real model path demonstrates the correct abstraction.
+- `DeviceTelemetry` lets a backend publish allocator memory and utilization
+  without depending on the runtime or observation layer.
