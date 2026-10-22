@@ -105,10 +105,21 @@ impl LlamaFactory {
         let cache_profile = cache_config
             .profile(&config)
             .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
+        let attention_profile = ola_kernel::PagedAttentionProfile::new(
+            ola_kernel::burn_device_target(&self.device),
+            ola_kernel::KernelDType::F32,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.attention_head_dim(),
+            cache_config.tokens_per_block(),
+        )
+        .expect("validated Llama and KV-cache dimensions form a kernel profile");
         let model =
             BurnLlamaModel::with_kv_cache(module, config, self.device.clone(), cache_config)
                 .map_err(|error| LlamaLoadError::KvCache(error.to_string()))?;
-        Ok(CausalLanguageModel::new(tokenizer, model).with_kv_cache_profile(cache_profile))
+        Ok(CausalLanguageModel::new(tokenizer, model)
+            .with_kv_cache_profile(cache_profile)
+            .with_paged_attention_profile(attention_profile))
     }
 
     /// Loads configuration and weights while leaving tokenization to the caller.

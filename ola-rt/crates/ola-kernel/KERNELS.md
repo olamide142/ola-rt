@@ -55,7 +55,8 @@ implementations.
 2. **Route kernel selection through `ExecutionPlan` and `ExecutionPolicy`.**
    - Extend `PlannedBatch` in `ExecutionPlan` to carry `KernelSelection`
      (consisting of the selected `KernelDescriptor` or an explicit portable
-     fallback indicator).
+     fallback indicator) for decode and resumable-prefill work that actually
+     invokes paged attention. Dense full-prompt prefill carries no such choice.
    - `ExecutionPolicy` evaluates the snapshot (device, model, batch shape,
      dtype) and selects the appropriate kernel implementation.
    - If an optimized kernel is unavailable, unsupported, or disabled by policy,
@@ -106,10 +107,14 @@ implementations.
    reason. Backend-neutral telemetry types moved from `ola-observe` to
    `ola-core`, removing the dependency cycle that would otherwise prevent
    `ola-runtime` from consuming kernel selections.
-2. **Execution-plan IR and policy representation.**
-   Add kernel selection fields to `PlannedBatch` in `ola-runtime::ExecutionPlan`.
-   Update `ExecutionPolicy` and `PlanningSnapshot` to resolve kernel choices and
-   record fallbacks deterministically.
+2. **Execution-plan IR and policy representation.** **Complete 2026-10-21.**
+   Applicable `PlannedBatch` values now carry exact `KernelRequirements` and
+   the selected provider. Models publish a `PagedAttentionProfile`; policy
+   derives page count only after scheduling, admission, batching, and grouping
+   settle decode or resumable-prefill rows. Dense full-prompt prefill remains
+   unannotated. Plan validation recomputes requirements, `PlanReport` v6 records
+   target/dtype/configuration/provider/fallback details, and conflict tests show
+   deferred or budget-excluded work cannot distort selection.
 3. **Decouple `ola-burn` model execution.**
    Replace the hardcoded `#[cfg(feature = ...)]` kernel instantiation in
    `LlamaModel` with kernel delegation from the runtime context. Verify identical

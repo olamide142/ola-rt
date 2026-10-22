@@ -46,8 +46,9 @@ The public building blocks are:
 The registry always contains the portable provider. Feature-gated CubeCL
 implementations publish f32 target capabilities and a higher preference; equal
 priorities are ordered by stable provider name, so registration order cannot
-change a plan. The Llama decoder still selects its implementation locally until
-execution-plan integration is complete.
+change a plan. Runtime plans now retain the exact requirements, selected
+provider, and portable-fallback diagnostics. The Llama decoder still selects
+its implementation locally until execution delegation is complete.
 
 ## Invariants
 
@@ -88,10 +89,10 @@ Before an optimized implementation is selected by the model path:
 
 ## Next integration step
 
-Carry `KernelSelection` through the runtime execution plan and policy, then let
-the Llama execution context resolve that selection instead of instantiating a
-CubeCL kernel behind compile-time feature checks. Tune the existing CubeCL
-kernel against the portable path after that boundary is observable. It
+Let the Llama execution context resolve the plan's `KernelSelection` instead of
+instantiating a CubeCL kernel behind compile-time feature checks. Tune the
+existing CubeCL kernel against the portable path after that boundary is
+observable. It
 currently concatenates page tensors before dispatch and recomputes each
 query/key score for every output dimension, so optimization should focus on
 device-side page layout and reducing redundant arithmetic.

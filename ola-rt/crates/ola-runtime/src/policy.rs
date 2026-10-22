@@ -4,7 +4,7 @@
 
 use std::{error::Error, fmt};
 
-use ola_core::RequestId;
+use ola_core::{ModelId, RequestId};
 
 use crate::{DecisionRecord, ExecutionPlan, ExecutorIteration, PlanningSnapshot};
 
@@ -79,6 +79,13 @@ pub enum PolicyError {
     InvalidRanking(RequestId),
     /// The batch policy selected an unknown candidate or selected one twice.
     InvalidBatchSelection(RequestId),
+    /// Kernel requirements could not be derived or resolved for a model.
+    KernelSelection {
+        /// Model whose invocation could not be planned.
+        model_id: ModelId,
+        /// Capability or registry diagnostic.
+        message: String,
+    },
 }
 
 impl fmt::Display for PolicyError {
@@ -92,6 +99,12 @@ impl fmt::Display for PolicyError {
                 formatter,
                 "batch policy returned invalid or duplicate request `{request}`"
             ),
+            Self::KernelSelection { model_id, message } => {
+                write!(
+                    formatter,
+                    "kernel selection for model `{model_id}` failed: {message}"
+                )
+            }
         }
     }
 }

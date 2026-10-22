@@ -43,8 +43,8 @@ pub use kv_cache::{
 pub use model_registry::ModelRegistry;
 pub use plan::{
     DecodeView, ExecutionPlan, IterationId, LifecycleAction, PlanDivergence, PlanError,
-    PlanEstimates, PlannedBatch, PlannedDeferral, PlannedPhase, PlannedRow, PreemptionReason,
-    PrefillView, ReleaseReason,
+    PlanEstimates, PlannedBatch, PlannedDeferral, PlannedKernel, PlannedPhase, PlannedRow,
+    PreemptionReason, PrefillView, ReleaseReason,
 };
 pub use policy::{ExecutionPolicy, PolicyDecision, PolicyDescriptor, PolicyError};
 pub use preemption::{

@@ -78,6 +78,15 @@ return `None`, retain the independent-session correctness path. Prefill batches 
 different prompt lengths. Lifecycle events are restored to deterministic
 request order even when backend invocation order groups models differently.
 
+Models may also publish a paged-attention planning profile. After scheduling,
+admission, token budgeting, and grouping settle the exact rows, the composed
+policy derives each decode or resumable-prefill invocation's target, dtype,
+head/GQA shape, and logical page count and resolves a provider through
+`KernelRegistry`. Ordinary full-prompt prefill remains dense and carries no
+paged-decode selection. The plan retains both the requirements and either the
+optimized provider or a typed portable fallback; validation recomputes the
+requirements from the snapshot and rows.
+
 `ExecutorIteration::execution_batches` records decode invocations and
 successful prefill invocations as `Tensor` or `Individual`, including request
 IDs in tensor-row order, meaningful input positions, and artificial padding

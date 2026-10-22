@@ -5,13 +5,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ola_core::{ModelId, RequestId};
+use ola_kernel::{KernelRegistry, KernelTarget};
 
 use crate::{
     AdmissionContext, AdmissionDecision, AdmissionOutcome, AdmissionPolicy, AdmissionReason,
     AdmissionRecord, BatchCandidate, BatchContext, BatchExecutionMode, BatchHook, BatchPhase,
     BatchPolicy, CapabilityFallback, DecisionRecord, ExecutionPlan, ExecutionPolicy, FifoScheduler,
-    GroupingRecord, LifecycleAction, NoPreemption, PlannedBatch, PlannedDeferral, PlannedPhase,
-    PlannedRow, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
+    GroupingRecord, LifecycleAction, NoPreemption, PlannedBatch, PlannedDeferral, PlannedKernel,
+    PlannedPhase, PlannedRow, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
     PreemptionCandidate, PreemptionPolicy, PreemptionReason, PreemptionRecord, PrefillBatcher,
     RankingRecord, Scheduler, SelectionRecord, SelectionStage, UnboundedBatchPolicy,
     UnbucketedPrefillBatcher, UnconstrainedAdmission,
@@ -29,6 +30,7 @@ pub struct ComposedPolicy {
     grouping: Box<dyn PrefillBatcher>,
     head_of_line: HeadOfLine,
     preemption: Box<dyn PreemptionPolicy>,
+    kernels: KernelRegistry,
 }
 
 /// What admission does when the policy defers a ranked request.
@@ -64,6 +66,7 @@ impl Default for ComposedPolicy {
             grouping: Box::new(UnbucketedPrefillBatcher),
             head_of_line: HeadOfLine::Block,
             preemption: Box::new(NoPreemption),
+            kernels: KernelRegistry::new(),
         }
     }
 }
@@ -103,6 +106,16 @@ impl ComposedPolicy {
     #[must_use]
     pub fn with_preemption(mut self, preemption: impl PreemptionPolicy + 'static) -> Self {
         self.preemption = Box::new(preemption);
+        self
+    }
+
+    /// Replaces the kernel providers consulted for every model invocation.
+    ///
+    /// A registry always retains a portable provider; callers add optimized
+    /// providers before installing it here.
+    #[must_use]
+    pub fn with_kernel_registry(mut self, kernels: KernelRegistry) -> Self {
+        self.kernels = kernels;
         self
     }
 
@@ -361,7 +374,48 @@ impl ComposedPolicy {
             record,
             room,
         )?;
+        self.plan_kernels(snapshot, &mut execution_plan.batches)?;
         Ok(execution_plan)
+    }
+
+    fn plan_kernels(
+        &self,
+        snapshot: &PlanningSnapshot,
+        batches: &mut [PlannedBatch],
+    ) -> Result<(), PolicyError> {
+        for batch in batches {
+            if batch.phase == PlannedPhase::Prefill {
+                batch.kernel = None;
+                continue;
+            }
+            let Some(profile) = snapshot.model(&batch.model_id).paged_attention else {
+                batch.kernel = None;
+                continue;
+            };
+            let sequence_tokens = batch
+                .rows
+                .iter()
+                .map(|row| row.positions.end)
+                .max()
+                .expect("planned batches contain at least one row");
+            let requirements = profile.requirements(sequence_tokens).map_err(|error| {
+                PolicyError::KernelSelection {
+                    model_id: batch.model_id.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            let selection = self.kernels.select(requirements).map_err(|error| {
+                PolicyError::KernelSelection {
+                    model_id: batch.model_id.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            batch.kernel = Some(PlannedKernel {
+                requirements,
+                selection,
+            });
+        }
+        Ok(())
     }
 
     /// Ranks queued work and plans admissions into the remaining slots.
@@ -650,6 +704,7 @@ impl ComposedPolicy {
                         phase,
                         model_id,
                         mode: BatchExecutionMode::Individual,
+                        kernel: None,
                         rows: vec![row],
                     },
                 ));
@@ -700,12 +755,25 @@ impl ExecutionPolicy for ComposedPolicy {
             HeadOfLine::Block => "block".to_owned(),
             HeadOfLine::Backfill { max_skipped } => format!("backfill-{max_skipped}"),
         };
-        let descriptor = PolicyDescriptor::new("composed")
+        let mut descriptor = PolicyDescriptor::new("composed")
             .with_config("head_of_line", head_of_line)
             .with_component(self.scheduler.descriptor())
             .with_component(self.admission.descriptor())
             .with_component(self.batch.descriptor())
             .with_component(self.grouping.descriptor());
+        let optimized = self
+            .kernels
+            .capabilities()
+            .into_iter()
+            .filter(|capability| capability.descriptor().target() != KernelTarget::Portable)
+            .map(|capability| capability.descriptor().name())
+            .collect::<Vec<_>>();
+        if !optimized.is_empty() {
+            descriptor = descriptor.with_component(
+                PolicyDescriptor::new("kernel-registry")
+                    .with_config("optimized", optimized.join("|")),
+            );
+        }
         // Listed only when enabled, so policies without preemption keep the
         // descriptors their reports already carry.
         let preemption = self.preemption.descriptor();
@@ -824,6 +892,7 @@ fn plan_decode_batches(
                 phase: PlannedPhase::Decode,
                 model_id,
                 mode: BatchExecutionMode::Individual,
+                kernel: None,
                 rows: vec![row],
             });
         }
@@ -876,6 +945,7 @@ fn assign_batch_modes(
             phase,
             model_id: model_id.clone(),
             mode: BatchExecutionMode::Individual,
+            kernel: None,
             rows: vec![row],
         }));
     }
@@ -900,6 +970,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use ola_core::{Priority, Timestamp};
+    use ola_kernel::{
+        KernelCapability, KernelDType, KernelDescriptor, KernelOperation, PagedAttentionKernel,
+        PagedAttentionProfile, PagedAttentionProvider, PortablePagedAttention,
+    };
     use ola_model::{BatchCapabilities, KvCacheProfile};
 
     use super::*;
@@ -957,6 +1031,7 @@ mod tests {
                     chunked_prefill: true,
                     kv_cache: KvCacheProfile::new(8, 4, kv_capacity_bytes),
                     kv_pool: None,
+                    paged_attention: None,
                 },
             )]),
             memory: MemoryState::default(),
@@ -994,6 +1069,111 @@ mod tests {
             .validate(snapshot, policy.enforces_model_kv_capacity())
             .unwrap();
         decision
+    }
+
+    struct CpuTestProvider {
+        max_pages: usize,
+    }
+
+    impl PagedAttentionProvider for CpuTestProvider {
+        fn capability(&self) -> KernelCapability {
+            KernelCapability::new(
+                KernelDescriptor::new(
+                    "cpu-test-paged-attention",
+                    KernelOperation::PagedAttentionDecode,
+                    KernelTarget::Cpu,
+                ),
+                [KernelTarget::Cpu],
+                [KernelDType::F32],
+            )
+            .with_head_dimensions([128])
+            .with_gqa_ratios([4])
+            .with_max_pages(self.max_pages)
+        }
+
+        fn priority(&self) -> u16 {
+            10
+        }
+
+        fn create(&self) -> Box<dyn PagedAttentionKernel> {
+            Box::new(PortablePagedAttention::new())
+        }
+    }
+
+    fn kernel_policy(max_pages: usize) -> ComposedPolicy {
+        let mut registry = KernelRegistry::new();
+        registry.register(CpuTestProvider { max_pages }).unwrap();
+        ComposedPolicy::default().with_kernel_registry(registry)
+    }
+
+    fn enable_kernel_profile(snapshot: &mut PlanningSnapshot) {
+        snapshot.models.get_mut(&model()).unwrap().paged_attention = Some(
+            PagedAttentionProfile::new(KernelTarget::Cpu, KernelDType::F32, 32, 8, 128, 4).unwrap(),
+        );
+    }
+
+    #[test]
+    fn dense_initial_prefill_has_no_paged_decode_selection() {
+        let mut snapshot = snapshot(4, 1_024, BatchCapabilities::ALL, &[(5, 3, 2)]);
+        enable_kernel_profile(&mut snapshot);
+
+        let decision = plan(&kernel_policy(8), &snapshot);
+
+        assert_eq!(decision.plan.batches.len(), 1);
+        assert_eq!(decision.plan.batches[0].phase, PlannedPhase::Prefill);
+        assert!(decision.plan.batches[0].kernel.is_none());
+    }
+
+    #[test]
+    fn kernel_selection_runs_after_batch_policy_and_uses_only_selected_rows() {
+        let mut snapshot = snapshot(4, 1_024, BatchCapabilities::ALL, &[]);
+        add_decode(&mut snapshot, 1, 1, 8, 32);
+        snapshot.decoding.get_mut(&id(1)).unwrap().position = 3;
+        add_decode(&mut snapshot, 2, 1, 8, 32);
+        snapshot.decoding.get_mut(&id(2)).unwrap().position = 8;
+        enable_kernel_profile(&mut snapshot);
+
+        let wide = plan(&kernel_policy(1), &snapshot);
+        let wide_kernel = wide.plan.batches[0].kernel.as_ref().unwrap();
+        assert_eq!(wide_kernel.requirements.page_count(), 3);
+        assert!(wide_kernel.selection.is_fallback());
+
+        let budgeted = kernel_policy(1).with_batch(FifoTokenBudgetPolicy::new(1).unwrap());
+        let budgeted = plan(&budgeted, &snapshot);
+        let kernel = budgeted.plan.batches[0].kernel.as_ref().unwrap();
+        assert_eq!(kernel.requirements.page_count(), 1);
+        assert_eq!(
+            kernel.selection.descriptor().name(),
+            "cpu-test-paged-attention"
+        );
+        assert!(!kernel.selection.is_fallback());
+        assert!(matches!(
+            budgeted.plan.deferrals.as_slice(),
+            [PlannedDeferral::Budget { request_id, .. }] if *request_id == id(2)
+        ));
+    }
+
+    #[test]
+    fn deferred_memory_admission_does_not_change_live_kernel_selection() {
+        let mut snapshot = snapshot(2, 128, BatchCapabilities::ALL, &[(5, 5, 4)]);
+        add_decode(&mut snapshot, 1, 1, 8, 96);
+        snapshot.decoding.get_mut(&id(1)).unwrap().position = 3;
+        enable_kernel_profile(&mut snapshot);
+        let policy = kernel_policy(1).with_admission(MemoryAwareAdmission);
+
+        let decision = plan(&policy, &snapshot);
+
+        assert!(decision.plan.lifecycle.is_empty());
+        assert!(matches!(
+            decision.plan.deferrals.as_slice(),
+            [PlannedDeferral::Admission { request_id, .. }] if *request_id == id(5)
+        ));
+        let kernel = decision.plan.batches[0].kernel.as_ref().unwrap();
+        assert_eq!(
+            kernel.selection.descriptor().name(),
+            "cpu-test-paged-attention"
+        );
+        assert_eq!(kernel.requirements.page_count(), 1);
     }
 
     #[test]

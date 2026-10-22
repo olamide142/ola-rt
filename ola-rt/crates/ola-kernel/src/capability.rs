@@ -46,6 +46,95 @@ pub struct KernelRequirements {
     page_count: usize,
 }
 
+/// Model-level facts needed to derive per-invocation attention requirements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PagedAttentionProfile {
+    target: KernelTarget,
+    dtype: KernelDType,
+    query_heads: usize,
+    key_value_heads: usize,
+    head_dim: usize,
+    page_size: usize,
+}
+
+impl PagedAttentionProfile {
+    /// Creates and validates a model's paged-attention planning profile.
+    pub fn new(
+        target: KernelTarget,
+        dtype: KernelDType,
+        query_heads: usize,
+        key_value_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+    ) -> Result<Self, KernelError> {
+        if query_heads == 0 || key_value_heads == 0 || head_dim == 0 || page_size == 0 {
+            return Err(KernelError::new(
+                "paged-attention profile dimensions and page size must be greater than zero",
+            ));
+        }
+        if !query_heads.is_multiple_of(key_value_heads) {
+            return Err(KernelError::new(
+                "paged-attention profile query heads must be divisible by key/value heads",
+            ));
+        }
+        Ok(Self {
+            target,
+            dtype,
+            query_heads,
+            key_value_heads,
+            head_dim,
+            page_size,
+        })
+    }
+
+    /// Returns the physical execution target.
+    pub const fn target(self) -> KernelTarget {
+        self.target
+    }
+
+    /// Returns the model tensor dtype.
+    pub const fn dtype(self) -> KernelDType {
+        self.dtype
+    }
+
+    /// Returns the number of query heads.
+    pub const fn query_heads(self) -> usize {
+        self.query_heads
+    }
+
+    /// Returns the number of key/value heads.
+    pub const fn key_value_heads(self) -> usize {
+        self.key_value_heads
+    }
+
+    /// Returns one attention head's width.
+    pub const fn head_dim(self) -> usize {
+        self.head_dim
+    }
+
+    /// Returns token positions held by one logical KV page.
+    pub const fn page_size(self) -> usize {
+        self.page_size
+    }
+
+    /// Derives requirements for an invocation whose longest row attends
+    /// through `sequence_tokens` positions.
+    pub fn requirements(self, sequence_tokens: usize) -> Result<KernelRequirements, KernelError> {
+        if sequence_tokens == 0 {
+            return Err(KernelError::new(
+                "paged-attention sequence length must be greater than zero",
+            ));
+        }
+        KernelRequirements::paged_attention_decode(
+            self.target,
+            self.dtype,
+            self.head_dim,
+            self.query_heads / self.key_value_heads,
+            sequence_tokens.div_ceil(self.page_size),
+        )
+    }
+}
+
 impl KernelRequirements {
     /// Describes a paged decode-attention invocation.
     pub fn paged_attention_decode(
@@ -299,6 +388,21 @@ mod tests {
             KernelOperation::PagedAttentionDecode,
             KernelTarget::Wgpu,
         )
+    }
+
+    #[test]
+    fn model_profile_derives_page_rounded_requirements() {
+        let profile =
+            PagedAttentionProfile::new(KernelTarget::Wgpu, KernelDType::F16, 32, 8, 128, 16)
+                .unwrap();
+
+        let requirements = profile.requirements(17).unwrap();
+
+        assert_eq!(requirements.target(), KernelTarget::Wgpu);
+        assert_eq!(requirements.dtype(), KernelDType::F16);
+        assert_eq!(requirements.head_dim(), 128);
+        assert_eq!(requirements.gqa_ratio(), 4);
+        assert_eq!(requirements.page_count(), 2);
     }
 
     #[test]

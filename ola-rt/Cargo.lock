@@ -4827,6 +4827,7 @@ name = "ola-bench"
 version = "0.1.0"
 dependencies = [
  "ola-core",
+ "ola-kernel",
  "ola-model",
  "ola-observe",
  "ola-runtime",
@@ -4886,6 +4887,7 @@ name = "ola-model"
 version = "0.1.0"
 dependencies = [
  "ola-core",
+ "ola-kernel",
 ]
 
 [[package]]
@@ -4904,6 +4906,7 @@ name = "ola-runtime"
 version = "0.1.0"
 dependencies = [
  "ola-core",
+ "ola-kernel",
  "ola-model",
 ]
 

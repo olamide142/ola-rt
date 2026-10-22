@@ -1,6 +1,7 @@
 use std::{any::Any, error::Error, fmt, sync::Arc};
 
 use ola_core::GenerationConfig;
+use ola_kernel::PagedAttentionProfile;
 
 /// Stage at which model execution failed.
 ///
@@ -399,6 +400,7 @@ pub struct CausalLanguageModel {
     tokenizer: Arc<dyn Tokenizer>,
     model: Arc<dyn CausalModel>,
     kv_cache_profile: Option<KvCacheProfile>,
+    paged_attention_profile: Option<PagedAttentionProfile>,
 }
 
 impl CausalLanguageModel {
@@ -412,6 +414,7 @@ impl CausalLanguageModel {
             tokenizer: Arc::new(tokenizer),
             model: Arc::new(model),
             kv_cache_profile: None,
+            paged_attention_profile: None,
         }
     }
 
@@ -421,6 +424,7 @@ impl CausalLanguageModel {
             tokenizer,
             model,
             kv_cache_profile: None,
+            paged_attention_profile: None,
         }
     }
 
@@ -433,6 +437,17 @@ impl CausalLanguageModel {
     /// Returns physical KV-pool metadata when the architecture supplied it.
     pub const fn kv_cache_profile(&self) -> Option<KvCacheProfile> {
         self.kv_cache_profile
+    }
+
+    /// Attaches backend-neutral facts used to plan paged attention kernels.
+    pub const fn with_paged_attention_profile(mut self, profile: PagedAttentionProfile) -> Self {
+        self.paged_attention_profile = Some(profile);
+        self
+    }
+
+    /// Returns paged-attention planning metadata when the model uses it.
+    pub const fn paged_attention_profile(&self) -> Option<PagedAttentionProfile> {
+        self.paged_attention_profile
     }
 
     /// Returns whether request sessions can process prompts incrementally.

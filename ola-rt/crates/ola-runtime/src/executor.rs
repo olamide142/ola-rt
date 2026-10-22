@@ -743,6 +743,7 @@ impl Executor {
                                 chunked_prefill: model.supports_chunked_prefill(),
                                 kv_cache: model.kv_cache_profile(),
                                 kv_pool: model.kv_pool_status(),
+                                paged_attention: model.paged_attention_profile(),
                             });
                     (descriptor.id.clone(), snapshot)
                 })
@@ -2744,6 +2745,7 @@ mod tests {
                 phase: PlannedPhase::Decode,
                 model_id: "tiny".into(),
                 mode: BatchExecutionMode::Tensor,
+                kernel: None,
                 rows: vec![
                     PlannedRow {
                         request_id: first,
@@ -2799,6 +2801,7 @@ mod tests {
                     phase: PlannedPhase::ContinuedPrefill,
                     model_id: "tiny".into(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: None,
                     rows: vec![PlannedRow {
                         request_id,
                         event_index: 0,
@@ -3402,6 +3405,7 @@ mod tests {
                 phase: PlannedPhase::Prefill,
                 model_id: "tiny".into(),
                 mode: BatchExecutionMode::Individual,
+                kernel: None,
                 rows: vec![PlannedRow {
                     request_id: admitted,
                     event_index: 1,

@@ -193,8 +193,8 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 
 - [ ] Finish and validate the CubeCL paged-attention extension.
 - [x] Define kernel capabilities and selection constraints.
-- [ ] Represent backend/device and kernel selections in `ExecutionPlan`.
-- [ ] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
+- [x] Represent backend/device and kernel selections in `ExecutionPlan`.
+- [x] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
 - [x] Add provider selection and portable fallback.
 - [ ] Compare every optimized implementation with the portable reference.
 - [ ] Fuse page traversal, score reduction, and value accumulation.
@@ -203,7 +203,7 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 - [ ] Investigate ragged multi-position prefill chunks.
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs.
 - [ ] Compare optimized paths against the single-request oracle.
-- [ ] Record kernel identity, target, configuration, and fallback in reports.
+- [x] Record kernel identity, target, configuration, and fallback in plan reports.
 - [ ] Record kernel choices and kernel latency in observability traces.
 - [ ] Require warm-ups, repetitions, distributions, workload identity, and numerical conformance before making performance claims.
 

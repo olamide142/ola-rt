@@ -8,7 +8,9 @@ Covers `todo.md` P2 and builds on `EXECUTION_PLAN.md`. All six steps are impleme
 One replaceable `ExecutionPolicy` turns an immutable snapshot of runtime state
 into an `ExecutionPlan` plus a record of *why* it decided that. Scheduling,
 admission, token budgeting, and prefill grouping are components of the
-policy. They are not decisions scattered through `Executor`.
+policy. Kernel-provider selection is a fifth component evaluated after the
+other components determine the exact invocation rows. These are not decisions
+scattered through `Executor`.
 
 Done when FIFO, memory-aware admission, token budgeting, and prefill grouping
 run through that single path with no output or lifecycle regressions. The
@@ -108,7 +110,7 @@ pub struct PolicyDescriptor {
 ### Composition
 
 `ComposedPolicy` implements `ExecutionPolicy` by moving today's planning
-algorithm out of `Executor` unchanged. It holds four replaceable components:
+algorithm out of `Executor`. It holds five replaceable components:
 
 | Component | Today | Change |
 | --- | --- | --- |
@@ -116,6 +118,7 @@ algorithm out of `Executor` unchanged. It holds four replaceable components:
 | `AdmissionPolicy` | `decide(&mut self, &AdmissionContext)` | `&self`; context built from the snapshot |
 | `BatchPolicy` | `select(&mut self, &BatchContext)` | `&self` |
 | `PrefillBatcher` | `buckets(&mut self, …)` → keys | renamed `PrefillGrouping`; `group(&self, lengths) -> GroupingDecision` returning keys **and** alternatives and estimates |
+| `KernelRegistry` | hardcoded in Llama | select from model target/dtype/shape and the final planned rows; record typed portable fallback |
 
 Every component also implements `descriptor()`. The default
 `ComposedPolicy` (FIFO, unconstrained admission, unbounded batch,
@@ -207,11 +210,10 @@ Each step keeps `make verify` and `make test-fixture` green.
      oversized prefill, memory against predicted release, grouping against a
      missing capability, and admission against the KV check.
 
-   Kernel-selection conflicts are recorded as deferred until the kernel track
-   adds a selection to the plan.
-
    **Done** in `src/composed.rs` tests, planning hand-built snapshots without
-   an executor. The kernel-selection conflict remains deferred.
+   an executor. Kernel-track step 2 adds conflicts against batching and
+   memory-deferred admission: only rows surviving those policies influence
+   page-count constraints and provider selection.
 
 ## Out of scope for P2
 
@@ -219,4 +221,5 @@ Each step keeps `make verify` and `make test-fixture` green.
   already carries the fields they need.
 - Populating `DeviceSnapshot` and `PolicyMeasurements`: P6 telemetry and P4
   calibration.
-- Kernel selection: the kernel track.
+- Kernel execution delegation: kernel-track step 3. Policy selection and plan
+  representation are implemented.

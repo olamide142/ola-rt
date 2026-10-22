@@ -84,6 +84,13 @@ starts: bytes per token, token positions per page, and total shared pool
 capacity. The runtime uses that profile for conservative admission without
 depending on Burn tensors or Llama-specific configuration types.
 
+Models with replaceable paged attention may additionally attach a
+`PagedAttentionProfile`. It records the execution target, dtype, attention-head
+geometry, and page size needed to derive exact kernel requirements after a
+runtime policy has chosen the invocation rows. It advertises planning facts;
+the mutable session remains responsible for consuming the selected provider
+during execution.
+
 ## Availability versus residency
 
 Catalog membership means an artifact is configured and selectable. It does not

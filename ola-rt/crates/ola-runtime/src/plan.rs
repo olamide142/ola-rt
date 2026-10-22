@@ -10,6 +10,7 @@ use std::fmt;
 use std::ops::Range;
 
 use ola_core::{ModelId, Priority, RequestId, Timestamp};
+use ola_kernel::{KernelRequirements, KernelSelection, PagedAttentionProfile};
 
 use crate::{AdmissionReason, BatchExecutionMode, BatchPhase, PlanningSnapshot};
 
@@ -124,8 +125,21 @@ pub struct PlannedBatch {
     pub model_id: ModelId,
     /// Intended execution mechanism.
     pub mode: BatchExecutionMode,
+    /// Kernel requirements and provider selected for a decode or
+    /// resumable-prefill invocation when the model publishes a
+    /// paged-attention profile.
+    pub kernel: Option<PlannedKernel>,
     /// Rows in tensor order.
     pub rows: Vec<PlannedRow>,
+}
+
+/// Kernel decision attached to one model invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedKernel {
+    /// Target, dtype, tensor shape, and page count the policy matched.
+    pub requirements: KernelRequirements,
+    /// Provider selected by the kernel registry, including fallback reason.
+    pub selection: KernelSelection,
 }
 
 impl PlannedBatch {
@@ -368,6 +382,7 @@ struct ValidationView<'a> {
     decoding: &'a BTreeMap<RequestId, DecodeView>,
     model_kv_capacity: BTreeMap<&'a ModelId, u64>,
     chunked_models: BTreeSet<&'a ModelId>,
+    paged_attention: BTreeMap<&'a ModelId, PagedAttentionProfile>,
     prefill_chunk_size: Option<usize>,
 }
 
@@ -414,6 +429,13 @@ impl<'a> ValidationView<'a> {
                 .filter(|(_, model)| model.chunked_prefill)
                 .map(|(model_id, _)| model_id)
                 .collect(),
+            paged_attention: snapshot
+                .models
+                .iter()
+                .filter_map(|(model_id, model)| {
+                    model.paged_attention.map(|profile| (model_id, profile))
+                })
+                .collect(),
             prefill_chunk_size: snapshot.limits.prefill_chunk_size,
         }
     }
@@ -448,6 +470,13 @@ pub enum PlanError {
     EmptyBatch(usize),
     /// An individual invocation contains more than one row.
     IndividualBatchWidth(usize),
+    /// A paged-attention invocation has no kernel decision on its batch.
+    MissingKernelSelection(usize),
+    /// A batch carries a kernel decision although it does not invoke paged
+    /// attention.
+    UnexpectedKernelSelection(usize),
+    /// A kernel decision's requirements do not match its batch and model.
+    KernelRequirementsMismatch(usize),
     /// A row's or admission's model differs from the request's model.
     ModelMismatch {
         /// Offending request.
@@ -554,6 +583,17 @@ impl fmt::Display for PlanError {
             Self::IndividualBatchWidth(index) => write!(
                 formatter,
                 "individual planned batch {index} has more than one row"
+            ),
+            Self::MissingKernelSelection(index) => {
+                write!(formatter, "planned batch {index} has no kernel selection")
+            }
+            Self::UnexpectedKernelSelection(index) => write!(
+                formatter,
+                "planned batch {index} has a kernel selection but does not invoke paged attention"
+            ),
+            Self::KernelRequirementsMismatch(index) => write!(
+                formatter,
+                "planned batch {index} kernel requirements contradict its model or rows"
             ),
             Self::ModelMismatch {
                 request_id,
@@ -768,6 +808,7 @@ impl ExecutionPlan {
                     }
                 }
             }
+            validate_kernel(view, index, batch)?;
         }
         for request_id in admitted.keys().chain(&prefilled) {
             if admitted.contains_key(request_id) != prefilled.contains(request_id) {
@@ -873,6 +914,44 @@ impl ExecutionPlan {
     }
 }
 
+fn validate_kernel(
+    view: &ValidationView<'_>,
+    batch_index: usize,
+    batch: &PlannedBatch,
+) -> Result<(), PlanError> {
+    if batch.phase == PlannedPhase::Prefill {
+        return if batch.kernel.is_none() {
+            Ok(())
+        } else {
+            Err(PlanError::UnexpectedKernelSelection(batch_index))
+        };
+    }
+    match (
+        view.paged_attention.get(&batch.model_id),
+        batch.kernel.as_ref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(PlanError::MissingKernelSelection(batch_index)),
+        (None, Some(_)) => Err(PlanError::UnexpectedKernelSelection(batch_index)),
+        (Some(profile), Some(kernel)) => {
+            let sequence_tokens = batch
+                .rows
+                .iter()
+                .map(|row| row.positions.end)
+                .max()
+                .expect("validated batch is non-empty");
+            let expected = profile
+                .requirements(sequence_tokens)
+                .expect("validated model profile and non-empty rows form requirements");
+            if kernel.requirements == expected {
+                Ok(())
+            } else {
+                Err(PlanError::KernelRequirementsMismatch(batch_index))
+            }
+        }
+    }
+}
+
 fn validate_row(
     view: &ValidationView<'_>,
     batch: &PlannedBatch,
@@ -960,6 +1039,7 @@ fn validate_row(
 #[cfg(test)]
 mod tests {
     use ola_core::Priority;
+    use ola_kernel::{KernelDType, KernelRegistry, KernelTarget, PagedAttentionProfile};
     use ola_model::{BatchCapabilities, KvCacheProfile};
 
     use super::*;
@@ -1043,6 +1123,7 @@ mod tests {
                     chunked_prefill: true,
                     kv_cache: KvCacheProfile::new(1, 1, 400),
                     kv_pool: None,
+                    paged_attention: None,
                 },
             )]),
             memory: MemoryState::default(),
@@ -1075,18 +1156,21 @@ mod tests {
                     phase: PlannedPhase::Decode,
                     model_id: model(),
                     mode: BatchExecutionMode::Tensor,
+                    kernel: None,
                     rows: vec![row(3, 0, 9..10, false), row(4, 1, 6..7, false)],
                 },
                 PlannedBatch {
                     phase: PlannedPhase::ContinuedPrefill,
                     model_id: model(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: None,
                     rows: vec![row(2, 2, 3..7, true)],
                 },
                 PlannedBatch {
                     phase: PlannedPhase::Prefill,
                     model_id: model(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: None,
                     rows: vec![row(1, 3, 0..2, false)],
                 },
             ],
@@ -1120,11 +1204,66 @@ mod tests {
     }
 
     #[test]
+    fn validates_kernel_presence_and_requirements_against_model_and_rows() {
+        let mut snapshot = view();
+        let profile =
+            PagedAttentionProfile::new(KernelTarget::Cpu, KernelDType::F32, 32, 8, 128, 4).unwrap();
+        snapshot.models.get_mut(&model()).unwrap().paged_attention = Some(profile);
+        let registry = KernelRegistry::new();
+        let mut planned = plan();
+        for batch in &mut planned.batches {
+            if batch.phase == PlannedPhase::Prefill {
+                continue;
+            }
+            let requirements = profile
+                .requirements(
+                    batch
+                        .rows
+                        .iter()
+                        .map(|row| row.positions.end)
+                        .max()
+                        .unwrap(),
+                )
+                .unwrap();
+            batch.kernel = Some(PlannedKernel {
+                requirements,
+                selection: registry.select(requirements).unwrap(),
+            });
+        }
+
+        assert_eq!(planned.validate(&snapshot, true), Ok(()));
+        assert!(planned.batches[2].kernel.is_none());
+
+        let mut missing = planned.clone();
+        missing.batches[1].kernel = None;
+        assert_eq!(
+            missing.validate(&snapshot, true),
+            Err(PlanError::MissingKernelSelection(1))
+        );
+
+        let mut unexpected = planned.clone();
+        unexpected.batches[2].kernel = unexpected.batches[0].kernel.clone();
+        assert_eq!(
+            unexpected.validate(&snapshot, true),
+            Err(PlanError::UnexpectedKernelSelection(2))
+        );
+
+        let mut mismatched = planned;
+        mismatched.batches[0].kernel.as_mut().unwrap().requirements =
+            profile.requirements(1).unwrap();
+        assert_eq!(
+            mismatched.validate(&snapshot, true),
+            Err(PlanError::KernelRequirementsMismatch(0))
+        );
+    }
+
+    #[test]
     fn padding_is_derived_from_rectangular_tensor_rows() {
         let batch = PlannedBatch {
             phase: PlannedPhase::Prefill,
             model_id: model(),
             mode: BatchExecutionMode::Tensor,
+            kernel: None,
             rows: vec![row(1, 0, 0..5, true), row(2, 1, 0..2, true)],
         };
         assert_eq!(batch.input_tokens(), 7);
@@ -1266,6 +1405,7 @@ mod tests {
             phase: PlannedPhase::Decode,
             model_id: model(),
             mode: BatchExecutionMode::Tensor,
+            kernel: None,
             rows: Vec::new(),
         });
         assert_eq!(empty.validate(&view(), true), Err(PlanError::EmptyBatch(3)));

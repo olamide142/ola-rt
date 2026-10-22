@@ -669,6 +669,7 @@ mod tests {
                     phase: PlannedPhase::Decode,
                     model_id: "tiny".into(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: None,
                     rows: vec![PlannedRow {
                         request_id,
                         event_index: 0,

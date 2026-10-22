@@ -66,8 +66,13 @@ The types are in `src/plan.rs`. In summary:
   predicted_releases }`;
 - `LifecycleAction::{Admit, Reject, Fail}`. `Admit` carries the KV
   reservation; its event comes from the request's first prefill row;
-- `PlannedBatch { phase, model_id, mode, rows }` with
+- `PlannedBatch { phase, model_id, mode, kernel, rows }` with
   `PlannedPhase::{Prefill, ContinuedPrefill, Decode}`;
+- `PlannedKernel { requirements, selection }`, present for decode and
+  resumable-prefill batches when the model publishes a paged-attention
+  profile. Ordinary full-prompt prefill remains dense. Requirements record
+  target, dtype, head width, GQA ratio, and page count; selection records the
+  provider and any portable-fallback reason;
 - `PlannedRow { request_id, event_index, positions, final_prompt_chunk }`,
   where `positions` is the absolute range processed and therefore also the KV
   growth;
@@ -77,8 +82,8 @@ The types are in `src/plan.rs`. In summary:
   limit, and model KV capacities) that `validate` checks against.
 
 Padding and `PlanEstimates` are computed from the rows rather than stored, so
-they cannot contradict them. A `KernelSelection` field is added when the
-kernel track needs it.
+they cannot contradict them. Kernel page count is likewise derived from the
+longest row and the model's page size before provider selection.
 
 `ExecutorIteration::execution_plan` replaces the former `IterationPlan`
 record; `ola-observe` derives its scheduled and deferred counts from
@@ -113,6 +118,10 @@ state ──► Planner (reads state, consults policies) ──► ExecutionPlan
 - **unsupported chunking:** a partial prompt row targets a model without
   resumable prefill (it would fail the request at execution), or a prompt
   row on a resumable model exceeds the executor's chunk size;
+- **invalid kernel decision:** a paged-attention decode or resumable-prefill
+  batch has no selection, a full-prompt prefill or model without that operation
+  has one, or recorded requirements contradict the model profile and batch
+  rows;
 - **bad release:** a predicted release is not a limit-reaching decode row in
   this plan;
 - **over capacity:** live minus predicted releases plus admissions exceeds
@@ -208,7 +217,7 @@ functions of a snapshot.
 
 `ola-runtime` and `ola-core` do not depend on serde; only `ola-bench` and
 `ola-burn` do. To keep the runtime free of serialization concerns, `ola-bench`
-owns a versioned `PlanReport` (schema version 1), converted from an
+owns a versioned `PlanReport` (currently schema version 6), converted from an
 `ExecutorIteration` in the same way as the schema-v2 benchmark reports.
 `ExecutionPlan` also implements `Display` as a one-line summary for logs and
 interfaces.
@@ -241,7 +250,8 @@ Each step keeps `make verify` and the fixture tests green.
 
 ## Out of scope for P1
 
-- Kernel selection. The field exists but stays `None` until the kernel track.
+- Kernel execution delegation. Plans select and report providers, but model
+  execution consumes that selection in kernel-track step 3.
 - Time-based cost estimates. Estimates are tokens, padding, invocations, and
   bytes only; calibrated costs belong to P4.
 - Combining the policies into one `ExecutionPolicy` (P2).

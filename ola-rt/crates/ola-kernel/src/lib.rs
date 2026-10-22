@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod capability;
+mod device;
 mod error;
 mod metadata;
 mod paged_attention;
@@ -11,7 +12,10 @@ mod cubecl_extension;
 #[cfg(feature = "cubecl")]
 mod telemetry;
 
-pub use capability::{KernelCapability, KernelDType, KernelIncompatibility, KernelRequirements};
+pub use capability::{
+    KernelCapability, KernelDType, KernelIncompatibility, KernelRequirements, PagedAttentionProfile,
+};
+pub use device::burn_device_target;
 pub use error::KernelError;
 pub use metadata::{KernelDescriptor, KernelOperation, KernelTarget};
 pub use paged_attention::{

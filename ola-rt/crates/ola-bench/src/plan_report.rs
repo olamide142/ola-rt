@@ -7,6 +7,7 @@
 
 use std::{error::Error, fmt};
 
+use ola_kernel::{KernelDType, KernelIncompatibility, KernelTarget};
 use ola_runtime::{
     AdmissionDecision, AdmissionOutcome, AdmissionRecord, BatchCandidate, BatchExecutionMode,
     BatchHook, BatchPhase, CostAwarePrefillDecision, DecisionRecord, ExecutionPlan,
@@ -20,8 +21,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Version 2 added [`PlanReport::decision`]; version 3 added
 /// [`PlanReport::iteration`]; version 4 added the KV-exhaustion divergence;
-/// version 5 added preemption.
-pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 5;
+/// version 5 added preemption; version 6 added kernel requirements,
+/// selections, and portable-fallback diagnostics.
+pub const PLAN_REPORT_SCHEMA_VERSION: u32 = 6;
 
 /// One iteration's validated plan and observed divergences.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -306,12 +308,107 @@ pub struct PlanReportBatch {
     pub model: String,
     /// Intended execution mechanism.
     pub mode: PlanReportMode,
+    /// Planned paged-attention kernel, when the model uses that operation.
+    pub kernel: Option<PlanReportKernel>,
     /// Rows in tensor order.
     pub rows: Vec<PlanReportRow>,
     /// Real input positions.
     pub input_tokens: usize,
     /// Right-padding positions.
     pub padding_tokens: usize,
+}
+
+/// Serialized kernel requirements and selected provider.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportKernel {
+    /// Physical target on which the model tensors live.
+    pub target: PlanReportKernelTarget,
+    /// Floating-point storage type.
+    pub dtype: PlanReportKernelDType,
+    /// Width of one attention head.
+    pub head_dim: usize,
+    /// Query heads sharing each key/value head.
+    pub gqa_ratio: usize,
+    /// Logical KV pages visible to the longest row.
+    pub page_count: usize,
+    /// Stable selected provider name.
+    pub provider: String,
+    /// Target family implemented by the provider.
+    pub provider_target: PlanReportKernelTarget,
+    /// Why an optimized provider was not selected.
+    pub fallback: Option<PlanReportKernelFallback>,
+}
+
+/// Serialized execution target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportKernelTarget {
+    /// Backend-portable tensor operations.
+    Portable,
+    /// Host CPU.
+    Cpu,
+    /// WebGPU.
+    Wgpu,
+    /// Native CUDA.
+    Cuda,
+    /// Target introduced by a newer kernel crate.
+    Unknown,
+}
+
+/// Serialized floating-point dtype.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportKernelDType {
+    /// IEEE f32.
+    F32,
+    /// Backend-selected flexible f32.
+    Flex32,
+    /// IEEE f16.
+    F16,
+    /// Brain f16.
+    Bf16,
+    /// Dtype introduced by a newer kernel crate.
+    Unknown,
+}
+
+/// Serialized portable fallback explanation.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportKernelFallback {
+    /// Stable reason identifier.
+    pub reason: String,
+    /// Optimized providers rejected by capability matching.
+    pub rejections: Vec<PlanReportKernelRejection>,
+}
+
+/// Serialized rejected optimized provider.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub struct PlanReportKernelRejection {
+    /// Stable provider name.
+    pub provider: String,
+    /// Provider target family.
+    pub provider_target: PlanReportKernelTarget,
+    /// First incompatible constraint.
+    pub reason: PlanReportKernelIncompatibility,
+}
+
+/// Serialized capability mismatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReportKernelIncompatibility {
+    /// Wrong operation family.
+    Operation,
+    /// Wrong physical target.
+    Target,
+    /// Unsupported dtype.
+    DType,
+    /// Unsupported head width.
+    HeadDimension,
+    /// Unsupported GQA ratio.
+    GqaRatio,
+    /// Too many logical pages.
+    PageCount,
+    /// Constraint introduced by a newer kernel crate.
+    Unknown,
 }
 
 /// Serialized planned row.
@@ -659,6 +756,32 @@ fn batch(batch: &PlannedBatch) -> PlanReportBatch {
             BatchExecutionMode::Tensor => PlanReportMode::Tensor,
             BatchExecutionMode::Individual => PlanReportMode::Individual,
         },
+        kernel: batch.kernel.as_ref().map(|kernel| {
+            let descriptor = kernel.selection.descriptor();
+            PlanReportKernel {
+                target: kernel_target(kernel.requirements.target()),
+                dtype: kernel_dtype(kernel.requirements.dtype()),
+                head_dim: kernel.requirements.head_dim(),
+                gqa_ratio: kernel.requirements.gqa_ratio(),
+                page_count: kernel.requirements.page_count(),
+                provider: descriptor.name().to_owned(),
+                provider_target: kernel_target(descriptor.target()),
+                fallback: kernel.selection.fallback_reason().map(|reason| {
+                    PlanReportKernelFallback {
+                        reason: "no_compatible_optimized_provider".into(),
+                        rejections: reason
+                            .rejections()
+                            .iter()
+                            .map(|rejection| PlanReportKernelRejection {
+                                provider: rejection.descriptor.name().to_owned(),
+                                provider_target: kernel_target(rejection.descriptor.target()),
+                                reason: kernel_incompatibility(rejection.reason),
+                            })
+                            .collect(),
+                    }
+                }),
+            }
+        }),
         rows: batch
             .rows
             .iter()
@@ -672,6 +795,38 @@ fn batch(batch: &PlannedBatch) -> PlanReportBatch {
             .collect(),
         input_tokens: batch.input_tokens(),
         padding_tokens: batch.padding_tokens(),
+    }
+}
+
+const fn kernel_target(target: KernelTarget) -> PlanReportKernelTarget {
+    match target {
+        KernelTarget::Portable => PlanReportKernelTarget::Portable,
+        KernelTarget::Cpu => PlanReportKernelTarget::Cpu,
+        KernelTarget::Wgpu => PlanReportKernelTarget::Wgpu,
+        KernelTarget::Cuda => PlanReportKernelTarget::Cuda,
+        _ => PlanReportKernelTarget::Unknown,
+    }
+}
+
+const fn kernel_dtype(dtype: KernelDType) -> PlanReportKernelDType {
+    match dtype {
+        KernelDType::F32 => PlanReportKernelDType::F32,
+        KernelDType::Flex32 => PlanReportKernelDType::Flex32,
+        KernelDType::F16 => PlanReportKernelDType::F16,
+        KernelDType::Bf16 => PlanReportKernelDType::Bf16,
+        _ => PlanReportKernelDType::Unknown,
+    }
+}
+
+const fn kernel_incompatibility(reason: KernelIncompatibility) -> PlanReportKernelIncompatibility {
+    match reason {
+        KernelIncompatibility::Operation => PlanReportKernelIncompatibility::Operation,
+        KernelIncompatibility::Target => PlanReportKernelIncompatibility::Target,
+        KernelIncompatibility::DType => PlanReportKernelIncompatibility::DType,
+        KernelIncompatibility::HeadDimension => PlanReportKernelIncompatibility::HeadDimension,
+        KernelIncompatibility::GqaRatio => PlanReportKernelIncompatibility::GqaRatio,
+        KernelIncompatibility::PageCount => PlanReportKernelIncompatibility::PageCount,
+        _ => PlanReportKernelIncompatibility::Unknown,
     }
 }
 
@@ -785,9 +940,25 @@ impl From<serde_json::Error> for PlanReportError {
 #[cfg(test)]
 mod tests {
     use ola_core::{RequestId, Timestamp};
-    use ola_runtime::{AdmissionReason, PlannedRow};
+    use ola_kernel::{KernelRegistry, KernelRequirements};
+    use ola_runtime::{AdmissionReason, PlannedKernel, PlannedRow};
 
     use super::*;
+
+    fn planned_kernel() -> PlannedKernel {
+        let requirements = KernelRequirements::paged_attention_decode(
+            KernelTarget::Wgpu,
+            KernelDType::F32,
+            128,
+            4,
+            2,
+        )
+        .unwrap();
+        PlannedKernel {
+            requirements,
+            selection: KernelRegistry::new().select(requirements).unwrap(),
+        }
+    }
 
     fn plan() -> ExecutionPlan {
         ExecutionPlan {
@@ -811,6 +982,7 @@ mod tests {
                     phase: PlannedPhase::Decode,
                     model_id: "tiny".into(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: Some(planned_kernel()),
                     rows: vec![PlannedRow {
                         request_id: RequestId::new(1),
                         event_index: 0,
@@ -822,6 +994,7 @@ mod tests {
                     phase: PlannedPhase::Prefill,
                     model_id: "tiny".into(),
                     mode: BatchExecutionMode::Individual,
+                    kernel: None,
                     rows: vec![PlannedRow {
                         request_id: RequestId::new(2),
                         event_index: 1,
@@ -872,6 +1045,9 @@ mod tests {
             r#""action": "admit""#,
             r#""reason": "model has no KV-cache resource profile""#,
             r#""phase": "decode""#,
+            r#""provider": "portable-burn-paged-attention""#,
+            r#""provider_target": "portable""#,
+            r#""reason": "no_compatible_optimized_provider""#,
             r#""kind": "slots""#,
             r#""reason": "output_limit""#,
             r#""policy": "composed[fifo]""#,

@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use ola_core::{ModelId, Priority, RequestId, Timestamp};
+use ola_kernel::PagedAttentionProfile;
 use ola_model::{BatchCapabilities, KvCacheProfile, KvPoolStatus};
 
 use crate::{BatchPressure, DecodeView, MemoryState, PrefillView};
@@ -60,6 +61,8 @@ pub struct ModelSnapshot {
     /// Physical KV-pool occupancy at the iteration boundary, when the model
     /// allocates from a shared pool.
     pub kv_pool: Option<KvPoolStatus>,
+    /// Paged-attention kernel facts, when the model uses that operation.
+    pub paged_attention: Option<PagedAttentionProfile>,
 }
 
 impl ModelSnapshot {
@@ -70,6 +73,7 @@ impl ModelSnapshot {
         chunked_prefill: false,
         kv_cache: None,
         kv_pool: None,
+        paged_attention: None,
     };
 }
 
