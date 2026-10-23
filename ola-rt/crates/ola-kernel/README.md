@@ -40,6 +40,7 @@ The public building blocks are:
   implementation;
 - `PagedKvPage` and `PagedAttentionInput` for an explicit operator boundary;
 - `PagedAttentionKernel` for interchangeable implementations;
+- `KernelExecutionMetrics` for shared synchronous call counts and host timing;
 - `PortablePagedAttention` as the initial reference implementation;
 - `KernelError` for configuration, input, and implementation failures.
 
@@ -90,12 +91,14 @@ Before an optimized implementation is selected by the model path:
 
 ## Next integration step
 
-Record the executed selection and invocation timing in observability traces,
-then populate experiment identities from those records. Tune the existing
-CubeCL kernel against the portable path after that boundary is observable. It
-currently concatenates page tensors before dispatch and recomputes each
-query/key score for every output dimension, so optimization should focus on
-device-side page layout and reducing redundant arithmetic.
+Tune the existing CubeCL kernel against the portable path now that execution
+records, request traces, and model-backed experiment variants expose the
+provider actually used. `KernelExecutionMetrics` measures synchronous host time
+inside `PagedAttentionKernel::execute`; it is not device-event timing when a
+backend queues work asynchronously. The current CubeCL path concatenates page
+tensors before dispatch and recomputes each query/key score for every output
+dimension, so optimization should focus on device-side page layout and reducing
+redundant arithmetic.
 
 The current `Vec` of page tensors is a correctness-friendly interface, but the
 GPU implementation must be checked for launch and data-layout costs. If one

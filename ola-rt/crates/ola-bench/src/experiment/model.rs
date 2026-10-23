@@ -2,7 +2,7 @@
 //! prefill reports.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
     sync::Arc,
@@ -92,9 +92,11 @@ impl Experiment for LlamaGeneration {
         };
         let request_id = executor.submit(request, clock.now()).map_err(run_error)?;
         let mut trace = context.trace.as_ref().map(|trace| trace.run("greedy"));
+        let mut kernels = BTreeSet::new();
         let started = Instant::now();
         'generation: for _ in 0..10_000 {
             let iteration = executor.step_iteration(clock.now()).map_err(run_error)?;
+            record_kernel_names(&iteration.execution_batches, &mut kernels);
             if let Some(trace) = &mut trace {
                 trace.observe(&iteration, executor.state())?;
             }
@@ -166,7 +168,11 @@ impl Experiment for LlamaGeneration {
                 ),
             ],
             vec![(
-                plain_variant("greedy"),
+                Variant {
+                    label: "greedy".into(),
+                    policy: None,
+                    kernel: joined_kernel_names(kernels),
+                },
                 vec![values(&[
                     ("generated_tokens", as_f64(generated)),
                     ("elapsed", as_f64(elapsed.as_micros())),
@@ -285,6 +291,9 @@ impl Experiment for PrefillStrategies {
                 )
             }),
         );
+        for ((trials, _), variant) in strategies.iter().zip(&mut parts.variants) {
+            variant.kernel = summaries_kernel_identity(&trials.samples);
+        }
         parts.details = Some(serde_json::json!({
             "calibration": {
                 "invocation_overhead_tokens": calibration.invocation_overhead_tokens,
@@ -461,6 +470,11 @@ impl Experiment for ChunkedPrefill {
         };
         let count =
             |name| MetricSpec::new(name, Unit::Count, TimeDomain::Untimed, Direction::Neither);
+        let complete_variant = Variant {
+            label: "complete".into(),
+            policy: None,
+            kernel: comparison.unchunked.kernel.clone(),
+        };
         let mut outcome = finish(
             &self.descriptor(),
             context,
@@ -485,15 +499,12 @@ impl Experiment for ChunkedPrefill {
                 ),
             ],
             vec![
-                (
-                    plain_variant("complete"),
-                    vec![sample(&comparison.unchunked)],
-                ),
+                (complete_variant, vec![sample(&comparison.unchunked)]),
                 (
                     Variant {
                         label: "chunked".into(),
                         policy: Some(format!("prefill_chunk_size={chunk_size}")),
-                        kernel: None,
+                        kernel: comparison.chunked.kernel.clone(),
                     },
                     vec![sample(&comparison.chunked)],
                 ),
@@ -657,6 +668,29 @@ fn prefill_workload(prompts: &[Vec<u32>], max_new_tokens: usize) -> (&'static st
         "prefill-prompts",
         content_digest(format!("{prompts:?}/{max_new_tokens}").as_bytes()),
     )
+}
+
+fn record_kernel_names(batches: &[ola_runtime::ExecutionBatch], names: &mut BTreeSet<String>) {
+    names.extend(batches.iter().filter_map(|batch| {
+        batch
+            .kernel
+            .filter(|kernel| kernel.calls > 0)
+            .map(|kernel| kernel.descriptor.name().to_owned())
+    }));
+}
+
+fn joined_kernel_names(names: BTreeSet<String>) -> Option<String> {
+    (!names.is_empty()).then(|| names.into_iter().collect::<Vec<_>>().join(","))
+}
+
+fn summaries_kernel_identity(samples: &[crate::PrefillExecutionSummary]) -> Option<String> {
+    let names = samples
+        .iter()
+        .filter_map(|sample| sample.kernel.as_deref())
+        .flat_map(|names| names.split(','))
+        .map(str::to_owned)
+        .collect();
+    joined_kernel_names(names)
 }
 
 /// The metrics a prefill-strategies report declares.
@@ -926,5 +960,24 @@ impl Experiment for CostCalibration {
             pooled_fit.residual_rms_micros,
         );
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod kernel_identity_tests {
+    use super::*;
+
+    #[test]
+    fn observed_kernel_names_are_stable_and_deduplicated() {
+        let names = ["z-kernel", "a-kernel", "z-kernel"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        assert_eq!(
+            joined_kernel_names(names).as_deref(),
+            Some("a-kernel,z-kernel")
+        );
+        assert_eq!(joined_kernel_names(BTreeSet::new()), None);
     }
 }

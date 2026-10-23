@@ -125,6 +125,7 @@ IDs, and the traces are covered by tests. That is P6's completion criterion.
 
 ## Out of scope
 
-NVML utilization, distributed tracing (OpenTelemetry), and kernel,
-prefix-cache, and residency instrumentation, which belong to the kernel
-track, P7, and P8.
+NVML utilization and distributed tracing (OpenTelemetry). Prefix-cache and
+residency instrumentation belong to P7 and P8. The later kernel-track extension
+adds executed provider identity, target, call count, and synchronous host-call
+duration to invocation traces without changing this P6 design.

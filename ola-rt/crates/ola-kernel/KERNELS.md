@@ -124,10 +124,14 @@ implementations.
    silently ignoring it. Compiled CubeCL providers are registered by the
    default composed policy, and a counting-provider integration test proves the
    planned implementation reaches tensor decode.
-4. **Observability and benchmarking closure.**
-   Emit kernel identity and kernel timing in `ola-observe::TraceEvent::Invocation`.
-   Populate `Variant::kernel` in `ola-bench` experiment runs and report
-   comparisons.
+4. **Observability and benchmarking closure.** **Complete 2026-10-23.**
+   Actual `ExecutionBatch` records now retain the provider descriptor, call
+   count, and aggregate synchronous host time inside the selected kernel.
+   `ola-observe::TraceEvent::Invocation` emits that identity, target, count,
+   and duration; model-backed `ola-bench` variants populate `Variant::kernel`
+   from provider names observed across the run. The host metric includes device
+   work only when a provider synchronizes before returning, so later studies
+   must use backend device events before calling it device-kernel latency.
 5. **Optimize CubeCL paged attention.**
    Eliminate pre-dispatch tensor concatenation in `CubePagedAttention`. Implement
    fused page traversal, online softmax reduction, and value accumulation.

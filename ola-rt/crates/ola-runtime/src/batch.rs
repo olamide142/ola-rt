@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 
 use ola_core::{RequestId, Timestamp};
+use ola_kernel::KernelDescriptor;
 
 use crate::{GroupingDecision, PolicyDescriptor};
 
@@ -22,6 +23,21 @@ pub enum BatchExecutionMode {
     Individual,
 }
 
+/// Selected kernel work observed inside one model invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutedKernel {
+    /// Stable identity of the provider that executed.
+    pub descriptor: KernelDescriptor,
+    /// Number of synchronous calls to that provider in the model invocation.
+    pub calls: u64,
+    /// Host wall time spent inside those calls, in nanoseconds, when the
+    /// executor has a clock.
+    ///
+    /// This includes device work only when the provider synchronizes before
+    /// returning. Wider model-call timing includes later token read-back.
+    pub host_duration_nanos: Option<u64>,
+}
+
 /// One model invocation emitted while executing an iteration plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionBatch {
@@ -35,6 +51,8 @@ pub struct ExecutionBatch {
     pub input_tokens: usize,
     /// Artificial prompt positions computed only to make tensor rows rectangular.
     pub padding_tokens: usize,
+    /// Executed paged-attention provider and its aggregate synchronous timing.
+    pub kernel: Option<ExecutedKernel>,
     /// Time just before the model was invoked.
     ///
     /// With an executor clock this is read from the clock; without one it is
@@ -649,6 +667,7 @@ mod tests {
             mode: BatchExecutionMode::Tensor,
             input_tokens: 13,
             padding_tokens: 3,
+            kernel: None,
             started_at: Timestamp::ZERO,
             finished_at: Timestamp::ZERO,
         };

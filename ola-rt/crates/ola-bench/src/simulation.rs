@@ -656,6 +656,7 @@ mod tests {
             mode: ola_runtime::BatchExecutionMode::Tensor,
             input_tokens,
             padding_tokens,
+            kernel: None,
         };
         let cost = CostModel::default();
 

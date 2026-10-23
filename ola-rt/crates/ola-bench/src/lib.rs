@@ -381,6 +381,8 @@ pub struct PrefillExecutionSummary {
     pub peak_kv_cache_bytes: u64,
     /// Highest worst-case KV reservation observed during execution.
     pub peak_reserved_kv_bytes: u64,
+    /// Canonical comma-separated executed provider names, when applicable.
+    pub kernel: Option<String>,
 }
 
 impl PrefillExecutionSummary {
@@ -1153,6 +1155,22 @@ fn summarize_strategy_trials(samples: Vec<PrefillExecutionSummary>) -> PrefillSt
     }
 }
 
+fn record_kernel_names(
+    batches: &[ola_runtime::ExecutionBatch],
+    kernels: &mut std::collections::BTreeSet<String>,
+) {
+    kernels.extend(batches.iter().filter_map(|batch| {
+        batch
+            .kernel
+            .filter(|kernel| kernel.calls > 0)
+            .map(|kernel| kernel.descriptor.name().to_owned())
+    }));
+}
+
+fn kernel_identity(kernels: std::collections::BTreeSet<String>) -> Option<String> {
+    (!kernels.is_empty()).then(|| kernels.into_iter().collect::<Vec<_>>().join(","))
+}
+
 fn execute_prefill_strategy<P>(
     model: &CausalLanguageModel,
     config: &PrefillExecutionConfig,
@@ -1225,7 +1243,9 @@ where
         total_elapsed: Duration::ZERO,
         peak_kv_cache_bytes: 0,
         peak_reserved_kv_bytes: 0,
+        kernel: None,
     };
+    let mut kernels = std::collections::BTreeSet::new();
     let prefill_iterations = match chunk_size {
         Some(chunk_size) => config.prompts.iter().try_fold(0_usize, |total, prompt| {
             total.checked_add(prompt.len().div_ceil(chunk_size))
@@ -1252,6 +1272,7 @@ where
             .map_err(|_| ExecutionBenchmarkError::TimestampOverflow)?;
         let iteration_started = Instant::now();
         let iteration = executor.step_iteration(at)?;
+        record_kernel_names(&iteration.execution_batches, &mut kernels);
         let iteration_elapsed = iteration_started.elapsed();
         let contains_prefill = iteration
             .execution_batches
@@ -1311,6 +1332,7 @@ where
         }
     }
     summary.total_elapsed = total_started.elapsed();
+    summary.kernel = kernel_identity(kernels);
 
     let outputs = request_ids
         .into_iter()
@@ -1374,7 +1396,9 @@ fn run_prefill_fairness(
         total_elapsed: Duration::ZERO,
         peak_kv_cache_bytes: 0,
         peak_reserved_kv_bytes: 0,
+        kernel: None,
     };
+    let mut kernels = std::collections::BTreeSet::new();
     let prefill_bound = match chunk_size {
         Some(size) => config.prompts.iter().try_fold(0_usize, |sum, prompt| {
             sum.checked_add(prompt.len().div_ceil(size))
@@ -1400,6 +1424,7 @@ fn run_prefill_fairness(
                 .map(Timestamp::from_micros)
                 .map_err(|_| ExecutionBenchmarkError::TimestampOverflow)?,
         )?;
+        record_kernel_names(&iteration.execution_batches, &mut kernels);
         let iteration_elapsed = iteration_started.elapsed();
         let event_elapsed = started.elapsed();
         if iteration
@@ -1469,6 +1494,7 @@ fn run_prefill_fairness(
         }
     }
     execution.total_elapsed = started.elapsed();
+    execution.kernel = kernel_identity(kernels);
     let requests = (0..request_ids.len())
         .map(|request_index| {
             Ok(PrefillFairnessRequest {
@@ -2135,6 +2161,7 @@ mod tests {
             total_elapsed: Duration::from_micros(prefill_micros + 100),
             peak_kv_cache_bytes: 128,
             peak_reserved_kv_bytes: 128,
+            kernel: None,
         };
         PrefillStrategyTrials {
             samples: vec![sample],

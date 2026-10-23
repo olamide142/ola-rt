@@ -108,6 +108,21 @@ pub enum TraceEvent {
         input_tokens: usize,
         /// Padding positions across all rows.
         padding_tokens: usize,
+        /// Stable executed-kernel provider name, when this invocation used one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel: Option<String>,
+        /// Kernel target family (`portable`, `cpu`, `wgpu`, or `cuda`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel_target: Option<String>,
+        /// Synchronous calls to the selected kernel within this model call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel_calls: Option<u64>,
+        /// Aggregate host wall time inside those calls, in nanoseconds.
+        ///
+        /// Device work is included only when the provider synchronizes before
+        /// returning. Later token read-back is covered by the invocation time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kernel_host_duration_ns: Option<u64>,
         /// When the invocation finished; see `ExecutionBatch::finished_at`.
         finished_us: u64,
     },
@@ -277,6 +292,16 @@ impl Tracer {
                         rows: batch.request_ids.len(),
                         input_tokens: batch.input_tokens,
                         padding_tokens: batch.padding_tokens,
+                        kernel: batch
+                            .kernel
+                            .map(|kernel| kernel.descriptor.name().to_owned()),
+                        kernel_target: batch
+                            .kernel
+                            .map(|kernel| kernel_target(kernel.descriptor.target()).to_owned()),
+                        kernel_calls: batch.kernel.map(|kernel| kernel.calls),
+                        kernel_host_duration_ns: batch
+                            .kernel
+                            .and_then(|kernel| kernel.host_duration_nanos),
                         finished_us: batch.finished_at.as_micros(),
                     },
                 );
@@ -439,6 +464,16 @@ impl Tracer {
             | ExecutorEvent::Deferred { .. }
             | ExecutorEvent::BatchDeferred { .. } => {}
         }
+    }
+}
+
+fn kernel_target(target: ola_kernel::KernelTarget) -> &'static str {
+    match target {
+        ola_kernel::KernelTarget::Portable => "portable",
+        ola_kernel::KernelTarget::Cpu => "cpu",
+        ola_kernel::KernelTarget::Wgpu => "wgpu",
+        ola_kernel::KernelTarget::Cuda => "cuda",
+        _ => "unknown",
     }
 }
 

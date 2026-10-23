@@ -576,6 +576,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(*start),
                     finished_at: Timestamp::from_micros(*finish),
                 })
@@ -687,6 +688,7 @@ mod tests {
                 mode: BatchExecutionMode::Individual,
                 input_tokens: 1,
                 padding_tokens: 0,
+                kernel: None,
                 started_at: Timestamp::from_micros(70),
                 finished_at: Timestamp::from_micros(70),
             }],
@@ -785,6 +787,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 13,
                 padding_tokens: 3,
+                kernel: None,
                 started_at: Timestamp::from_micros(10),
                 finished_at: Timestamp::from_micros(10),
             }],

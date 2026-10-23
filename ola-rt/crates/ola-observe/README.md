@@ -87,7 +87,7 @@ true, and one `TraceEvent`:
 | `admission` | `admitted` (reserved KV, budget fit), `deferred` or `rejected` (reason), `no_slot`, `preparation_failed` | planning |
 | `backfill_skipped` | later work admitted past it | planning |
 | `selection` | the batch policy selected or deferred its next operation (stage, token cost) | planning |
-| `invocation` | it ran in a model call (index, phase, tensor or individual, rows, tokens, padding, finish) | call start |
+| `invocation` | it ran in a model call (index, phase, tensor or individual, rows, tokens, padding, executed kernel identity/target/calls/host duration when applicable, finish) | call start |
 | `prefill_progress` | a prompt segment ran | call finish |
 | `token` | a token was produced (index, ID, phase) | call finish |
 | `completed`, `failed`, `rejected`, `cancelled` | terminal | terminal |
@@ -106,6 +106,12 @@ sums an iteration's invocation latency, and `busy_fraction` is the share of
 the interval since the previous iteration started that the previous
 iteration's invocations occupied: a backend-independent proxy for device
 activity. `ObservationTotals::invocation_micros` accumulates it.
+
+Paged-attention invocations additionally carry the selected provider and the
+aggregate nanoseconds spent synchronously inside its `execute` calls. This is a
+host-call boundary: asynchronous device work is included only if the provider
+synchronizes before returning. The wider invocation interval still ends after
+selected token IDs return to the host.
 
 `ola-core` owns and `ola-observe` re-exports the backend-neutral
 `DeviceTelemetry` interface for device readings:

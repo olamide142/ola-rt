@@ -205,7 +205,7 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs.
 - [ ] Compare optimized paths against the single-request oracle.
 - [x] Record kernel identity, target, configuration, and fallback in plan reports.
-- [ ] Record kernel choices and kernel latency in observability traces.
+- [x] Record kernel choices and synchronous host-call latency in observability traces.
 - [ ] Require warm-ups, repetitions, distributions, workload identity, and numerical conformance before making performance claims.
 
 Done when policy selects an optimized paged-attention kernel with a portable fallback, it matches the reference within tolerance, and a study-grade report measures its effect.

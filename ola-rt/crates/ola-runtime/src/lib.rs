@@ -22,10 +22,10 @@ pub use admission::{
 };
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,
-    CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutionBatch, FifoTokenBudgetPolicy,
-    MixedTokenBudgetPolicy, PowerOfTwoPrefillBatcher, PrefillBatcher, PrefillGroupingEstimate,
-    PrefillGroupingStrategy, QueueAdaptiveTokenBudget, UnboundedBatchPolicy,
-    UnbucketedPrefillBatcher,
+    CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutedKernel, ExecutionBatch,
+    FifoTokenBudgetPolicy, MixedTokenBudgetPolicy, PowerOfTwoPrefillBatcher, PrefillBatcher,
+    PrefillGroupingEstimate, PrefillGroupingStrategy, QueueAdaptiveTokenBudget,
+    UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
 pub use composed::{ComposedPolicy, HeadOfLine};
 pub use decision::{

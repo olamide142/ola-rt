@@ -4,6 +4,7 @@ mod capability;
 mod device;
 mod error;
 mod metadata;
+mod metrics;
 mod paged_attention;
 mod registry;
 
@@ -18,6 +19,7 @@ pub use capability::{
 pub use device::burn_device_target;
 pub use error::KernelError;
 pub use metadata::{KernelDescriptor, KernelOperation, KernelTarget};
+pub use metrics::{KernelExecutionMetrics, KernelExecutionSnapshot};
 pub use paged_attention::{
     PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvPage,
     PortablePagedAttention,

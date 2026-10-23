@@ -317,13 +317,17 @@ fn comparisons_report_identity_differences_and_refuse_incomparable_reports() {
     let mut candidate = baseline.clone();
     candidate.metadata.model = Some("tiny-llama".into());
     candidate.variants[0].policy = Some("policy-changed".into());
+    candidate.variants[0].kernel = Some("kernel-changed".into());
     let comparison = compare_reports(&baseline, &candidate, CompareOptions::default()).unwrap();
     let fields = comparison
         .identity_differences
         .iter()
         .map(|difference| difference.field.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(fields, ["model", "variant fifo policy"]);
+    assert_eq!(
+        fields,
+        ["model", "variant fifo policy", "variant fifo kernel"]
+    );
 
     let mut other_workload = baseline.clone();
     other_workload.workload.digest = content_digest(b"other");

@@ -642,6 +642,7 @@ mod tests {
             total_elapsed: Duration::from_micros(total_micros),
             peak_kv_cache_bytes: 128,
             peak_reserved_kv_bytes: 256,
+            kernel: None,
         }
     }
 }

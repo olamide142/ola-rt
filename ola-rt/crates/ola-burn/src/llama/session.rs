@@ -40,10 +40,11 @@ impl BurnLlamaModel {
 }
 
 fn paged_attention_kernel(context: ModelExecutionContext<'_>) -> Box<dyn PagedAttentionKernel> {
-    context.paged_attention().map_or_else(
-        || Box::new(PortablePagedAttention::new()),
-        ola_kernel::KernelSelection::create,
-    )
+    match (context.paged_attention(), context.kernel_metrics()) {
+        (Some(selection), Some(metrics)) => selection.create_measured(metrics),
+        (Some(selection), None) => selection.create(),
+        (None, _) => Box::new(PortablePagedAttention::new()),
+    }
 }
 
 impl CausalModel for BurnLlamaModel {
@@ -1389,6 +1390,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 5,
                 padding_tokens: 1,
+                kernel: None,
                 started_at: Timestamp::from_micros(10),
                 finished_at: Timestamp::from_micros(10),
             }]
@@ -1404,6 +1406,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                kernel: decoded.execution_batches[0].kernel,
                 started_at: Timestamp::from_micros(20),
                 finished_at: Timestamp::from_micros(20),
             }]
@@ -1428,7 +1431,8 @@ mod tests {
         let policy = ComposedPolicy::default().with_kernel_registry(kernels);
         let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
             .unwrap()
-            .with_policy(policy);
+            .with_policy(policy)
+            .with_clock(Arc::new(ola_core::MonotonicClock::start()));
         executor
             .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
             .unwrap();
@@ -1438,17 +1442,27 @@ mod tests {
             executor.submit(spec, Timestamp::ZERO).unwrap();
         }
 
-        let prefill = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        let prefill = executor
+            .step_iteration(Timestamp::from_micros(1_000_000))
+            .unwrap();
         assert!(prefill.execution_plan.batches[0].kernel.is_none());
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-        let decode = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        let decode = executor
+            .step_iteration(Timestamp::from_micros(2_000_000))
+            .unwrap();
         let planned = decode.execution_plan.batches[0]
             .kernel
             .as_ref()
             .expect("decode carries the selected provider");
         assert_eq!(planned.selection.descriptor(), counting_descriptor());
         assert_eq!(decode.execution_batches[0].mode, BatchExecutionMode::Tensor);
+        let executed = decode.execution_batches[0]
+            .kernel
+            .expect("execution records the selected provider");
+        assert_eq!(executed.descriptor, counting_descriptor());
+        assert_eq!(executed.calls, 2);
+        assert!(executed.host_duration_nanos.is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 

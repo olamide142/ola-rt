@@ -1,8 +1,9 @@
 use std::{fmt, sync::Arc};
 
 use crate::{
-    KernelCapability, KernelDescriptor, KernelError, KernelIncompatibility, KernelOperation,
-    KernelRequirements, KernelTarget, PagedAttentionKernel, PortablePagedAttention,
+    KernelCapability, KernelDescriptor, KernelError, KernelExecutionMetrics, KernelIncompatibility,
+    KernelOperation, KernelRequirements, KernelTarget, PagedAttentionKernel,
+    PortablePagedAttention, metrics::MeasuredPagedAttentionKernel,
 };
 
 /// Factory and capability declaration for a paged-attention implementation.
@@ -82,6 +83,17 @@ impl KernelSelection {
     /// output; stable plan identity is the descriptor plus fallback record.
     pub fn create(&self) -> Box<dyn PagedAttentionKernel> {
         self.provider.create()
+    }
+
+    /// Creates the selected implementation with synchronous host-call timing.
+    pub fn create_measured(
+        &self,
+        metrics: &KernelExecutionMetrics,
+    ) -> Box<dyn PagedAttentionKernel> {
+        Box::new(MeasuredPagedAttentionKernel::new(
+            self.provider.create(),
+            metrics.clone(),
+        ))
     }
 }
 

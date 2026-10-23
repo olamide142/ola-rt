@@ -1,7 +1,7 @@
 use std::{any::Any, error::Error, fmt, sync::Arc};
 
 use ola_core::GenerationConfig;
-use ola_kernel::{KernelSelection, PagedAttentionProfile};
+use ola_kernel::{KernelExecutionMetrics, KernelSelection, PagedAttentionProfile};
 
 /// Stage at which model execution failed.
 ///
@@ -78,9 +78,10 @@ impl Error for ModelExecutionError {}
 /// Model implementations consume only the operations they advertise. Keeping
 /// the provider selection here avoids coupling generic execution traits to a
 /// concrete Burn or CubeCL kernel type.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ModelExecutionContext<'a> {
     paged_attention: Option<&'a KernelSelection>,
+    kernel_metrics: Option<&'a KernelExecutionMetrics>,
 }
 
 impl<'a> ModelExecutionContext<'a> {
@@ -88,6 +89,7 @@ impl<'a> ModelExecutionContext<'a> {
     pub const fn new() -> Self {
         Self {
             paged_attention: None,
+            kernel_metrics: None,
         }
     }
 
@@ -100,6 +102,17 @@ impl<'a> ModelExecutionContext<'a> {
     /// Returns the planned paged-attention provider, when applicable.
     pub const fn paged_attention(self) -> Option<&'a KernelSelection> {
         self.paged_attention
+    }
+
+    /// Attaches the measurement sink for calls to the selected kernel.
+    pub const fn with_kernel_metrics(mut self, metrics: &'a KernelExecutionMetrics) -> Self {
+        self.kernel_metrics = Some(metrics);
+        self
+    }
+
+    /// Returns the measurement sink for selected-kernel calls, when enabled.
+    pub const fn kernel_metrics(self) -> Option<&'a KernelExecutionMetrics> {
+        self.kernel_metrics
     }
 }
 

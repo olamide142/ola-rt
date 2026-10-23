@@ -9,6 +9,7 @@ use std::{
 use ola_core::{
     Clock, Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp,
 };
+use ola_kernel::KernelExecutionMetrics;
 use ola_model::{
     CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionContext,
     ModelExecutionError, PrefillOutcome, SessionMetrics,
@@ -16,11 +17,11 @@ use ola_model::{
 
 use crate::{
     AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecisionRecord, DecodeView,
-    ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, IterationId, LifecycleAction,
-    ModelSnapshot, PlanDivergence, PlanError, PlannedBatch, PlannedDeferral, PlannedPhase,
-    PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError, PolicyMeasurements,
-    PreemptionReason, PrefillView, QueuedRequest, ReleaseReason, RequestRecord, Runtime,
-    RuntimeError, RuntimeState, composed::is_complete_prompt,
+    ExecutedKernel, ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, IterationId,
+    LifecycleAction, ModelSnapshot, PlanDivergence, PlanError, PlannedBatch, PlannedDeferral,
+    PlannedPhase, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
+    PolicyMeasurements, PreemptionReason, PrefillView, QueuedRequest, ReleaseReason, RequestRecord,
+    Runtime, RuntimeError, RuntimeState, composed::is_complete_prompt,
 };
 
 /// Final output retained after successful execution.
@@ -369,6 +370,14 @@ impl Executor {
     /// than `at`.
     fn now(&self, at: Timestamp) -> Timestamp {
         self.clock.as_ref().map_or(at, |clock| clock.now().max(at))
+    }
+
+    fn kernel_execution_metrics(&self) -> KernelExecutionMetrics {
+        if self.clock.is_some() {
+            KernelExecutionMetrics::new()
+        } else {
+            KernelExecutionMetrics::without_timing()
+        }
     }
 
     /// Wraps a runtime with a bounded number of concurrently live sessions.
@@ -999,12 +1008,6 @@ impl Executor {
     ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
         let model = members[0].model.clone();
-        let context = batch
-            .kernel
-            .as_ref()
-            .map_or_else(ModelExecutionContext::new, |kernel| {
-                ModelExecutionContext::new().with_paged_attention(&kernel.selection)
-            });
         let prompts = batch
             .rows
             .iter()
@@ -1018,6 +1021,8 @@ impl Executor {
         } else {
             at
         };
+        let kernel_metrics = self.kernel_execution_metrics();
+        let context = model_execution_context(batch, &kernel_metrics);
         let batched = if batch.mode == BatchExecutionMode::Tensor {
             let prompt_slices = prompts.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let final_chunks = batch
@@ -1073,6 +1078,7 @@ impl Executor {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: batch.input_tokens(),
                 padding_tokens: batch.padding_tokens(),
+                kernel: executed_kernel(batch, &kernel_metrics),
                 started_at,
                 finished_at,
             });
@@ -1109,6 +1115,8 @@ impl Executor {
             }
         } else {
             for (row, mut pending) in batch.rows.iter().zip(members) {
+                let kernel_metrics = self.kernel_execution_metrics();
+                let context = model_execution_context(batch, &kernel_metrics);
                 let started_at = self.now(at);
                 let result = execute_prefill_segment(&mut pending, row.input_tokens(), context);
                 let finished_at = self.now(at);
@@ -1118,6 +1126,7 @@ impl Executor {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: row.input_tokens(),
                     padding_tokens: 0,
+                    kernel: executed_kernel(batch, &kernel_metrics),
                     started_at,
                     finished_at,
                 });
@@ -1234,12 +1243,6 @@ impl Executor {
         at: Timestamp,
     ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
-        let context = batch
-            .kernel
-            .as_ref()
-            .map_or_else(ModelExecutionContext::new, |kernel| {
-                ModelExecutionContext::new().with_paged_attention(&kernel.selection)
-            });
         let input_tokens = members
             .iter()
             .map(|active| active.last_token.id)
@@ -1252,6 +1255,8 @@ impl Executor {
         } else {
             at
         };
+        let kernel_metrics = self.kernel_execution_metrics();
+        let context = model_execution_context(batch, &kernel_metrics);
         let batched = if batch.mode == BatchExecutionMode::Tensor {
             let mut sessions: Vec<&mut dyn GenerationSession> = Vec::with_capacity(members.len());
             for active in &mut members {
@@ -1285,6 +1290,7 @@ impl Executor {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: members.len(),
                 padding_tokens: 0,
+                kernel: executed_kernel(batch, &kernel_metrics),
                 started_at,
                 finished_at,
             });
@@ -1316,6 +1322,8 @@ impl Executor {
             }
         } else {
             for (row, mut active) in batch.rows.iter().zip(members) {
+                let kernel_metrics = self.kernel_execution_metrics();
+                let context = model_execution_context(batch, &kernel_metrics);
                 let started_at = self.now(at);
                 let result = active
                     .session
@@ -1327,6 +1335,7 @@ impl Executor {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: executed_kernel(batch, &kernel_metrics),
                     started_at,
                     finished_at,
                 });
@@ -1647,6 +1656,34 @@ const fn execution_phase(phase: BatchPhase) -> ExecutionPhase {
         BatchPhase::Prefill => ExecutionPhase::Prefill,
         BatchPhase::Decode => ExecutionPhase::Decode,
     }
+}
+
+fn model_execution_context<'a>(
+    batch: &'a PlannedBatch,
+    metrics: &'a KernelExecutionMetrics,
+) -> ModelExecutionContext<'a> {
+    batch
+        .kernel
+        .as_ref()
+        .map_or_else(ModelExecutionContext::new, |kernel| {
+            ModelExecutionContext::new()
+                .with_paged_attention(&kernel.selection)
+                .with_kernel_metrics(metrics)
+        })
+}
+
+fn executed_kernel(
+    batch: &PlannedBatch,
+    metrics: &KernelExecutionMetrics,
+) -> Option<ExecutedKernel> {
+    batch.kernel.as_ref().map(|kernel| {
+        let snapshot = metrics.snapshot();
+        ExecutedKernel {
+            descriptor: kernel.selection.descriptor(),
+            calls: snapshot.calls,
+            host_duration_nanos: snapshot.host_duration_nanos,
+        }
+    })
 }
 
 fn execute_prefill_segment(
@@ -2302,6 +2339,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 3,
                 padding_tokens: 1,
+                kernel: None,
                 started_at: Timestamp::from_micros(3),
                 finished_at: Timestamp::from_micros(3),
             }
@@ -2484,6 +2522,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                kernel: None,
                 started_at: Timestamp::from_micros(10),
                 finished_at: Timestamp::from_micros(10),
             }]
@@ -2525,6 +2564,7 @@ mod tests {
                     mode: BatchExecutionMode::Tensor,
                     input_tokens: 2,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(20),
                     finished_at: Timestamp::from_micros(20),
                 },
@@ -2534,6 +2574,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(20),
                     finished_at: Timestamp::from_micros(20),
                 },
@@ -2583,6 +2624,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(10),
                     finished_at: Timestamp::from_micros(10),
                 },
@@ -2592,6 +2634,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(10),
                     finished_at: Timestamp::from_micros(10),
                 },
@@ -2618,6 +2661,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(20),
                     finished_at: Timestamp::from_micros(20),
                 },
@@ -2627,6 +2671,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 1,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(20),
                     finished_at: Timestamp::from_micros(20),
                 },
@@ -2735,6 +2780,7 @@ mod tests {
                 mode: BatchExecutionMode::Tensor,
                 input_tokens: 2,
                 padding_tokens: 0,
+                kernel: None,
                 started_at: Timestamp::from_micros(20),
                 finished_at: Timestamp::from_micros(20),
             }]
@@ -3482,6 +3528,7 @@ mod tests {
                     mode: BatchExecutionMode::Tensor,
                     input_tokens: 12,
                     padding_tokens: 2,
+                    kernel: None,
                     started_at: Timestamp::from_micros(10),
                     finished_at: Timestamp::from_micros(10),
                 },
@@ -3491,6 +3538,7 @@ mod tests {
                     mode: BatchExecutionMode::Individual,
                     input_tokens: 9,
                     padding_tokens: 0,
+                    kernel: None,
                     started_at: Timestamp::from_micros(10),
                     finished_at: Timestamp::from_micros(10),
                 },

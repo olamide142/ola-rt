@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-23 12:11 BST (Europe/London)
+**Last updated:** 2026-10-23 12:46 BST (Europe/London)
 
-**Source revision:** working tree based on `14aabe6` on `master`
+**Source revision:** working tree based on `c5c22da` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -35,8 +35,11 @@ profiles; policy resolves a provider only after other policies settle exact
 rows, and validated execution plans plus schema-v6 plan reports retain the
 requirements, provider, and fallback diagnostics. Runtime execution now passes
 that exact provider into individual and tensor-batched Llama decode/resumable
-prefill calls. Kernel-track steps 1–2 are committed through `14aabe6`; execution
-delegation is complete in this checkpoint.
+prefill calls. Actual execution records and request traces now add provider
+identity, target, call count, and clock-gated synchronous host duration;
+model-backed experiment variants retain the canonical provider set they
+actually invoked. Kernel-track steps 1–3 are committed through `c5c22da`;
+observability/report closure is complete in this working tree.
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -184,11 +187,11 @@ performance claim.
 | Execution policy | Kernel-aware | `ExecutionPolicy` plans from an immutable snapshot through `&self`; `ComposedPolicy` combines scheduler, admission, batch, grouping, and kernel-registry decisions with stable descriptors and full decision records |
 | Execution planning | Kernel-aware | Each validated `ExecutionPlan` records admissions, invocations, kernel requirements/selections, deferrals, and predicted releases before atomic commit; divergences recorded; schema-v6 `PlanReport` JSON |
 | Batch composition | Adaptive baseline working | Auditable token budget plus unbucketed, power-of-two, and cost-aware workload grouping |
-| Observability | Working | Model-call timing, per-token timestamps and inter-token distributions, iteration correlation IDs, per-request traces (HTTP endpoint, JSON Lines for the server and traceable experiments), device memory and utilization via CubeCL, busy fraction; shown not to change execution |
+| Observability | Kernel-aware | Model-call and synchronous kernel host timing, executed provider identity/call counts, per-token timestamps and inter-token distributions, iteration correlation IDs, per-request traces, device memory/utilization, and busy fraction; shown not to change execution |
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
 | Experiment framework | Working | `ExperimentRegistry` of twelve experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
 | Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
-| Kernel abstraction | Planned execution working | Validated paged-attention contract, model profiles, deterministic provider registry, typed portable fallback, plan/report integration, and exact-provider delegation into individual and tensor-batched Llama execution |
+| Kernel abstraction | Observable planned execution | Validated paged-attention contract, model profiles, deterministic provider registry, typed portable fallback, exact-provider delegation, execution/trace identity and synchronous host timing, and experiment variant identity |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -496,6 +499,13 @@ performance claim.
 
 At the working tree recorded above:
 
+- Kernel-track step 4 validation: 247 tests passed across kernel, model,
+  runtime, observation, Burn, and benchmark crates (3 external-fixture tests
+  ignored), including exact-provider call aggregation, trace JSON round-trip,
+  and report comparison on kernel identity. WGPU and CUDA all-target feature
+  compilation, workspace checks, Clippy with warnings denied, and
+  documentation passed. Clockless execution disables wall-time sampling so
+  replay records retain deterministic provider/call data.
 - Kernel-track step 3 validation: the focused kernel/model/runtime/Burn suites
   passed (158 tests, with 3 ignored fixture tests); all 15 CubeCL CPU kernel
   tests passed, including numerical conformance and compiled-provider
@@ -698,9 +708,10 @@ and `TOKENS` variables.
 - Slots freed by EOS or failure are refilled on the next iteration because
   plans are built before execution; only limit-reaching completions are reused
   in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
-- Execution and plan reports carry the selected provider, but invocation traces
-  do not yet record kernel identity or isolate kernel latency from the wider
-  model-call interval.
+- Invocation traces carry the selected provider, target, call count, and
+  synchronous host duration inside `PagedAttentionKernel::execute`. That is
+  not device-event timing: asynchronous backend work is included only when the
+  provider synchronizes before returning.
 - Batch timing measures from just before a model call to after its token IDs
   return to the host; work a backend leaves queued beyond that boundary is
   not attributed.
@@ -722,8 +733,9 @@ and `TOKENS` variables.
 - The in-executor adaptive prefill policy still calibrates from two points;
   the least-squares fit is available to experiments but not yet wired into
   the default policy.
-- Plan reports record complete kernel decisions, but experiment variants do
-  not yet populate their kernel-identity field from those plans.
+- Model-backed experiment variants populate kernel identity from providers that
+  were actually called. Full-prefill-only calibration correctly remains
+  unlabelled because it does not invoke paged decode attention.
 - Report comparison treats overlapping intervals as inconclusive; it does
   not yet run a paired test, so small real changes need more repetitions.
 
@@ -746,8 +758,6 @@ and `TOKENS` variables.
    - gate regressions in CI with `ola experiment compare`.
 
 3. **Paged-attention optimization (Kernel track, next)**
-   - record executed kernel identity and timing in observability traces and
-     experiment variants;
    - re-run the page-size sweep with real kernel cost per page;
    - fuse page traversal, score reduction, and value accumulation where the
      selected accelerator backend permits;
@@ -770,6 +780,16 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-23 12:46 BST — working tree on `c5c22da`:** Completed kernel-track
+  step 4: measured provider wrappers aggregate synchronous call count and host
+  duration per actual execution batch; request traces emit provider identity,
+  target, calls, and optional nanoseconds; clockless replay keeps timing absent
+  and deterministic; model-backed experiment variants retain providers that
+  were actually invoked, and report comparison surfaces kernel changes. All
+  247 affected-crate tests pass (3 fixture tests ignored), and WGPU/CUDA
+  all-target feature compilation, workspace checks, Clippy, and documentation
+  pass.
 
 - **2026-10-23 12:11 BST — working tree on `14aabe6`:** Completed kernel-track
   step 3: exact provider handles survive planning, `ModelExecutionContext`

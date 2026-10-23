@@ -3,6 +3,7 @@
 use std::any::Any;
 
 use ola_core::{GenerationConfig, ModelDescriptor, RequestId, RequestSpec, Timestamp};
+use ola_kernel::{KernelDescriptor, KernelOperation, KernelTarget};
 use ola_model::{
     CausalLanguageModel, CausalModel, GeneratedToken, GenerationSession, ModelExecutionError,
     SessionMetrics, Tokenizer,
@@ -11,7 +12,7 @@ use ola_observe::{
     TraceEvent, TraceRecord, Tracer,
     trace::{read_jsonl, write_jsonl},
 };
-use ola_runtime::{Executor, Runtime};
+use ola_runtime::{ExecutedKernel, Executor, Runtime};
 
 struct Numbers;
 
@@ -127,9 +128,20 @@ fn traces_follow_each_request_from_arrival_to_its_outcome() {
         .unwrap();
     records.extend(tracer.observe_cancellation(cancelled, executor.state()));
     for step in [10, 20, 30] {
-        let iteration = executor
+        let mut iteration = executor
             .step_iteration(Timestamp::from_micros(step))
             .unwrap();
+        if step == 20 {
+            iteration.execution_batches[0].kernel = Some(ExecutedKernel {
+                descriptor: KernelDescriptor::new(
+                    "trace-test-kernel",
+                    KernelOperation::PagedAttentionDecode,
+                    KernelTarget::Cpu,
+                ),
+                calls: 3,
+                host_duration_nanos: Some(1_250),
+            });
+        }
         records.extend(tracer.observe_iteration(&iteration, executor.state()));
     }
 
@@ -186,6 +198,28 @@ fn traces_follow_each_request_from_arrival_to_its_outcome() {
         .unwrap();
     assert_eq!(arrival.at_us, 2);
     assert_eq!(arrival.iteration, None);
+    let kernel_invocation = records
+        .iter()
+        .find_map(|record| match &record.event {
+            TraceEvent::Invocation {
+                kernel: Some(kernel),
+                kernel_target,
+                kernel_calls,
+                kernel_host_duration_ns,
+                ..
+            } => Some((
+                kernel.as_str(),
+                kernel_target.as_deref(),
+                *kernel_calls,
+                *kernel_host_duration_ns,
+            )),
+            _ => None,
+        })
+        .expect("instrumented invocation is traced");
+    assert_eq!(
+        kernel_invocation,
+        ("trace-test-kernel", Some("cpu"), Some(3), Some(1_250),)
+    );
     assert!(
         records
             .iter()
