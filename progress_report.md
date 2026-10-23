@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-23 12:46 BST (Europe/London)
+**Last updated:** 2026-10-23 13:08 BST (Europe/London)
 
-**Source revision:** working tree based on `c5c22da` on `master`
+**Source revision:** working tree based on `5cd3da2` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -38,8 +38,10 @@ that exact provider into individual and tensor-batched Llama decode/resumable
 prefill calls. Actual execution records and request traces now add provider
 identity, target, call count, and clock-gated synchronous host duration;
 model-backed experiment variants retain the canonical provider set they
-actually invoked. Kernel-track steps 1–3 are committed through `c5c22da`;
-observability/report closure is complete in this working tree.
+actually invoked. Kernel-track steps 1–4 are committed through `5cd3da2`.
+The current working tree removes the non-compiling per-page tensor-sequence
+prototype and records the device-resident flattened-buffer direction for the
+next optimization.
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -499,6 +501,10 @@ performance claim.
 
 At the working tree recorded above:
 
+- CubeCL optimization probe: directly compiling the old per-page prototype
+  failed because CubeCL 0.11 cannot use `Sequence<Tensor<F>>` launch arguments;
+  the prototype also bypassed Burn Fusion conversion. It was removed, the
+  limitation was recorded, and CubeCL CPU feature compilation passes again.
 - Kernel-track step 4 validation: 247 tests passed across kernel, model,
   runtime, observation, Burn, and benchmark crates (3 external-fixture tests
   ignored), including exact-provider call aggregation, trace JSON round-trip,
@@ -669,6 +675,9 @@ and `TOKENS` variables.
 - Page-native attention is a correctness-first composition of portable Burn
   operations, not a fused CUDA/WGPU kernel; performance must be measured before
   making speed claims.
+- CubeCL 0.11 cannot launch a sequence of tensor page bindings. Removing
+  pre-dispatch concatenation therefore requires a device-resident flattened K/V
+  allocation plus page-offset metadata, not the removed per-page prototype.
 - Native CUDA is wired and compiles, but this machine cannot execute it until a
   compatible CUDA toolkit providing NVRTC is installed. WGPU is the currently
   validated local GPU path.
@@ -780,6 +789,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-23 13:08 BST — working tree on `5cd3da2`:** Probed and rejected the
+  unwired per-page CubeCL prototype: `Sequence<Tensor<F>>` is not a valid
+  CubeCL 0.11 launch argument and its primitive conversions bypass Burn Fusion.
+  Removed the obsolete file, documented the flattened device-buffer/page-offset
+  direction, and revalidated CubeCL CPU feature compilation.
 
 - **2026-10-23 12:46 BST — working tree on `c5c22da`:** Completed kernel-track
   step 4: measured provider wrappers aggregate synchronous call count and host

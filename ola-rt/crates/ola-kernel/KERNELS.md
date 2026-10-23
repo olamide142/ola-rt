@@ -29,8 +29,8 @@ implementations.
   1. It concatenates page tensors (`BurnTensor::cat`) into a contiguous
      tensor before dispatch to work around CubeCL 0.11 sequence limits.
   2. The kernel recomputes query-key scores for every output dimension.
-  3. `ola-kernel/src/cubecl_paged_attention.rs` is a tracked but unwired
-     alternative attempting per-page bindings.
+  3. A now-removed `cubecl_paged_attention.rs` prototype attempted per-page
+     tensor bindings, which CubeCL 0.11 cannot represent as launch arguments.
 - **Kernel selection is embedded in Llama.** In `ola-burn/src/llama/model.rs`,
   decode attention checks compile-time `#[cfg(feature = "wgpu")]` and
   `#[cfg(feature = "cuda")]` flags and hardcodes `CubePagedAttention::new`,
@@ -135,7 +135,11 @@ implementations.
 5. **Optimize CubeCL paged attention.**
    Eliminate pre-dispatch tensor concatenation in `CubePagedAttention`. Implement
    fused page traversal, online softmax reduction, and value accumulation.
-   Clean up or remove obsolete unwired prototypes.
+   The obsolete unwired prototype is removed: a 2026-10-23 compile probe
+   confirmed CubeCL 0.11 cannot use `Sequence<Tensor<F>>` as a launch argument,
+   and the prototype also bypassed Burn Fusion conversion. Use a device-resident
+   flattened K/V allocation plus page-offset metadata instead of per-page
+   tensor bindings.
 6. **Conformance and study-grade evaluation.**
    Implement conformance tests across diverse page counts and head configurations.
    Execute an empirical kernel comparison benchmark in `ola-bench` evaluating
