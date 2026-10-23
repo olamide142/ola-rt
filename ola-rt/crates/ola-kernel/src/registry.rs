@@ -1,3 +1,5 @@
+use std::{fmt, sync::Arc};
+
 use crate::{
     KernelCapability, KernelDescriptor, KernelError, KernelIncompatibility, KernelOperation,
     KernelRequirements, KernelTarget, PagedAttentionKernel, PortablePagedAttention,
@@ -51,10 +53,11 @@ impl KernelFallbackReason {
 }
 
 /// Deterministic result of matching requirements against registered providers.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct KernelSelection {
     descriptor: KernelDescriptor,
     fallback_reason: Option<KernelFallbackReason>,
+    provider: Arc<dyn PagedAttentionProvider>,
 }
 
 impl KernelSelection {
@@ -72,10 +75,36 @@ impl KernelSelection {
     pub const fn is_fallback(&self) -> bool {
         self.fallback_reason.is_some()
     }
+
+    /// Creates the exact provider implementation retained by this selection.
+    ///
+    /// The executable handle is deliberately omitted from equality and debug
+    /// output; stable plan identity is the descriptor plus fallback record.
+    pub fn create(&self) -> Box<dyn PagedAttentionKernel> {
+        self.provider.create()
+    }
 }
 
+impl fmt::Debug for KernelSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KernelSelection")
+            .field("descriptor", &self.descriptor)
+            .field("fallback_reason", &self.fallback_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for KernelSelection {
+    fn eq(&self, other: &Self) -> bool {
+        self.descriptor == other.descriptor && self.fallback_reason == other.fallback_reason
+    }
+}
+
+impl Eq for KernelSelection {}
+
 struct RegisteredProvider {
-    provider: Box<dyn PagedAttentionProvider>,
+    provider: Arc<dyn PagedAttentionProvider>,
     capability: KernelCapability,
     priority: u16,
 }
@@ -100,6 +129,40 @@ impl KernelRegistry {
         registry
             .register(PortablePagedAttention::new())
             .expect("the built-in portable provider declaration is valid");
+        registry
+    }
+
+    /// Creates the portable registry plus every provider compiled into this
+    /// build.
+    ///
+    /// Capability matching still decides whether a compiled provider can run
+    /// a particular model invocation; feature availability alone never forces
+    /// its selection.
+    pub fn with_compiled_providers() -> Self {
+        let registry = Self::new();
+        #[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+        let mut registry = registry;
+        #[cfg(feature = "cubecl-cpu")]
+        registry
+            .register(
+                crate::CubePagedAttention::new(KernelTarget::Cpu)
+                    .expect("the CubeCL CPU feature supports the CPU target"),
+            )
+            .expect("the built-in CubeCL CPU provider declaration is valid");
+        #[cfg(feature = "wgpu")]
+        registry
+            .register(
+                crate::CubePagedAttention::new(KernelTarget::Wgpu)
+                    .expect("the CubeCL WGPU feature supports the WGPU target"),
+            )
+            .expect("the built-in CubeCL WGPU provider declaration is valid");
+        #[cfg(feature = "cuda")]
+        registry
+            .register(
+                crate::CubePagedAttention::new(KernelTarget::Cuda)
+                    .expect("the CubeCL CUDA feature supports the CUDA target"),
+            )
+            .expect("the built-in CubeCL CUDA provider declaration is valid");
         registry
     }
 
@@ -137,7 +200,7 @@ impl KernelRegistry {
         }
         self.providers.push(RegisteredProvider {
             priority: provider.priority(),
-            provider: Box::new(provider),
+            provider: Arc::new(provider),
             capability,
         });
         Ok(())
@@ -177,6 +240,7 @@ impl KernelRegistry {
             return Ok(KernelSelection {
                 descriptor: provider.capability.descriptor(),
                 fallback_reason: None,
+                provider: Arc::clone(&provider.provider),
             });
         }
 
@@ -217,6 +281,7 @@ impl KernelRegistry {
         Ok(KernelSelection {
             descriptor: portable.capability.descriptor(),
             fallback_reason,
+            provider: Arc::clone(&portable.provider),
         })
     }
 
@@ -228,7 +293,7 @@ impl KernelRegistry {
         self.providers
             .iter()
             .find(|provider| provider.capability.descriptor() == selection.descriptor)
-            .map(|provider| provider.provider.create())
+            .map(|_| selection.create())
             .ok_or_else(|| {
                 KernelError::new(format!(
                     "selected kernel provider {} is not registered",
@@ -351,7 +416,6 @@ mod tests {
 
     #[test]
     fn selected_provider_can_create_a_kernel() {
-        let registry = KernelRegistry::new();
         let requirements = KernelRequirements::paged_attention_decode(
             KernelTarget::Portable,
             KernelDType::F32,
@@ -361,10 +425,29 @@ mod tests {
         )
         .unwrap();
 
-        let selection = registry.select(requirements).unwrap();
-        let kernel = registry.create(&selection).unwrap();
+        let selection = KernelRegistry::new().select(requirements).unwrap();
+        let kernel = selection.create();
 
         assert_eq!(kernel.descriptor(), selection.descriptor());
+        assert!(!selection.is_fallback());
+    }
+
+    #[cfg(feature = "cubecl-cpu")]
+    #[test]
+    fn compiled_provider_registry_selects_cubecl_for_its_target() {
+        let registry = KernelRegistry::with_compiled_providers();
+        let requirements = KernelRequirements::paged_attention_decode(
+            KernelTarget::Cpu,
+            KernelDType::F32,
+            128,
+            4,
+            2,
+        )
+        .unwrap();
+
+        let selection = registry.select(requirements).unwrap();
+
+        assert_eq!(selection.descriptor().name(), "cubecl-cpu-paged-attention");
         assert!(!selection.is_fallback());
     }
 }

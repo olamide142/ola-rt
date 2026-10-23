@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
 use ola_core::GenerationConfig;
+use ola_kernel::{PagedAttentionKernel, PortablePagedAttention};
 use ola_model::{
     BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
-    ModelExecutionError, PrefillOutcome, SessionMetrics,
+    ModelExecutionContext, ModelExecutionError, PrefillOutcome, SessionMetrics,
 };
 use ola_runtime::KvBlockError;
 
@@ -36,6 +37,13 @@ impl BurnLlamaModel {
             cache_pool: Arc::new(Mutex::new(cache_pool)),
         })
     }
+}
+
+fn paged_attention_kernel(context: ModelExecutionContext<'_>) -> Box<dyn PagedAttentionKernel> {
+    context.paged_attention().map_or_else(
+        || Box::new(PortablePagedAttention::new()),
+        ola_kernel::KernelSelection::create,
+    )
 }
 
 impl CausalModel for BurnLlamaModel {
@@ -256,6 +264,21 @@ impl CausalModel for BurnLlamaModel {
         prompt_chunks: &[&[u32]],
         is_final: &[bool],
     ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+        self.prefill_chunk_batch_with_context(
+            sessions,
+            prompt_chunks,
+            is_final,
+            ModelExecutionContext::new(),
+        )
+    }
+
+    fn prefill_chunk_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_chunks: &[&[u32]],
+        is_final: &[bool],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
         let batch_size = sessions.len();
         if prompt_chunks.len() != batch_size || is_final.len() != batch_size {
             return Some(batch_error(
@@ -312,6 +335,7 @@ impl CausalModel for BurnLlamaModel {
             TensorData::new(token_values, [batch_size, padded_length]),
             &self.device,
         );
+        let kernel = paged_attention_kernel(context);
         let logits = {
             let mut caches = typed
                 .iter_mut()
@@ -326,6 +350,7 @@ impl CausalModel for BurnLlamaModel {
                 input_ids,
                 caches.as_mut_slice(),
                 &sequence_lengths,
+                kernel.as_ref(),
             ) {
                 Ok(logits) => logits,
                 Err(error) => {
@@ -397,6 +422,15 @@ impl CausalModel for BurnLlamaModel {
         sessions: &mut [&mut dyn GenerationSession],
         input_tokens: &[u32],
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        self.decode_batch_with_context(sessions, input_tokens, ModelExecutionContext::new())
+    }
+
+    fn decode_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        input_tokens: &[u32],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
         let batch_size = sessions.len();
         if input_tokens.len() != batch_size {
             return Some(batch_error(
@@ -444,6 +478,7 @@ impl CausalModel for BurnLlamaModel {
             .collect::<Vec<_>>();
         let input_ids: Tensor<2, Int> =
             Tensor::from_data(TensorData::new(token_values, [batch_size, 1]), &self.device);
+        let kernel = paged_attention_kernel(context);
         let logits = {
             let mut caches = typed
                 .iter_mut()
@@ -454,7 +489,10 @@ impl CausalModel for BurnLlamaModel {
                         .expect("Llama sessions allocate a cache at creation")
                 })
                 .collect::<Vec<_>>();
-            match self.module.decode_batch(input_ids, caches.as_mut_slice()) {
+            match self
+                .module
+                .decode_batch(input_ids, caches.as_mut_slice(), kernel.as_ref())
+            {
                 Ok(logits) => logits,
                 Err(error) => {
                     return Some(batch_error(
@@ -701,6 +739,15 @@ impl GenerationSession for LlamaSession {
         prompt_tokens: &[u32],
         is_final: bool,
     ) -> Result<PrefillOutcome, ModelExecutionError> {
+        self.prefill_chunk_with_context(prompt_tokens, is_final, ModelExecutionContext::new())
+    }
+
+    fn prefill_chunk_with_context(
+        &mut self,
+        prompt_tokens: &[u32],
+        is_final: bool,
+        context: ModelExecutionContext<'_>,
+    ) -> Result<PrefillOutcome, ModelExecutionError> {
         self.validate_prefill_chunk(prompt_tokens)?;
         let token_values = prompt_tokens.iter().map(|&id| i64::from(id)).collect();
         let input_ids: Tensor<2, Int> = Tensor::from_data(
@@ -711,9 +758,10 @@ impl GenerationSession for LlamaSession {
             .cache
             .as_mut()
             .expect("sessions allocate a cache at creation");
+        let kernel = paged_attention_kernel(context);
         let logits = self
             .module
-            .prefill_chunk(input_ids, cache)
+            .prefill_chunk(input_ids, cache, kernel.as_ref())
             .map_err(|error| cache_error(ExecutionStage::Prefill, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
         self.accept_tokens(prompt_tokens);
@@ -727,6 +775,14 @@ impl GenerationSession for LlamaSession {
     }
 
     fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError> {
+        self.decode_with_context(input_token, ModelExecutionContext::new())
+    }
+
+    fn decode_with_context(
+        &mut self,
+        input_token: u32,
+        context: ModelExecutionContext<'_>,
+    ) -> Result<GeneratedToken, ModelExecutionError> {
         self.validate_decode_input(input_token)?;
         let input_ids: Tensor<2, Int> = Tensor::from_data(
             TensorData::new(vec![i64::from(input_token)], [1, 1]),
@@ -738,9 +794,10 @@ impl GenerationSession for LlamaSession {
                 "decode requires an initialized KV cache",
             )
         })?;
+        let kernel = paged_attention_kernel(context);
         let logits = self
             .module
-            .decode(input_ids, cache)
+            .decode(input_ids, cache, kernel.as_ref())
             .map_err(|error| cache_error(ExecutionStage::Decode, error))?;
         self.metrics.kv_cache_bytes = cache.bytes();
         self.accept_tokens(&[input_token]);
@@ -795,9 +852,18 @@ fn batch_error<T>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use burn::tensor::Tensor;
     use ola_core::{ModelDescriptor, RequestSpec, Timestamp};
+    use ola_kernel::{
+        KernelCapability, KernelDType, KernelDescriptor, KernelOperation, KernelRegistry,
+        KernelTarget, PagedAttentionInput, PagedAttentionProfile, PagedAttentionProvider,
+    };
     use ola_model::{CausalLanguageModel, Tokenizer};
-    use ola_runtime::{BatchExecutionMode, BatchPhase, ExecutionBatch, Executor, Runtime};
+    use ola_runtime::{
+        BatchExecutionMode, BatchPhase, ComposedPolicy, ExecutionBatch, Executor, Runtime,
+    };
 
     use super::*;
 
@@ -864,6 +930,58 @@ mod tests {
         let module = LlamaForCausalLM::init(&config, &device);
         BurnLlamaModel::with_kv_cache(module, config, device, LlamaKvCacheConfig::new(64, 16))
             .unwrap()
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    struct CountingKernel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    const fn counting_descriptor() -> KernelDescriptor {
+        KernelDescriptor::new(
+            "test-counting-paged-attention",
+            KernelOperation::PagedAttentionDecode,
+            KernelTarget::Cpu,
+        )
+    }
+
+    impl PagedAttentionProvider for CountingProvider {
+        fn capability(&self) -> KernelCapability {
+            KernelCapability::new(
+                counting_descriptor(),
+                [KernelTarget::Cpu],
+                [KernelDType::F32],
+            )
+            .with_head_dimensions([4])
+            .with_gqa_ratios([2])
+        }
+
+        fn priority(&self) -> u16 {
+            10
+        }
+
+        fn create(&self) -> Box<dyn PagedAttentionKernel> {
+            Box::new(CountingKernel {
+                calls: Arc::clone(&self.calls),
+            })
+        }
+    }
+
+    impl PagedAttentionKernel for CountingKernel {
+        fn descriptor(&self) -> KernelDescriptor {
+            counting_descriptor()
+        }
+
+        fn execute(
+            &self,
+            input: PagedAttentionInput,
+        ) -> Result<Tensor<4>, ola_kernel::KernelError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            PortablePagedAttention::new().execute(input)
+        }
     }
 
     fn greedy(max_new_tokens: usize) -> GenerationConfig {
@@ -1292,6 +1410,46 @@ mod tests {
         );
         assert_eq!(decoded.active_requests, 2);
         assert_eq!(decoded.execution_plan.estimates().input_tokens, 2);
+    }
+
+    #[test]
+    fn executor_routes_the_planned_provider_into_tensor_decode() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut kernels = KernelRegistry::new();
+        kernels
+            .register(CountingProvider {
+                calls: Arc::clone(&calls),
+            })
+            .unwrap();
+        let profile =
+            PagedAttentionProfile::new(KernelTarget::Cpu, KernelDType::F32, 2, 1, 4, 16).unwrap();
+        let artifact = CausalLanguageModel::new(NumericTokenizer, tiny_model())
+            .with_paged_attention_profile(profile);
+        let policy = ComposedPolicy::default().with_kernel_registry(kernels);
+        let mut executor = Executor::with_max_active_requests(Runtime::default(), 2)
+            .unwrap()
+            .with_policy(policy);
+        executor
+            .register_model(ModelDescriptor::language("tiny", "llama"), artifact)
+            .unwrap();
+        for prompt in ["1 4", "1 5 7"] {
+            let mut spec = RequestSpec::text("tiny", prompt);
+            spec.generation = greedy(2);
+            executor.submit(spec, Timestamp::ZERO).unwrap();
+        }
+
+        let prefill = executor.step_iteration(Timestamp::from_micros(10)).unwrap();
+        assert!(prefill.execution_plan.batches[0].kernel.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let decode = executor.step_iteration(Timestamp::from_micros(20)).unwrap();
+        let planned = decode.execution_plan.batches[0]
+            .kernel
+            .as_ref()
+            .expect("decode carries the selected provider");
+        assert_eq!(planned.selection.descriptor(), counting_descriptor());
+        assert_eq!(decode.execution_batches[0].mode, BatchExecutionMode::Tensor);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-22 12:05 BST (Europe/London)
+**Last updated:** 2026-10-23 12:11 BST (Europe/London)
 
-**Source revision:** working tree based on `b78bb5e` on `master`
+**Source revision:** working tree based on `14aabe6` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -33,8 +33,10 @@ by declared constraints and stable priority, or records a typed reason for
 portable fallback. Model artifacts can now publish target/dtype/attention/page
 profiles; policy resolves a provider only after other policies settle exact
 rows, and validated execution plans plus schema-v6 plan reports retain the
-requirements, provider, and fallback diagnostics. Kernel-track step 1 is
-committed as `b78bb5e`; the execution-planning integration is uncommitted.
+requirements, provider, and fallback diagnostics. Runtime execution now passes
+that exact provider into individual and tensor-batched Llama decode/resumable
+prefill calls. Kernel-track steps 1–2 are committed through `14aabe6`; execution
+delegation is complete in this checkpoint.
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -186,7 +188,7 @@ performance claim.
 | Workloads and metrics | Calibrated execution probe | Fixed replay, cost calibration, rotating three-way trials, repeated mixed-workload chunk fairness, per-request TTFT/completion latency distributions, raw samples, summaries, schema-v2 JSON |
 | Experiment framework | Working | `ExperimentRegistry` of twelve experiments (probes and studies); `ola-experiment/1` reports with typed metrics, raw samples, recomputed summaries, seeded bootstrap intervals, and full identity; report comparison with interval-separated verdicts; least-squares cost calibration feeding virtual time; legacy v2 import |
 | Experiment CLI | Working | `ola experiment list/run/compare` with CI exit codes; reports identical to the workbench's |
-| Kernel abstraction | Planned selection working | Validated paged-attention contract, model profiles, target/dtype/shape/page constraints, deterministic provider registry, typed portable fallback, and plan/report integration; Llama execution delegation is next |
+| Kernel abstraction | Planned execution working | Validated paged-attention contract, model profiles, deterministic provider registry, typed portable fallback, plan/report integration, and exact-provider delegation into individual and tensor-batched Llama execution |
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
@@ -494,6 +496,13 @@ performance claim.
 
 At the working tree recorded above:
 
+- Kernel-track step 3 validation: the focused kernel/model/runtime/Burn suites
+  passed (158 tests, with 3 ignored fixture tests); all 15 CubeCL CPU kernel
+  tests passed, including numerical conformance and compiled-provider
+  selection; WGPU and CUDA feature compilation passed; formatting, workspace
+  checks, Clippy with warnings denied, and documentation passed. A final
+  workspace-test rerun completed at the process level, but its terminal adapter
+  did not return an exit status, so it is not counted as additional evidence.
 - `make verify`: **passed** (formatting, workspace checks, 289 tests, Clippy
   with warnings denied, and documentation) with zero compiler warnings; 13
   fixture tests ignored by default.
@@ -689,9 +698,9 @@ and `TOKENS` variables.
 - Slots freed by EOS or failure are refilled on the next iteration because
   plans are built before execution; only limit-reaching completions are reused
   in the same iteration. The TTFT effect on EOS-heavy traces is unmeasured.
-- Execution plans select and validate kernel providers, but Llama execution
-  still instantiates CubeCL or portable attention through compile-time target
-  checks rather than consuming the planned selection.
+- Execution and plan reports carry the selected provider, but invocation traces
+  do not yet record kernel identity or isolate kernel latency from the wider
+  model-call interval.
 - Batch timing measures from just before a model call to after its token IDs
   return to the host; work a backend leaves queued beyond that boundary is
   not attributed.
@@ -737,8 +746,8 @@ and `TOKENS` variables.
    - gate regressions in CI with `ola experiment compare`.
 
 3. **Paged-attention optimization (Kernel track, next)**
-   - make Llama consume the planned provider instead of compile-time target
-     checks;
+   - record executed kernel identity and timing in observability traces and
+     experiment variants;
    - re-run the page-size sweep with real kernel cost per page;
    - fuse page traversal, score reduction, and value accumulation where the
      selected accelerator backend permits;
@@ -761,6 +770,14 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-23 12:11 BST — working tree on `14aabe6`:** Completed kernel-track
+  step 3: exact provider handles survive planning, `ModelExecutionContext`
+  routes them through individual and tensor-batched decode/resumable prefill,
+  Llama no longer chooses CubeCL through compile-time branches, compiled
+  providers populate the default policy registry, and a counting-provider
+  integration test proves the planned implementation executes. Default core
+  tests pass, all 15 CubeCL CPU kernel tests pass, and WGPU/CUDA targets compile.
 
 - **2026-10-22 12:05 BST — working tree on `b78bb5e`:** Completed kernel-track
   step 2: model paged-attention profiles, per-decode/resumable-prefill

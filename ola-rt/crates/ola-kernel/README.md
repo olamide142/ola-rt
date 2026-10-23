@@ -47,8 +47,9 @@ The registry always contains the portable provider. Feature-gated CubeCL
 implementations publish f32 target capabilities and a higher preference; equal
 priorities are ordered by stable provider name, so registration order cannot
 change a plan. Runtime plans now retain the exact requirements, selected
-provider, and portable-fallback diagnostics. The Llama decoder still selects
-its implementation locally until execution delegation is complete.
+provider, and portable-fallback diagnostics. Each selection retains its exact
+provider factory behind the stable descriptor, so the runtime can pass it into
+Llama without resolving the name through a second registry.
 
 ## Invariants
 
@@ -89,10 +90,9 @@ Before an optimized implementation is selected by the model path:
 
 ## Next integration step
 
-Let the Llama execution context resolve the plan's `KernelSelection` instead of
-instantiating a CubeCL kernel behind compile-time feature checks. Tune the
-existing CubeCL kernel against the portable path after that boundary is
-observable. It
+Record the executed selection and invocation timing in observability traces,
+then populate experiment identities from those records. Tune the existing
+CubeCL kernel against the portable path after that boundary is observable. It
 currently concatenates page tensors before dispatch and recomputes each
 query/key score for every output dimension, so optimization should focus on
 device-side page layout and reducing redundant arithmetic.

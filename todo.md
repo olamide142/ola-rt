@@ -196,6 +196,7 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 - [x] Represent backend/device and kernel selections in `ExecutionPlan`.
 - [x] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
 - [x] Add provider selection and portable fallback.
+- [x] Route planned providers into individual and tensor-batched model execution.
 - [ ] Compare every optimized implementation with the portable reference.
 - [ ] Fuse page traversal, score reduction, and value accumulation.
 - [ ] Optimize request-local tensor-batched decode attention.

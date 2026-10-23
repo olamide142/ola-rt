@@ -66,7 +66,7 @@ impl Default for ComposedPolicy {
             grouping: Box::new(UnbucketedPrefillBatcher),
             head_of_line: HeadOfLine::Block,
             preemption: Box::new(NoPreemption),
-            kernels: KernelRegistry::new(),
+            kernels: KernelRegistry::with_compiled_providers(),
         }
     }
 }

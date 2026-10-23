@@ -72,7 +72,8 @@ The types are in `src/plan.rs`. In summary:
   resumable-prefill batches when the model publishes a paged-attention
   profile. Ordinary full-prompt prefill remains dense. Requirements record
   target, dtype, head width, GQA ratio, and page count; selection records the
-  provider and any portable-fallback reason;
+  provider and any portable-fallback reason. Behind that stable identity the
+  in-memory selection retains the exact provider factory used at commit;
 - `PlannedRow { request_id, event_index, positions, final_prompt_chunk }`,
   where `positions` is the absolute range processed and therefore also the KV
   growth;

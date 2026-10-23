@@ -118,7 +118,7 @@ algorithm out of `Executor`. It holds five replaceable components:
 | `AdmissionPolicy` | `decide(&mut self, &AdmissionContext)` | `&self`; context built from the snapshot |
 | `BatchPolicy` | `select(&mut self, &BatchContext)` | `&self` |
 | `PrefillBatcher` | `buckets(&mut self, …)` → keys | renamed `PrefillGrouping`; `group(&self, lengths) -> GroupingDecision` returning keys **and** alternatives and estimates |
-| `KernelRegistry` | hardcoded in Llama | select from model target/dtype/shape and the final planned rows; record typed portable fallback |
+| `KernelRegistry` | hardcoded in Llama | register the portable provider plus compiled CubeCL targets, select from model target/dtype/shape and final rows, and retain the exact provider for commit |
 
 Every component also implements `descriptor()`. The default
 `ComposedPolicy` (FIFO, unconstrained admission, unbounded batch,
@@ -221,5 +221,5 @@ Each step keeps `make verify` and `make test-fixture` green.
   already carries the fields they need.
 - Populating `DeviceSnapshot` and `PolicyMeasurements`: P6 telemetry and P4
   calibration.
-- Kernel execution delegation: kernel-track step 3. Policy selection and plan
-  representation are implemented.
+- Kernel timing and trace attribution: kernel-track step 4. Selection, plan
+  representation, and execution delegation are implemented.

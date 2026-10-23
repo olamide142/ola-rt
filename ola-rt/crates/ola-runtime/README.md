@@ -85,7 +85,10 @@ head/GQA shape, and logical page count and resolves a provider through
 `KernelRegistry`. Ordinary full-prompt prefill remains dense and carries no
 paged-decode selection. The plan retains both the requirements and either the
 optimized provider or a typed portable fallback; validation recomputes the
-requirements from the snapshot and rows.
+requirements from the snapshot and rows. At commit, the executor passes that
+exact selection through `ModelExecutionContext`; individual and tensor-batched
+Llama paths consume the same provider. A model that cannot consume a planned
+choice fails explicitly rather than silently substituting another kernel.
 
 `ExecutorIteration::execution_batches` records decode invocations and
 successful prefill invocations as `Tensor` or `Individual`, including request

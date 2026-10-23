@@ -10,8 +10,8 @@ use ola_core::{
     Clock, Input, ModelDescriptor, ModelId, Request, RequestId, RequestSpec, Timestamp,
 };
 use ola_model::{
-    CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionError, PrefillOutcome,
-    SessionMetrics,
+    CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionContext,
+    ModelExecutionError, PrefillOutcome, SessionMetrics,
 };
 
 use crate::{
@@ -999,6 +999,12 @@ impl Executor {
     ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
         let model = members[0].model.clone();
+        let context = batch
+            .kernel
+            .as_ref()
+            .map_or_else(ModelExecutionContext::new, |kernel| {
+                ModelExecutionContext::new().with_paged_attention(&kernel.selection)
+            });
         let prompts = batch
             .rows
             .iter()
@@ -1033,7 +1039,12 @@ impl Executor {
                             .collect()
                     })
             } else {
-                model.prefill_chunk_batch(&mut sessions, &prompt_slices, &final_chunks)
+                model.prefill_chunk_batch_with_context(
+                    &mut sessions,
+                    &prompt_slices,
+                    &final_chunks,
+                    context,
+                )
             }
         } else {
             None
@@ -1099,7 +1110,7 @@ impl Executor {
         } else {
             for (row, mut pending) in batch.rows.iter().zip(members) {
                 let started_at = self.now(at);
-                let result = execute_prefill_segment(&mut pending, row.input_tokens());
+                let result = execute_prefill_segment(&mut pending, row.input_tokens(), context);
                 let finished_at = self.now(at);
                 outcome.execution_batches.push(ExecutionBatch {
                     phase: BatchPhase::Prefill,
@@ -1223,6 +1234,12 @@ impl Executor {
         at: Timestamp,
     ) -> Result<BatchOutcome, ExecutorError> {
         let mut outcome = BatchOutcome::default();
+        let context = batch
+            .kernel
+            .as_ref()
+            .map_or_else(ModelExecutionContext::new, |kernel| {
+                ModelExecutionContext::new().with_paged_attention(&kernel.selection)
+            });
         let input_tokens = members
             .iter()
             .map(|active| active.last_token.id)
@@ -1240,7 +1257,7 @@ impl Executor {
             for active in &mut members {
                 sessions.push(active.session.as_mut());
             }
-            model.decode_batch(&mut sessions, &input_tokens)
+            model.decode_batch_with_context(&mut sessions, &input_tokens, context)
         } else {
             None
         };
@@ -1300,7 +1317,9 @@ impl Executor {
         } else {
             for (row, mut active) in batch.rows.iter().zip(members) {
                 let started_at = self.now(at);
-                let result = active.session.decode(active.last_token.id);
+                let result = active
+                    .session
+                    .decode_with_context(active.last_token.id, context);
                 let finished_at = self.now(at);
                 outcome.execution_batches.push(ExecutionBatch {
                     phase: BatchPhase::Decode,
@@ -1633,6 +1652,7 @@ const fn execution_phase(phase: BatchPhase) -> ExecutionPhase {
 fn execute_prefill_segment(
     pending: &mut PendingPrefill,
     chunk_len: usize,
+    context: ModelExecutionContext<'_>,
 ) -> Result<PrefillOutcome, ModelExecutionError> {
     debug_assert!(chunk_len > 0);
     let end = pending.cursor.saturating_add(chunk_len);
@@ -1645,7 +1665,9 @@ fn execute_prefill_segment(
             .prefill(&prompt_chunk)
             .map(PrefillOutcome::Token)
     } else {
-        pending.session.prefill_chunk(&prompt_chunk, is_final)
+        pending
+            .session
+            .prefill_chunk_with_context(&prompt_chunk, is_final, context)
     };
     if result.is_ok() {
         pending.cursor = end;

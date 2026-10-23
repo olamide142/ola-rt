@@ -115,10 +115,15 @@ implementations.
    unannotated. Plan validation recomputes requirements, `PlanReport` v6 records
    target/dtype/configuration/provider/fallback details, and conflict tests show
    deferred or budget-excluded work cannot distort selection.
-3. **Decouple `ola-burn` model execution.**
-   Replace the hardcoded `#[cfg(feature = ...)]` kernel instantiation in
-   `LlamaModel` with kernel delegation from the runtime context. Verify identical
-   outputs against the single-request correctness path.
+3. **Decouple `ola-burn` model execution.** **Complete 2026-10-22.**
+   `KernelSelection` retains the selected provider factory behind its stable
+   identity. The runtime passes it through `ModelExecutionContext` for decode
+   and resumable prefill; Llama consumes it in individual and tensor-batched
+   paths, while direct session calls use the portable correctness provider.
+   Models that do not implement delegation reject a supplied choice instead of
+   silently ignoring it. Compiled CubeCL providers are registered by the
+   default composed policy, and a counting-provider integration test proves the
+   planned implementation reaches tensor decode.
 4. **Observability and benchmarking closure.**
    Emit kernel identity and kernel timing in `ola-observe::TraceEvent::Invocation`.
    Populate `Variant::kernel` in `ola-bench` experiment runs and report

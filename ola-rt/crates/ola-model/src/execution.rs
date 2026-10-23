@@ -1,7 +1,7 @@
 use std::{any::Any, error::Error, fmt, sync::Arc};
 
 use ola_core::GenerationConfig;
-use ola_kernel::PagedAttentionProfile;
+use ola_kernel::{KernelSelection, PagedAttentionProfile};
 
 /// Stage at which model execution failed.
 ///
@@ -72,6 +72,36 @@ impl fmt::Display for ModelExecutionError {
 }
 
 impl Error for ModelExecutionError {}
+
+/// Immutable per-invocation choices supplied by the runtime planner.
+///
+/// Model implementations consume only the operations they advertise. Keeping
+/// the provider selection here avoids coupling generic execution traits to a
+/// concrete Burn or CubeCL kernel type.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelExecutionContext<'a> {
+    paged_attention: Option<&'a KernelSelection>,
+}
+
+impl<'a> ModelExecutionContext<'a> {
+    /// Creates a context with no specialized kernel choices.
+    pub const fn new() -> Self {
+        Self {
+            paged_attention: None,
+        }
+    }
+
+    /// Attaches the paged-attention provider selected for this invocation.
+    pub const fn with_paged_attention(mut self, selection: &'a KernelSelection) -> Self {
+        self.paged_attention = Some(selection);
+        self
+    }
+
+    /// Returns the planned paged-attention provider, when applicable.
+    pub const fn paged_attention(self) -> Option<&'a KernelSelection> {
+        self.paged_attention
+    }
+}
 
 /// Text/token conversion associated with one loaded model artifact.
 ///
@@ -207,6 +237,24 @@ pub trait CausalModel: Send + Sync {
         None
     }
 
+    /// Attempts tensor-batched resumable prefill with planned kernel choices.
+    ///
+    /// Implementations that advertise a paged-attention profile override this
+    /// method. The default refuses to discard a supplied choice and otherwise
+    /// delegates to the compatibility hook.
+    fn prefill_chunk_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_chunks: &[&[u32]],
+        is_final: &[bool],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+        if context.paged_attention().is_some() {
+            return None;
+        }
+        self.prefill_chunk_batch(sessions, prompt_chunks, is_final)
+    }
+
     /// Attempts one tensor-batched decode across compatible sessions.
     ///
     /// Returning `None` declares that this implementation has no batched path;
@@ -220,6 +268,22 @@ pub trait CausalModel: Send + Sync {
         _input_tokens: &[u32],
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
         None
+    }
+
+    /// Attempts tensor-batched decode with planned kernel choices.
+    ///
+    /// The default requests individual fallback when a provider was supplied,
+    /// ensuring a model cannot silently execute a different kernel.
+    fn decode_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        input_tokens: &[u32],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        if context.paged_attention().is_some() {
+            return None;
+        }
+        self.decode_batch(sessions, input_tokens)
     }
 }
 
@@ -364,11 +428,48 @@ pub trait GenerationSession: Send {
         self.prefill(prompt_tokens).map(PrefillOutcome::Token)
     }
 
+    /// Processes a resumable prompt segment with planned kernel choices.
+    ///
+    /// Models without kernel delegation reject a non-empty context rather
+    /// than silently ignoring the execution plan.
+    fn prefill_chunk_with_context(
+        &mut self,
+        prompt_tokens: &[u32],
+        is_final: bool,
+        context: ModelExecutionContext<'_>,
+    ) -> Result<PrefillOutcome, ModelExecutionError> {
+        if context.paged_attention().is_some() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Prefill,
+                "this model does not accept planned paged-attention kernels",
+            ));
+        }
+        self.prefill_chunk(prompt_tokens, is_final)
+    }
+
     /// Consumes the previously generated token and returns the next token.
     ///
     /// The caller passes `input_token` explicitly so execution traces can
     /// distinguish model output from the next decode input.
     fn decode(&mut self, input_token: u32) -> Result<GeneratedToken, ModelExecutionError>;
+
+    /// Decodes one token with planned kernel choices.
+    ///
+    /// Models without kernel delegation reject a non-empty context rather
+    /// than silently ignoring the execution plan.
+    fn decode_with_context(
+        &mut self,
+        input_token: u32,
+        context: ModelExecutionContext<'_>,
+    ) -> Result<GeneratedToken, ModelExecutionError> {
+        if context.paged_attention().is_some() {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::Decode,
+                "this model does not accept planned paged-attention kernels",
+            ));
+        }
+        self.decode(input_token)
+    }
 
     /// Attaches the model's cached KV for the longest cached prefix of
     /// `tokens` to a session that has processed nothing, and returns how
@@ -509,6 +610,19 @@ impl CausalLanguageModel {
             .prefill_chunk_batch(sessions, prompt_chunks, is_final)
     }
 
+    /// Attempts model-specific tensor-batched resumable prefill with the
+    /// planner's per-invocation choices.
+    pub fn prefill_chunk_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        prompt_chunks: &[&[u32]],
+        is_final: &[bool],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<PrefillOutcome, ModelExecutionError>>> {
+        self.model
+            .prefill_chunk_batch_with_context(sessions, prompt_chunks, is_final, context)
+    }
+
     /// Attempts a model-specific tensor-batched decode.
     pub fn decode_batch(
         &self,
@@ -516,6 +630,18 @@ impl CausalLanguageModel {
         input_tokens: &[u32],
     ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
         self.model.decode_batch(sessions, input_tokens)
+    }
+
+    /// Attempts model-specific tensor-batched decode with the planner's
+    /// per-invocation choices.
+    pub fn decode_batch_with_context(
+        &self,
+        sessions: &mut [&mut dyn GenerationSession],
+        input_tokens: &[u32],
+        context: ModelExecutionContext<'_>,
+    ) -> Option<Vec<Result<GeneratedToken, ModelExecutionError>>> {
+        self.model
+            .decode_batch_with_context(sessions, input_tokens, context)
     }
 }
 

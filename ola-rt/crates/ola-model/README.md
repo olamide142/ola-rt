@@ -87,9 +87,11 @@ depending on Burn tensors or Llama-specific configuration types.
 Models with replaceable paged attention may additionally attach a
 `PagedAttentionProfile`. It records the execution target, dtype, attention-head
 geometry, and page size needed to derive exact kernel requirements after a
-runtime policy has chosen the invocation rows. It advertises planning facts;
-the mutable session remains responsible for consuming the selected provider
-during execution.
+runtime policy has chosen the invocation rows. `ModelExecutionContext` carries
+the resulting provider selection into resumable-prefill and decode calls. A
+model that advertises the profile must implement those contextual hooks; the
+compatibility defaults reject a supplied choice rather than executing a
+different kernel silently.
 
 ## Availability versus residency
 
