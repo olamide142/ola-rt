@@ -5,7 +5,9 @@ use burn::{
         Device, Int, Tensor, activation::silu, module::attention, ops::AttentionModuleOptions,
     },
 };
-use ola_kernel::{PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvPage};
+use ola_kernel::{
+    PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvBlocks, PagedKvPage,
+};
 use ola_runtime::KvBlockError;
 
 use super::{LlamaConfig, kv_cache::LlamaKvCache};
@@ -602,7 +604,7 @@ impl LlamaAttention {
         let query = self.rotary_embedding.forward(query, position);
         let key = self.rotary_embedding.forward(key, position);
         cache.write_layer(layer, position, key, value);
-        self.attend_paged_decode(query, cache.read_layer_pages(layer), kernel)
+        self.attend_paged_decode(query, cache.read_layer(layer), kernel)
     }
 
     fn prefill_chunk(
@@ -617,11 +619,7 @@ impl LlamaAttention {
         let query = self.rotary_embedding.forward(query, position);
         let key = self.rotary_embedding.forward(key, position);
         cache.write_layer(layer, position, key, value);
-        self.attend_paged_decode(
-            query,
-            cache.read_layer_pages_prefix(layer, position + 1),
-            kernel,
-        )
+        self.attend_paged_decode(query, cache.read_layer_prefix(layer, position + 1), kernel)
     }
 
     fn prefill_chunk_batch(
@@ -636,7 +634,7 @@ impl LlamaAttention {
         let batch_size = query.dims()[0];
         debug_assert_eq!(batch_size, caches.len());
         debug_assert_eq!(batch_size, positions.len());
-        let mut contexts = Vec::with_capacity(batch_size);
+        let mut inputs = Vec::with_capacity(batch_size);
         for index in 0..batch_size {
             let query = query.clone().slice([
                 index..index + 1,
@@ -659,12 +657,14 @@ impl LlamaAttention {
             let query = self.rotary_embedding.forward(query, positions[index]);
             let key = self.rotary_embedding.forward(key, positions[index]);
             caches[index].write_layer(layer, positions[index], key, value);
-            contexts.push(self.attend_paged_decode_context(
+            inputs.push(self.paged_attention_input(
                 query,
-                caches[index].read_layer_pages_prefix(layer, positions[index] + 1),
-                kernel,
+                caches[index].read_layer_prefix(layer, positions[index] + 1),
             ));
         }
+        let contexts = kernel
+            .execute_batch(inputs)
+            .expect("the planned paged-attention provider must execute batched Llama input");
         self.project_attention_output(Tensor::cat(contexts, 0))
     }
 
@@ -680,7 +680,7 @@ impl LlamaAttention {
         let batch_size = query.dims()[0];
         debug_assert_eq!(batch_size, caches.len());
         debug_assert_eq!(batch_size, positions.len());
-        let mut contexts = Vec::with_capacity(batch_size);
+        let mut inputs = Vec::with_capacity(batch_size);
         for index in 0..batch_size {
             let query = query.clone().slice([
                 index..index + 1,
@@ -703,12 +703,11 @@ impl LlamaAttention {
             let query = self.rotary_embedding.forward(query, positions[index]);
             let key = self.rotary_embedding.forward(key, positions[index]);
             caches[index].write_layer(layer, positions[index], key, value);
-            contexts.push(self.attend_paged_decode_context(
-                query,
-                caches[index].read_layer_pages(layer),
-                kernel,
-            ));
+            inputs.push(self.paged_attention_input(query, caches[index].read_layer(layer)));
         }
+        let contexts = kernel
+            .execute_batch(inputs)
+            .expect("the planned paged-attention provider must execute batched Llama input");
         self.project_attention_output(Tensor::cat(contexts, 0))
     }
 
@@ -778,18 +777,30 @@ impl LlamaAttention {
     fn attend_paged_decode(
         &self,
         query: Tensor<4>,
-        pages: Vec<(Tensor<4>, Tensor<4>)>,
+        cache: (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks),
         kernel: &dyn PagedAttentionKernel,
     ) -> Tensor<3> {
-        self.project_attention_output(self.attend_paged_decode_context(query, pages, kernel))
+        self.project_attention_output(self.attend_paged_decode_context(query, cache, kernel))
     }
 
     fn attend_paged_decode_context(
         &self,
         query: Tensor<4>,
-        pages: Vec<(Tensor<4>, Tensor<4>)>,
+        cache: (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks),
         kernel: &dyn PagedAttentionKernel,
     ) -> Tensor<4> {
+        let input = self.paged_attention_input(query, cache);
+        kernel
+            .execute(input)
+            .expect("the planned paged-attention provider must execute validated Llama input")
+    }
+
+    fn paged_attention_input(
+        &self,
+        query: Tensor<4>,
+        cache: (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks),
+    ) -> PagedAttentionInput {
+        let (pages, blocks) = cache;
         let config = PagedAttentionConfig::new(
             self.num_attention_heads,
             self.num_key_value_heads,
@@ -801,10 +812,10 @@ impl LlamaAttention {
             .map(|(key, value)| PagedKvPage::new(key, value))
             .collect();
         let input = PagedAttentionInput::new(query, pages, config)
-            .expect("Llama cache pages must satisfy the paged-attention contract");
-        kernel
-            .execute(input)
-            .expect("the planned paged-attention provider must execute validated Llama input")
+            .expect("Llama cache pages must satisfy the paged-attention contract")
+            .with_blocks(blocks)
+            .expect("Llama physical cache must satisfy the paged-attention contract");
+        input
     }
 
     fn project_attention_output(&self, context: Tensor<4>) -> Tensor<3> {

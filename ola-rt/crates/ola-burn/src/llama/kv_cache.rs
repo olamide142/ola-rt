@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use burn::tensor::Tensor;
+use ola_kernel::{PagedKvBlockTable, PagedKvBlocks};
 use ola_model::KvCacheProfile;
 use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
 
@@ -87,6 +88,8 @@ pub(crate) struct LlamaKvCache {
     pool: Arc<Mutex<LlamaKvPool>>,
     sequence: KvSequenceId,
     tokens: usize,
+    block_ids: Vec<usize>,
+    block_table: Option<PagedKvBlockTable>,
 }
 
 impl LlamaKvCache {
@@ -96,6 +99,8 @@ impl LlamaKvCache {
             pool,
             sequence,
             tokens: 0,
+            block_ids: Vec::new(),
+            block_table: None,
         })
     }
 
@@ -109,6 +114,7 @@ impl LlamaKvCache {
             .manager
             .attach_prefix(self.sequence, tokens)?;
         self.tokens = attached;
+        self.refresh_block_table();
         Ok(attached)
     }
 
@@ -129,6 +135,7 @@ impl LlamaKvCache {
             .manager
             .append(self.sequence, additional_tokens)?;
         self.tokens = new_token_count;
+        self.refresh_block_table();
         Ok(())
     }
 
@@ -174,6 +181,7 @@ impl LlamaKvCache {
         lock_pool(&pool).manager.append_batch(&reservations)?;
         for (cache, &additional_tokens) in caches.iter_mut().zip(additional_tokens) {
             cache.tokens += additional_tokens;
+            cache.refresh_block_table();
         }
         Ok(())
     }
@@ -188,17 +196,25 @@ impl LlamaKvCache {
         lock_pool(&self.pool).write_layer(self.sequence, layer, token_offset, key, value);
     }
 
-    pub(crate) fn read_layer_pages(&self, layer: usize) -> Vec<(Tensor<4>, Tensor<4>)> {
-        lock_pool(&self.pool).read_layer_pages(self.sequence, layer)
+    pub(crate) fn read_layer(&self, layer: usize) -> (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks) {
+        self.read_layer_prefix(layer, self.tokens)
     }
 
     /// Reads only the populated prefix of an atomically pre-reserved segment.
-    pub(crate) fn read_layer_pages_prefix(
+    pub(crate) fn read_layer_prefix(
         &self,
         layer: usize,
         token_count: usize,
-    ) -> Vec<(Tensor<4>, Tensor<4>)> {
-        lock_pool(&self.pool).read_layer_pages_prefix(self.sequence, layer, token_count)
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks) {
+        let tokens_per_block = lock_pool(&self.pool).manager.tokens_per_block();
+        let logical_blocks = token_count.div_ceil(tokens_per_block);
+        let block_table = self
+            .block_table
+            .as_ref()
+            .expect("a populated cache owns a device block table")
+            .prefix(logical_blocks)
+            .expect("a populated prefix must fit its reserved block table");
+        lock_pool(&self.pool).read_layer_prefix(self.sequence, layer, token_count, block_table)
     }
 
     /// Returns physical page bytes attributed to this sequence.
@@ -210,6 +226,33 @@ impl LlamaKvCache {
             .expect("a live cache owns a block table")
             .len() as u64;
         blocks * pool.manager.metrics().block_bytes
+    }
+
+    fn refresh_block_table(&mut self) {
+        let (block_ids, device) = {
+            let pool = lock_pool(&self.pool);
+            let block_ids = pool
+                .manager
+                .block_table(self.sequence)
+                .expect("a live cache owns a block table")
+                .iter()
+                .map(|block| block.get())
+                .collect::<Vec<_>>();
+            (block_ids, pool.device.clone())
+        };
+        if block_ids == self.block_ids {
+            return;
+        }
+        self.block_ids = block_ids;
+        self.block_table = if self.block_ids.is_empty() {
+            None
+        } else {
+            let physical_blocks = lock_pool(&self.pool).manager.metrics().total_blocks;
+            Some(
+                PagedKvBlockTable::new(self.block_ids.clone(), physical_blocks, &device)
+                    .expect("the runtime block manager must produce valid physical indices"),
+            )
+        };
     }
 
     #[cfg(test)]
@@ -240,8 +283,8 @@ pub(crate) struct LlamaKvPool {
 }
 
 struct LlamaLayerPages {
-    keys: Vec<Option<Tensor<4>>>,
-    values: Vec<Option<Tensor<4>>>,
+    keys: Tensor<4>,
+    values: Tensor<4>,
 }
 
 impl LlamaKvPool {
@@ -282,10 +325,16 @@ impl LlamaKvPool {
             manager = manager.with_prefix_cache();
         }
         let physical_blocks = manager.metrics().total_blocks;
+        let page_shape = [
+            physical_blocks,
+            model.num_key_value_heads,
+            config.tokens_per_block,
+            model.attention_head_dim(),
+        ];
         let layers = (0..model.num_hidden_layers)
             .map(|_| LlamaLayerPages {
-                keys: (0..physical_blocks).map(|_| None).collect(),
-                values: (0..physical_blocks).map(|_| None).collect(),
+                keys: Tensor::zeros(page_shape, &device),
+                values: Tensor::zeros(page_shape, &device),
             })
             .collect();
         Ok(Self {
@@ -341,53 +390,35 @@ impl LlamaKvPool {
                 source_offset..source_offset + count,
                 0..head_dim,
             ]);
-            let page_shape = [1, heads, tokens_per_block, head_dim];
-            let key_page = layer.keys[physical_block]
-                .take()
-                .unwrap_or_else(|| Tensor::zeros(page_shape, &self.device));
-            let value_page = layer.values[physical_block]
-                .take()
-                .unwrap_or_else(|| Tensor::zeros(page_shape, &self.device));
-            layer.keys[physical_block] = Some(key_page.slice_assign(
+            layer.keys = layer.keys.clone().slice_assign(
                 [
-                    0..1,
+                    physical_block..physical_block + 1,
                     0..heads,
                     block_offset..block_offset + count,
                     0..head_dim,
                 ],
                 key_values,
-            ));
-            layer.values[physical_block] = Some(value_page.slice_assign(
+            );
+            layer.values = layer.values.clone().slice_assign(
                 [
-                    0..1,
+                    physical_block..physical_block + 1,
                     0..heads,
                     block_offset..block_offset + count,
                     0..head_dim,
                 ],
                 value_values,
-            ));
+            );
             source_offset += count;
         }
     }
 
-    fn read_layer_pages(
-        &self,
-        sequence: KvSequenceId,
-        layer: usize,
-    ) -> Vec<(Tensor<4>, Tensor<4>)> {
-        let token_count = self
-            .manager
-            .cached_tokens(sequence)
-            .expect("a live cache owns token accounting");
-        self.read_layer_pages_prefix(sequence, layer, token_count)
-    }
-
-    fn read_layer_pages_prefix(
+    fn read_layer_prefix(
         &self,
         sequence: KvSequenceId,
         layer: usize,
         token_count: usize,
-    ) -> Vec<(Tensor<4>, Tensor<4>)> {
+        block_table: PagedKvBlockTable,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks) {
         let reserved_tokens = self
             .manager
             .cached_tokens(sequence)
@@ -413,19 +444,29 @@ impl LlamaKvPool {
             let remaining = token_count - logical_block * tokens_per_block;
             let used = remaining.min(tokens_per_block);
             let physical = block.get();
-            let key = layer.keys[physical]
-                .as_ref()
-                .expect("every reserved layer page must be populated")
-                .clone()
-                .slice([0..1, 0..self.num_key_value_heads, 0..used, 0..self.head_dim]);
-            let value = layer.values[physical]
-                .as_ref()
-                .expect("every reserved layer page must be populated")
-                .clone()
-                .slice([0..1, 0..self.num_key_value_heads, 0..used, 0..self.head_dim]);
+            let key = layer.keys.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                0..used,
+                0..self.head_dim,
+            ]);
+            let value = layer.values.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                0..used,
+                0..self.head_dim,
+            ]);
             pages.push((key, value));
         }
-        pages
+        let blocks = PagedKvBlocks::new(
+            layer.keys.clone(),
+            layer.values.clone(),
+            block_table,
+            tokens_per_block,
+            token_count,
+        )
+        .expect("Llama cache storage must satisfy the paged-attention block contract");
+        (pages, blocks)
     }
 }
 
@@ -498,7 +539,7 @@ mod tests {
             &device,
         );
         first.write_layer(0, 0, keys, values);
-        let pages = first.read_layer_pages(0);
+        let (pages, _blocks) = first.read_layer(0);
         let (keys, values): (Vec<_>, Vec<_>) = pages.into_iter().unzip();
         let keys = Tensor::cat(keys, 2);
         let values = Tensor::cat(values, 2);

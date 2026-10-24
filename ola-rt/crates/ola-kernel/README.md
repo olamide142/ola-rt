@@ -38,7 +38,8 @@ The public building blocks are:
   deterministic provider choice and typed portable-fallback reasons;
 - `PagedAttentionConfig` for the shape invariants shared by every
   implementation;
-- `PagedKvPage` and `PagedAttentionInput` for an explicit operator boundary;
+- `PagedKvPage` and `PagedAttentionInput` for logical pages, with
+  `PagedKvBlockTable` and `PagedKvBlocks` for a flattened physical cache view;
 - `PagedAttentionKernel` for interchangeable implementations;
 - `KernelExecutionMetrics` for shared synchronous call counts and host timing;
 - `PortablePagedAttention` as the initial reference implementation;
@@ -61,6 +62,8 @@ The initial operation is intentionally narrow:
 - every KV page has batch size one and at least one populated token;
 - the final page may be shorter than earlier pages;
 - pages are supplied in logical sequence order;
+- optimized implementations may use a validated device block table to map
+  logical pages to non-contiguous physical blocks;
 - the output is an attention context, before the model's output projection;
 - the portable implementation uses an online softmax and never concatenates
   all pages into a sequence-sized temporary.

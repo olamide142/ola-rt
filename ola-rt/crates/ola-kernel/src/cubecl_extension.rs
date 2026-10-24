@@ -1,8 +1,11 @@
 use burn::{
-    backend::{Dispatch, DispatchDevice, backend_extension, tensor::FloatTensor},
-    tensor::{DType, Tensor as BurnTensor},
+    backend::{
+        Dispatch, DispatchDevice, backend_extension,
+        tensor::{FloatTensor, IntTensor},
+    },
+    tensor::{DType, Int as BurnInt, Tensor as BurnTensor, TensorData},
 };
-use burn_backend::{Backend, Shape, cubecl::dtype_to_storage_type};
+use burn_backend::{Backend, cubecl::dtype_to_storage_type};
 use burn_cubecl::{
     CubeBackend, CubeDevice, cubecl, kernel::untile, ops::numeric::empty_device_dtype,
     tensor::CubeTensor,
@@ -23,6 +26,8 @@ pub trait PagedAttentionOps: Backend {
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
+        block_table: IntTensor<Self>,
+        token_counts: IntTensor<Self>,
         groups: usize,
     ) -> FloatTensor<Self>;
 }
@@ -32,9 +37,18 @@ impl PagedAttentionOps for CubeBackend {
         query: FloatTensor<Self>,
         key: FloatTensor<Self>,
         value: FloatTensor<Self>,
+        block_table: IntTensor<Self>,
+        token_counts: IntTensor<Self>,
         groups: usize,
     ) -> FloatTensor<Self> {
-        launch_paged_attention(untile(query), untile(key), untile(value), groups)
+        launch_paged_attention(
+            untile(query),
+            untile(key),
+            untile(value),
+            untile(block_table),
+            untile(token_counts),
+            groups,
+        )
     }
 }
 
@@ -63,6 +77,9 @@ impl CubePagedAttention {
     /// GPU runtime. Other devices and dtypes should retain the portable path.
     pub fn supports(&self, input: &PagedAttentionInput) -> bool {
         if input.dtype() != DType::F32 {
+            return false;
+        }
+        if input.blocks().is_none() {
             return false;
         }
         match (self.target, input.query().device().as_dispatch()) {
@@ -97,25 +114,107 @@ impl PagedAttentionKernel for CubePagedAttention {
             )));
         }
 
-        let (query, pages, config) = input.into_parts();
-        let mut keys = Vec::with_capacity(pages.len());
-        let mut values = Vec::with_capacity(pages.len());
-        for page in pages {
-            keys.push(page.key().clone());
-            values.push(page.value().clone());
-        }
-
-        // CubeCL 0.11 sequences cannot contain tensor arguments. Keep the page
-        // API at the Ola boundary and pack the device tensors before dispatch.
-        let key = BurnTensor::cat(keys, 2);
-        let value = BurnTensor::cat(values, 2);
+        let (query, _pages, blocks, config) = input.into_parts();
+        let blocks = blocks.expect("supports requires physical KV blocks");
+        let (key, value, block_table, _tokens_per_block, token_count) = blocks.into_parts();
+        let block_count = block_table.dims()[0];
+        let block_table = block_table.reshape([1, block_count]);
+        let token_counts: BurnTensor<1, BurnInt> = BurnTensor::from_data(
+            TensorData::new(vec![token_count as i64], [1]),
+            &query.device(),
+        );
         let output = <Dispatch as PagedAttentionOps>::paged_attention(
             query.into_dispatch(),
             key.into_dispatch(),
             value.into_dispatch(),
+            block_table.into_dispatch(),
+            token_counts.into_dispatch(),
             config.groups(),
         );
         Ok(BurnTensor::<4>::from_dispatch(output))
+    }
+
+    fn execute_batch(
+        &self,
+        inputs: Vec<PagedAttentionInput>,
+    ) -> Result<Vec<BurnTensor<4>>, KernelError> {
+        let mut queries = Vec::with_capacity(inputs.len());
+        let mut blocks = Vec::with_capacity(inputs.len());
+        let mut config = None;
+        for input in inputs {
+            if !self.supports(&input) {
+                return Err(KernelError::new("CubeCL does not support a batched input"));
+            }
+            let (query, _pages, physical, input_config) = input.into_parts();
+            let physical = physical.expect("supports requires physical KV blocks");
+            if let Some(expected) = config {
+                if expected != input_config {
+                    return Err(KernelError::new(
+                        "batched paged attention inputs must share one configuration",
+                    ));
+                }
+            } else {
+                config = Some(input_config);
+            }
+            queries.push(query);
+            blocks.push(physical);
+        }
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let config = config.expect("non-empty batch has a configuration");
+        let key = blocks[0].key().clone();
+        let value = blocks[0].value().clone();
+        let tokens_per_block = blocks[0].tokens_per_block();
+        let max_blocks = blocks
+            .iter()
+            .map(|block| block.block_table().len())
+            .max()
+            .expect("non-empty batch has blocks");
+        let mut table_values = Vec::with_capacity(blocks.len() * max_blocks);
+        let mut token_values = Vec::with_capacity(blocks.len());
+        for block in &blocks {
+            if block.key().dims() != key.dims()
+                || block.value().dims() != value.dims()
+                || block.tokens_per_block() != tokens_per_block
+                || block.key().device() != key.device()
+            {
+                return Err(KernelError::new(
+                    "batched paged attention inputs must share one physical KV pool",
+                ));
+            }
+            let ids = block.block_table().block_ids();
+            table_values.extend(ids.iter().map(|id| *id as i64));
+            table_values.extend(std::iter::repeat_n(0_i64, max_blocks - ids.len()));
+            token_values.push(block.token_count() as i64);
+        }
+        let device = queries[0].device();
+        let query = BurnTensor::cat(queries, 0);
+        let block_table: BurnTensor<2, BurnInt> = BurnTensor::from_data(
+            TensorData::new(table_values, [blocks.len(), max_blocks]),
+            &device,
+        );
+        let token_counts: BurnTensor<1, BurnInt> =
+            BurnTensor::from_data(TensorData::new(token_values, [blocks.len()]), &device);
+        let output = <Dispatch as PagedAttentionOps>::paged_attention(
+            query.into_dispatch(),
+            key.into_dispatch(),
+            value.into_dispatch(),
+            block_table.into_dispatch(),
+            token_counts.into_dispatch(),
+            config.groups(),
+        );
+        let output = BurnTensor::<4>::from_dispatch(output);
+        Ok((0..blocks.len())
+            .map(|index| {
+                output.clone().slice([
+                    index..index + 1,
+                    0..config.query_heads(),
+                    0..1,
+                    0..config.head_dim(),
+                ])
+            })
+            .collect())
     }
 }
 
@@ -137,6 +236,8 @@ fn launch_paged_attention(
     query: CubeTensor,
     key: CubeTensor,
     value: CubeTensor,
+    block_table: CubeTensor,
+    token_counts: CubeTensor,
     groups: usize,
 ) -> CubeTensor {
     let client = query.client.clone();
@@ -146,40 +247,8 @@ fn launch_paged_attention(
         query.meta.shape().clone(),
         query.dtype,
     );
-    let [_, heads, _, dim]: [usize; 4] = query
-        .meta
-        .shape()
-        .dims()
-        .try_into()
-        .expect("validated query has rank four");
-    let [_, _, tokens, _]: [usize; 4] = key
-        .meta
-        .shape()
-        .dims()
-        .try_into()
-        .expect("validated key pages have rank four");
-    let score_shape = Shape::new([1, heads, 1, tokens]);
-    let scores = empty_device_dtype(
-        client.clone(),
-        query.device.clone(),
-        score_shape,
-        query.dtype,
-    );
-    let score_items = heads * tokens;
-    let score_cube_dim = CubeDim::new(&client, score_items);
-    let score_cube_count = calculate_cube_count_elemwise(&client, score_items, score_cube_dim);
-    paged_attention_scores::launch(
-        &client,
-        score_cube_count,
-        score_cube_dim,
-        query.into_tensor_arg(),
-        key.into_tensor_arg(),
-        scores.clone().into_tensor_arg(),
-        groups,
-        dtype_to_storage_type(scores.dtype),
-    );
-
-    let work_items = heads * dim;
+    let [batch, heads, _, dim] = query.meta.shape().dims();
+    let work_items = batch * heads * dim;
     let cube_dim = CubeDim::new(&client, work_items);
     let cube_count = calculate_cube_count_elemwise(&client, work_items, cube_dim);
 
@@ -187,70 +256,66 @@ fn launch_paged_attention(
         &client,
         cube_count,
         cube_dim,
-        scores.into_tensor_arg(),
+        query.into_tensor_arg(),
+        key.into_tensor_arg(),
         value.into_tensor_arg(),
+        block_table.clone().into_tensor_arg(),
         output.clone().into_tensor_arg(),
+        token_counts.into_tensor_arg(),
         groups,
         dtype_to_storage_type(output.dtype),
+        dtype_to_storage_type(block_table.dtype),
     );
     output
 }
 
-/// Computes each query-head/key-token score once before value accumulation.
+/// Traverses physical pages and applies online softmax in one dispatch.
 #[cube(launch)]
-fn paged_attention_scores<F: Float>(
+fn paged_attention<F: Float, I: Int>(
     query: &Tensor<F>,
     key: &Tensor<F>,
-    scores: &mut Tensor<F>,
-    groups: usize,
-    #[define(F)] _dtype: ElemType,
-) {
-    let head_dim = query.shape(3);
-    let tokens = key.shape(2);
-    let score_elements = query.shape(1) * tokens;
-    if ABSOLUTE_POS >= score_elements {
-        terminate!();
-    }
-
-    let query_head = ABSOLUTE_POS / tokens;
-    let token = ABSOLUTE_POS % tokens;
-    let kv_head = query_head / groups;
-    let scale = f32::cast_from(head_dim).sqrt().recip();
-    let mut score = f32::new(0.0);
-    for dim in 0..head_dim {
-        let query_offset = query_head * query.stride(1) + dim * query.stride(3);
-        let key_offset = kv_head * key.stride(1) + token * key.stride(2) + dim * key.stride(3);
-        score = score + f32::cast_from(query[query_offset]) * f32::cast_from(key[key_offset]);
-    }
-    let score_offset = query_head * scores.stride(1) + token * scores.stride(3);
-    scores[score_offset] = F::cast_from(score * scale);
-}
-
-/// Applies online softmax to precomputed scores and accumulates one value dim.
-#[cube(launch)]
-fn paged_attention<F: Float>(
-    scores: &Tensor<F>,
     value: &Tensor<F>,
+    block_table: &Tensor<I>,
     output: &mut Tensor<F>,
+    token_counts: &Tensor<I>,
     groups: usize,
     #[define(F)] _dtype: ElemType,
+    #[define(I)] _int_dtype: ElemType,
 ) {
     let head_dim = value.shape(3);
-    let output_elements = scores.shape(1) * head_dim;
+    let output_elements = query.shape(0) * query.shape(1) * head_dim;
     if ABSOLUTE_POS >= output_elements {
         terminate!();
     }
 
-    let query_head = ABSOLUTE_POS / head_dim;
-    let output_dim = ABSOLUTE_POS % head_dim;
+    let request = ABSOLUTE_POS / (query.shape(1) * head_dim);
+    let head_position = ABSOLUTE_POS % (query.shape(1) * head_dim);
+    let query_head = head_position / head_dim;
+    let output_dim = head_position % head_dim;
     let kv_head = query_head / groups;
+    let tokens_per_block = key.shape(2);
+    let token_count = usize::cast_from(token_counts[request]);
+    let scale = f32::cast_from(head_dim).sqrt().recip();
     let mut running_max = f32::new(-3.402_823_5e38);
     let mut running_sum = f32::new(0.0);
     let mut running_output = f32::new(0.0);
 
-    for token in 0..scores.shape(3) {
-        let score_offset = query_head * scores.stride(1) + token * scores.stride(3);
-        let score = f32::cast_from(scores[score_offset]);
+    for token in 0..token_count {
+        let logical_block = token / tokens_per_block;
+        let block_offset = token % tokens_per_block;
+        let table_offset = request * block_table.stride(0) + logical_block * block_table.stride(1);
+        let physical_block = usize::cast_from(block_table[table_offset]);
+        let mut score = f32::new(0.0);
+        for dim in 0..head_dim {
+            let query_offset =
+                request * query.stride(0) + query_head * query.stride(1) + dim * query.stride(3);
+            let key_offset = physical_block * key.stride(0)
+                + kv_head * key.stride(1)
+                + block_offset * key.stride(2)
+                + dim * key.stride(3);
+            score += f32::cast_from(query[query_offset]) * f32::cast_from(key[key_offset]);
+        }
+        score *= scale;
         let new_max = if score > running_max {
             score
         } else {
@@ -258,15 +323,18 @@ fn paged_attention<F: Float>(
         };
         let previous_scale = (running_max - new_max).exp();
         let weight = (score - new_max).exp();
-        let value_offset =
-            kv_head * value.stride(1) + token * value.stride(2) + output_dim * value.stride(3);
+        let value_offset = physical_block * value.stride(0)
+            + kv_head * value.stride(1)
+            + block_offset * value.stride(2)
+            + output_dim * value.stride(3);
         running_sum = running_sum * previous_scale + weight;
         running_output =
             running_output * previous_scale + weight * f32::cast_from(value[value_offset]);
         running_max = new_max;
     }
 
-    let output_offset = query_head * output.stride(1) + output_dim * output.stride(3);
+    let output_offset =
+        request * output.stride(0) + query_head * output.stride(1) + output_dim * output.stride(3);
     output[output_offset] = F::cast_from(running_output / running_sum);
 }
 
@@ -280,7 +348,9 @@ mod tests {
     use burn::tensor::{Device, Tensor, TensorData};
 
     use super::*;
-    use crate::{PagedAttentionConfig, PagedKvPage, PortablePagedAttention};
+    use crate::{
+        PagedAttentionConfig, PagedKvBlockTable, PagedKvBlocks, PagedKvPage, PortablePagedAttention,
+    };
 
     #[test]
     #[cfg(feature = "cubecl-cpu")]
@@ -373,7 +443,7 @@ mod tests {
             config,
         )
         .unwrap();
-        assert_input_matches(input, target, 1e-5);
+        assert_input_matches(attach_physical_blocks(input), target, 1e-5);
     }
 
     fn assert_input_matches(input: PagedAttentionInput, target: KernelTarget, tolerance: f32) {
@@ -385,7 +455,7 @@ mod tests {
             .unwrap();
         let actual = CubePagedAttention::new(target)
             .unwrap()
-            .execute(input)
+            .execute(input.clone())
             .unwrap()
             .into_data()
             .try_to_vec::<f32>()
@@ -398,6 +468,40 @@ mod tests {
                 error <= tolerance,
                 "output {index} differs by {error} (tolerance {tolerance})"
             );
+        }
+
+        let batched = CubePagedAttention::new(target)
+            .unwrap()
+            .execute_batch(vec![input.clone(), input.clone()])
+            .unwrap();
+        assert_eq!(batched.len(), 2);
+        let first = batched[0].clone().into_data().try_to_vec::<f32>().unwrap();
+        let second = batched[1].clone().into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(first, second);
+
+        // The second request has fewer logical blocks but shares the same
+        // physical pool geometry. This is the ragged request case: each row
+        // must stop at its own token count rather than the padded table width.
+        let short = PagedAttentionInput::new(
+            input.query().clone(),
+            vec![input.pages()[0].clone()],
+            input.config(),
+        )
+        .unwrap();
+        let short = attach_physical_blocks(short);
+        let expected_short = PortablePagedAttention::new()
+            .execute(short.clone())
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let ragged = CubePagedAttention::new(target)
+            .unwrap()
+            .execute_batch(vec![input.clone(), short])
+            .unwrap();
+        let actual_short = ragged[1].clone().into_data().try_to_vec::<f32>().unwrap();
+        for (actual, expected) in actual_short.into_iter().zip(expected_short) {
+            assert!((actual - expected).abs() <= tolerance);
         }
     }
 
@@ -439,12 +543,64 @@ mod tests {
                 PagedKvPage::new(key, value)
             })
             .collect();
-        PagedAttentionInput::new(
-            query,
-            pages,
-            PagedAttentionConfig::new(QUERY_HEADS, KV_HEADS, HEAD_DIM).unwrap(),
+        attach_physical_blocks(
+            PagedAttentionInput::new(
+                query,
+                pages,
+                PagedAttentionConfig::new(QUERY_HEADS, KV_HEADS, HEAD_DIM).unwrap(),
+            )
+            .unwrap(),
         )
-        .unwrap()
+    }
+
+    fn attach_physical_blocks(input: PagedAttentionInput) -> PagedAttentionInput {
+        let device = input.query().device();
+        let config = input.config();
+        let tokens_per_block = input
+            .pages()
+            .iter()
+            .map(|page| page.key().dims()[2])
+            .max()
+            .unwrap();
+        let physical_blocks = (input.pages().len() + 1).max(3);
+        let shape = [
+            physical_blocks,
+            config.key_value_heads(),
+            tokens_per_block,
+            config.head_dim(),
+        ];
+        let mut key = Tensor::zeros(shape, &device);
+        let mut value = Tensor::zeros(shape, &device);
+        let mut block_ids = Vec::with_capacity(input.pages().len());
+        let mut token_count = 0;
+        for (logical, page) in input.pages().iter().enumerate() {
+            let physical = physical_blocks - 1 - logical;
+            let used = page.key().dims()[2];
+            key = key.slice_assign(
+                [
+                    physical..physical + 1,
+                    0..config.key_value_heads(),
+                    0..used,
+                    0..config.head_dim(),
+                ],
+                page.key().clone(),
+            );
+            value = value.slice_assign(
+                [
+                    physical..physical + 1,
+                    0..config.key_value_heads(),
+                    0..used,
+                    0..config.head_dim(),
+                ],
+                page.value().clone(),
+            );
+            block_ids.push(physical);
+            token_count += used;
+        }
+        let block_table = PagedKvBlockTable::new(block_ids, physical_blocks, &device).unwrap();
+        let blocks =
+            PagedKvBlocks::new(key, value, block_table, tokens_per_block, token_count).unwrap();
+        input.with_blocks(blocks).unwrap()
     }
 
     #[cfg(feature = "wgpu")]

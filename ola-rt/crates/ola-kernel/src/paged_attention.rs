@@ -1,4 +1,4 @@
-use burn::tensor::{DType, Tensor};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 
 use crate::{
     KernelCapability, KernelDType, KernelDescriptor, KernelError, KernelOperation, KernelTarget,
@@ -98,11 +98,218 @@ impl PagedKvPage {
     }
 }
 
+/// Validated logical-to-physical page indices resident on the compute device.
+#[derive(Clone)]
+pub struct PagedKvBlockTable {
+    tensor: Tensor<1, Int>,
+    block_ids: Vec<usize>,
+    physical_blocks: usize,
+}
+
+impl PagedKvBlockTable {
+    /// Uploads a non-empty logical block table after validating every index.
+    pub fn new(
+        block_ids: Vec<usize>,
+        physical_blocks: usize,
+        device: &Device,
+    ) -> Result<Self, KernelError> {
+        if physical_blocks == 0 {
+            return Err(KernelError::new(
+                "physical KV block count must be greater than zero",
+            ));
+        }
+        if block_ids.is_empty() {
+            return Err(KernelError::new(
+                "a populated KV cache requires at least one logical block",
+            ));
+        }
+        for (logical, physical) in block_ids.iter().copied().enumerate() {
+            if physical >= physical_blocks {
+                return Err(KernelError::new(format!(
+                    "logical KV block {logical} maps to physical block {physical}, outside {physical_blocks} blocks"
+                )));
+            }
+        }
+        let values = block_ids
+            .iter()
+            .map(|block| {
+                i64::try_from(*block)
+                    .map_err(|_| KernelError::new("physical KV block index exceeds i64"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let length = values.len();
+        Ok(Self {
+            tensor: Tensor::from_data(TensorData::new(values, [length]), device),
+            block_ids,
+            physical_blocks,
+        })
+    }
+
+    /// Returns a view covering the first `logical_blocks` entries.
+    #[allow(clippy::single_range_in_vec_init)]
+    pub fn prefix(&self, logical_blocks: usize) -> Result<Self, KernelError> {
+        if logical_blocks == 0 || logical_blocks > self.block_ids.len() {
+            return Err(KernelError::new(format!(
+                "logical block prefix {logical_blocks} is outside a {}-block table",
+                self.block_ids.len()
+            )));
+        }
+        Ok(Self {
+            tensor: self.tensor.clone().slice([0..logical_blocks]),
+            block_ids: self.block_ids[..logical_blocks].to_vec(),
+            physical_blocks: self.physical_blocks,
+        })
+    }
+
+    /// Returns the number of populated logical blocks.
+    pub const fn len(&self) -> usize {
+        self.block_ids.len()
+    }
+
+    /// Reports whether this table contains no logical blocks.
+    pub const fn is_empty(&self) -> bool {
+        self.block_ids.is_empty()
+    }
+
+    /// Returns the device integer tensor consumed by optimized kernels.
+    pub const fn tensor(&self) -> &Tensor<1, Int> {
+        &self.tensor
+    }
+
+    #[cfg(feature = "cubecl")]
+    pub(crate) fn block_ids(&self) -> &[usize] {
+        &self.block_ids
+    }
+}
+
+/// Device-resident physical KV blocks and the logical-to-physical block table.
+///
+/// The logical page views remain part of [`PagedAttentionInput`] for portable
+/// implementations. Optimized kernels can use this representation to traverse
+/// the cache without concatenating those views into a sequence-sized tensor.
+#[derive(Clone)]
+pub struct PagedKvBlocks {
+    key: Tensor<4>,
+    value: Tensor<4>,
+    block_table: PagedKvBlockTable,
+    tokens_per_block: usize,
+    token_count: usize,
+}
+
+impl PagedKvBlocks {
+    /// Creates physical cache metadata.
+    ///
+    /// Key and value tensors use shape
+    /// `[physical_blocks, key_value_heads, tokens_per_block, head_dim]`.
+    /// The block table contains one physical block index per populated logical
+    /// block, in sequence order.
+    pub fn new(
+        key: Tensor<4>,
+        value: Tensor<4>,
+        block_table: PagedKvBlockTable,
+        tokens_per_block: usize,
+        token_count: usize,
+    ) -> Result<Self, KernelError> {
+        let key_shape = key.dims();
+        let value_shape = value.dims();
+        if key_shape != value_shape {
+            return Err(KernelError::new(format!(
+                "physical KV blocks have different key {key_shape:?} and value {value_shape:?} shapes"
+            )));
+        }
+        if key_shape.contains(&0) {
+            return Err(KernelError::new(
+                "physical KV block dimensions must be greater than zero",
+            ));
+        }
+        if tokens_per_block == 0 || key_shape[2] != tokens_per_block {
+            return Err(KernelError::new(format!(
+                "physical KV block token dimension must equal tokens_per_block {tokens_per_block}, found {}",
+                key_shape[2]
+            )));
+        }
+        let logical_blocks = block_table.len();
+        if logical_blocks == 0 || token_count == 0 {
+            return Err(KernelError::new(
+                "physical KV metadata requires populated blocks and tokens",
+            ));
+        }
+        if token_count > logical_blocks.saturating_mul(tokens_per_block)
+            || token_count <= (logical_blocks - 1).saturating_mul(tokens_per_block)
+        {
+            return Err(KernelError::new(format!(
+                "token count {token_count} does not match {logical_blocks} logical blocks of {tokens_per_block} tokens"
+            )));
+        }
+        let device = key.device();
+        if value.device() != device || block_table.tensor.device() != device {
+            return Err(KernelError::new(
+                "physical KV blocks and block table must live on the same device",
+            ));
+        }
+        if value.dtype() != key.dtype() {
+            return Err(KernelError::new(
+                "physical key and value blocks must use the same dtype",
+            ));
+        }
+        if block_table.physical_blocks != key_shape[0] {
+            return Err(KernelError::new(format!(
+                "block table addresses {} physical blocks but K/V storage contains {}",
+                block_table.physical_blocks, key_shape[0]
+            )));
+        }
+        Ok(Self {
+            key,
+            value,
+            block_table,
+            tokens_per_block,
+            token_count,
+        })
+    }
+
+    /// Returns all physical key blocks.
+    pub const fn key(&self) -> &Tensor<4> {
+        &self.key
+    }
+
+    /// Returns all physical value blocks.
+    pub const fn value(&self) -> &Tensor<4> {
+        &self.value
+    }
+
+    /// Returns the logical-to-physical block table.
+    pub const fn block_table(&self) -> &PagedKvBlockTable {
+        &self.block_table
+    }
+
+    /// Returns the physical page width.
+    pub const fn tokens_per_block(&self) -> usize {
+        self.tokens_per_block
+    }
+
+    /// Returns the populated logical token count.
+    pub const fn token_count(&self) -> usize {
+        self.token_count
+    }
+
+    #[cfg(feature = "cubecl")]
+    pub(crate) fn into_parts(self) -> (Tensor<4>, Tensor<4>, Tensor<1, Int>, usize, usize) {
+        (
+            self.key,
+            self.value,
+            self.block_table.tensor,
+            self.tokens_per_block,
+            self.token_count,
+        )
+    }
+}
+
 /// Validated input to single-sequence paged decode attention.
 #[derive(Clone)]
 pub struct PagedAttentionInput {
     query: Tensor<4>,
     pages: Vec<PagedKvPage>,
+    blocks: Option<PagedKvBlocks>,
     config: PagedAttentionConfig,
 }
 
@@ -159,8 +366,38 @@ impl PagedAttentionInput {
         Ok(Self {
             query,
             pages,
+            blocks: None,
             config,
         })
+    }
+
+    /// Attaches device-resident physical blocks for optimized implementations.
+    pub fn with_blocks(mut self, blocks: PagedKvBlocks) -> Result<Self, KernelError> {
+        let shape = blocks.key.dims();
+        if shape[1] != self.config.key_value_heads || shape[3] != self.config.head_dim {
+            return Err(KernelError::new(format!(
+                "physical KV block shape must be [physical_blocks, {}, tokens_per_block, {}], found {shape:?}",
+                self.config.key_value_heads, self.config.head_dim
+            )));
+        }
+        if blocks.key.device() != self.query.device() || blocks.key.dtype() != self.query.dtype() {
+            return Err(KernelError::new(
+                "physical KV blocks and query must use the same device and dtype",
+            ));
+        }
+        let page_tokens = self
+            .pages
+            .iter()
+            .map(|page| page.key.dims()[2])
+            .sum::<usize>();
+        if page_tokens != blocks.token_count {
+            return Err(KernelError::new(format!(
+                "logical pages contain {page_tokens} tokens but physical metadata contains {}",
+                blocks.token_count
+            )));
+        }
+        self.blocks = Some(blocks);
+        Ok(self)
     }
 
     /// Returns the query tensor.
@@ -173,6 +410,11 @@ impl PagedAttentionInput {
         &self.pages
     }
 
+    /// Returns physical cache metadata when the producer owns a flattened pool.
+    pub const fn blocks(&self) -> Option<&PagedKvBlocks> {
+        self.blocks.as_ref()
+    }
+
     /// Returns the validated dimensions.
     pub const fn config(&self) -> PagedAttentionConfig {
         self.config
@@ -183,8 +425,15 @@ impl PagedAttentionInput {
         self.query.dtype()
     }
 
-    pub(crate) fn into_parts(self) -> (Tensor<4>, Vec<PagedKvPage>, PagedAttentionConfig) {
-        (self.query, self.pages, self.config)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Tensor<4>,
+        Vec<PagedKvPage>,
+        Option<PagedKvBlocks>,
+        PagedAttentionConfig,
+    ) {
+        (self.query, self.pages, self.blocks, self.config)
     }
 }
 
@@ -195,6 +444,20 @@ pub trait PagedAttentionKernel: Send + Sync {
 
     /// Produces an attention context with shape `[1, query_heads, 1, head_dim]`.
     fn execute(&self, input: PagedAttentionInput) -> Result<Tensor<4>, KernelError>;
+
+    /// Executes independent one-token queries as one logical operation.
+    ///
+    /// Providers may override this to use a genuinely batched dispatch. The
+    /// default deliberately preserves the portable request-local semantics.
+    fn execute_batch(
+        &self,
+        inputs: Vec<PagedAttentionInput>,
+    ) -> Result<Vec<Tensor<4>>, KernelError> {
+        inputs
+            .into_iter()
+            .map(|input| self.execute(input))
+            .collect()
+    }
 }
 
 /// Reference implementation composed from portable Burn tensor operations.
@@ -218,7 +481,7 @@ impl PagedAttentionKernel for PortablePagedAttention {
     }
 
     fn execute(&self, input: PagedAttentionInput) -> Result<Tensor<4>, KernelError> {
-        let (query, pages, config) = input.into_parts();
+        let (query, pages, _blocks, config) = input.into_parts();
         let scale = (config.head_dim as f32).sqrt();
         let mut pages = pages.into_iter();
         let (first_key, first_value) = pages
@@ -314,6 +577,16 @@ mod tests {
             .expect("empty pages must fail validation");
 
         assert!(error.message().contains("at least one"));
+    }
+
+    #[test]
+    fn rejects_a_block_table_that_addresses_outside_the_physical_pool() {
+        let device = Default::default();
+        let error = PagedKvBlockTable::new(vec![0, 2], 2, &device)
+            .err()
+            .expect("an out-of-range physical block must be rejected");
+
+        assert!(error.message().contains("outside 2 blocks"));
     }
 
     #[test]

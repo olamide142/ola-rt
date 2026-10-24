@@ -191,16 +191,20 @@ Done when a second architecture and a sharded checkpoint load through the regist
 Route kernel choices through framework plan, policy, capability, and benchmark boundaries rather than embedding them directly in Llama.
 Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 
-- [ ] Finish and validate the CubeCL paged-attention extension.
+- [x] Finish and validate the first CubeCL paged-attention extension. (Single fused traversal over a device block table; CPU and WGPU conformance pass; CUDA workspace compiles.)
 - [x] Define kernel capabilities and selection constraints.
 - [x] Represent backend/device and kernel selections in `ExecutionPlan`.
 - [x] Test kernel-selection conflicts with scheduling, admission, batching, and memory policy.
 - [x] Add provider selection and portable fallback.
 - [x] Route planned providers into individual and tensor-batched model execution.
-- [ ] Compare every optimized implementation with the portable reference.
-- [ ] Fuse page traversal, score reduction, and value accumulation.
-- [ ] Optimize request-local tensor-batched decode attention.
-- [ ] Investigate ragged multi-request decode attention.
+- [x] Compare the first optimized implementation with the portable reference. (CPU and WGPU, multiple logical pages, partial final page, grouped heads, reversed physical block mapping.)
+- [x] Fuse page traversal, score reduction, and value accumulation into one CubeCL dispatch. (Score computation is still repeated per output dimension; shared score tiling remains future work.)
+- [x] Optimize request-local tensor-batched decode attention. (CubeCL now
+  stacks request queries and consumes padded device block tables in one
+  dispatch; portable providers retain the request-local fallback.)
+- [ ] Investigate ragged multi-request decode attention. (Ragged logical
+  lengths now work within one physical KV geometry; cross-pool or incompatible
+  shape grouping remains.)
 - [ ] Investigate ragged multi-position prefill chunks.
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs.
 - [ ] Compare optimized paths against the single-request oracle.

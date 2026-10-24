@@ -1,8 +1,8 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-23 13:08 BST (Europe/London)
+**Last updated:** 2026-10-24 14:18 BST (Europe/London)
 
-**Source revision:** working tree based on `5cd3da2` on `master`
+**Source revision:** working tree based on `3363e15` on `master`
 
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
@@ -39,9 +39,17 @@ prefill calls. Actual execution records and request traces now add provider
 identity, target, call count, and clock-gated synchronous host duration;
 model-backed experiment variants retain the canonical provider set they
 actually invoked. Kernel-track steps 1–4 are committed through `5cd3da2`.
-The current working tree removes the non-compiling per-page tensor-sequence
-prototype and records the device-resident flattened-buffer direction for the
-next optimization.
+The current working tree completes the first fused CubeCL paged-attention
+implementation: Llama stores each layer in flattened physical K/V tensors,
+passes a validated device block table, and CubeCL fuses page traversal, score
+calculation, online softmax, and value accumulation into one dispatch. The old
+per-page tensor-sequence prototype was removed after a compile probe showed
+CubeCL 0.11 cannot represent it as a launch argument. Tensor-batched Llama
+decode now routes through a batch kernel boundary; CubeCL stacks request-local
+queries and block tables into one dispatch while portable providers preserve
+the independent-request fallback. The same dispatch is conformance-tested with
+ragged logical block counts and per-request token lengths; cross-pool grouping
+remains deferred.
 
 This is the authoritative, timestamped snapshot of OlaRT's implementation
 progress. The root `README.md` describes the project vision, the local and
@@ -501,6 +509,13 @@ performance claim.
 
 At the working tree recorded above:
 
+- CubeCL fused paged-attention implementation: 19 kernel tests passed with the
+  CPU feature, including an optimized-versus-portable comparison over two
+  logical pages, a partial final page, grouped query heads, and reversed
+  physical block mapping. The WGPU numerical conformance test passed on the
+  local integrated GPU. CUDA and WGPU workspace all-target feature checks both
+  passed. The 27 local `ola-burn` tests and its README doctest passed (3 tests
+  requiring the pinned external model fixture remain ignored).
 - CubeCL optimization probe: directly compiling the old per-page prototype
   failed because CubeCL 0.11 cannot use `Sequence<Tensor<F>>` launch arguments;
   the prototype also bypassed Burn Fusion conversion. It was removed, the
@@ -678,6 +693,9 @@ and `TOKENS` variables.
 - CubeCL 0.11 cannot launch a sequence of tensor page bindings. Removing
   pre-dispatch concatenation therefore requires a device-resident flattened K/V
   allocation plus page-offset metadata, not the removed per-page prototype.
+- The fused CubeCL kernel currently recomputes each query-key score for every
+  output dimension. The flattened Burn KV pool also needs study-grade latency
+  and memory profiling before any performance benefit is claimed.
 - Native CUDA is wired and compiles, but this machine cannot execute it until a
   compatible CUDA toolkit providing NVRTC is installed. WGPU is the currently
   validated local GPU path.
@@ -789,6 +807,27 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
+  CubeCL conformance to ragged requests with different logical block counts and
+  token lengths sharing one physical KV geometry. Per-request token counts and
+  padded block-table rows are honored; incompatible physical pools remain a
+  launch-grouping follow-up. Focused kernel and Llama batch tests pass.
+
+- **2026-10-24 — working tree on `3363e15`:** Added the tensor-batched decode
+  kernel boundary. CubeCL now executes multiple request-local paged-attention
+  queries in one dispatch using a padded device block table and per-request
+  token counts; Llama routes tensor-batched decode through it. Portable
+  execution remains the correctness fallback. Kernel and Burn tests pass,
+  including batched CubeCL conformance and unequal-position Llama decode.
+
+- **2026-10-23 18:13 BST — working tree on `3363e15`:** Completed the first
+  fused CubeCL paged-attention path. Llama now uses flattened per-layer K/V
+  tensors and validated device block tables; CubeCL traverses non-contiguous
+  physical pages and combines score calculation, online softmax, and value
+  accumulation in one dispatch. CPU and WGPU conformance, `ola-burn` tests,
+  and CUDA/WGPU workspace checks pass. Score calculation is still repeated per
+  output dimension, and no performance claim is made pending measurement.
 
 - **2026-10-23 13:08 BST — working tree on `5cd3da2`:** Probed and rejected the
   unwired per-page CubeCL prototype: `Sequence<Tensor<F>>` is not a valid

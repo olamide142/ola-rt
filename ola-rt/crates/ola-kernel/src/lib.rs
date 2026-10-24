@@ -21,8 +21,8 @@ pub use error::KernelError;
 pub use metadata::{KernelDescriptor, KernelOperation, KernelTarget};
 pub use metrics::{KernelExecutionMetrics, KernelExecutionSnapshot};
 pub use paged_attention::{
-    PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvPage,
-    PortablePagedAttention,
+    PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvBlockTable,
+    PagedKvBlocks, PagedKvPage, PortablePagedAttention,
 };
 pub use registry::{
     KernelFallbackReason, KernelRegistry, KernelRejection, KernelSelection, PagedAttentionProvider,

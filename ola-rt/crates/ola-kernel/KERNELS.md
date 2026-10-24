@@ -23,14 +23,13 @@ implementations.
   softmax across logical KV pages using Burn tensor operations without
   materializing sequence-sized temporary tensors. It serves as the numerical
   baseline.
-- **An experimental CubeCL implementation exists.** `CubePagedAttention` in
-  `ola-kernel/src/cubecl_extension.rs` provides WGPU and CUDA execution
-  paths via Burn's CubeCL/Fusion backend extension. However:
-  1. It concatenates page tensors (`BurnTensor::cat`) into a contiguous
-     tensor before dispatch to work around CubeCL 0.11 sequence limits.
-  2. The kernel recomputes query-key scores for every output dimension.
-  3. A now-removed `cubecl_paged_attention.rs` prototype attempted per-page
-     tensor bindings, which CubeCL 0.11 cannot represent as launch arguments.
+- **CubeCL has a fused paged traversal.** `CubePagedAttention` in
+  `ola-kernel/src/cubecl_extension.rs` receives one physical K/V pool and a
+  device-resident logical-to-physical block table. One CubeCL launch computes
+  scores, online softmax, and value accumulation while traversing the block
+  table. It does not concatenate the active sequence on each call. Each output
+  dimension currently recomputes each score; a future tiled kernel can share
+  score work across dimensions.
 - **Kernel selection is embedded in Llama.** In `ola-burn/src/llama/model.rs`,
   decode attention checks compile-time `#[cfg(feature = "wgpu")]` and
   `#[cfg(feature = "cuda")]` flags and hardcodes `CubePagedAttention::new`,
@@ -70,14 +69,20 @@ implementations.
    Burn implementation remains available unconditionally as the fallback and oracle.
 
 4. **Eliminate device-side page packing in CubeCL paged attention.**
-   Refactor `CubePagedAttention` to eliminate `BurnTensor::cat` on every
-   step. KV pages should be indexed either through a device-resident page table
-   buffer or structured batch bindings. Fuse the score reduction (online softmax)
-   and value accumulation into a shared-memory or register-tiled kernel pass.
+   Complete: Llama stores each layer in flattened physical K/V allocations,
+   uploads a validated device block table when a sequence's allocation changes,
+   and CubeCL traverses it in one fused dispatch. The portable implementation
+   still consumes logical page views. Score work is currently repeated per
+   output dimension; sharing it across dimensions remains a kernel optimization.
 
 5. **Multi-request and multi-position operations.**
-   - Decode: Move from request-local page loops to batched decode attention
-     where multiple sequences in a tensor batch share a single kernel launch.
+   - Decode: **Request-local tensor batching complete 2026-10-24.** The
+     provider boundary accepts independent inputs; CubeCL stacks queries and
+     consumes a padded device block table in one launch, while portable
+     providers retain the independent-request fallback.
+   - Decode: Ragged logical lengths are validated for one physical KV geometry;
+     requests with different physical pools or incompatible shapes still need
+     launch grouping before they can share a dispatch.
    - Resumable prefill: Investigate ragged multi-position chunk execution rather
      than stepping one offset at a time.
 
@@ -133,13 +138,14 @@ implementations.
    work only when a provider synchronizes before returning, so later studies
    must use backend device events before calling it device-kernel latency.
 5. **Optimize CubeCL paged attention.**
-   Eliminate pre-dispatch tensor concatenation in `CubePagedAttention`. Implement
-   fused page traversal, online softmax reduction, and value accumulation.
-   The obsolete unwired prototype is removed: a 2026-10-23 compile probe
-   confirmed CubeCL 0.11 cannot use `Sequence<Tensor<F>>` as a launch argument,
-   and the prototype also bypassed Burn Fusion conversion. Use a device-resident
-   flattened K/V allocation plus page-offset metadata instead of per-page
-   tensor bindings.
+   **First fused implementation complete 2026-10-23.** Eliminate active-sequence
+   concatenation and fuse physical page traversal, score calculation, online
+   softmax, and value accumulation into a single CubeCL dispatch. Retain the
+   device-resident flattened K/V pool and block-table layout. The old per-page
+   binding prototype was removed after a compile probe confirmed CubeCL 0.11
+   cannot use `Sequence<Tensor<F>>` launch arguments and its primitive
+   conversions bypassed Burn Fusion. Further work can share score computation
+   across output dimensions and benchmark the memory/performance tradeoff.
 6. **Conformance and study-grade evaluation.**
    Implement conformance tests across diverse page counts and head configurations.
    Execute an empirical kernel comparison benchmark in `ola-bench` evaluating
