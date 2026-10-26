@@ -4,6 +4,9 @@ use burn::tensor::Device;
 use ola_core::ComputeBackend;
 
 pub mod llama;
+pub mod mistral;
+/// Hugging Face tokenizer adapter for models executed with Burn.
+pub mod tokenizer;
 
 /// Associates a Burn backend and device with the backend-neutral runtime.
 #[derive(Clone, Debug)]

@@ -1,0 +1,748 @@
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use burn::tensor::Tensor;
+use ola_kernel::{PagedKvBlockTable, PagedKvBlocks};
+use ola_model::KvCacheProfile;
+use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
+
+use super::MistralConfig;
+
+/// Capacity and page geometry for the Mistral KV-cache pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MistralKvCacheConfig {
+    capacity_tokens: usize,
+    tokens_per_block: usize,
+    prefix_cache: bool,
+}
+
+impl MistralKvCacheConfig {
+    /// Creates a cache configuration.
+    ///
+    /// Capacity is shared by every live session created from one loaded model.
+    /// Invalid or overflowing values are reported when the model is loaded.
+    pub const fn new(capacity_tokens: usize, tokens_per_block: usize) -> Self {
+        Self {
+            capacity_tokens,
+            tokens_per_block,
+            prefix_cache: false,
+        }
+    }
+
+    /// Keeps full KV blocks after their sessions end so later sessions with
+    /// the same prompt prefix reuse them instead of recomputing.
+    #[must_use]
+    pub const fn with_prefix_cache(mut self) -> Self {
+        self.prefix_cache = true;
+        self
+    }
+
+    /// Uses one model context of capacity and 16 token positions per block.
+    pub const fn for_model(config: &MistralConfig) -> Self {
+        Self::new(config.max_position_embeddings, 16)
+    }
+
+    /// Returns the requested minimum token capacity shared by all sessions.
+    ///
+    /// The physical pool rounds this up to a whole number of blocks.
+    pub const fn capacity_tokens(self) -> usize {
+        self.capacity_tokens
+    }
+
+    /// Returns the number of token positions in each physical block.
+    pub const fn tokens_per_block(self) -> usize {
+        self.tokens_per_block
+    }
+
+    pub(crate) fn profile(self, model: &MistralConfig) -> Result<KvCacheProfile, KvBlockError> {
+        if self.capacity_tokens == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "capacity_tokens must be greater than zero",
+            ));
+        }
+        if self.tokens_per_block == 0 {
+            return Err(KvBlockError::InvalidConfiguration(
+                "tokens_per_block must be greater than zero",
+            ));
+        }
+        let element_bytes = std::mem::size_of::<f32>() as u64;
+        let bytes_per_token = checked_product(&[
+            model.num_hidden_layers as u64,
+            2,
+            model.num_key_value_heads as u64,
+            model.attention_head_dim() as u64,
+            element_bytes,
+        ])?;
+        let total_blocks = self.capacity_tokens.div_ceil(self.tokens_per_block);
+        let capacity_bytes = checked_product(&[
+            total_blocks as u64,
+            self.tokens_per_block as u64,
+            bytes_per_token,
+        ])?;
+        KvCacheProfile::new(bytes_per_token, self.tokens_per_block, capacity_bytes).ok_or(
+            KvBlockError::InvalidConfiguration("KV-cache profile must be non-empty"),
+        )
+    }
+}
+
+pub(crate) struct MistralKvCache {
+    pool: Arc<Mutex<MistralKvPool>>,
+    sequence: KvSequenceId,
+    tokens: usize,
+    block_ids: Vec<usize>,
+    block_table: Option<PagedKvBlockTable>,
+}
+
+impl MistralKvCache {
+    pub(crate) fn allocate(pool: Arc<Mutex<MistralKvPool>>) -> Result<Self, KvBlockError> {
+        let sequence = lock_pool(&pool).manager.allocate()?;
+        Ok(Self {
+            pool,
+            sequence,
+            tokens: 0,
+            block_ids: Vec::new(),
+            block_table: None,
+        })
+    }
+
+    pub(crate) const fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Attaches the longest cached prefix of `tokens` to this empty cache.
+    pub(crate) fn attach_prefix(&mut self, tokens: &[u32]) -> Result<usize, KvBlockError> {
+        let attached = lock_pool(&self.pool)
+            .manager
+            .attach_prefix(self.sequence, tokens)?;
+        self.tokens = attached;
+        self.refresh_block_table();
+        Ok(attached)
+    }
+
+    /// Reports the content of positions whose KV has been written.
+    pub(crate) fn record_tokens(&self, tokens: &[u32]) {
+        let result = lock_pool(&self.pool)
+            .manager
+            .record_tokens(self.sequence, tokens);
+        debug_assert!(result.is_ok(), "recorded content follows written positions");
+    }
+
+    pub(crate) fn reserve(&mut self, additional_tokens: usize) -> Result<(), KvBlockError> {
+        let new_token_count = self
+            .tokens
+            .checked_add(additional_tokens)
+            .ok_or(KvBlockError::TokenCountOverflow(self.sequence))?;
+        lock_pool(&self.pool)
+            .manager
+            .append(self.sequence, additional_tokens)?;
+        self.tokens = new_token_count;
+        self.refresh_block_table();
+        Ok(())
+    }
+
+    /// Atomically grows several caches backed by the same physical pool.
+    pub(crate) fn reserve_batch(
+        caches: &mut [&mut Self],
+        additional_tokens: usize,
+    ) -> Result<(), KvBlockError> {
+        let additional_tokens = vec![additional_tokens; caches.len()];
+        Self::reserve_batch_lengths(caches, &additional_tokens)
+    }
+
+    /// Atomically grows several caches with different segment lengths.
+    pub(crate) fn reserve_batch_lengths(
+        caches: &mut [&mut Self],
+        additional_tokens: &[usize],
+    ) -> Result<(), KvBlockError> {
+        if caches.is_empty() {
+            return Ok(());
+        }
+        let pool = caches[0].pool.clone();
+        for cache in &caches[1..] {
+            if !Arc::ptr_eq(&pool, &cache.pool) {
+                return Err(KvBlockError::InvalidConfiguration(
+                    "batched reservations require caches from the same pool",
+                ));
+            }
+        }
+        let mut growth = Vec::with_capacity(caches.len());
+        for (cache, &count) in caches.iter().zip(additional_tokens) {
+            growth.push((cache.sequence, count));
+        }
+        lock_pool(&pool).manager.append_batch(&growth)?;
+        for (cache, &count) in caches.iter_mut().zip(additional_tokens) {
+            cache.tokens = cache
+                .tokens
+                .checked_add(count)
+                .ok_or(KvBlockError::TokenCountOverflow(cache.sequence))?;
+            cache.refresh_block_table();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_layer(
+        &self,
+        layer: usize,
+        token_offset: usize,
+        key: Tensor<4>,
+        value: Tensor<4>,
+    ) {
+        lock_pool(&self.pool).write_layer(self.sequence, layer, token_offset, key, value);
+    }
+
+    pub(crate) fn read_layer(
+        &self,
+        layer: usize,
+        sliding_window: Option<usize>,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, Option<PagedKvBlocks>) {
+        let start = match sliding_window {
+            Some(window) => self.tokens.saturating_sub(window),
+            None => 0,
+        };
+        if start == 0 {
+            let (pages, blocks) = self.read_layer_prefix(layer, self.tokens);
+            (pages, Some(blocks))
+        } else {
+            self.read_layer_window(layer, start, self.tokens)
+        }
+    }
+
+    /// Reads only the populated prefix of an atomically pre-reserved segment.
+    pub(crate) fn read_layer_prefix(
+        &self,
+        layer: usize,
+        token_count: usize,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks) {
+        let tokens_per_block = lock_pool(&self.pool).manager.tokens_per_block();
+        let logical_blocks = token_count.div_ceil(tokens_per_block);
+        let block_table = self
+            .block_table
+            .as_ref()
+            .expect("a populated cache owns a device block table")
+            .prefix(logical_blocks)
+            .expect("a populated prefix must fit its reserved block table");
+        lock_pool(&self.pool).read_layer_prefix(self.sequence, layer, token_count, block_table)
+    }
+
+    /// Reads a sub-window `[start, end)` of tokens, respecting sliding window attention.
+    pub(crate) fn read_layer_window(
+        &self,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, Option<PagedKvBlocks>) {
+        if start == 0 {
+            let (pages, blocks) = self.read_layer_prefix(layer, end);
+            return (pages, Some(blocks));
+        }
+        lock_pool(&self.pool).read_layer_window(self.sequence, layer, start, end)
+    }
+
+    /// Returns physical page bytes attributed to this sequence.
+    pub(crate) fn bytes(&self) -> u64 {
+        let pool = lock_pool(&self.pool);
+        let blocks = pool
+            .manager
+            .block_table(self.sequence)
+            .expect("a live cache owns a block table")
+            .len() as u64;
+        blocks * pool.manager.metrics().block_bytes
+    }
+
+    fn refresh_block_table(&mut self) {
+        let (block_ids, device) = {
+            let pool = lock_pool(&self.pool);
+            let block_ids = pool
+                .manager
+                .block_table(self.sequence)
+                .expect("a live cache owns a block table")
+                .iter()
+                .map(|block| block.get())
+                .collect::<Vec<_>>();
+            (block_ids, pool.device.clone())
+        };
+        if block_ids == self.block_ids {
+            return;
+        }
+        self.block_ids = block_ids;
+        self.block_table = if self.block_ids.is_empty() {
+            None
+        } else {
+            let physical_blocks = lock_pool(&self.pool).manager.metrics().total_blocks;
+            Some(
+                PagedKvBlockTable::new(self.block_ids.clone(), physical_blocks, &device)
+                    .expect("the runtime block manager must produce valid physical indices"),
+            )
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_ids(&self) -> Vec<usize> {
+        lock_pool(&self.pool)
+            .manager
+            .block_table(self.sequence)
+            .expect("a live cache owns a block table")
+            .iter()
+            .map(|block| block.get())
+            .collect()
+    }
+}
+
+impl Drop for MistralKvCache {
+    fn drop(&mut self) {
+        let result = lock_pool(&self.pool).manager.free(self.sequence);
+        debug_assert!(result.is_ok(), "a live cache sequence must be releasable");
+    }
+}
+
+pub(crate) struct MistralKvPool {
+    manager: KvBlockManager,
+    layers: Vec<MistralLayerPages>,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    device: burn::tensor::Device,
+}
+
+struct MistralLayerPages {
+    keys: Tensor<4>,
+    values: Tensor<4>,
+}
+
+impl MistralKvPool {
+    pub(crate) fn status(&self) -> ola_model::KvPoolStatus {
+        let metrics = self.manager.metrics();
+        ola_model::KvPoolStatus {
+            total_blocks: metrics.total_blocks,
+            free_blocks: metrics.free_blocks,
+            allocated_blocks: metrics.allocated_blocks,
+            cached_blocks: metrics.cached_blocks,
+            tokens_per_block: self.manager.tokens_per_block(),
+            live_sequences: metrics.live_sequences,
+            evictions: metrics.evictions,
+            prefix_hit_tokens: metrics.prefix_hit_tokens,
+        }
+    }
+
+    pub(crate) fn cached_prefix(&self, tokens: &[u32]) -> ola_model::CachedPrefix {
+        let found = self.manager.lookup_prefix(tokens);
+        ola_model::CachedPrefix {
+            tokens: found.tokens,
+            evictable_blocks: found.evictable_blocks,
+        }
+    }
+
+    pub(crate) fn new(
+        model: &MistralConfig,
+        config: MistralKvCacheConfig,
+        device: burn::tensor::Device,
+    ) -> Result<Self, KvBlockError> {
+        let profile = config.profile(model)?;
+        let mut manager = KvBlockManager::new(
+            profile.capacity_bytes(),
+            profile.tokens_per_block(),
+            profile.bytes_per_token(),
+        )?;
+        if config.prefix_cache {
+            manager = manager.with_prefix_cache();
+        }
+        let physical_blocks = manager.metrics().total_blocks;
+        let page_shape = [
+            physical_blocks,
+            model.num_key_value_heads,
+            config.tokens_per_block,
+            model.attention_head_dim(),
+        ];
+        let layers = (0..model.num_hidden_layers)
+            .map(|_| MistralLayerPages {
+                keys: Tensor::zeros(page_shape, &device),
+                values: Tensor::zeros(page_shape, &device),
+            })
+            .collect();
+        Ok(Self {
+            manager,
+            layers,
+            num_key_value_heads: model.num_key_value_heads,
+            head_dim: model.attention_head_dim(),
+            device,
+        })
+    }
+
+    fn write_layer(
+        &mut self,
+        sequence: KvSequenceId,
+        layer: usize,
+        token_offset: usize,
+        key: Tensor<4>,
+        value: Tensor<4>,
+    ) {
+        let [batch, heads, token_count, head_dim] = key.dims();
+        debug_assert_eq!(value.dims(), key.dims());
+        debug_assert_eq!(batch, 1);
+        debug_assert_eq!(heads, self.num_key_value_heads);
+        debug_assert_eq!(head_dim, self.head_dim);
+        debug_assert!(token_offset + token_count <= self.manager.cached_tokens(sequence).unwrap());
+
+        let tokens_per_block = self.manager.tokens_per_block();
+        let block_table = self
+            .manager
+            .block_table(sequence)
+            .expect("a reserved cache owns a block table")
+            .to_vec();
+        let layer = self
+            .layers
+            .get_mut(layer)
+            .expect("model and cache layer counts must agree");
+        let mut source_offset = 0;
+        while source_offset < token_count {
+            let logical_position = token_offset + source_offset;
+            let logical_block = logical_position / tokens_per_block;
+            let block_offset = logical_position % tokens_per_block;
+            let physical_block = block_table[logical_block].get();
+            let count = (tokens_per_block - block_offset).min(token_count - source_offset);
+            let key_values = key.clone().slice([
+                0..1,
+                0..heads,
+                source_offset..source_offset + count,
+                0..head_dim,
+            ]);
+            let value_values = value.clone().slice([
+                0..1,
+                0..heads,
+                source_offset..source_offset + count,
+                0..head_dim,
+            ]);
+            layer.keys = layer.keys.clone().slice_assign(
+                [
+                    physical_block..physical_block + 1,
+                    0..heads,
+                    block_offset..block_offset + count,
+                    0..head_dim,
+                ],
+                key_values,
+            );
+            layer.values = layer.values.clone().slice_assign(
+                [
+                    physical_block..physical_block + 1,
+                    0..heads,
+                    block_offset..block_offset + count,
+                    0..head_dim,
+                ],
+                value_values,
+            );
+            source_offset += count;
+        }
+    }
+
+    fn read_layer_prefix(
+        &self,
+        sequence: KvSequenceId,
+        layer: usize,
+        token_count: usize,
+        block_table: PagedKvBlockTable,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, PagedKvBlocks) {
+        let reserved_tokens = self
+            .manager
+            .cached_tokens(sequence)
+            .expect("a live cache owns token accounting");
+        debug_assert!(token_count <= reserved_tokens);
+        debug_assert!(token_count > 0);
+        let tokens_per_block = self.manager.tokens_per_block();
+        let layer = self
+            .layers
+            .get(layer)
+            .expect("model and cache layer counts must agree");
+        let mut pages = Vec::new();
+        // Blocks reserved past the populated prefix (a chunk is reserved
+        // whole, then read position by position) are not read.
+        for (logical_block, block) in self
+            .manager
+            .block_table(sequence)
+            .expect("a live cache owns a block table")
+            .iter()
+            .enumerate()
+            .take(token_count.div_ceil(tokens_per_block))
+        {
+            let remaining = token_count - logical_block * tokens_per_block;
+            let used = remaining.min(tokens_per_block);
+            let physical = block.get();
+            let key = layer.keys.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                0..used,
+                0..self.head_dim,
+            ]);
+            let value = layer.values.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                0..used,
+                0..self.head_dim,
+            ]);
+            pages.push((key, value));
+        }
+        let pool_id = self as *const Self as usize as u64;
+        let blocks = PagedKvBlocks::new_with_pool_id(
+            layer.keys.clone(),
+            layer.values.clone(),
+            block_table,
+            tokens_per_block,
+            token_count,
+            pool_id,
+        )
+        .expect("Mistral cache storage must satisfy the paged-attention block contract");
+        (pages, blocks)
+    }
+
+    fn read_layer_window(
+        &self,
+        sequence: KvSequenceId,
+        layer: usize,
+        start: usize,
+        end: usize,
+    ) -> (Vec<(Tensor<4>, Tensor<4>)>, Option<PagedKvBlocks>) {
+        let reserved_tokens = self
+            .manager
+            .cached_tokens(sequence)
+            .expect("a live cache owns token accounting");
+        debug_assert!(end <= reserved_tokens);
+        debug_assert!(start < end);
+        let tokens_per_block = self.manager.tokens_per_block();
+        let layer = self
+            .layers
+            .get(layer)
+            .expect("model and cache layer counts must agree");
+        let mut pages = Vec::new();
+        for (logical_block, block) in self
+            .manager
+            .block_table(sequence)
+            .expect("a live cache owns a block table")
+            .iter()
+            .enumerate()
+            .take(end.div_ceil(tokens_per_block))
+        {
+            let block_start = logical_block * tokens_per_block;
+            let block_end = block_start + tokens_per_block;
+            if block_end <= start {
+                continue;
+            }
+            let slice_start = start.saturating_sub(block_start);
+            let slice_end = (end - block_start).min(tokens_per_block);
+            let physical = block.get();
+            let key = layer.keys.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                slice_start..slice_end,
+                0..self.head_dim,
+            ]);
+            let value = layer.values.clone().slice([
+                physical..physical + 1,
+                0..self.num_key_value_heads,
+                slice_start..slice_end,
+                0..self.head_dim,
+            ]);
+            pages.push((key, value));
+        }
+        (pages, None)
+    }
+}
+
+fn checked_product(values: &[u64]) -> Result<u64, KvBlockError> {
+    values.iter().try_fold(1_u64, |product, value| {
+        product
+            .checked_mul(*value)
+            .ok_or(KvBlockError::ConfigurationOverflow)
+    })
+}
+
+fn lock_pool(pool: &Mutex<MistralKvPool>) -> MutexGuard<'_, MistralKvPool> {
+    pool.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::tensor::TensorData;
+
+    use super::*;
+
+    fn tiny_config() -> MistralConfig {
+        MistralConfig {
+            model_type: "mistral".into(),
+            vocab_size: 8,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            max_position_embeddings: 16,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            sliding_window: Some(4),
+            head_dim: None,
+            hidden_act: "silu".into(),
+            attention_bias: false,
+            mlp_bias: false,
+            tie_word_embeddings: false,
+            rope_scaling: None,
+            bos_token_id: Some(1),
+            eos_token_id: vec![2],
+        }
+    }
+
+    #[test]
+    fn writes_and_reads_across_non_contiguous_physical_pages() {
+        let device = Default::default();
+        let config = tiny_config();
+        let pool = Arc::new(Mutex::new(
+            MistralKvPool::new(
+                &config,
+                MistralKvCacheConfig::new(16, 2),
+                device,
+            )
+            .unwrap(),
+        ));
+
+        let mut first = MistralKvCache::allocate(pool.clone()).unwrap();
+        let mut second = MistralKvCache::allocate(pool.clone()).unwrap();
+
+        first.reserve(2).unwrap();
+        second.reserve(2).unwrap();
+        first.reserve(2).unwrap();
+
+        let head_dim = config.attention_head_dim();
+        let key = Tensor::<4>::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [
+                1, 1, 4, head_dim,
+            ]),
+            &Default::default(),
+        );
+        let value = Tensor::<4>::from_data(
+            TensorData::new(
+                vec![
+                    10.0_f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
+                ],
+                [1, 1, 4, head_dim],
+            ),
+            &Default::default(),
+        );
+        first.write_layer(0, 0, key, value);
+
+        let (pages, _) = first.read_layer_prefix(0, 4);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[0].0.clone().into_data().try_to_vec::<f32>().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            pages[1].0.clone().into_data().try_to_vec::<f32>().unwrap(),
+            vec![5.0, 6.0, 7.0, 8.0]
+        );
+        assert_eq!(first.block_ids(), vec![0, 2]);
+        assert_eq!(second.block_ids(), vec![1]);
+    }
+
+    #[test]
+    fn reads_window_across_block_boundaries() {
+        let device = Default::default();
+        let config = tiny_config();
+        let pool = Arc::new(Mutex::new(
+            MistralKvPool::new(
+                &config,
+                MistralKvCacheConfig::new(16, 2),
+                device,
+            )
+            .unwrap(),
+        ));
+
+        let mut cache = MistralKvCache::allocate(pool).unwrap();
+        cache.reserve(6).unwrap();
+
+        let head_dim = config.attention_head_dim();
+        let key = Tensor::<4>::from_data(
+            TensorData::new(
+                vec![
+                    1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+                [1, 1, 6, head_dim],
+            ),
+            &Default::default(),
+        );
+        let value = key.clone();
+        cache.write_layer(0, 0, key, value);
+
+        // Read window [2, 6) -> 4 tokens: tokens 2, 3, 4, 5
+        let (pages, blocks) = cache.read_layer_window(0, 2, 6);
+        assert!(blocks.is_none());
+        assert_eq!(pages.len(), 2);
+        // Block 1 (tokens 2..3)
+        assert_eq!(
+            pages[0].0.clone().into_data().try_to_vec::<f32>().unwrap(),
+            vec![5.0, 6.0, 7.0, 8.0]
+        );
+        // Block 2 (tokens 4..5)
+        assert_eq!(
+            pages[1].0.clone().into_data().try_to_vec::<f32>().unwrap(),
+            vec![9.0, 10.0, 11.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn released_pages_are_reused_and_capacity_failure_is_atomic() {
+        let device = Default::default();
+        let config = tiny_config();
+        let pool = Arc::new(Mutex::new(
+            MistralKvPool::new(
+                &config,
+                MistralKvCacheConfig::new(4, 2),
+                device,
+            )
+            .unwrap(),
+        ));
+
+        let first = MistralKvCache::allocate(pool.clone()).unwrap();
+        let mut second = MistralKvCache::allocate(pool.clone()).unwrap();
+
+        second.reserve(2).unwrap();
+        assert_eq!(second.block_ids(), vec![0]);
+
+        drop(first);
+
+        let mut third = MistralKvCache::allocate(pool.clone()).unwrap();
+        third.reserve(2).unwrap();
+        assert_eq!(third.block_ids(), vec![1]);
+
+        let overflow = third.reserve(4);
+        assert!(matches!(overflow, Err(KvBlockError::InsufficientCapacity { .. })));
+        assert_eq!(third.block_ids(), vec![1]);
+        assert_eq!(third.tokens(), 2);
+    }
+
+    #[test]
+    fn variable_length_batch_reservation_is_atomic() {
+        let device = Default::default();
+        let config = tiny_config();
+        let pool = Arc::new(Mutex::new(
+            MistralKvPool::new(
+                &config,
+                MistralKvCacheConfig::new(6, 2),
+                device,
+            )
+            .unwrap(),
+        ));
+
+        let mut first = MistralKvCache::allocate(pool.clone()).unwrap();
+        let mut second = MistralKvCache::allocate(pool.clone()).unwrap();
+
+        MistralKvCache::reserve_batch_lengths(&mut [&mut first, &mut second], &[2, 3]).unwrap();
+        assert_eq!(first.tokens(), 2);
+        assert_eq!(first.block_ids(), vec![0]);
+        assert_eq!(second.tokens(), 3);
+        assert_eq!(second.block_ids(), vec![1, 2]);
+
+        let failure =
+            MistralKvCache::reserve_batch_lengths(&mut [&mut first, &mut second], &[2, 2]);
+        assert!(matches!(failure, Err(KvBlockError::BatchInsufficientCapacity { .. })));
+        assert_eq!(first.tokens(), 2);
+        assert_eq!(first.block_ids(), vec![0]);
+        assert_eq!(second.tokens(), 3);
+        assert_eq!(second.block_ids(), vec![1, 2]);
+    }
+}

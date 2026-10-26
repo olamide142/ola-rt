@@ -137,6 +137,32 @@ different segment lengths. The implementation atomically reserves all rows,
 then tensor-batches the active row subset at each segment offset while each row
 attends only through its newly populated absolute position.
 
+## Mistral implementation
+
+`ola_burn::mistral` implements the Mistral architecture family. It follows the same
+Hugging Face directory layout and strict validation principles as Llama, with
+support for:
+
+- `model_type: "mistral"`;
+- Grouped-query attention with arbitrary valid head ratios;
+- Split-half rotary position embeddings;
+- SwiGLU feed-forward networks with SiLU activation;
+- Optional sliding-window attention (`sliding_window`), enforcing attention spans
+  in both full-sequence forward passes and block-paged decode attention;
+- Block-paged KV cache pools (`MistralKvPool`, `MistralKvCache`) with prefix caching,
+  sub-window reads, and atomic variable-length multi-request reservations;
+- Resumable prompt chunking (`prefill_chunk`) and tensor-batched decode (`decode_batch`);
+- An executable probe via `examples/run_mistral.rs`.
+
+```rust,no_run
+use burn::tensor::Device;
+use ola_burn::mistral::{MistralFactory, MistralKvCacheConfig};
+
+let factory = MistralFactory::new(Device::flex())
+    .with_kv_cache(MistralKvCacheConfig::new(8_192, 32));
+# let _ = factory;
+```
+
 ## Running a local artifact
 
 From the implementation workspace:
