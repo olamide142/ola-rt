@@ -10,8 +10,6 @@ ola-core.workspace = true
 ola-kernel.workspace = true
 ola-model.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
 
 [lints]

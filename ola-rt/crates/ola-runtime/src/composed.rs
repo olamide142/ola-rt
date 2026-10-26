@@ -788,6 +788,23 @@ impl ExecutionPolicy for ComposedPolicy {
         let mut scheduled = Vec::new();
         let mut record = DecisionRecord {
             policy: self.descriptor(),
+            arrival_times: snapshot
+                .queued
+                .iter()
+                .map(|request| (request.request_id, request.queued_at))
+                .chain(
+                    snapshot
+                        .prefilling
+                        .iter()
+                        .map(|(request_id, request)| (*request_id, request.arrived_at)),
+                )
+                .chain(
+                    snapshot
+                        .decoding
+                        .iter()
+                        .map(|(request_id, request)| (*request_id, request.arrived_at)),
+                )
+                .collect(),
             ..DecisionRecord::default()
         };
         // With preemption enabled, admissions must also fit the pool's free

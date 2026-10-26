@@ -5,7 +5,9 @@
 //! outcome the policy's components produced while building it, so policies
 //! can be audited and compared without re-running them.
 
-use ola_core::{ModelId, RequestId};
+use std::collections::BTreeMap;
+
+use ola_core::{ModelId, RequestId, Timestamp};
 
 use crate::{
     AdmissionContext, AdmissionDecision, BatchContext, CostAwarePrefillDecision, PlannedPhase,
@@ -17,6 +19,9 @@ use crate::{
 pub struct DecisionRecord {
     /// Policy that made the decision.
     pub policy: PolicyDescriptor,
+    /// Queue-arrival timestamps visible to this planning pass, retained so
+    /// stateful policies can derive wait, TTFT, and completion rewards later.
+    pub arrival_times: BTreeMap<RequestId, Timestamp>,
     /// How queued work was ranked for admission.
     pub ranking: RankingRecord,
     /// Every ranked request the policy considered, in ranking order.

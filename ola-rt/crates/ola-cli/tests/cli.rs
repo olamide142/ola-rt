@@ -179,6 +179,32 @@ fn run_prints_labelled_summaries_and_honours_overrides() {
 }
 
 #[test]
+fn experiment_run_loads_json_config_and_cli_sets_win() {
+    let directory = scratch("experiment-config");
+    std::fs::create_dir_all(&directory).unwrap();
+    let config = directory.join("run.json");
+    std::fs::write(
+        &config,
+        r#"{"id":"fifo-workload","parameters":{"requests":"10"}}"#,
+    )
+    .unwrap();
+
+    let (code, output) = ola(&[
+        "experiment",
+        "run",
+        "fifo-workload",
+        "--config",
+        config.to_str().unwrap(),
+        "--set",
+        "requests=12",
+    ]);
+
+    assert_eq!(code, EXIT_OK, "{output}");
+    assert!(output.starts_with("12 requests"), "{output}");
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn errors_exit_with_code_two() {
     let (code, output) = ola(&["experiment", "run", "no-such-experiment"]);
     assert_eq!(code, EXIT_ERROR);

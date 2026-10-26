@@ -1,8 +1,10 @@
 # Adaptive policy design note
 
-Status: **backlog** (2026-10-16). Not scheduled; tracked in `todo.md` under
-*Adaptive execution policy*, after P4. Builds on `EXECUTION_POLICY.md` and
-`SCHEDULING_BASELINES.md`. Nothing here is implemented yet.
+Status: **foundation implemented; research loop remains backlog** (2026-10-26).
+The wrapper, fallback validation, decision attribution, arrival context, and
+seeded observation state are implemented. Online tuning and offline evaluation
+remain tracked in `todo.md` under *Adaptive execution policy*. Builds on
+`EXECUTION_POLICY.md` and `SCHEDULING_BASELINES.md`.
 
 ## Goal
 
@@ -27,8 +29,7 @@ with it, and updates it from committed iterations.
    - cost-aware grouping overhead;
    - scheduler choice and aging interval;
    - backfill's skip limit;
-   - effective slot count and chunk size, at or below the executor's limits
-     (see gap 1).
+   - effective slot count and chunk size, at or below the executor's limits.
 
    `plan(&self, &snapshot)` plans with the inner policy. Rebuilding the inner
    policy belongs in `observe`, not in every `plan` call.
@@ -70,27 +71,12 @@ with it, and updates it from committed iterations.
   virtual time against the FIFO, priority, SJF, EDF, and backfill baselines
   before running online.
 
-## Gaps to close
+## Remaining gaps
 
-1. **Executor limits are construction-time ceilings.** `max_active_requests`
-   and `prefill_chunk_size` are executor configuration, visible read-only in
-   the snapshot. Validation enforces both as ceilings: slots always, and the
-   chunk size for resumable models. A policy can choose effective values
-   *below* them by admitting fewer requests or planning shorter chunks, but
-   not above. Either treat them as hard caps with θ choosing effective
-   values below, or move them into the plan.
-2. **No arrival times in `observe`.** Token events and `iteration.at` give
-   every request's token emission times, but arrival times live only in the
-   snapshot and `RuntimeState`, so `observe` cannot compute time to first
-   token or completion latency. The policy sees `queued_at` while planning
-   but cannot store it without breaking `plan(&self)`, and `ola-observe`'s
-   `observe_iteration` needs `&RuntimeState` for the same reason. Smallest
-   fix: pass `observe` the snapshot it planned from, or the arrival times of
-   requests that produced events.
-3. **Measurement and device inputs are empty.** `PolicyMeasurements` waits
+1. **Measurement and device inputs are empty.** `PolicyMeasurements` waits
    for P4 calibration and `DeviceSnapshot` for P6 telemetry, so cost- and
    device-aware tuning is not yet possible.
-4. **Kernels and model placement are not in the plan.** The kernel track and
+2. **Kernels and model placement are not in the plan.** The kernel track and
    P8 must add them before they can be tuned.
 
 ## Backlog

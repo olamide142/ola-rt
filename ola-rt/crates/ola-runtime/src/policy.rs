@@ -86,6 +86,8 @@ pub enum PolicyError {
         /// Capability or registry diagnostic.
         message: String,
     },
+    /// The adaptive wrapper rejected a candidate plan before commit.
+    InvalidCandidate(String),
 }
 
 impl fmt::Display for PolicyError {
@@ -104,6 +106,9 @@ impl fmt::Display for PolicyError {
                     formatter,
                     "kernel selection for model `{model_id}` failed: {message}"
                 )
+            }
+            Self::InvalidCandidate(message) => {
+                write!(formatter, "adaptive candidate plan rejected: {message}")
             }
         }
     }

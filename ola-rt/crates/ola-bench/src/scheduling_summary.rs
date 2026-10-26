@@ -535,7 +535,8 @@ fn to_f64(value: impl TryInto<u64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use ola_runtime::{
-        EarliestDeadlineFirst, HeadOfLine, JobCost, PriorityScheduler, ShortestJobFirst,
+        AdaptivePolicy, EarliestDeadlineFirst, HeadOfLine, JobCost, PriorityScheduler,
+        ShortestJobFirst,
     };
 
     use super::*;
@@ -600,6 +601,37 @@ mod tests {
             compare(&trace, &config, policies()),
             compare(&trace, &config, policies())
         );
+    }
+
+    #[test]
+    fn offline_comparison_runs_an_adaptive_policy_deterministically() {
+        let trace = SchedulingTrace::overload(TraceParameters {
+            requests: 30,
+            ..parameters(2_000)
+        });
+        let config = SimulationConfig::default();
+        let adaptive_factory = || {
+            AdaptivePolicy::new(fifo(), vec![("mode", "fixed".into())])
+                .with_fallback(fifo())
+                .with_update(|_, observations, theta| {
+                    if let Some((_, value)) = theta.iter_mut().find(|(key, _)| *key == "mode") {
+                        *value = observations.len().to_string();
+                    }
+                })
+                .with_seed(11)
+        };
+        let policies = || {
+            vec![
+                Box::new(adaptive_factory()) as Box<dyn ExecutionPolicy>,
+                Box::new(fifo()) as Box<dyn ExecutionPolicy>,
+            ]
+        };
+        let first = compare(&trace, &config, policies());
+        let second = compare(&trace, &config, policies());
+
+        assert_eq!(first, second);
+        assert!(first.summaries[0].policy.starts_with("adaptive{"));
+        assert_eq!(first.summaries[0].completed, first.summaries[1].completed);
     }
 
     #[test]

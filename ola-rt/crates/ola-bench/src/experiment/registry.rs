@@ -11,6 +11,7 @@ use std::{
 use ola_model::CausalLanguageModel;
 use ola_observe::{Tracer, trace::write_jsonl};
 use ola_runtime::{ExecutorIteration, RuntimeState};
+use serde::{Deserialize, Serialize};
 
 use super::{ExperimentKind, ExperimentReport, ReportError, TimeDomain};
 
@@ -100,6 +101,30 @@ pub struct ExperimentDescriptor {
     pub requirements: Vec<Requirement>,
     /// Declared parameters, in display order.
     pub parameters: Vec<ParameterSpec>,
+}
+
+/// Serializable selection and parameter overrides for one experiment run.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExperimentRunConfig {
+    /// Stable experiment identifier.
+    pub id: String,
+    /// Parameter overrides, keyed by the descriptor's stable parameter names.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, String>,
+}
+
+impl ExperimentRunConfig {
+    /// Decodes a run configuration from JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    fn overrides(&self) -> Vec<(String, String)> {
+        self.parameters
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
 }
 
 /// Resolved parameter values for one run.
@@ -381,6 +406,15 @@ impl ExperimentRegistry {
         let outcome = experiment.run(context, &parameters)?;
         conforms(&descriptor, &outcome.report)?;
         Ok(outcome)
+    }
+
+    /// Runs the experiment selected by a serializable configuration.
+    pub fn run_config(
+        &self,
+        config: &ExperimentRunConfig,
+        context: &ExperimentContext,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        self.run(&config.id, context, &config.overrides())
     }
 
     /// Returns whether experiment `id` exists and can write traces.

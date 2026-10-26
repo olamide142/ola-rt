@@ -27,6 +27,14 @@ impl ExecutorBuilder {
         }
     }
 
+    /// Creates a builder from a JSON-encoded [`ExecutorConfig`].
+    ///
+    /// This keeps configuration loading at the builder boundary while model
+    /// attachment and policy construction remain explicit Rust operations.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json).map(|config| Self::new().with_config(config))
+    }
+
     /// Replaces the scalar configuration loaded from a file or service.
     pub fn with_config(mut self, config: ExecutorConfig) -> Self {
         self.config = config;
@@ -95,5 +103,28 @@ mod tests {
 
         assert_eq!(executor.runtime().state().memory.capacity_bytes, 1024);
         assert_eq!(executor.policy_descriptor().name, "composed");
+    }
+
+    #[test]
+    fn builds_from_json_configuration() {
+        let executor = ExecutorBuilder::from_json(
+            r#"{
+                "max_active_requests": 2,
+                "memory_capacity_bytes": 4096,
+                "device_label": "test-device",
+                "batch_policy": {"kind": "fifo_token_budget", "max_tokens": 8}
+            }"#,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(executor.runtime().state().memory.capacity_bytes, 4096);
+        assert_eq!(executor.max_active_requests(), 2);
+    }
+
+    #[test]
+    fn rejects_invalid_json_configuration() {
+        assert!(ExecutorBuilder::from_json("{not-json").is_err());
     }
 }

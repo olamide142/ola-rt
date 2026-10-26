@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod admission;
+mod adaptive;
 mod batch;
 mod builder;
 mod composed;
@@ -22,6 +23,7 @@ pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
     UnconstrainedAdmission, WatermarkAdmission,
 };
+pub use adaptive::{AdaptivePolicy, AdaptiveRequestObservation};
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,
     CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutedKernel, ExecutionBatch,

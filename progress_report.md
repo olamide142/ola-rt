@@ -810,6 +810,89 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
+- **2026-10-26 — working tree:** Added a read-only `AdaptivePolicy::theta`
+  accessor and removed unnecessary descriptor initialization from construction.
+  Runtime tests passed (121 passed).
+
+- **2026-10-26 — working tree:** Updated the offline adaptive comparison to
+  exercise a real observation hook that mutates a bounded θ field at iteration
+  boundaries. The deterministic comparison test passed.
+
+- **2026-10-26 — working tree:** Added regression coverage proving stale or
+  otherwise invalid adaptive candidate plans are replaced by the safe fallback
+  before returning from `plan`. Adaptive runtime tests passed (7 passed).
+
+- **2026-10-26 — working tree:** Made adaptive plan validation intrinsic to
+  `AdaptivePolicy`: candidate and fallback plans are validated against the
+  planning snapshot and their KV-capacity guarantees before delegation returns.
+  Runtime tests passed (120 passed).
+
+- **2026-10-26 — working tree:** Added deterministic offline evaluation
+  coverage for `AdaptivePolicy` through the existing virtual-time scheduling
+  comparison harness. Adaptive and FIFO runs produce reproducible summaries;
+  `cargo test -p ola-bench --lib` passed (68 passed).
+
+- **2026-10-26 — working tree:** Added an observation-only adaptive update
+  hook. It receives committed iteration timing observations and may update θ
+  for the next planning boundary; planning remains read-only. Runtime tests
+  passed (120 passed).
+
+- **2026-10-26 — working tree:** Added a direct adaptive reward-observation
+  helper that derives per-request TTFT and completion latency from committed
+  events and arrival context. Runtime tests passed (119 passed).
+
+- **2026-10-26 — working tree:** Added `AdaptiveRequestObservation` derived
+  from committed iteration events and decision-record arrival timestamps. It
+  exposes per-request first-token and completion timestamps plus TTFT and
+  completion latency in microseconds. Runtime tests passed (119 passed).
+
+- **2026-10-26 — working tree:** Closed the adaptive limits boundary: active
+  slots and resumable-prefill chunk size remain executor hard ceilings, while
+  adaptive policies may choose lower effective values through their plans.
+  Updated `ADAPTIVE_POLICY.md` to distinguish implemented foundation from the
+  remaining research loop.
+
+- **2026-10-26 — working tree:** Added deterministic observation-time
+  randomness to `AdaptivePolicy`. Seeds and random state are exposed in the
+  policy descriptor, while state advances only from committed `observe` calls.
+  Runtime tests passed (118 passed).
+
+- **2026-10-26 — working tree:** Added planning-visible request arrival times
+  to `DecisionRecord`, covering queued, prefilling, and decoding requests.
+  Adaptive observers can now derive waiting, TTFT, and completion rewards from
+  the committed iteration without changing executor construction. Runtime and
+  benchmark tests passed (117 and 67 passed).
+
+- **2026-10-26 — working tree:** Added adaptive candidate validation and typed
+  rejection handling. A validator can reject a candidate before commit, routing
+  it to the safe fallback; candidate policy errors use the same path. Runtime
+  tests passed (117 passed).
+
+- **2026-10-26 — working tree:** Extended `AdaptivePolicy` with an optional
+  safe fallback. Candidate policy errors now fall back to the configured policy
+  while retaining adaptive identity in the decision record; both policies are
+  observed and safety capabilities are combined conservatively. Runtime tests
+  passed (116 passed).
+
+- **2026-10-26 — working tree:** Added the initial `AdaptivePolicy` wrapper.
+  It delegates planning to an inner policy while recording sorted θ parameters
+  and the committed observation counter in every decision descriptor. Runtime
+  tests passed (115 passed).
+
+- **2026-10-26 — working tree:** Wired `ExperimentRunConfig` into the CLI via
+  `ola experiment run <id> --config FILE`; explicit `--set` overrides take
+  precedence and mismatched experiment IDs are rejected. CLI integration tests
+  passed (7 passed).
+
+- **2026-10-26 — working tree:** Added serializable `ExperimentRunConfig`
+  selection with JSON loading and registry execution, including malformed JSON
+  and parameter-override coverage. `cargo test -p ola-bench --lib` passed (67
+  passed).
+
+- **2026-10-26 — working tree:** Added `ExecutorBuilder::from_json` as the
+  direct runtime configuration-file boundary, with invalid-JSON rejection
+  coverage. `cargo test -p ola-runtime --lib` passed (114 passed).
+
 - **2026-10-26 — working tree on `a685411`:** Extended `ExecutorConfig` with
   serializable batch-policy selection for unbounded, FIFO token-budget, and
   mixed token-budget batching. Invalid zero or inconsistent budgets fail before

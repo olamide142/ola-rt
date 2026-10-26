@@ -7,13 +7,13 @@
 
 mod serve;
 
-use std::{io::Write, path::PathBuf};
+use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
 use burn::tensor::Device;
 use ola_bench::{
     Change, CompareOptions, ExperimentCategory, ExperimentContext, ExperimentKind,
-    ExperimentRegistry, ExperimentReport, ExperimentTrace, ParameterValue, Requirement, TimeDomain,
-    compare_reports,
+    ExperimentRegistry, ExperimentReport, ExperimentRunConfig, ExperimentTrace, ParameterValue,
+    Requirement, TimeDomain, compare_reports,
 };
 use ola_burn::llama::LlamaFactory;
 use ola_model::CausalLanguageModel;
@@ -27,7 +27,7 @@ pub const EXIT_ERROR: u8 = 2;
 
 const USAGE: &str = "usage:
   ola experiment list
-  ola experiment run <id> [--model DIR] [--backend cpu|wgpu|cuda] [--set KEY=VALUE]...
+  ola experiment run <id> [--config FILE] [--model DIR] [--backend cpu|wgpu|cuda] [--set KEY=VALUE]...
                          [--results-dir DIR] [--json] [--trace FILE]
   ola experiment compare <baseline.json> <candidate.json>
                          [--threshold FRACTION] [--allow-workload-mismatch]
@@ -115,6 +115,7 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
     let mut model_directory = None;
     let mut backend = "cpu".to_owned();
     let mut overrides = Vec::new();
+    let mut config_path = None;
     let mut results_directory = None;
     let mut json = false;
     let mut trace_path = None;
@@ -126,6 +127,7 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
                 .ok_or_else(|| format!("{flag} requires a value"))
         };
         match *flag {
+            "--config" => config_path = Some(PathBuf::from(value()?)),
             "--model" => model_directory = Some(PathBuf::from(value()?)),
             "--backend" => backend = value()?,
             "--set" => {
@@ -141,6 +143,23 @@ fn run_experiment(id: &str, rest: &[&str], out: &mut impl Write) -> Result<u8, S
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
+
+    let mut configured = BTreeMap::new();
+    if let Some(path) = config_path {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|error| format!("could not read config {}: {error}", path.display()))?;
+        let config = ExperimentRunConfig::from_json(&json)
+            .map_err(|error| format!("could not parse config {}: {error}", path.display()))?;
+        if config.id != id {
+            return Err(format!(
+                "config selects experiment `{}`, but command selects `{id}`",
+                config.id
+            ));
+        }
+        configured.extend(config.parameters);
+    }
+    configured.extend(overrides);
+    let overrides = configured.into_iter().collect::<Vec<_>>();
 
     let registry = ExperimentRegistry::builtin();
     // Checked before the file is created, so a refused run leaves nothing.

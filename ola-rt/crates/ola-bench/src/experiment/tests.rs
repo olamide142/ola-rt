@@ -377,6 +377,25 @@ fn run(id: &str, overrides: &[(&str, &str)]) -> Result<ExperimentOutcome, Experi
 }
 
 #[test]
+fn a_json_run_config_selects_and_overrides_an_experiment() {
+    let config = ExperimentRunConfig::from_json(
+        r#"{"id":"fifo-workload","parameters":{"requests":"10"}}"#,
+    )
+    .unwrap();
+    let outcome = ExperimentRegistry::builtin()
+        .run_config(&config, &ExperimentContext::default())
+        .unwrap();
+
+    assert_eq!(outcome.report.experiment.id, "fifo-workload");
+    assert!(outcome.summary.starts_with("10 requests"));
+}
+
+#[test]
+fn a_json_run_config_rejects_malformed_json() {
+    assert!(ExperimentRunConfig::from_json("{not-json").is_err());
+}
+
+#[test]
 fn every_builtin_experiment_runs_with_its_defaults() {
     let registry = ExperimentRegistry::builtin();
     let descriptors = registry.descriptors();

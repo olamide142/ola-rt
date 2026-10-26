@@ -101,12 +101,12 @@ policy configuration. Design note:
 `ola-rt/crates/ola-runtime/ADAPTIVE_POLICY.md`. Depends on P4 calibration for
 cost-aware knobs.
 
-- [ ] Add an `AdaptivePolicy` wrapper holding configuration θ and an inner `ComposedPolicy`.
-- [ ] Validate candidate plans inside the wrapper and fall back to a known-safe configuration.
-- [ ] Record the wrapper's descriptor, θ, and update counter in every `DecisionRecord`.
-- [ ] Give `observe` arrival times (or the planning snapshot) so rewards can use TTFT and completion latency.
-- [ ] Decide whether slot count and chunk size stay executor ceilings or move into the plan.
-- [ ] Keep randomness seeded and consumed only in `observe`.
+- [x] Add an `AdaptivePolicy` wrapper holding configuration θ and an inner policy.
+- [x] Validate candidate plans inside the wrapper and fall back to a known-safe configuration.
+- [x] Record the wrapper's descriptor, θ, and update counter in every `DecisionRecord`.
+- [x] Give `observe` arrival times (or the planning snapshot) so rewards can use TTFT and completion latency. (Decision records retain all planning-visible arrival timestamps.)
+- [x] Decide whether slot count and chunk size stay executor ceilings or move into the plan. (Keep them as executor hard ceilings; adaptive policies may choose lower effective values.)
+- [x] Keep randomness seeded and consumed only in `observe`.
 - [ ] Pretrain and evaluate offline in the P3 virtual-time harness against the baselines.
 
 Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures.
