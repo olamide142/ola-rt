@@ -95,6 +95,12 @@ summaries. Every strategy must preserve output tokens. These are operational
 host measurements, not a wall-clock fairness guarantee or publication-quality
 performance claim.
 
+The feature-gated `paged-attention-kernel` study compares portable and CubeCL
+attention across page sizes, batches, partial final pages, and configurable
+unused physical KV blocks (`pool_slack_blocks`). It reports physical-pool
+fragmentation explicitly; accelerator occupancy still requires a hardware
+profiler and is not inferred from host latency.
+
 ## Experiment framework
 
 Every benchmark and experiment is an `Experiment` in `ExperimentRegistry`
@@ -116,6 +122,15 @@ Every benchmark and experiment is an `Experiment` in `ExperimentRegistry`
 improved or regressed only when intervals separate and the change exceeds a
 threshold; otherwise inconclusive. Probes are labelled not for publication;
 studies must meet minimum repetitions (3, or 5 plus a warm-up in host time).
+
+The `paged-attention-kernel` study is available with
+`--features cubecl-cpu` for CPU CubeCL validation or `--features wgpu` for the
+local WGPU device. It records portable and optimized latency distributions,
+page/batch workload parameters, and maximum absolute oracle error. These
+feature-enabled runs are the required entry point for kernel performance
+claims; the default `ola-bench` build does not compile accelerator backends.
+The default workload uses 23 populated tokens, so page sizes that do not divide
+that length also report logical page count and padding-token waste.
 `cost-calibration` fits `fixed + per_token·dense + per_call·calls` by least
 squares over a shape grid, and `CostFit::from_report` turns a saved fit into
 a `CostModel` for virtual-time comparisons. The terminal workbench and the

@@ -82,6 +82,39 @@ impl LlamaConfig {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
+    /// Returns the supported linear RoPE position scale.
+    ///
+    /// Hugging Face represents this as `{ "type": "linear", "factor": N }`.
+    /// A missing object is the ordinary unscaled Llama layout.
+    pub fn rope_scaling_factor(&self) -> Result<f64, LlamaConfigError> {
+        let Some(scaling) = self.rope_scaling.as_ref() else {
+            return Ok(1.0);
+        };
+        let object = scaling.as_object().ok_or_else(|| {
+            LlamaConfigError::Invalid("rope_scaling must be a JSON object".into())
+        })?;
+        let scaling_type = object
+            .get("type")
+            .or_else(|| object.get("rope_type"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| LlamaConfigError::Invalid("rope_scaling.type is required".into()))?;
+        if scaling_type != "linear" {
+            return Err(LlamaConfigError::Unsupported(format!(
+                "RoPE scaling type `{scaling_type}`"
+            )));
+        }
+        let factor = object
+            .get("factor")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| LlamaConfigError::Invalid("rope_scaling.factor is required".into()))?;
+        if !factor.is_finite() || factor < 1.0 {
+            return Err(LlamaConfigError::Invalid(
+                "rope_scaling.factor must be finite and at least one".into(),
+            ));
+        }
+        Ok(factor)
+    }
+
     /// Verifies shape invariants and rejects unsupported Llama variants.
     pub fn validate(&self) -> Result<(), LlamaConfigError> {
         if self.model_type != "llama" {
@@ -148,24 +181,7 @@ impl LlamaConfig {
                 self.hidden_act
             )));
         }
-        if self.attention_bias {
-            return Err(LlamaConfigError::Unsupported(
-                "attention projection biases".into(),
-            ));
-        }
-        if self.mlp_bias {
-            return Err(LlamaConfigError::Unsupported(
-                "MLP projection biases".into(),
-            ));
-        }
-        if self.tie_word_embeddings {
-            return Err(LlamaConfigError::Unsupported(
-                "tied input/output embeddings".into(),
-            ));
-        }
-        if self.rope_scaling.is_some() {
-            return Err(LlamaConfigError::Unsupported("RoPE scaling".into()));
-        }
+        self.rope_scaling_factor()?;
         Ok(())
     }
 }
@@ -278,14 +294,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_features_instead_of_silently_misexecuting_them() {
+    fn accepts_linear_rope_scaling() {
         let json = MINIMAL.replace(
             "\"unrelated_training_field\": true",
             "\"rope_scaling\": {\"type\": \"linear\", \"factor\": 2.0}",
         );
+        let config = LlamaConfig::from_json(json.as_bytes()).unwrap();
+
+        assert_eq!(config.rope_scaling_factor().unwrap(), 2.0);
+    }
+
+    #[test]
+    fn rejects_non_linear_rope_scaling_instead_of_misexecuting_it() {
+        let json = MINIMAL.replace(
+            "\"unrelated_training_field\": true",
+            "\"rope_scaling\": {\"type\": \"dynamic\", \"factor\": 2.0}",
+        );
         let error = LlamaConfig::from_json(json.as_bytes()).unwrap_err();
 
-        assert_eq!(error, LlamaConfigError::Unsupported("RoPE scaling".into()));
+        assert_eq!(
+            error,
+            LlamaConfigError::Unsupported("RoPE scaling type `dynamic`".into())
+        );
     }
 
     #[test]

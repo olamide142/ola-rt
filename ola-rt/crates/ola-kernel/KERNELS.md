@@ -80,11 +80,15 @@ implementations.
      provider boundary accepts independent inputs; CubeCL stacks queries and
      consumes a padded device block table in one launch, while portable
      providers retain the independent-request fallback.
-   - Decode: Ragged logical lengths are validated for one physical KV geometry;
-     requests with different physical pools or incompatible shapes still need
-     launch grouping before they can share a dispatch.
-   - Resumable prefill: Investigate ragged multi-position chunk execution rather
-     than stepping one offset at a time.
+   - Decode: Ragged logical lengths are validated for one physical KV geometry.
+     Each physical KV pool carries an explicit identity, so homogeneous
+     same-pool requests retain the fused launch while incompatible or
+     cross-pool groups fall back to independent launches safely.
+   - Resumable prefill: Active requests at each offset now share the batched
+     one-position dispatch, including unequal chunk lengths; runtime/model
+     conformance covers unequal absolute cursors. Fusing multiple positions
+     into one launch remains a separate contract because each query position
+     has a different causal valid length.
 
 6. **Observability and report integration.**
    - Update `TraceEvent::Invocation` in `ola-observe` to record the selected
@@ -148,8 +152,10 @@ implementations.
    across output dimensions and benchmark the memory/performance tradeoff.
 6. **Conformance and study-grade evaluation.**
    Implement conformance tests across diverse page counts and head configurations.
-   Execute an empirical kernel comparison benchmark in `ola-bench` evaluating
-   portable versus CubeCL execution across page sizes and batch sizes.
+   Single-request and ragged batched CubeCL outputs are now checked against the
+   portable single-request oracle. The versioned `ola-bench` study evaluates
+   portable versus CubeCL execution across page sizes, batch sizes, and partial
+   final pages; accelerator occupancy and broader fragmentation studies remain.
 
 ## Out of scope
 

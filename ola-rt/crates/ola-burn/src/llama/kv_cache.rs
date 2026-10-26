@@ -458,12 +458,14 @@ impl LlamaKvPool {
             ]);
             pages.push((key, value));
         }
-        let blocks = PagedKvBlocks::new(
+        let pool_id = self as *const Self as usize as u64;
+        let blocks = PagedKvBlocks::new_with_pool_id(
             layer.keys.clone(),
             layer.values.clone(),
             block_table,
             tokens_per_block,
             token_count,
+            pool_id,
         )
         .expect("Llama cache storage must satisfy the paged-attention block contract");
         (pages, blocks)

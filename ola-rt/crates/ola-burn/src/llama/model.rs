@@ -2,7 +2,10 @@ use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     tensor::{
-        Device, Int, Tensor, activation::silu, module::attention, ops::AttentionModuleOptions,
+        Device, Int, Tensor,
+        activation::silu,
+        module::{attention, linear as tensor_linear},
+        ops::AttentionModuleOptions,
     },
 };
 use ola_kernel::{
@@ -22,6 +25,8 @@ use super::{LlamaConfig, kv_cache::LlamaKvCache};
 pub struct LlamaForCausalLM {
     model: LlamaModel,
     lm_head: Linear,
+    #[module(skip)]
+    tied_embeddings: bool,
 }
 
 impl LlamaForCausalLM {
@@ -29,7 +34,20 @@ impl LlamaForCausalLM {
     pub fn init(config: &LlamaConfig, device: &Device) -> Self {
         Self {
             model: LlamaModel::init(config, device),
-            lm_head: linear(config.hidden_size, config.vocab_size, device),
+            lm_head: linear(config.hidden_size, config.vocab_size, false, device),
+            tied_embeddings: config.tie_word_embeddings,
+        }
+    }
+
+    fn project_logits(&self, hidden_states: Tensor<3>) -> Tensor<3> {
+        if self.tied_embeddings {
+            tensor_linear(
+                hidden_states,
+                self.model.embed_tokens.weight.val().transpose(),
+                None,
+            )
+        } else {
+            self.lm_head.forward(hidden_states)
         }
     }
 
@@ -40,7 +58,7 @@ impl LlamaForCausalLM {
     /// full-sequence method for both prefill and decode so correctness can be
     /// established before introducing cache mutation.
     pub fn forward(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
-        self.lm_head.forward(self.model.forward(input_ids))
+        self.project_logits(self.model.forward(input_ids))
     }
 
     /// Processes a complete prompt and returns logits plus its populated cache.
@@ -50,7 +68,7 @@ impl LlamaForCausalLM {
         cache: &mut LlamaKvCache,
     ) -> Result<Tensor<3>, KvBlockError> {
         let hidden_states = self.model.prefill(input_ids, cache)?;
-        Ok(self.lm_head.forward(hidden_states))
+        Ok(self.project_logits(hidden_states))
     }
 
     /// Processes a resumable prompt segment against the existing cache.
@@ -60,9 +78,7 @@ impl LlamaForCausalLM {
         cache: &mut LlamaKvCache,
         kernel: &dyn PagedAttentionKernel,
     ) -> Result<Tensor<3>, KvBlockError> {
-        Ok(self
-            .lm_head
-            .forward(self.model.prefill_chunk(input_ids, cache, kernel)?))
+        Ok(self.project_logits(self.model.prefill_chunk(input_ids, cache, kernel)?))
     }
 
     /// Processes right-padded prompts in one tensor invocation.
@@ -75,7 +91,7 @@ impl LlamaForCausalLM {
         caches: &mut [&mut LlamaKvCache],
         sequence_lengths: &[usize],
     ) -> Result<Tensor<3>, KvBlockError> {
-        Ok(self.lm_head.forward(
+        Ok(self.project_logits(
             self.model
                 .prefill_batch(input_ids, caches, sequence_lengths)?,
         ))
@@ -89,7 +105,7 @@ impl LlamaForCausalLM {
         sequence_lengths: &[usize],
         kernel: &dyn PagedAttentionKernel,
     ) -> Result<Tensor<3>, KvBlockError> {
-        Ok(self.lm_head.forward(self.model.prefill_chunk_batch(
+        Ok(self.project_logits(self.model.prefill_chunk_batch(
             input_ids,
             caches,
             sequence_lengths,
@@ -104,9 +120,7 @@ impl LlamaForCausalLM {
         cache: &mut LlamaKvCache,
         kernel: &dyn PagedAttentionKernel,
     ) -> Result<Tensor<3>, KvBlockError> {
-        Ok(self
-            .lm_head
-            .forward(self.model.decode(input_ids, cache, kernel)?))
+        Ok(self.project_logits(self.model.decode(input_ids, cache, kernel)?))
     }
 
     /// Processes one token for each request while preserving isolated caches.
@@ -116,9 +130,7 @@ impl LlamaForCausalLM {
         caches: &mut [&mut LlamaKvCache],
         kernel: &dyn PagedAttentionKernel,
     ) -> Result<Tensor<3>, KvBlockError> {
-        Ok(self
-            .lm_head
-            .forward(self.model.decode_batch(input_ids, caches, kernel)?))
+        Ok(self.project_logits(self.model.decode_batch(input_ids, caches, kernel)?))
     }
 }
 
@@ -531,13 +543,37 @@ impl LlamaAttention {
         let query_width = config.num_attention_heads * head_dim;
         let key_value_width = config.num_key_value_heads * head_dim;
         Self {
-            q_proj: linear(config.hidden_size, query_width, device),
-            k_proj: linear(config.hidden_size, key_value_width, device),
-            v_proj: linear(config.hidden_size, key_value_width, device),
-            o_proj: linear(query_width, config.hidden_size, device),
+            q_proj: linear(
+                config.hidden_size,
+                query_width,
+                config.attention_bias,
+                device,
+            ),
+            k_proj: linear(
+                config.hidden_size,
+                key_value_width,
+                config.attention_bias,
+                device,
+            ),
+            v_proj: linear(
+                config.hidden_size,
+                key_value_width,
+                config.attention_bias,
+                device,
+            ),
+            o_proj: linear(
+                query_width,
+                config.hidden_size,
+                config.attention_bias,
+                device,
+            ),
             rotary_embedding: LlamaRotaryEmbedding {
                 head_dim,
                 theta: config.rope_theta,
+                position_scale: config
+                    .rope_scaling_factor()
+                    .expect("validated Llama config has valid RoPE scaling")
+                    as f32,
             },
             num_attention_heads: config.num_attention_heads,
             num_key_value_heads: config.num_key_value_heads,
@@ -849,6 +885,7 @@ fn repeat_key_value(tensor: Tensor<4>, groups: usize) -> Tensor<4> {
 struct LlamaRotaryEmbedding {
     head_dim: usize,
     theta: f64,
+    position_scale: f32,
 }
 
 impl LlamaRotaryEmbedding {
@@ -872,6 +909,7 @@ impl LlamaRotaryEmbedding {
             &device,
         )
         .float()
+        .div_scalar(self.position_scale)
         .reshape([sequence, 1]);
         let frequencies = positions * inverse_frequency.reshape([1, half]);
         let frequencies = Tensor::cat(vec![frequencies.clone(), frequencies], 1);
@@ -902,9 +940,24 @@ struct LlamaMlp {
 impl LlamaMlp {
     fn init(config: &LlamaConfig, device: &Device) -> Self {
         Self {
-            gate_proj: linear(config.hidden_size, config.intermediate_size, device),
-            up_proj: linear(config.hidden_size, config.intermediate_size, device),
-            down_proj: linear(config.intermediate_size, config.hidden_size, device),
+            gate_proj: linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config.mlp_bias,
+                device,
+            ),
+            up_proj: linear(
+                config.hidden_size,
+                config.intermediate_size,
+                config.mlp_bias,
+                device,
+            ),
+            down_proj: linear(
+                config.intermediate_size,
+                config.hidden_size,
+                config.mlp_bias,
+                device,
+            ),
         }
     }
 
@@ -915,9 +968,9 @@ impl LlamaMlp {
     }
 }
 
-fn linear(input: usize, output: usize, device: &Device) -> Linear {
+fn linear(input: usize, output: usize, bias: bool, device: &Device) -> Linear {
     LinearConfig::new(input, output)
-        .with_bias(false)
+        .with_bias(bias)
         .init(device)
 }
 
@@ -965,6 +1018,69 @@ mod tests {
         let logits = model.forward(input);
 
         assert_eq!(logits.dims(), [1, 3, 32]);
+    }
+
+    #[test]
+    fn tied_output_projection_reuses_input_embedding_matrix() {
+        let device = Default::default();
+        let mut config = tiny_config();
+        config.tie_word_embeddings = true;
+        let model = LlamaForCausalLM::init(&config, &device);
+        let input = Tensor::from_data(TensorData::new(vec![1_i64, 5, 9], [1, 3]), &device);
+        let hidden = model.model.forward(input.clone());
+
+        let expected = tensor_linear(
+            hidden,
+            model.model.embed_tokens.weight.val().transpose(),
+            None,
+        );
+
+        assert_eq!(model.forward(input).into_data(), expected.into_data());
+    }
+
+    #[test]
+    fn linear_rope_scaling_changes_nonzero_rotary_positions() {
+        let device = Default::default();
+        let mut config = tiny_config();
+        config.rope_scaling = Some(serde_json::json!({
+            "type": "linear",
+            "factor": 2.0,
+        }));
+        let model = LlamaForCausalLM::init(&config, &device);
+        let rotary = &model.model.layers[0].self_attn.rotary_embedding;
+        let input = Tensor::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0], [1, 1, 1, 4]),
+            &device,
+        );
+
+        let scaled = rotary.forward(input.clone(), 1).into_data();
+        let unscaled = LlamaRotaryEmbedding {
+            head_dim: 4,
+            theta: config.rope_theta,
+            position_scale: 1.0,
+        }
+        .forward(input, 1)
+        .into_data();
+
+        assert_ne!(scaled, unscaled);
+    }
+
+    #[test]
+    fn configured_projection_biases_are_present_in_attention_and_mlp() {
+        let device = Default::default();
+        let mut config = tiny_config();
+        config.attention_bias = true;
+        config.mlp_bias = true;
+        let model = LlamaForCausalLM::init(&config, &device);
+        let layer = &model.model.layers[0];
+
+        assert!(layer.self_attn.q_proj.bias.is_some());
+        assert!(layer.self_attn.k_proj.bias.is_some());
+        assert!(layer.self_attn.v_proj.bias.is_some());
+        assert!(layer.self_attn.o_proj.bias.is_some());
+        assert!(layer.mlp.gate_proj.bias.is_some());
+        assert!(layer.mlp.up_proj.bias.is_some());
+        assert!(layer.mlp.down_proj.bias.is_some());
     }
 
     #[test]

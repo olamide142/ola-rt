@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, error::Error, fmt};
 
 use crate::{ModelId, RequestId, Timestamp};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 /// Kind of data supplied as one request input.
 pub enum Modality {
     /// Untokenized natural-language text.

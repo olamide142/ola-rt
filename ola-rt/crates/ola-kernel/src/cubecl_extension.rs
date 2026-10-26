@@ -90,51 +90,26 @@ impl CubePagedAttention {
             _ => false,
         }
     }
-}
 
-impl PagedAttentionKernel for CubePagedAttention {
-    fn descriptor(&self) -> KernelDescriptor {
-        let name = match self.target {
-            KernelTarget::Wgpu => "cubecl-wgpu-paged-attention",
-            KernelTarget::Cuda => "cubecl-cuda-paged-attention",
-            #[cfg(feature = "cubecl-cpu")]
-            KernelTarget::Cpu => "cubecl-cpu-paged-attention",
-            _ => unreachable!("constructor rejects non-CubeCL targets"),
+    /// Returns whether two supported inputs can share one physical launch.
+    fn can_share_batch(first: &PagedAttentionInput, input: &PagedAttentionInput) -> bool {
+        let Some(first_blocks) = first.blocks() else {
+            return false;
         };
-        KernelDescriptor::new(name, KernelOperation::PagedAttentionDecode, self.target)
+        let Some(blocks) = input.blocks() else {
+            return false;
+        };
+        input.config() == first.config()
+            && input.dtype() == first.dtype()
+            && input.query().device() == first.query().device()
+            && blocks.key().dims() == first_blocks.key().dims()
+            && blocks.value().dims() == first_blocks.value().dims()
+            && blocks.tokens_per_block() == first_blocks.tokens_per_block()
+            && blocks.pool_id() == first_blocks.pool_id()
     }
 
-    fn execute(&self, input: PagedAttentionInput) -> Result<BurnTensor<4>, KernelError> {
-        if !self.supports(&input) {
-            return Err(KernelError::new(format!(
-                "{} does not support dtype {:?} on device {:?}",
-                self.descriptor().name(),
-                input.dtype(),
-                input.query().device()
-            )));
-        }
-
-        let (query, _pages, blocks, config) = input.into_parts();
-        let blocks = blocks.expect("supports requires physical KV blocks");
-        let (key, value, block_table, _tokens_per_block, token_count) = blocks.into_parts();
-        let block_count = block_table.dims()[0];
-        let block_table = block_table.reshape([1, block_count]);
-        let token_counts: BurnTensor<1, BurnInt> = BurnTensor::from_data(
-            TensorData::new(vec![token_count as i64], [1]),
-            &query.device(),
-        );
-        let output = <Dispatch as PagedAttentionOps>::paged_attention(
-            query.into_dispatch(),
-            key.into_dispatch(),
-            value.into_dispatch(),
-            block_table.into_dispatch(),
-            token_counts.into_dispatch(),
-            config.groups(),
-        );
-        Ok(BurnTensor::<4>::from_dispatch(output))
-    }
-
-    fn execute_batch(
+    /// Executes one homogeneous group as a single padded-table dispatch.
+    fn execute_shareable_batch(
         &self,
         inputs: Vec<PagedAttentionInput>,
     ) -> Result<Vec<BurnTensor<4>>, KernelError> {
@@ -215,6 +190,91 @@ impl PagedAttentionKernel for CubePagedAttention {
                 ])
             })
             .collect())
+    }
+}
+
+impl PagedAttentionKernel for CubePagedAttention {
+    fn descriptor(&self) -> KernelDescriptor {
+        let name = match self.target {
+            KernelTarget::Wgpu => "cubecl-wgpu-paged-attention",
+            KernelTarget::Cuda => "cubecl-cuda-paged-attention",
+            #[cfg(feature = "cubecl-cpu")]
+            KernelTarget::Cpu => "cubecl-cpu-paged-attention",
+            _ => unreachable!("constructor rejects non-CubeCL targets"),
+        };
+        KernelDescriptor::new(name, KernelOperation::PagedAttentionDecode, self.target)
+    }
+
+    fn execute(&self, input: PagedAttentionInput) -> Result<BurnTensor<4>, KernelError> {
+        if !self.supports(&input) {
+            return Err(KernelError::new(format!(
+                "{} does not support dtype {:?} on device {:?}",
+                self.descriptor().name(),
+                input.dtype(),
+                input.query().device()
+            )));
+        }
+
+        let (query, _pages, blocks, config) = input.into_parts();
+        let blocks = blocks.expect("supports requires physical KV blocks");
+        let (key, value, block_table, _tokens_per_block, token_count) = blocks.into_parts();
+        let block_count = block_table.dims()[0];
+        let block_table = block_table.reshape([1, block_count]);
+        let token_counts: BurnTensor<1, BurnInt> = BurnTensor::from_data(
+            TensorData::new(vec![token_count as i64], [1]),
+            &query.device(),
+        );
+        let output = <Dispatch as PagedAttentionOps>::paged_attention(
+            query.into_dispatch(),
+            key.into_dispatch(),
+            value.into_dispatch(),
+            block_table.into_dispatch(),
+            token_counts.into_dispatch(),
+            config.groups(),
+        );
+        Ok(BurnTensor::<4>::from_dispatch(output))
+    }
+
+    fn execute_batch(
+        &self,
+        inputs: Vec<PagedAttentionInput>,
+    ) -> Result<Vec<BurnTensor<4>>, KernelError> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut groups: Vec<Vec<(usize, PagedAttentionInput)>> = Vec::new();
+        let mut outputs: Vec<Option<BurnTensor<4>>> = (0..inputs.len()).map(|_| None).collect();
+        for (index, input) in inputs.into_iter().enumerate() {
+            if !self.supports(&input) {
+                outputs[index] = Some(self.execute(input)?);
+                continue;
+            }
+            let group = groups
+                .iter_mut()
+                .find(|group| Self::can_share_batch(&group[0].1, &input));
+            if let Some(group) = group {
+                group.push((index, input));
+            } else {
+                groups.push(vec![(index, input)]);
+            }
+        }
+        for group in groups {
+            let indices = group.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let group_inputs = group
+                .into_iter()
+                .map(|(_, input)| input)
+                .collect::<Vec<_>>();
+            let group_outputs = self.execute_shareable_batch(group_inputs)?;
+            for (index, output) in indices.into_iter().zip(group_outputs) {
+                outputs[index] = Some(output);
+            }
+        }
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| KernelError::new("batched attention produced no output"))
+            })
+            .collect()
     }
 }
 
@@ -382,9 +442,19 @@ mod tests {
         let cubecl_two_pages = measure(&cubecl, &two_pages, WARMUP, RUNS);
         let portable_one_page = measure(&portable, &one_page, WARMUP, RUNS);
         let portable_two_pages = measure(&portable, &two_pages, WARMUP, RUNS);
+        let cubecl_two_request_batch = measure_batch(
+            &cubecl,
+            &[two_pages.clone(), two_pages.clone()],
+            WARMUP,
+            RUNS,
+        );
         eprintln!(
-            "WGPU attention (32 query heads, 8 KV heads, dim 64, 256 tokens): CubeCL one/two pages {:?}/{:?}, portable {:?}/{:?}; includes synchronization and output readback",
-            cubecl_one_page, cubecl_two_pages, portable_one_page, portable_two_pages,
+            "WGPU attention (32 query heads, 8 KV heads, dim 64, 256 tokens): CubeCL one/two pages {:?}/{:?}, two-request batch {:?}, portable {:?}/{:?}; includes synchronization and output readback",
+            cubecl_one_page,
+            cubecl_two_pages,
+            cubecl_two_request_batch,
+            portable_one_page,
+            portable_two_pages,
         );
     }
 
@@ -503,6 +573,64 @@ mod tests {
         for (actual, expected) in actual_short.into_iter().zip(expected_short) {
             assert!((actual - expected).abs() <= tolerance);
         }
+
+        let incompatible_page = PagedKvPage::new(
+            input.pages()[0]
+                .key()
+                .clone()
+                .slice([0..1, 0..2, 0..2, 0..4]),
+            input.pages()[0]
+                .value()
+                .clone()
+                .slice([0..1, 0..2, 0..2, 0..4]),
+        );
+        let incompatible = attach_physical_blocks(
+            PagedAttentionInput::new(
+                input.query().clone(),
+                vec![incompatible_page],
+                input.config(),
+            )
+            .unwrap(),
+        );
+        let expected_incompatible = PortablePagedAttention::new()
+            .execute(incompatible.clone())
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let independent_source = PagedAttentionInput::new(
+            input.query().clone(),
+            input.pages().to_vec(),
+            input.config(),
+        )
+        .unwrap();
+        let independent_pool = attach_physical_blocks_with_pool_id(independent_source, 8);
+        let grouped = CubePagedAttention::new(target)
+            .unwrap()
+            .execute_batch(vec![input.clone(), incompatible])
+            .unwrap();
+        let actual_incompatible = grouped[1].clone().into_data().try_to_vec::<f32>().unwrap();
+        for (actual, expected) in actual_incompatible.into_iter().zip(expected_incompatible) {
+            assert!((actual - expected).abs() <= tolerance);
+        }
+
+        // Matching shapes are not sufficient to fuse requests: independently
+        // allocated physical pools must remain isolated even when their
+        // layouts happen to be identical.
+        let expected_independent = PortablePagedAttention::new()
+            .execute(independent_pool.clone())
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let isolated = CubePagedAttention::new(target)
+            .unwrap()
+            .execute_batch(vec![input, independent_pool])
+            .unwrap();
+        let actual_independent = isolated[1].clone().into_data().try_to_vec::<f32>().unwrap();
+        for (actual, expected) in actual_independent.into_iter().zip(expected_independent) {
+            assert!((actual - expected).abs() <= tolerance);
+        }
     }
 
     #[cfg(feature = "wgpu")]
@@ -554,6 +682,13 @@ mod tests {
     }
 
     fn attach_physical_blocks(input: PagedAttentionInput) -> PagedAttentionInput {
+        attach_physical_blocks_with_pool_id(input, 7)
+    }
+
+    fn attach_physical_blocks_with_pool_id(
+        input: PagedAttentionInput,
+        pool_id: u64,
+    ) -> PagedAttentionInput {
         let device = input.query().device();
         let config = input.config();
         let tokens_per_block = input
@@ -598,8 +733,15 @@ mod tests {
             token_count += used;
         }
         let block_table = PagedKvBlockTable::new(block_ids, physical_blocks, &device).unwrap();
-        let blocks =
-            PagedKvBlocks::new(key, value, block_table, tokens_per_block, token_count).unwrap();
+        let blocks = PagedKvBlocks::new_with_pool_id(
+            key,
+            value,
+            block_table,
+            tokens_per_block,
+            token_count,
+            pool_id,
+        )
+        .unwrap();
         input.with_blocks(blocks).unwrap()
     }
 
@@ -626,6 +768,33 @@ mod tests {
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
+        }
+        start.elapsed() / runs as u32
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn measure_batch(
+        kernel: &dyn PagedAttentionKernel,
+        inputs: &[PagedAttentionInput],
+        warmup: usize,
+        runs: usize,
+    ) -> Duration {
+        for _ in 0..warmup {
+            let _ = kernel
+                .execute_batch(inputs.to_vec())
+                .unwrap()
+                .into_iter()
+                .flat_map(|output| output.into_data().try_to_vec::<f32>().unwrap())
+                .collect::<Vec<_>>();
+        }
+        let start = Instant::now();
+        for _ in 0..runs {
+            let _ = kernel
+                .execute_batch(inputs.to_vec())
+                .unwrap()
+                .into_iter()
+                .flat_map(|output| output.into_data().try_to_vec::<f32>().unwrap())
+                .collect::<Vec<_>>();
         }
         start.elapsed() / runs as u32
     }

@@ -62,7 +62,8 @@ and what should be built next?**
 
 OlaRT has moved beyond repository scaffolding into its first complete inference
 vertical slice. It can load a narrowly supported Hugging Face Llama checkpoint,
-tokenize a prompt, execute prefill, perform cached greedy decoding, report
+tokenize a prompt, execute prefill, perform cached greedy or seeded
+temperature/top-p decoding, report
 request-local KV-cache storage, and expose that workflow through a Ratatui
 terminal application.
 
@@ -205,7 +206,7 @@ performance claim.
 | Burn integration | Working | Backend-neutral adapter with CPU, opt-in WGPU, and opt-in native CUDA features |
 | Llama loading | Narrow path working | Local config, tokenizer, single SafeTensors file, strict validation |
 | Llama execution | Working | Embedding, GQA attention, RoPE, SwiGLU, RMSNorm, LM head |
-| Generation sessions | Working | Prefill, cached one-token decode, greedy selection, EOS/limit checks |
+| Generation sessions | Working | Prefill, cached one-token decode, greedy or seeded temperature/top-p selection, EOS/limit checks |
 | Paged KV cache | Working foundation | Per-layer physical pages addressed through runtime block tables |
 | KV block manager | Working | Fixed blocks, logical tables, atomic growth, free/reuse, fragmentation |
 | Serving | Driver working | A dedicated thread owns the executor; async or blocking handles submit, stream text deltas, cancel (including on drop), and report status; bounded in-flight admission and finished-request retention; lock-free health and readiness; draining or immediate shutdown |
@@ -708,7 +709,8 @@ and `TOKENS` variables.
   execution group. Cost-aware grouping can choose power-of-two buckets.
   Resumable Llama chunks currently advance one prompt position at a time. Each
   offset tensor-batches its active rows, but there is not yet a fused
-  multi-position ragged chunk kernel. Generation remains greedy.
+  multi-position ragged chunk kernel. Generation supports greedy and seeded
+  temperature/top-p selection.
 - Decode batches still traverse each request's physical pages independently;
   page attention is not yet a fused ragged multi-request kernel.
 - Admission reserves worst-case KV demand; it does not yet predict early EOS or
@@ -807,6 +809,186 @@ Update this file whenever a meaningful capability is merged. Each update should:
 6. add a short entry to the history below.
 
 ## History
+
+- **2026-10-26 — working tree on `a685411`:** Extended `ExecutorConfig` with
+  serializable batch-policy selection for unbounded, FIFO token-budget, and
+  mixed token-budget batching. Invalid zero or inconsistent budgets fail before
+  executor construction with a typed configuration error. Added policy
+  selection coverage; `cargo test -p ola-runtime --lib` passed (112 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Extended `ExecutorConfig` with
+  an optional device label. Configured executors now expose a planning
+  `DeviceSnapshot` with that label and memory capacity, while live backend
+  telemetry remains separately injectable. Added builder/snapshot coverage;
+  `cargo test -p ola-runtime --lib` passed (112 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Made backend-neutral model
+  definitions serializable. Core model IDs, architecture IDs, descriptors,
+  kinds, and modalities now support Serde, while `ModelSource` and
+  `ModelDefinition` round-trip local and Hugging Face artifact references.
+  Added a JSON round-trip regression test; `cargo test -p ola-core --lib`
+  passed (4 passed), `cargo test -p ola-model --lib` passed (11 passed), and
+  `cargo test -p ola-runtime --lib` passed (112 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added `ExecutorBuilder` as the
+  stable high-level construction surface. It composes `ExecutorConfig` with a
+  dynamic execution policy and validates limits through the existing executor
+  errors, while model loading remains explicit. Builder construction and
+  policy selection are covered; `cargo test -p ola-runtime --lib` passed (112
+  passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added `ExecutorConfig`, a
+  serializable configuration boundary for active-request limits, resumable
+  prefill chunk size, and device-memory capacity. `Executor::from_config`
+  applies those values while leaving model artifacts and dynamic policy
+  objects explicit runtime dependencies. Added JSON parsing and construction
+  tests; `cargo test -p ola-runtime --lib` passed (111 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added explicit backend-neutral
+  model placement metadata with `Host`, named `Device`, and `Unspecified`
+  states. Placement changes are rejected while requests use the model and do
+  not claim to migrate backend buffers; resident placement can be queried
+  alongside lifecycle events. Runtime placement regression coverage passes with
+  the 109-test `ola-runtime` suite.
+
+- **2026-10-26 — working tree on `a685411`:** Added the backend-neutral
+  `ModelMemoryProfile` boundary for resident weights and persistent workspace.
+  Executors now add declared bytes on model registration/attachment and
+  release them on unload; models without a profile remain explicitly unknown.
+  Resource accounting is covered by the lifecycle test; `cargo test -p
+  ola-model --lib` passed (10 passed) and `cargo test -p ola-runtime --lib`
+  passed (109 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Exposed model residency and
+  lifecycle observability from the executor. Callers can enumerate resident
+  executable IDs and read ordered loaded/unloaded events, while planning
+  snapshots continue to distinguish attached and detached metadata. Lifecycle
+  tests cover load, blocked unload, successful unload, and reattach;
+  `cargo test -p ola-runtime --lib` passed (109 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added explicit executable model
+  unload/reload lifecycle operations to the runtime executor. Unload refuses
+  models referenced by queued, active, or prefilling requests, retains model
+  metadata for a later reattach, exposes stable loaded-model IDs, and reports
+  typed not-loaded and busy errors. Added lifecycle regression coverage;
+  `cargo test -p ola-runtime --lib` passed (109 passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added configured attention and
+  MLP projection-bias support for Llama. Linear modules now preserve the
+  checkpoint-declared bias shape, while activation handling remains explicit:
+  only gated `silu` is supported and other activation names are rejected until
+  a checkpoint-backed conformance case defines their semantics. Added a
+  module-construction regression test; `cargo test -p ola-burn --lib` passed
+  (34 passed, 3 ignored) and `cargo test -p ola-runtime --lib` passed (108
+  passed).
+
+- **2026-10-26 — working tree on `a685411`:** Added selected linear RoPE
+  scaling for Llama. Configuration parsing validates the scaling object and
+  factor, rotary positions are divided by that factor across full, cached,
+  resumable, and batched attention paths, and unsupported scaling types remain
+  rejected. Added config and nonzero-position regression tests; `cargo test
+  -p ola-burn --lib` passed (33 passed, 3 ignored).
+
+- **2026-10-26 — working tree on `a685411`:** Added selected tied-embedding
+  support for Llama. The output projection now reuses the input embedding
+  matrix, the non-persistent tie flag preserves the checkpoint hierarchy, and
+  SafeTensors loading permits only the expected absent `lm_head.weight` while
+  still rejecting all other missing tensors. Added a projection-equivalence
+  regression test; `cargo test -p ola-burn --lib` passed (31 passed, 3
+  ignored).
+
+- **2026-10-26 — working tree on `a685411`:** Added Llama probabilistic
+  sampling with session-owned SplitMix64 state. Temperature zero remains
+  greedy; positive temperature applies nucleus `top_p` filtering and weighted
+  sampling. Single- and tensor-batched prefill/decode paths use the same
+  selector, and seeded sessions reproduce token sequences in focused tests.
+
+- **2026-10-26 — working tree on `a685411`:** Added indexed SafeTensors
+  loading for `model.safetensors.index.json` and
+  `pytorch_model.safetensors.index.json`. The loader validates referenced
+  shards, deduplicates their paths, merges lazy tensor snapshots with
+  duplicate-name detection, and applies the complete checkpoint once; the
+  existing single-file path remains unchanged.
+
+- **2026-10-26 — working tree on `a685411`:** Extended CubeCL ragged decode
+  batching to partition mixed inputs into homogeneous physical-pool/config
+  launch groups. Compatible requests still share one padded-table dispatch,
+  while incompatible or unsupported requests retain request-local execution;
+  outputs are restored to caller order. This advances provider-side launch
+  grouping without claiming the remaining scheduler-side grouping work.
+
+- **2026-10-24 — working tree on `3363e15`:** Routed tensor-batched resumable
+  prefill attention through the same batched provider operation used by decode.
+  Unequal prompt chunks still execute at their active offsets and retain output
+  equivalence; a true multi-position ragged attention contract remains future
+  work. Focused unequal-position chunk tests pass.
+
+- **2026-10-24 — working tree on `3363e15`:** Extended kernel telemetry
+  measurement across the new batch boundary. Measured providers now record one
+  synchronous call and duration per batched dispatch, including portable
+  fallback execution inside that operation; the provider-routing test was
+  updated to distinguish dispatch count from inner request count.
+
+- **2026-10-24 — working tree on `3363e15`:** Closed the optimized-path oracle
+  comparison for single and ragged batched CubeCL attention. Each optimized
+  result is checked against portable single-request execution; performance
+  measurement is still intentionally deferred until warm-up and repetition
+  reporting is wired.
+
+- **2026-10-24 — working tree on `3363e15`:** Extended the ignored WGPU kernel
+  microbenchmark with warm-up/repetition timing for one-page, two-page, and
+  two-request batched attention. Measurements include output synchronization and
+  readback and are labeled as host-call latency; publication-grade report
+  integration remains outstanding.
+
+- **2026-10-24 — working tree on `3363e15`:** Added a regression test for
+  batched provider telemetry: one `execute_batch` operation records one
+  dispatch even when the portable fallback processes multiple request inputs.
+  This keeps report call counts aligned with actual provider launches.
+
+- **2026-10-25 — working tree on `3363e15`:** Added the optional
+  `paged-attention-kernel` `ola-experiment/1` host study under the
+  `ola-bench/cubecl-cpu` feature. It records warm-ups, repetitions, workload
+  parameters, portable and CubeCL kernel identities, latency distributions,
+  batch/page dimensions, and maximum absolute oracle error. Default and
+  CubeCL-feature registry tests pass; accelerator report execution remains
+  pending.
+
+- **2026-10-25 — working tree on `3363e15`:** Integrated the kernel study into
+  the benchmark registry behind `ola-bench/cubecl-cpu`. Default builds remain
+  lightweight; feature-enabled runs validate the report protocol and execute
+  65 benchmark tests, including the registered paged-attention study.
+
+- **2026-10-25 — working tree on `3363e15`:** Added the opt-in
+  `ola-bench/wgpu` feature to run the same versioned paged-attention study on
+  WGPU. The local adapter test completed with one page, one request, one
+  warm-up, and five measured repetitions; report protocol and oracle validation
+  passed.
+
+- **2026-10-25 — working tree on `3363e15`:** Extended the kernel study
+  workload to 23 populated tokens across configurable page sizes, including a
+  partial final page. Reports now retain logical page count and padding-token
+  waste beside latency, batch size, and oracle error. The CPU registry study and
+  the local WGPU integration study both pass.
+
+- **2026-10-26 — working tree on `3363e15`:** Made CubeCL batch execution
+  safe for incompatible request groups. Different attention shapes or physical
+  KV geometries now use independent provider launches instead of failing after
+  batch preparation; homogeneous groups retain the fused dispatch. Conformance
+  covers the fallback path, while explicit cross-pool launch grouping remains.
+
+- **2026-10-26 — working tree on `3363e15`:** Added explicit physical KV-pool
+  identity to `PagedKvBlocks`. Llama cache views from one pool share that
+  identity, while independently created pools are prevented from entering the
+  fused batch path accidentally; incompatible and cross-pool groups fall back
+  to independent launches. Focused CubeCL, Llama, and WGPU benchmark checks
+  pass.
+
+- **2026-10-26 — working tree on `3363e15`:** Audited ragged resumable
+  prefill. Unequal chunk lengths and unequal absolute cursors already execute
+  through active-offset batching and match complete independent prefill, so
+  the runtime/model item is complete. A separate follow-up remains for a
+  causal multi-position kernel launch with per-query valid-length metadata.
 
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and

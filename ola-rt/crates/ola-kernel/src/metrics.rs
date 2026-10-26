@@ -125,10 +125,24 @@ impl PagedAttentionKernel for MeasuredPagedAttentionKernel {
         self.metrics.record(nanos);
         result
     }
+
+    fn execute_batch(
+        &self,
+        inputs: Vec<PagedAttentionInput>,
+    ) -> Result<Vec<Tensor<4>>, KernelError> {
+        let started = self.metrics.measures_time().then(Instant::now);
+        let result = self.inner.execute_batch(inputs);
+        let nanos =
+            started.map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        self.metrics.record(nanos);
+        result
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use burn::tensor::{Device, Tensor, TensorData};
+
     use super::*;
 
     #[test]
@@ -160,5 +174,31 @@ mod tests {
                 host_duration_nanos: Some(18),
             }
         );
+    }
+
+    #[test]
+    fn batched_execution_records_one_dispatch() {
+        let device = Device::default();
+        let query = Tensor::from_data(TensorData::new(vec![1.0_f32], [1, 1, 1, 1]), &device);
+        let key = Tensor::from_data(TensorData::new(vec![1.0_f32], [1, 1, 1, 1]), &device);
+        let value = Tensor::from_data(TensorData::new(vec![2.0_f32], [1, 1, 1, 1]), &device);
+        let config = crate::PagedAttentionConfig::new(1, 1, 1).unwrap();
+        let input = crate::PagedAttentionInput::new(
+            query,
+            vec![crate::PagedKvPage::new(key, value)],
+            config,
+        )
+        .unwrap();
+        let metrics = KernelExecutionMetrics::without_timing();
+        let kernel = MeasuredPagedAttentionKernel::new(
+            Box::new(crate::PortablePagedAttention::new()),
+            metrics.clone(),
+        );
+
+        kernel
+            .execute_batch(vec![input.clone(), input])
+            .expect("portable batch fallback must execute");
+
+        assert_eq!(metrics.snapshot().calls, 1);
     }
 }

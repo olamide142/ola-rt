@@ -1,7 +1,10 @@
 use std::fmt;
 
 /// Uniquely identifies a request within one runtime.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
 pub struct RequestId(u64);
 
 impl RequestId {
@@ -23,7 +26,10 @@ impl fmt::Display for RequestId {
 }
 
 /// Stable, human-readable identifier for a registered model.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
 pub struct ModelId(String);
 
 impl ModelId {
@@ -69,7 +75,10 @@ impl From<String> for ModelId {
 /// Examples include `llama`, `qwen2`, and `vision-transformer`. Architecture
 /// identity is intentionally separate from [`ModelId`]: many concrete model
 /// artifacts may share one implementation.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
 pub struct ArchitectureId(String);
 
 impl ArchitectureId {

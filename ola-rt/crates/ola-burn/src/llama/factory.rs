@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt,
     path::{Path, PathBuf},
 };
 
 use burn::tensor::Device;
-use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore};
 use ola_core::ArchitectureId;
 use ola_model::{
     ArchitectureFactory, ArchitectureLoadError, CausalLanguageModel, ModelDefinition, ModelSource,
@@ -133,19 +134,9 @@ impl LlamaFactory {
             return Err(LlamaLoadError::NotDirectory(directory.to_path_buf()));
         }
         let config = LlamaConfig::from_file(directory.join("config.json"))?;
-        let weights = find_single_safetensors_file(directory)?;
+        let weights = find_safetensors_files(directory)?;
         let mut module = LlamaForCausalLM::init(&config, &self.device);
-        // Burn stores RMSNorm scale as `gamma`, while Hugging Face Llama uses
-        // `weight`. The general PyTorch adapter cannot infer these nested
-        // architecture-specific containers, so keep the mapping explicit and
-        // narrow rather than allowing a partial checkpoint load.
-        let mut store = SafetensorsStore::from_file(weights)
-            .with_key_remapping(r"layernorm\.weight$", "layernorm.gamma")
-            .with_key_remapping(r"^model\.norm\.weight$", "model.norm.gamma")
-            .with_from_adapter(PyTorchToBurnAdapter);
-        module
-            .load_from(&mut store)
-            .map_err(|error| LlamaLoadError::Weights(error.to_string()))?;
+        load_safetensors_shards(&mut module, &weights, config.tie_word_embeddings)?;
         Ok(LoadedLlama { config, module })
     }
 }
@@ -177,10 +168,19 @@ impl ArchitectureFactory<CausalLanguageModel> for LlamaFactory {
     }
 }
 
-fn find_single_safetensors_file(directory: &Path) -> Result<PathBuf, LlamaLoadError> {
+fn find_safetensors_files(directory: &Path) -> Result<Vec<PathBuf>, LlamaLoadError> {
     let canonical = directory.join("model.safetensors");
     if canonical.is_file() {
-        return Ok(canonical);
+        return Ok(vec![canonical]);
+    }
+    for index_name in [
+        "model.safetensors.index.json",
+        "pytorch_model.safetensors.index.json",
+    ] {
+        let index = directory.join(index_name);
+        if index.is_file() {
+            return read_safetensors_index(&index);
+        }
     }
     let mut candidates = std::fs::read_dir(directory)
         .map_err(|error| LlamaLoadError::ReadDirectory(error.to_string()))?
@@ -193,10 +193,91 @@ fn find_single_safetensors_file(directory: &Path) -> Result<PathBuf, LlamaLoadEr
         .collect::<Vec<_>>();
     candidates.sort();
     match candidates.as_slice() {
-        [only] => Ok(only.clone()),
+        [only] => Ok(vec![only.clone()]),
         [] => Err(LlamaLoadError::MissingWeights(directory.to_path_buf())),
         _ => Err(LlamaLoadError::ShardedWeights(candidates)),
     }
+}
+
+fn read_safetensors_index(index: &Path) -> Result<Vec<PathBuf>, LlamaLoadError> {
+    let bytes = std::fs::read(index).map_err(|error| LlamaLoadError::Weights(error.to_string()))?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| LlamaLoadError::Weights(format!("invalid SafeTensors index: {error}")))?;
+    let weight_map = document
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| LlamaLoadError::Weights("SafeTensors index has no weight_map".into()))?;
+    let mut shard_names = weight_map
+        .values()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                LlamaLoadError::Weights("SafeTensors index shard names must be strings".into())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    shard_names.sort_unstable();
+    shard_names.dedup();
+    let directory = index.parent().unwrap_or_else(|| Path::new("."));
+    let paths = shard_names
+        .into_iter()
+        .map(|name| {
+            let path = directory.join(name);
+            if !path.is_file() {
+                return Err(LlamaLoadError::Weights(format!(
+                    "SafeTensors index references missing shard `{}`",
+                    path.display()
+                )));
+            }
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if paths.is_empty() {
+        return Err(LlamaLoadError::Weights(
+            "SafeTensors index contains an empty weight_map".into(),
+        ));
+    }
+    Ok(paths)
+}
+
+fn load_safetensors_shards(
+    module: &mut LlamaForCausalLM,
+    shards: &[PathBuf],
+    tied_embeddings: bool,
+) -> Result<(), LlamaLoadError> {
+    let mut snapshots = BTreeMap::new();
+    for shard in shards {
+        let mut store = SafetensorsStore::from_file(shard)
+            .with_key_remapping(r"layernorm\.weight$", "layernorm.gamma")
+            .with_key_remapping(r"^model\.norm\.weight$", "model.norm.gamma");
+        for (name, snapshot) in store
+            .get_all_tensors()
+            .map_err(|error| LlamaLoadError::Weights(error.to_string()))?
+        {
+            if snapshots.insert(name.clone(), snapshot.clone()).is_some() {
+                return Err(LlamaLoadError::Weights(format!(
+                    "duplicate tensor `{name}` across SafeTensors shards"
+                )));
+            }
+        }
+    }
+    let result = module.apply(
+        snapshots.into_values().collect(),
+        None,
+        Some(Box::new(PyTorchToBurnAdapter)),
+        false,
+    );
+    let unexpected_missing = result
+        .missing
+        .iter()
+        .filter(|(path, _)| !(tied_embeddings && path == "lm_head.weight"));
+    if !result.errors.is_empty() || unexpected_missing.count() != 0 {
+        return Err(LlamaLoadError::Weights(format!(
+            "indexed SafeTensors did not fully load: {} missing tensors, {} errors",
+            result.missing.len(),
+            result.errors.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Failure while materializing a local Llama artifact.
@@ -212,7 +293,7 @@ pub enum LlamaLoadError {
     ReadDirectory(String),
     /// No SafeTensors weights file was found.
     MissingWeights(PathBuf),
-    /// More than one weights shard was found; shard indexes are not supported yet.
+    /// More than one weights shard was found without a supported index file.
     ShardedWeights(Vec<PathBuf>),
     /// SafeTensors could not be mapped completely onto the Burn module.
     Weights(String),
@@ -242,7 +323,7 @@ impl fmt::Display for LlamaLoadError {
             ),
             Self::ShardedWeights(paths) => write!(
                 formatter,
-                "found {} SafeTensors shards; indexed checkpoints are not implemented yet",
+                "found {} SafeTensors shards without a supported index file",
                 paths.len()
             ),
             Self::Weights(message) => write!(formatter, "failed to load model weights: {message}"),
@@ -281,6 +362,46 @@ mod tests {
         let factory = LlamaFactory::new(Device::flex());
 
         assert_eq!(factory.architecture().as_str(), "llama");
+    }
+
+    #[test]
+    fn indexed_safetensors_files_are_resolved_once_in_stable_order() {
+        let directory =
+            std::env::temp_dir().join(format!("ola-llama-index-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("model-00002-of-00002.safetensors"), b"").unwrap();
+        std::fs::write(directory.join("model-00001-of-00002.safetensors"), b"").unwrap();
+        std::fs::write(
+            directory.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"z":"model-00002-of-00002.safetensors","a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let paths = find_safetensors_files(&directory).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                directory.join("model-00001-of-00002.safetensors"),
+                directory.join("model-00002-of-00002.safetensors"),
+            ]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexed_safetensors_reject_missing_shards() {
+        let directory =
+            std::env::temp_dir().join(format!("ola-llama-index-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let error = find_safetensors_files(&directory).unwrap_err();
+        assert!(error.to_string().contains("missing shard"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Compares Burn with the independent scalar oracle documented in

@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use ola_core::ModelDescriptor;
+use serde::{Deserialize, Serialize};
 
 use crate::ModelError;
 
 /// Location from which an architecture factory resolves model artifacts.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelSource {
     /// Directory already materialized on the local filesystem.
     LocalDirectory(PathBuf),
@@ -19,7 +21,7 @@ pub enum ModelSource {
 }
 
 /// Selectable model metadata and artifact source.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ModelDefinition {
     /// Backend-neutral capabilities and architecture identity.
     pub descriptor: ModelDescriptor,
@@ -76,5 +78,24 @@ impl ModelDefinition {
             }),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ola_core::ModelDescriptor;
+
+    #[test]
+    fn model_definitions_round_trip_through_json() {
+        let definition = ModelDefinition::hugging_face(
+            ModelDescriptor::language("tiny", "llama"),
+            "org/model",
+            Some("revision".into()),
+        );
+        let encoded = serde_json::to_string(&definition).unwrap();
+        let decoded: ModelDefinition = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded, definition);
     }
 }

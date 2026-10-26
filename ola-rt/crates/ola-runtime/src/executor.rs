@@ -12,14 +12,15 @@ use ola_core::{
 use ola_kernel::KernelExecutionMetrics;
 use ola_model::{
     CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionContext,
-    ModelExecutionError, PrefillOutcome, SessionMetrics,
+    ModelExecutionError, ModelMemoryProfile, PrefillOutcome, SessionMetrics,
 };
 
 use crate::{
-    AdmissionReason, BatchExecutionMode, BatchPhase, ComposedPolicy, DecisionRecord, DecodeView,
-    ExecutedKernel, ExecutionBatch, ExecutionPlan, ExecutionPolicy, ExecutorLimits, IterationId,
-    LifecycleAction, ModelSnapshot, PlanDivergence, PlanError, PlannedBatch, PlannedDeferral,
-    PlannedPhase, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
+    AdmissionReason, BatchExecutionMode, BatchPhase, BatchPolicyConfig, ComposedPolicy,
+    DecisionRecord, DecodeView, DeviceSnapshot, ExecutedKernel, ExecutionBatch, ExecutionPlan,
+    ExecutionPolicy, ExecutorLimits, FifoTokenBudgetPolicy, IterationId, LifecycleAction,
+    MixedTokenBudgetPolicy, ModelSnapshot, PlanDivergence, PlanError, PlannedBatch,
+    PlannedDeferral, PlannedPhase, PlanningSnapshot, PolicyDecision, PolicyDescriptor, PolicyError,
     PolicyMeasurements, PreemptionReason, PrefillView, QueuedRequest, ReleaseReason, RequestRecord,
     Runtime, RuntimeError, RuntimeState, composed::is_complete_prompt,
 };
@@ -156,6 +157,32 @@ pub struct ExecutorIteration {
     pub reserved_kv_bytes: u64,
 }
 
+/// Change in executable-model residency owned by an executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelLifecycleEvent {
+    /// A model executable became resident and available for execution.
+    Loaded {
+        /// Stable model identifier.
+        model_id: ModelId,
+    },
+    /// A model executable was removed after its requests drained.
+    Unloaded {
+        /// Stable model identifier.
+        model_id: ModelId,
+    },
+}
+
+/// Backend-neutral placement label for a resident executable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelPlacement {
+    /// The architecture did not report a concrete placement.
+    Unspecified,
+    /// Resident in host memory.
+    Host,
+    /// Resident on a named accelerator or device.
+    Device(String),
+}
+
 impl ExecutorIteration {
     /// Returns true when the iteration observed no queued or active work.
     pub fn is_idle(&self) -> bool {
@@ -172,6 +199,10 @@ pub enum ExecutorError {
     ModelNotRegistered(ModelId),
     /// An executable was attached more than once under one model ID.
     DuplicateExecutableModel(ModelId),
+    /// An unload was requested for a model with no executable attached.
+    ModelNotLoaded(ModelId),
+    /// A model cannot be unloaded while requests still reference it.
+    ModelBusy(ModelId),
     /// A multi-request executor requires at least one active slot.
     InvalidActiveRequestLimit(usize),
     /// A resumable prefill segment must contain at least one token.
@@ -179,6 +210,8 @@ pub enum ExecutorError {
     /// The execution policy returned an impossible decision; nothing was
     /// mutated.
     Policy(PolicyError),
+    /// A serialized policy contained an invalid numeric parameter.
+    InvalidPolicyConfiguration(String),
     /// The executor built a plan that failed validation; nothing was mutated.
     InvalidPlan(PlanError),
 }
@@ -199,6 +232,11 @@ impl fmt::Display for ExecutorError {
                     "model `{model}` already has an executable attached"
                 )
             }
+            Self::ModelNotLoaded(model) => write!(formatter, "model `{model}` is not loaded"),
+            Self::ModelBusy(model) => write!(
+                formatter,
+                "model `{model}` cannot be unloaded while requests are using it"
+            ),
             Self::InvalidActiveRequestLimit(limit) => {
                 write!(
                     formatter,
@@ -209,6 +247,9 @@ impl fmt::Display for ExecutorError {
                 write!(formatter, "prefill chunk size must be positive, got {size}")
             }
             Self::Policy(error) => error.fmt(formatter),
+            Self::InvalidPolicyConfiguration(message) => {
+                write!(formatter, "invalid policy configuration: {message}")
+            }
             Self::InvalidPlan(error) => {
                 write!(formatter, "executor built an invalid plan: {error}")
             }
@@ -319,6 +360,9 @@ pub struct Executor {
     clock: Option<Arc<dyn Clock>>,
     iterations: u64,
     resumed: BTreeMap<RequestId, Resumed>,
+    model_lifecycle_events: Vec<ModelLifecycleEvent>,
+    model_placements: BTreeMap<ModelId, ModelPlacement>,
+    device: Option<DeviceSnapshot>,
 }
 
 impl Default for Executor {
@@ -347,6 +391,9 @@ impl Executor {
             clock: None,
             iterations: 0,
             resumed: BTreeMap::new(),
+            model_lifecycle_events: Vec::new(),
+            model_placements: BTreeMap::new(),
+            device: None,
         }
     }
 
@@ -390,6 +437,46 @@ impl Executor {
         }
         let mut executor = Self::new(runtime);
         executor.max_active_requests = max_active_requests;
+        Ok(executor)
+    }
+
+    /// Builds an executor from serializable scalar limits and memory settings.
+    pub fn from_config(config: crate::ExecutorConfig) -> Result<Self, ExecutorError> {
+        let mut executor =
+            Self::with_max_active_requests(Runtime::new(), config.max_active_requests)?;
+        if let Some(chunk_size) = config.prefill_chunk_size {
+            executor = executor.with_prefill_chunk_size(chunk_size)?;
+        }
+        executor.runtime.state_mut().memory.capacity_bytes = config.memory_capacity_bytes;
+        executor.device = config.device_label.map(|label| DeviceSnapshot {
+            label,
+            memory_capacity_bytes: Some(config.memory_capacity_bytes),
+            memory_used_bytes: None,
+        });
+        executor = match config.batch_policy {
+            BatchPolicyConfig::Unbounded => executor,
+            BatchPolicyConfig::FifoTokenBudget { max_tokens } => {
+                let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
+                    ExecutorError::InvalidPolicyConfiguration(
+                        "fifo token budget must be positive".into(),
+                    )
+                })?;
+                executor.with_policy(ComposedPolicy::default().with_batch(batch))
+            }
+            BatchPolicyConfig::MixedTokenBudget {
+                max_tokens,
+                max_prefill_tokens,
+            } => {
+                let batch = MixedTokenBudgetPolicy::new(max_tokens, max_prefill_tokens)
+                    .ok_or_else(|| {
+                        ExecutorError::InvalidPolicyConfiguration(
+                            "mixed token budget requires 0 < max_prefill_tokens <= max_tokens"
+                                .into(),
+                        )
+                    })?;
+                executor.with_policy(ComposedPolicy::default().with_batch(batch))
+            }
+        };
         Ok(executor)
     }
 
@@ -441,7 +528,14 @@ impl Executor {
             return Err(ExecutorError::DuplicateExecutableModel(id));
         }
         self.runtime.register_model(descriptor)?;
-        self.models.insert(id, model);
+        self.account_model_memory(model.memory_profile(), true);
+        self.models.insert(id.clone(), model);
+        self.model_placements
+            .insert(id.clone(), ModelPlacement::Unspecified);
+        self.model_lifecycle_events
+            .push(ModelLifecycleEvent::Loaded {
+                model_id: id.clone(),
+            });
         self.bump_generation();
         Ok(())
     }
@@ -458,9 +552,114 @@ impl Executor {
         if self.models.contains_key(&id) {
             return Err(ExecutorError::DuplicateExecutableModel(id));
         }
-        self.models.insert(id, model);
+        self.account_model_memory(model.memory_profile(), true);
+        self.models.insert(id.clone(), model);
+        self.model_placements
+            .insert(id.clone(), ModelPlacement::Unspecified);
+        self.model_lifecycle_events
+            .push(ModelLifecycleEvent::Loaded {
+                model_id: id.clone(),
+            });
         self.bump_generation();
         Ok(())
+    }
+
+    /// Unloads an executable while retaining its validated runtime metadata.
+    ///
+    /// Requests must be drained or cancelled first. Keeping metadata after
+    /// unload makes the lifecycle explicit: new submissions can still be
+    /// admitted to the runtime registry, but execution will report that the
+    /// executable is detached until [`Self::attach_model`] is called again.
+    pub fn unload_model(&mut self, id: &ModelId) -> Result<(), ExecutorError> {
+        if !self.models.contains_key(id) {
+            return Err(ExecutorError::ModelNotLoaded(id.clone()));
+        }
+        if self.model_is_busy(id) {
+            return Err(ExecutorError::ModelBusy(id.clone()));
+        }
+        let model = self
+            .models
+            .remove(id)
+            .expect("checked that the model is loaded");
+        self.model_placements.remove(id);
+        self.account_model_memory(model.memory_profile(), false);
+        self.model_lifecycle_events
+            .push(ModelLifecycleEvent::Unloaded {
+                model_id: id.clone(),
+            });
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Returns loaded executable model IDs in stable order.
+    pub fn loaded_model_ids(&self) -> impl ExactSizeIterator<Item = &ModelId> {
+        self.models.keys()
+    }
+
+    /// Returns model load/unload events in the order they occurred.
+    pub fn model_lifecycle_events(&self) -> &[ModelLifecycleEvent] {
+        &self.model_lifecycle_events
+    }
+
+    /// Records a new placement for a drained resident model.
+    ///
+    /// This is intentionally metadata-only until backend migration is part of
+    /// the model execution contract; it never claims to move live buffers.
+    pub fn place_model(
+        &mut self,
+        id: &ModelId,
+        placement: ModelPlacement,
+    ) -> Result<(), ExecutorError> {
+        if !self.models.contains_key(id) {
+            return Err(ExecutorError::ModelNotLoaded(id.clone()));
+        }
+        if self.model_is_busy(id) {
+            return Err(ExecutorError::ModelBusy(id.clone()));
+        }
+        self.model_placements.insert(id.clone(), placement);
+        self.bump_generation();
+        Ok(())
+    }
+
+    /// Returns the recorded placement of a resident model.
+    pub fn model_placement(&self, id: &ModelId) -> Option<&ModelPlacement> {
+        self.model_placements.get(id)
+    }
+
+    fn account_model_memory(&mut self, profile: Option<ModelMemoryProfile>, add: bool) {
+        let Some(profile) = profile else {
+            return;
+        };
+        let memory = &mut self.runtime.state_mut().memory;
+        if add {
+            memory.weights_bytes = memory.weights_bytes.saturating_add(profile.weights_bytes);
+            memory.workspace_bytes = memory
+                .workspace_bytes
+                .saturating_add(profile.workspace_bytes);
+        } else {
+            memory.weights_bytes = memory.weights_bytes.saturating_sub(profile.weights_bytes);
+            memory.workspace_bytes = memory
+                .workspace_bytes
+                .saturating_sub(profile.workspace_bytes);
+        }
+    }
+
+    fn model_is_busy(&self, id: &ModelId) -> bool {
+        self.prefilling
+            .values()
+            .any(|pending| &pending.model_id == id)
+            || self.runtime.state().queued_ids().any(|request_id| {
+                self.runtime
+                    .state()
+                    .request(request_id)
+                    .is_some_and(|record| &record.request.spec.model == id)
+            })
+            || self.runtime.state().active_ids().any(|request_id| {
+                self.runtime
+                    .state()
+                    .request(request_id)
+                    .is_some_and(|record| &record.request.spec.model == id)
+            })
     }
 
     /// Returns the executable attached for `id`, if any.
@@ -758,7 +957,7 @@ impl Executor {
                 })
                 .collect(),
             memory: state.memory,
-            device: None,
+            device: self.device.clone(),
             measurements: self.measurements,
         }
     }
@@ -1743,7 +1942,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{PlannedRow, RequestStatus};
+    use crate::{ExecutorConfig, PlannedRow, RequestStatus};
 
     #[derive(Clone, Copy)]
     struct NumericTokenizer;
@@ -1931,6 +2130,93 @@ mod tests {
 
     fn artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IncrementModel)
+    }
+
+    #[test]
+    fn unload_requires_a_drained_model_and_allows_reload() {
+        let mut executor = Executor::new(Runtime::new());
+        let model = ModelDescriptor::language("tiny", "increment");
+        executor
+            .register_model(
+                model,
+                artifact().with_memory_profile(ModelMemoryProfile::new(64, 16)),
+            )
+            .unwrap();
+        assert_eq!(executor.loaded_model_ids().count(), 1);
+        assert_eq!(
+            executor.model_placement(&"tiny".into()),
+            Some(&ModelPlacement::Unspecified)
+        );
+        executor
+            .place_model(&"tiny".into(), ModelPlacement::Device("gpu0".into()))
+            .unwrap();
+        assert_eq!(
+            executor.model_placement(&"tiny".into()),
+            Some(&ModelPlacement::Device("gpu0".into()))
+        );
+        assert_eq!(executor.runtime().state().memory.weights_bytes, 64);
+        assert_eq!(executor.runtime().state().memory.workspace_bytes, 16);
+        assert_eq!(
+            executor.model_lifecycle_events(),
+            &[ModelLifecycleEvent::Loaded {
+                model_id: "tiny".into()
+            }]
+        );
+
+        executor
+            .submit(request("1", 1), Timestamp::from_micros(0))
+            .unwrap();
+        assert_eq!(
+            executor.unload_model(&"tiny".into()),
+            Err(ExecutorError::ModelBusy("tiny".into()))
+        );
+
+        let request_id = executor.runtime().state().queued_ids().next().unwrap();
+        executor
+            .cancel(request_id, Timestamp::from_micros(1))
+            .unwrap();
+        executor.unload_model(&"tiny".into()).unwrap();
+        assert_eq!(executor.loaded_model_ids().count(), 0);
+        assert_eq!(executor.runtime().state().memory.weights_bytes, 0);
+        assert_eq!(executor.runtime().state().memory.workspace_bytes, 0);
+        assert!(matches!(
+            executor.model_lifecycle_events().last(),
+            Some(ModelLifecycleEvent::Unloaded { model_id }) if model_id == &"tiny".into()
+        ));
+        assert_eq!(
+            executor.unload_model(&"tiny".into()),
+            Err(ExecutorError::ModelNotLoaded("tiny".into()))
+        );
+
+        executor.attach_model("tiny".into(), artifact()).unwrap();
+        assert_eq!(executor.loaded_model_ids().count(), 1);
+    }
+
+    #[test]
+    fn builds_executor_limits_and_memory_from_config() {
+        let executor = Executor::from_config(ExecutorConfig {
+            max_active_requests: 4,
+            prefill_chunk_size: Some(32),
+            memory_capacity_bytes: 4096,
+            device_label: Some("cpu".into()),
+            batch_policy: BatchPolicyConfig::FifoTokenBudget { max_tokens: 8 },
+        })
+        .unwrap();
+
+        assert_eq!(executor.max_active_requests, 4);
+        assert_eq!(executor.prefill_chunk_size.map(NonZeroUsize::get), Some(32));
+        assert_eq!(executor.runtime.state().memory.capacity_bytes, 4096);
+        assert_eq!(
+            executor.snapshot(Timestamp::ZERO).device.unwrap().label,
+            "cpu"
+        );
+        assert!(
+            executor
+                .policy_descriptor()
+                .components
+                .iter()
+                .any(|component| component.name == "fifo-token-budget")
+        );
     }
 
     fn individual_artifact() -> CausalLanguageModel {

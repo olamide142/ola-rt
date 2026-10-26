@@ -172,17 +172,45 @@ Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, 
 
 ## P8: Model and runtime usability
 
-- [ ] Add probabilistic sampling with deterministic seeded tests.
-- [ ] Support indexed and sharded SafeTensors checkpoints.
-- [ ] Support selected tied-embedding configurations.
-- [ ] Support selected RoPE-scaling configurations.
-- [ ] Decide support for projection biases and activation variants.
+- [x] Add probabilistic sampling with deterministic seeded tests. (Temperature,
+  nucleus `top_p`, and session-owned seeded SplitMix64 state.)
+- [x] Support indexed and sharded SafeTensors checkpoints. (Indexed
+  `model.safetensors.index.json` and `pytorch_model.safetensors.index.json`
+  maps are validated, deduplicated, and merged lazily before one module apply.)
+- [x] Support selected tied-embedding configurations. (Llama configs with
+  `tie_word_embeddings` reuse `model.embed_tokens.weight` for logits; loaders
+  accept the intentionally absent `lm_head.weight` and reject other gaps.)
+- [x] Support selected RoPE-scaling configurations. (Llama accepts linear
+  scaling with a finite factor at least one; unsupported scaling types and
+  malformed objects are rejected.)
+- [x] Support configured attention and MLP projection biases. (Activation
+  variants remain explicitly limited to `silu` until a checkpoint-backed
+  conformance case establishes the intended gated-MLP semantics.)
 - [ ] Add a second architecture through the architecture registry.
-- [ ] Define model load, unload, placement, and residency operations.
-- [ ] Report model residency and load/unload events.
-- [ ] Account for model weights, workspace, and non-KV memory automatically.
-- [ ] Load configuration for models, devices, limits, policies, and experiments.
-- [ ] Add a stable high-level runtime builder after policy boundaries settle.
+- [x] Define model load and unload operations. (Executors can attach, safely
+  unload only drained models, enumerate loaded IDs, and attach again.)
+- [x] Define model placement and residency operations. (Resident executables
+  expose explicit host/device/unspecified placement metadata; placement changes
+  require a drained model until backend migration is supported.)
+- [x] Report model residency and load/unload events. (Loaded model IDs and
+  ordered executor lifecycle events are exposed read-only.)
+- [x] Account for model weights and persistent workspace automatically when
+  an architecture supplies a `ModelMemoryProfile`; unknown resource sizes
+  remain unaccounted rather than estimated.
+- [x] Load configuration for executor limits and device settings.
+  (`ExecutorConfig` supports JSON/Serde loading of limits, memory capacity,
+  and a stable device label.)
+- [x] Load configuration for model definitions and stable batch policies.
+  (Model definitions use Serde; `ExecutorConfig` selects unbounded,
+  FIFO-token-budget, or mixed-token-budget batching.)
+- [ ] Load configuration for experiments and remaining adaptive policy
+  components.
+- [x] Load model definitions from JSON/Serde. (Descriptors, identifiers,
+  modalities, and local/Hugging Face sources now round-trip; device, policy,
+  and experiment configuration remain separate follow-ups.)
+- [x] Add a stable high-level runtime builder after policy boundaries settle.
+  (`ExecutorBuilder` composes scalar config with an execution policy; model
+  loading remains an explicit attachment step.)
 
 Done when a second architecture and a sharded checkpoint load through the registry and pass conformance tests, seeded sampling is reproducible, and a runtime can be built from a configuration file.
 
@@ -203,14 +231,30 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
   stacks request queries and consumes padded device block tables in one
   dispatch; portable providers retain the request-local fallback.)
 - [ ] Investigate ragged multi-request decode attention. (Ragged logical
-  lengths now work within one physical KV geometry; cross-pool or incompatible
-  shape grouping remains.)
-- [ ] Investigate ragged multi-position prefill chunks.
-- [ ] Benchmark page-size, occupancy, and fragmentation trade-offs.
-- [ ] Compare optimized paths against the single-request oracle.
+  lengths now work within one physical KV geometry; explicit pool identity
+  partitions cross-pool or incompatible groups safely, and the CubeCL
+  provider now partitions mixed batches into homogeneous launches while
+  preserving request order; scheduler-side launch grouping remains.)
+- [x] Validate ragged multi-position prefill chunks at the runtime/model
+  boundary. Unequal chunks and absolute cursors are processed by active offset
+  with batched one-position attention; a fused multi-position kernel contract
+  remains a separate optimization.
+- [ ] Fuse multiple ragged prefill positions into one attention kernel launch.
+  This requires causal valid-length metadata rather than the current
+  single-query `PagedAttentionInput` contract.
+- [ ] Benchmark page-size, occupancy, and fragmentation trade-offs. (The
+  versioned `paged-attention-kernel` study now covers page-size, batch latency,
+  partial-final-page padding, and conformance on CPU/WGPU; accelerator
+  occupancy and broader KV fragmentation remain.)
+- [x] Compare optimized paths against the single-request oracle. (Single and
+  ragged batched CubeCL outputs are checked against portable single-request
+  execution.)
 - [x] Record kernel identity, target, configuration, and fallback in plan reports.
 - [x] Record kernel choices and synchronous host-call latency in observability traces.
-- [ ] Require warm-ups, repetitions, distributions, workload identity, and numerical conformance before making performance claims.
+- [x] Require warm-ups, repetitions, distributions, workload identity, and
+  numerical conformance before making performance claims. (The registered
+  paged-attention study enforces the host-study protocol and records oracle
+  error; accelerator studies remain future work.)
 
 Done when policy selects an optimized paged-attention kernel with a portable fallback, it matches the reference within tolerance, and a study-grade report measures its effect.
 

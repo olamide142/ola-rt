@@ -4826,6 +4826,7 @@ dependencies = [
 name = "ola-bench"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "ola-core",
  "ola-kernel",
  "ola-model",
@@ -4871,6 +4872,9 @@ dependencies = [
 [[package]]
 name = "ola-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "ola-kernel"
@@ -4888,6 +4892,8 @@ version = "0.1.0"
 dependencies = [
  "ola-core",
  "ola-kernel",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4909,6 +4915,8 @@ dependencies = [
  "ola-core",
  "ola-kernel",
  "ola-model",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,9 +1,13 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 
 use crate::{
     KernelCapability, KernelDType, KernelDescriptor, KernelError, KernelOperation, KernelTarget,
     PagedAttentionProvider,
 };
+
+static NEXT_PHYSICAL_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Dimensions shared by paged decode-attention implementations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +198,7 @@ pub struct PagedKvBlocks {
     block_table: PagedKvBlockTable,
     tokens_per_block: usize,
     token_count: usize,
+    pool_id: u64,
 }
 
 impl PagedKvBlocks {
@@ -209,6 +214,26 @@ impl PagedKvBlocks {
         block_table: PagedKvBlockTable,
         tokens_per_block: usize,
         token_count: usize,
+    ) -> Result<Self, KernelError> {
+        let pool_id = NEXT_PHYSICAL_POOL_ID.fetch_add(1, Ordering::Relaxed);
+        Self::new_with_pool_id(
+            key,
+            value,
+            block_table,
+            tokens_per_block,
+            token_count,
+            pool_id,
+        )
+    }
+
+    /// Creates physical cache metadata with an identity shared by one pool.
+    pub fn new_with_pool_id(
+        key: Tensor<4>,
+        value: Tensor<4>,
+        block_table: PagedKvBlockTable,
+        tokens_per_block: usize,
+        token_count: usize,
+        pool_id: u64,
     ) -> Result<Self, KernelError> {
         let key_shape = key.dims();
         let value_shape = value.dims();
@@ -264,6 +289,7 @@ impl PagedKvBlocks {
             block_table,
             tokens_per_block,
             token_count,
+            pool_id,
         })
     }
 
@@ -290,6 +316,11 @@ impl PagedKvBlocks {
     /// Returns the populated logical token count.
     pub const fn token_count(&self) -> usize {
         self.token_count
+    }
+
+    /// Returns the identity of the physical KV allocation backing this view.
+    pub const fn pool_id(&self) -> u64 {
+        self.pool_id
     }
 
     #[cfg(feature = "cubecl")]

@@ -505,6 +505,25 @@ pub trait GenerationSession: Send {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+/// Resident memory facts supplied by an architecture loader.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelMemoryProfile {
+    /// Bytes occupied by resident model weights.
+    pub weights_bytes: u64,
+    /// Persistent backend workspace reserved while the model is resident.
+    pub workspace_bytes: u64,
+}
+
+impl ModelMemoryProfile {
+    /// Creates a resource profile from resident weights and workspace bytes.
+    pub const fn new(weights_bytes: u64, workspace_bytes: u64) -> Self {
+        Self {
+            weights_bytes,
+            workspace_bytes,
+        }
+    }
+}
+
 /// Executable causal-language artifact produced by an architecture factory.
 ///
 /// Both members are reference counted so a loaded artifact can serve many
@@ -515,6 +534,7 @@ pub struct CausalLanguageModel {
     model: Arc<dyn CausalModel>,
     kv_cache_profile: Option<KvCacheProfile>,
     paged_attention_profile: Option<PagedAttentionProfile>,
+    memory_profile: Option<ModelMemoryProfile>,
 }
 
 impl CausalLanguageModel {
@@ -529,6 +549,7 @@ impl CausalLanguageModel {
             model: Arc::new(model),
             kv_cache_profile: None,
             paged_attention_profile: None,
+            memory_profile: None,
         }
     }
 
@@ -539,6 +560,7 @@ impl CausalLanguageModel {
             model,
             kv_cache_profile: None,
             paged_attention_profile: None,
+            memory_profile: None,
         }
     }
 
@@ -562,6 +584,17 @@ impl CausalLanguageModel {
     /// Returns paged-attention planning metadata when the model uses it.
     pub const fn paged_attention_profile(&self) -> Option<PagedAttentionProfile> {
         self.paged_attention_profile
+    }
+
+    /// Attaches optional resident-weight and workspace accounting facts.
+    pub const fn with_memory_profile(mut self, profile: ModelMemoryProfile) -> Self {
+        self.memory_profile = Some(profile);
+        self
+    }
+
+    /// Returns memory facts supplied by the architecture loader, when known.
+    pub const fn memory_profile(&self) -> Option<ModelMemoryProfile> {
+        self.memory_profile
     }
 
     /// Returns whether request sessions can process prompts incrementally.

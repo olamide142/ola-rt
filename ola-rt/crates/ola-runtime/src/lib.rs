@@ -2,7 +2,9 @@
 
 mod admission;
 mod batch;
+mod builder;
 mod composed;
+mod config;
 mod decision;
 mod error;
 mod executor;
@@ -27,7 +29,9 @@ pub use batch::{
     PrefillGroupingEstimate, PrefillGroupingStrategy, QueueAdaptiveTokenBudget,
     UnboundedBatchPolicy, UnbucketedPrefillBatcher,
 };
+pub use builder::ExecutorBuilder;
 pub use composed::{ComposedPolicy, HeadOfLine};
+pub use config::{BatchPolicyConfig, ExecutorConfig};
 pub use decision::{
     AdmissionOutcome, AdmissionRecord, BatchHook, CapabilityFallback, DecisionRecord,
     GroupingDecision, GroupingRecord, PreemptionRecord, RankingRecord, SelectionRecord,
@@ -36,6 +40,7 @@ pub use decision::{
 pub use error::RuntimeError;
 pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
+    ModelLifecycleEvent, ModelPlacement,
 };
 pub use kv_cache::{
     KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId, PrefixMatch,

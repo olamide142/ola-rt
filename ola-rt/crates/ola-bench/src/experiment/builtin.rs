@@ -2,6 +2,11 @@
 
 use std::{collections::BTreeMap, time::Duration, time::Instant};
 
+#[cfg(feature = "wgpu")]
+use burn::tensor::DeviceKind;
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+use burn::tensor::{Device, Tensor, TensorData};
+
 use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
     ComposedPolicy, EarliestDeadlineFirst, ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager,
@@ -21,10 +26,17 @@ use crate::{
     compare_schedulers_observed,
 };
 
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+use ola_kernel::{
+    CubePagedAttention, KernelTarget, PagedAttentionConfig, PagedAttentionInput,
+    PagedAttentionKernel, PagedKvBlockTable, PagedKvBlocks, PagedKvPage, PortablePagedAttention,
+};
+
 impl ExperimentRegistry {
     /// Returns every built-in experiment, in display order.
     pub fn builtin() -> Self {
-        Self::new(vec![
+        #[allow(unused_mut)]
+        let mut experiments: Vec<Box<dyn Experiment>> = vec![
             Box::new(super::LlamaGeneration),
             Box::new(super::PrefillStrategies),
             Box::new(super::ChunkedPrefill),
@@ -37,7 +49,10 @@ impl ExperimentRegistry {
             Box::new(KvPressure),
             Box::new(PrefixCache),
             Box::new(KvPageSize),
-        ])
+        ];
+        #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+        experiments.push(Box::new(PagedAttentionKernelStudy));
+        Self::new(experiments)
     }
 }
 
@@ -1133,6 +1148,312 @@ impl Experiment for PrefixCache {
         );
         Ok(ExperimentOutcome { summary, ..outcome })
     }
+}
+
+/// Portable versus CubeCL paged-attention latency and numerical conformance.
+pub struct PagedAttentionKernelStudy;
+
+impl Experiment for PagedAttentionKernelStudy {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "paged-attention-kernel",
+            name: "Paged-attention kernel",
+            description: "Warm-up and repeated portable-versus-CubeCL attention measurements",
+            category: ExperimentCategory::Benchmark,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Host,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::text("page_sizes", "Tokens per logical page", "4,8,16"),
+                ParameterSpec::integer("sequence_tokens", "Populated tokens per request", 23),
+                ParameterSpec::integer("batch", "Independent requests per dispatch", 2),
+                ParameterSpec::integer(
+                    "pool_slack_blocks",
+                    "Unused physical KV blocks per request",
+                    0,
+                ),
+                ParameterSpec::integer("warmups", "Discarded dispatches per variant", 1),
+                ParameterSpec::integer("repetitions", "Measured dispatches per variant", 5),
+            ],
+        }
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        #[cfg(not(any(feature = "cubecl-cpu", feature = "wgpu")))]
+        {
+            let _ = (context, parameters);
+            return Err(ExperimentError::Run(
+                "paged-attention-kernel requires the ola-bench cubecl-cpu feature".into(),
+            ));
+        }
+
+        #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+        {
+            let page_sizes = lengths(parameters, "page_sizes")?;
+            let batch = parameters.size("batch")?;
+            let sequence_tokens = parameters.size("sequence_tokens")?;
+            let pool_slack_blocks = parameters.size("pool_slack_blocks")?;
+            let warmups = parameters.size("warmups")?;
+            let repetitions = parameters.size("repetitions")?;
+            if batch == 0 || repetitions == 0 {
+                return Err(ExperimentError::Run(
+                    "batch and repetitions must be greater than zero".into(),
+                ));
+            }
+            #[cfg(feature = "wgpu")]
+            let (device, target) = (
+                Device::wgpu(DeviceKind::IntegratedGpu(0)),
+                KernelTarget::Wgpu,
+            );
+            #[cfg(all(not(feature = "wgpu"), feature = "cubecl-cpu"))]
+            let (device, target) = (Device::cpu(), KernelTarget::Cpu);
+            let portable = PortablePagedAttention::new();
+            let cube = CubePagedAttention::new(target).map_err(run_error)?;
+            let mut variants = Vec::new();
+            let mut content = String::new();
+            for page_size in page_sizes {
+                let input = kernel_input(&device, page_size, sequence_tokens, pool_slack_blocks)?;
+                let inputs = vec![input; batch];
+                let logical_pages = sequence_tokens.div_ceil(page_size);
+                let padding_tokens = logical_pages * page_size - sequence_tokens;
+                let physical_blocks = logical_pages
+                    .checked_add(1)
+                    .and_then(|blocks| blocks.checked_add(pool_slack_blocks))
+                    .ok_or_else(|| {
+                        ExperimentError::Run("physical KV block count overflowed".into())
+                    })?;
+                let unused_blocks = physical_blocks - logical_pages;
+                let pool_fragmentation = unused_blocks as f64 / physical_blocks as f64;
+                content.push_str(&format!(
+                    "page={page_size};tokens={sequence_tokens};batch={batch};pool_slack={pool_slack_blocks};physical_blocks={physical_blocks};"
+                ));
+                let expected = run_kernel(&portable, &inputs)?.1;
+                let mut portable_samples = Vec::with_capacity(repetitions);
+                let mut cube_samples = Vec::with_capacity(repetitions);
+                for _ in 0..warmups {
+                    let _ = run_kernel(&portable, &inputs)?;
+                    let _ = run_kernel(&cube, &inputs)?;
+                }
+                for _ in 0..repetitions {
+                    let (portable_time, _) = run_kernel(&portable, &inputs)?;
+                    portable_samples.push(values(&[
+                        ("latency_micros", micros(portable_time)),
+                        ("max_abs_error", 0.0),
+                        ("batch_size", batch as f64),
+                        ("page_tokens", page_size as f64),
+                        ("sequence_tokens", sequence_tokens as f64),
+                        ("logical_pages", logical_pages as f64),
+                        ("padding_tokens", padding_tokens as f64),
+                        ("physical_blocks", physical_blocks as f64),
+                        ("unused_blocks", unused_blocks as f64),
+                        ("pool_fragmentation", pool_fragmentation),
+                    ]));
+                    let (cube_time, actual) = run_kernel(&cube, &inputs)?;
+                    let error = max_error(&expected, &actual);
+                    cube_samples.push(values(&[
+                        ("latency_micros", micros(cube_time)),
+                        ("max_abs_error", error),
+                        ("batch_size", batch as f64),
+                        ("page_tokens", page_size as f64),
+                        ("sequence_tokens", sequence_tokens as f64),
+                        ("logical_pages", logical_pages as f64),
+                        ("padding_tokens", padding_tokens as f64),
+                        ("physical_blocks", physical_blocks as f64),
+                        ("unused_blocks", unused_blocks as f64),
+                        ("pool_fragmentation", pool_fragmentation),
+                    ]));
+                }
+                variants.push((
+                    Variant {
+                        label: format!("portable-page={page_size}"),
+                        policy: None,
+                        kernel: Some(portable.descriptor().name().to_owned()),
+                    },
+                    portable_samples,
+                ));
+                variants.push((
+                    Variant {
+                        label: format!("cubecl-page={page_size}"),
+                        policy: None,
+                        kernel: Some(cube.descriptor().name().to_owned()),
+                    },
+                    cube_samples,
+                ));
+            }
+            let mut outcome = finish(
+                &self.descriptor(),
+                context,
+                parameters,
+                if target == KernelTarget::Wgpu {
+                    "paged-attention-wgpu"
+                } else {
+                    "paged-attention-cpu"
+                },
+                (0..repetitions as u64).collect(),
+                vec![
+                    metric(
+                        "latency_micros",
+                        Unit::Micros,
+                        TimeDomain::Host,
+                        Direction::Lower,
+                    ),
+                    metric(
+                        "max_abs_error",
+                        Unit::Ratio,
+                        TimeDomain::Untimed,
+                        Direction::Lower,
+                    ),
+                    metric(
+                        "batch_size",
+                        Unit::Count,
+                        TimeDomain::Untimed,
+                        Direction::Neither,
+                    ),
+                    metric(
+                        "page_tokens",
+                        Unit::Tokens,
+                        TimeDomain::Untimed,
+                        Direction::Neither,
+                    ),
+                    metric(
+                        "sequence_tokens",
+                        Unit::Tokens,
+                        TimeDomain::Untimed,
+                        Direction::Neither,
+                    ),
+                    metric(
+                        "logical_pages",
+                        Unit::Count,
+                        TimeDomain::Untimed,
+                        Direction::Neither,
+                    ),
+                    metric(
+                        "padding_tokens",
+                        Unit::Tokens,
+                        TimeDomain::Untimed,
+                        Direction::Lower,
+                    ),
+                    metric(
+                        "physical_blocks",
+                        Unit::Count,
+                        TimeDomain::Untimed,
+                        Direction::Neither,
+                    ),
+                    metric(
+                        "unused_blocks",
+                        Unit::Count,
+                        TimeDomain::Untimed,
+                        Direction::Lower,
+                    ),
+                    metric(
+                        "pool_fragmentation",
+                        Unit::Ratio,
+                        TimeDomain::Untimed,
+                        Direction::Lower,
+                    ),
+                ],
+                variants,
+                format!(
+                    "{} page sizes × {} requests; pool_slack_blocks={pool_slack_blocks}; warmups={warmups}, repetitions={repetitions}",
+                    parameters.text("page_sizes")?,
+                    batch
+                ),
+            )?;
+            outcome.report.protocol.warmups = warmups;
+            outcome.report.protocol.repetitions = repetitions;
+            outcome.report.protocol.ordering = "portable then CubeCL per page size".into();
+            outcome.report.workload.digest = content_digest(content.as_bytes());
+            Ok(outcome)
+        }
+    }
+}
+
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+fn kernel_input(
+    device: &burn::tensor::Device,
+    page_size: usize,
+    sequence_tokens: usize,
+    pool_slack_blocks: usize,
+) -> Result<PagedAttentionInput, ExperimentError> {
+    if page_size == 0 || sequence_tokens == 0 {
+        return Err(ExperimentError::Run(
+            "page sizes and sequence tokens must be greater than zero".into(),
+        ));
+    }
+    let config = PagedAttentionConfig::new(4, 2, 4).map_err(run_error)?;
+    let query = Tensor::from_data(
+        TensorData::new(
+            (0..16).map(|index| index as f32 * 0.01).collect::<Vec<_>>(),
+            [1, 4, 1, 4],
+        ),
+        device,
+    );
+    let logical_pages = sequence_tokens.div_ceil(page_size);
+    let physical_blocks = logical_pages
+        .checked_add(1)
+        .and_then(|blocks| blocks.checked_add(pool_slack_blocks))
+        .ok_or_else(|| ExperimentError::Run("physical KV block count overflowed".into()))?;
+    let mut physical_key = Tensor::zeros([physical_blocks, 2, page_size, 4], device);
+    let mut physical_value = Tensor::zeros([physical_blocks, 2, page_size, 4], device);
+    let mut pages = Vec::with_capacity(logical_pages);
+    let mut block_ids = Vec::with_capacity(logical_pages);
+    for logical in 0..logical_pages {
+        let used = (sequence_tokens - logical * page_size).min(page_size);
+        let values = (0..2 * used * 4)
+            .map(|index| ((index + logical * 7) % 17) as f32 * 0.02 - 0.1)
+            .collect::<Vec<_>>();
+        let key = Tensor::from_data(TensorData::new(values.clone(), [1, 2, used, 4]), device);
+        let value = Tensor::from_data(TensorData::new(values, [1, 2, used, 4]), device);
+        let physical = logical + 1;
+        physical_key =
+            physical_key.slice_assign([physical..physical + 1, 0..2, 0..used, 0..4], key.clone());
+        physical_value = physical_value
+            .slice_assign([physical..physical + 1, 0..2, 0..used, 0..4], value.clone());
+        pages.push(PagedKvPage::new(key, value));
+        block_ids.push(physical);
+    }
+    let table = PagedKvBlockTable::new(block_ids, physical_blocks, device).map_err(run_error)?;
+    let blocks = PagedKvBlocks::new(
+        physical_key,
+        physical_value,
+        table,
+        page_size,
+        sequence_tokens,
+    )
+    .map_err(run_error)?;
+    PagedAttentionInput::new(query, pages, config)
+        .map_err(run_error)?
+        .with_blocks(blocks)
+        .map_err(run_error)
+}
+
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+fn run_kernel(
+    kernel: &dyn PagedAttentionKernel,
+    inputs: &[PagedAttentionInput],
+) -> Result<(Duration, Vec<Vec<f32>>), ExperimentError> {
+    let started = Instant::now();
+    let outputs = kernel.execute_batch(inputs.to_vec()).map_err(run_error)?;
+    let values = outputs
+        .into_iter()
+        .map(|output| output.into_data().try_to_vec::<f32>().map_err(run_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((started.elapsed(), values))
+}
+
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+fn max_error(expected: &[Vec<f32>], actual: &[Vec<f32>]) -> f64 {
+    expected
+        .iter()
+        .zip(actual)
+        .flat_map(|(expected, actual)| expected.iter().zip(actual))
+        .map(|(expected, actual)| f64::from((actual - expected).abs()))
+        .fold(0.0, f64::max)
 }
 
 /// KV page size: internal fragmentation against prefix-cache reuse.

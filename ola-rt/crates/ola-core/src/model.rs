@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, error::Error, fmt};
 use crate::{ArchitectureId, Modality, ModelId};
 
 /// Broad execution family for a registered model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ModelKind {
     /// A text/token model, typically an autoregressive decoder.
     Language,
@@ -14,7 +14,7 @@ pub enum ModelKind {
 }
 
 /// Runtime-visible model metadata, independent of any compute backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ModelDescriptor {
     /// Stable identifier used by requests.
     pub id: ModelId,

@@ -380,26 +380,28 @@ fn run(id: &str, overrides: &[(&str, &str)]) -> Result<ExperimentOutcome, Experi
 fn every_builtin_experiment_runs_with_its_defaults() {
     let registry = ExperimentRegistry::builtin();
     let descriptors = registry.descriptors();
-    assert_eq!(
-        descriptors
-            .iter()
-            .map(|descriptor| descriptor.id)
-            .collect::<Vec<_>>(),
-        [
-            "llama-generation",
-            "llama-prefill-strategies",
-            "llama-chunked-prefill",
-            "cost-calibration",
-            "kv-block-pressure",
-            "fifo-workload",
-            "prefill-bucketing",
-            "adaptive-prefill-cost",
-            "scheduler-comparison",
-            "kv-pressure",
-            "prefix-cache",
-            "kv-page-size",
-        ]
-    );
+    let actual = descriptors
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect::<Vec<_>>();
+    #[allow(unused_mut)]
+    let mut expected = vec![
+        "llama-generation",
+        "llama-prefill-strategies",
+        "llama-chunked-prefill",
+        "cost-calibration",
+        "kv-block-pressure",
+        "fifo-workload",
+        "prefill-bucketing",
+        "adaptive-prefill-cost",
+        "scheduler-comparison",
+        "kv-pressure",
+        "prefix-cache",
+        "kv-page-size",
+    ];
+    #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+    expected.push("paged-attention-kernel");
+    assert_eq!(actual, expected);
     for descriptor in descriptors {
         if descriptor.requirements.contains(&Requirement::LoadedModel) {
             assert!(matches!(
@@ -419,6 +421,25 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         );
         outcome.report.validate().unwrap();
     }
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+#[ignore = "requires a local WGPU adapter"]
+fn paged_attention_study_runs_on_wgpu() {
+    let outcome = run(
+        "paged-attention-kernel",
+        &[
+            ("page_sizes", "2"),
+            ("batch", "1"),
+            ("warmups", "1"),
+            ("repetitions", "5"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(outcome.report.protocol.warmups, 1);
+    assert_eq!(outcome.report.protocol.repetitions, 5);
+    outcome.report.validate().unwrap();
 }
 
 #[test]

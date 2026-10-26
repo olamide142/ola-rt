@@ -1,6 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use burn::tensor::{ElementConversion, Int, Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData};
 use ola_core::GenerationConfig;
 use ola_kernel::{PagedAttentionKernel, PortablePagedAttention};
 use ola_model::{
@@ -47,6 +50,78 @@ fn paged_attention_kernel(context: ModelExecutionContext<'_>) -> Box<dyn PagedAt
     }
 }
 
+fn entropy_seed() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64)
+}
+
+fn next_random(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+    value ^= value >> 31;
+    (value >> 11) as f64 * (1.0 / 9007199254740992.0)
+}
+
+fn sample_token(
+    logits: &[f32],
+    temperature: f32,
+    top_p: f32,
+    state: &mut u64,
+) -> Result<usize, String> {
+    if logits.is_empty() || logits.iter().any(|value| !value.is_finite()) {
+        return Err("model returned non-finite or empty logits".to_owned());
+    }
+    if temperature == 0.0 {
+        return Ok(logits
+            .iter()
+            .enumerate()
+            .max_by(|(left_id, left), (right_id, right)| {
+                left.total_cmp(right).then_with(|| right_id.cmp(left_id))
+            })
+            .map(|(id, _)| id)
+            .expect("non-empty logits have a maximum"));
+    }
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut probabilities = logits
+        .iter()
+        .map(|logit| ((*logit - maximum) / temperature).exp() as f64)
+        .collect::<Vec<_>>();
+    let normalizer = probabilities.iter().sum::<f64>();
+    if !normalizer.is_finite() || normalizer <= 0.0 {
+        return Err("model logits could not produce a probability distribution".to_owned());
+    }
+    probabilities
+        .iter_mut()
+        .for_each(|probability| *probability /= normalizer);
+    let mut ranked = (0..probabilities.len()).collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        probabilities[*right]
+            .total_cmp(&probabilities[*left])
+            .then_with(|| left.cmp(right))
+    });
+    let mut retained = Vec::new();
+    let mut cumulative = 0.0;
+    for index in ranked {
+        retained.push(index);
+        cumulative += probabilities[index];
+        if cumulative >= f64::from(top_p) {
+            break;
+        }
+    }
+    let draw = next_random(state) * cumulative;
+    let mut total = 0.0;
+    for index in retained {
+        total += probabilities[index];
+        if draw < total {
+            return Ok(index);
+        }
+    }
+    Ok(logits.len() - 1)
+}
+
 impl CausalModel for BurnLlamaModel {
     fn supports_chunked_prefill(&self) -> bool {
         true
@@ -88,14 +163,15 @@ impl CausalModel for BurnLlamaModel {
                 "top_p must be finite and in the interval (0, 1]",
             ));
         }
-        if generation.temperature != 0.0 {
+        if !generation.temperature.is_finite() || generation.temperature < 0.0 {
             return Err(ModelExecutionError::new(
                 ExecutionStage::SessionCreation,
-                "the initial Llama executor supports greedy decoding only; set temperature to 0",
+                "temperature must be finite and non-negative",
             ));
         }
         let cache = LlamaKvCache::allocate(self.cache_pool.clone())
             .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
+        let rng_state = generation.seed.unwrap_or_else(entropy_seed);
         Ok(Box::new(LlamaSession {
             module: self.module.clone(),
             config: self.config.clone(),
@@ -103,6 +179,7 @@ impl CausalModel for BurnLlamaModel {
             generation,
             tokens: Vec::new(),
             cache: Some(cache),
+            rng_state,
             last_generated: None,
             metrics: SessionMetrics::default(),
             terminal: false,
@@ -204,48 +281,14 @@ impl CausalModel for BurnLlamaModel {
                 ])
             })
             .collect::<Vec<_>>();
-        let selected = match Tensor::cat(final_rows, 0)
-            .argmax(2)
-            .into_data()
-            .try_to_vec_as::<i64>()
-        {
-            Ok(selected) => selected,
-            Err(error) => {
-                return Some(batch_error(
-                    batch_size,
-                    ModelExecutionError::new(
-                        ExecutionStage::Prefill,
-                        format!("failed to read batched selected tokens: {error}"),
-                    ),
-                ));
-            }
-        };
-        if selected.len() != batch_size {
-            return Some(batch_error(
-                batch_size,
-                ModelExecutionError::new(
-                    ExecutionStage::Prefill,
-                    format!(
-                        "backend returned {} token selections for batch size {batch_size}",
-                        selected.len()
-                    ),
-                ),
-            ));
-        }
-
         Some(
             typed
                 .into_iter()
                 .zip(prompt_tokens.iter().copied())
-                .zip(selected)
-                .map(|((session, prompt), selected)| {
-                    let selected = selected.elem::<i64>();
-                    let id = u32::try_from(selected).map_err(|_| {
-                        ModelExecutionError::new(
-                            ExecutionStage::Prefill,
-                            "backend returned a token ID outside the u32 range",
-                        )
-                    })?;
+                .enumerate()
+                .map(|(index, (session, prompt))| {
+                    let token =
+                        session.select_token(final_rows[index].clone(), ExecutionStage::Prefill)?;
                     session.accept_tokens(prompt);
                     session.metrics.prompt_tokens = prompt.len();
                     session.metrics.kv_cache_bytes = session
@@ -253,7 +296,7 @@ impl CausalModel for BurnLlamaModel {
                         .as_ref()
                         .expect("a live Llama session owns a cache")
                         .bytes();
-                    Ok(session.record_selected_token(id))
+                    Ok(token)
                 })
                 .collect(),
         )
@@ -362,38 +405,25 @@ impl CausalModel for BurnLlamaModel {
                 }
             }
         };
-        let selected = match logits.argmax(2).into_data().try_to_vec_as::<i64>() {
-            Ok(selected) => selected,
-            Err(error) => {
-                return Some(batch_error(
-                    batch_size,
-                    ModelExecutionError::new(
-                        ExecutionStage::Prefill,
-                        format!("failed to read chunked batch token selections: {error}"),
-                    ),
-                ));
-            }
-        };
-        if selected.len() != batch_size {
-            return Some(batch_error(
-                batch_size,
-                ModelExecutionError::new(
-                    ExecutionStage::Prefill,
-                    format!(
-                        "backend returned {} chunk selections for batch size {batch_size}",
-                        selected.len()
-                    ),
-                ),
-            ));
-        }
-
         Some(
             typed
                 .into_iter()
                 .zip(prompt_chunks.iter().copied())
                 .zip(is_final.iter().copied())
-                .zip(selected)
-                .map(|(((session, chunk), is_final), selected)| {
+                .enumerate()
+                .map(|(index, ((session, chunk), is_final))| {
+                    let token = if is_final {
+                        Some(session.select_token(
+                            logits.clone().slice([
+                                index..index + 1,
+                                0..1,
+                                0..self.config.vocab_size,
+                            ]),
+                            ExecutionStage::Prefill,
+                        )?)
+                    } else {
+                        None
+                    };
                     session.accept_tokens(chunk);
                     session.metrics.prompt_tokens = session.tokens.len();
                     session.metrics.kv_cache_bytes = session
@@ -402,14 +432,9 @@ impl CausalModel for BurnLlamaModel {
                         .expect("a live Llama session owns a cache")
                         .bytes();
                     if is_final {
-                        let selected = selected.elem::<i64>();
-                        let id = u32::try_from(selected).map_err(|_| {
-                            ModelExecutionError::new(
-                                ExecutionStage::Prefill,
-                                "backend returned a token ID outside the u32 range",
-                            )
-                        })?;
-                        Ok(PrefillOutcome::Token(session.record_selected_token(id)))
+                        Ok(PrefillOutcome::Token(
+                            token.expect("final chunks select a token"),
+                        ))
                     } else {
                         Ok(PrefillOutcome::Pending)
                     }
@@ -503,56 +528,25 @@ impl CausalModel for BurnLlamaModel {
                 }
             }
         };
-        let selected = match logits
-            .slice([0..batch_size, 0..1, 0..self.config.vocab_size])
-            .argmax(2)
-            .into_data()
-            .try_to_vec_as::<i64>()
-        {
-            Ok(selected) => selected,
-            Err(error) => {
-                return Some(batch_error(
-                    batch_size,
-                    ModelExecutionError::new(
-                        ExecutionStage::Decode,
-                        format!("failed to read batched selected tokens: {error}"),
-                    ),
-                ));
-            }
-        };
-        if selected.len() != batch_size {
-            return Some(batch_error(
-                batch_size,
-                ModelExecutionError::new(
-                    ExecutionStage::Decode,
-                    format!(
-                        "backend returned {} token selections for batch size {batch_size}",
-                        selected.len()
-                    ),
-                ),
-            ));
-        }
-
         Some(
             typed
                 .into_iter()
                 .zip(input_tokens.iter().copied())
-                .zip(selected)
-                .map(|((session, input_token), selected)| {
-                    let selected = selected.elem::<i64>();
-                    let id = u32::try_from(selected).map_err(|_| {
-                        ModelExecutionError::new(
-                            ExecutionStage::Decode,
-                            "backend returned a token ID outside the u32 range",
-                        )
-                    })?;
+                .enumerate()
+                .map(|(index, (session, input_token))| {
+                    let token = session.select_token(
+                        logits
+                            .clone()
+                            .slice([index..index + 1, 0..1, 0..self.config.vocab_size]),
+                        ExecutionStage::Decode,
+                    )?;
                     session.accept_tokens(&[input_token]);
                     session.metrics.kv_cache_bytes = session
                         .cache
                         .as_ref()
                         .expect("a live Llama session owns a cache")
                         .bytes();
-                    Ok(session.record_selected_token(id))
+                    Ok(token)
                 })
                 .collect(),
         )
@@ -567,6 +561,7 @@ struct LlamaSession {
     generation: GenerationConfig,
     tokens: Vec<u32>,
     cache: Option<LlamaKvCache>,
+    rng_state: u64,
     last_generated: Option<u32>,
     metrics: SessionMetrics,
     terminal: bool,
@@ -589,16 +584,21 @@ impl LlamaSession {
     ) -> Result<GeneratedToken, ModelExecutionError> {
         let sequence_length = logits.dims()[1];
         let vocabulary = self.config.vocab_size;
-        let last = logits
+        let values = logits
             .slice([0..1, sequence_length - 1..sequence_length, 0..vocabulary])
-            .argmax(2)
             .into_data()
-            .try_to_vec_as::<i64>()
+            .try_to_vec::<f32>()
             .map_err(|error| {
                 ModelExecutionError::new(stage, format!("failed to read selected token: {error}"))
             })?;
-        let selected = last[0].elem::<i64>();
-        let id = u32::try_from(selected).map_err(|_| {
+        let id = sample_token(
+            &values,
+            self.generation.temperature,
+            self.generation.top_p,
+            &mut self.rng_state,
+        )
+        .map_err(|error| ModelExecutionError::new(stage, error))?;
+        let id = u32::try_from(id).map_err(|_| {
             ModelExecutionError::new(stage, "backend returned a token ID outside the u32 range")
         })?;
         Ok(self.record_selected_token(id))
@@ -1461,21 +1461,44 @@ mod tests {
             .kernel
             .expect("execution records the selected provider");
         assert_eq!(executed.descriptor, counting_descriptor());
-        assert_eq!(executed.calls, 2);
+        // The provider sees one batched operation even when its portable
+        // fallback executes the two request-local inputs independently.
+        assert_eq!(executed.calls, 1);
         assert!(executed.host_duration_nanos.is_some());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn rejects_sampling_until_a_sampler_is_implemented() {
+    fn seeded_sampling_is_accepted_and_reproducible() {
         let model = tiny_model();
-        let error = model
-            .create_session(GenerationConfig::default())
-            .err()
-            .unwrap();
+        let generation = GenerationConfig {
+            max_new_tokens: 2,
+            temperature: 0.8,
+            top_p: 0.9,
+            seed: Some(17),
+        };
+        let mut first = model.create_session(generation.clone()).unwrap();
+        let mut second = model.create_session(generation).unwrap();
 
-        assert_eq!(error.stage(), ExecutionStage::SessionCreation);
-        assert!(error.message().contains("greedy"));
+        let first_token = first.prefill(&[1, 4, 5]).unwrap();
+        let second_token = second.prefill(&[1, 4, 5]).unwrap();
+        assert_eq!(first_token.id, second_token.id);
+        assert_eq!(
+            first.decode(first_token.id).unwrap().id,
+            second.decode(second_token.id).unwrap().id
+        );
+    }
+
+    #[test]
+    fn sampler_respects_nucleus_cutoff_and_seed() {
+        let logits = [4.0, 3.0, -20.0];
+        let mut first_state = 23;
+        let mut second_state = 23;
+        let first = sample_token(&logits, 1.0, 0.5, &mut first_state).unwrap();
+        let second = sample_token(&logits, 1.0, 0.5, &mut second_state).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, 0);
     }
 
     #[test]
