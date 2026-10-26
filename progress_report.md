@@ -810,6 +810,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
 
 ## History
 
+- **2026-10-26 — working tree:** Documented the solver-first adaptive route in
+  `ADAPTIVE_OPTIMIZATION_PLAN.md`. The plan retains the safety/observation
+  foundation, refactors policy replacement behind a factory, starts with an
+  exact finite candidate optimizer, and defers MILP/LP/convex adapters until
+  they match the dependency-free oracle.
+
 - **2026-10-26 — working tree:** Added a read-only `AdaptivePolicy::theta`
   accessor and removed unnecessary descriptor initialization from construction.
   Runtime tests passed (121 passed).

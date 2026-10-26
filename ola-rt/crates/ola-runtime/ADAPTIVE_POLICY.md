@@ -6,6 +6,9 @@ seeded observation state are implemented. Online tuning and offline evaluation
 remain tracked in `todo.md` under *Adaptive execution policy*. Builds on
 `EXECUTION_POLICY.md` and `SCHEDULING_BASELINES.md`.
 
+The solver-first implementation plan is in
+[`ADAPTIVE_OPTIMIZATION_PLAN.md`](ADAPTIVE_OPTIMIZATION_PLAN.md).
+
 ## Goal
 
 Tune policy configuration online, from the workload the runtime is actually
