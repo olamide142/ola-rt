@@ -24,8 +24,9 @@ pub use admission::{
     UnconstrainedAdmission, WatermarkAdmission,
 };
 pub use adaptive::{
-    AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveLinearConstraint, AdaptiveMemoryConstraint,
-    AdaptiveObjectiveMetrics,
+    AdaptiveConfigError, AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveLinearConstraint,
+    AdaptiveMemoryConstraint, AdaptiveObjectiveMetrics, AdaptiveParameterConfig,
+    AdaptivePolicyConfig,
     AdaptiveObjectiveWeights, AdaptiveOptimizationError, AdaptiveOptimizer, AdaptivePolicy,
     AdaptivePolicyFactory, AdaptiveRequestObservation, FiniteCandidateOptimizer,
     MilpCandidateOptimizer,

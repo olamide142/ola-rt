@@ -36,7 +36,7 @@ where
 ///
 /// `None` means that the runtime does not currently publish that constraint;
 /// an optimizer must not silently interpret unknown capacity as unlimited.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct AdaptiveConstraints {
     /// Maximum number of simultaneously active requests.
     pub max_active_requests: Option<usize>,
@@ -44,6 +44,102 @@ pub struct AdaptiveConstraints {
     pub prefill_chunk_size: Option<usize>,
     /// Available device memory, when telemetry is available.
     pub available_memory_bytes: Option<u64>,
+}
+
+/// One serialized adaptive parameter before it is resolved to the static key
+/// used by an executable policy factory.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AdaptiveParameterConfig {
+    /// Stable parameter name understood by the policy factory.
+    pub name: String,
+    /// Serialized parameter value passed to the factory.
+    pub value: String,
+}
+
+/// Serializable data configuration for an [`AdaptivePolicy`].
+///
+/// Factories, optimizers, validators, and update hooks intentionally remain
+/// executable Rust components. A caller resolves parameter names explicitly
+/// before constructing the policy, keeping configuration loading separate from
+/// code execution and preserving the safe fallback boundary.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AdaptivePolicyConfig {
+    /// Initial adaptive parameter vector.
+    #[serde(default)]
+    pub theta: Vec<AdaptiveParameterConfig>,
+    /// Committed iterations between optimizer proposals. Zero normalizes to
+    /// one when applied to an executable policy.
+    #[serde(default)]
+    pub optimization_interval: u64,
+    /// Seed reserved for observation-time updates.
+    #[serde(default)]
+    pub seed: u64,
+    /// Runtime ceilings and resource facts supplied to the optimizer.
+    #[serde(default)]
+    pub constraints: AdaptiveConstraints,
+}
+
+impl Default for AdaptivePolicyConfig {
+    fn default() -> Self {
+        Self {
+            theta: Vec::new(),
+            optimization_interval: 1,
+            seed: 0,
+            constraints: AdaptiveConstraints::default(),
+        }
+    }
+}
+
+/// Configuration failure raised before an executable adaptive policy is built.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdaptiveConfigError {
+    /// A parameter name is empty or repeated.
+    InvalidParameter(String),
+    /// A configured parameter is not known by the selected factory.
+    UnknownParameter(String),
+}
+
+impl fmt::Display for AdaptiveConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidParameter(message) => write!(formatter, "invalid adaptive parameter: {message}"),
+            Self::UnknownParameter(name) => write!(formatter, "unknown adaptive parameter `{name}`"),
+        }
+    }
+}
+
+impl Error for AdaptiveConfigError {}
+
+impl AdaptivePolicyConfig {
+    /// Resolves serialized names and applies the data configuration to an
+    /// executable policy. Factories and optimizers are attached separately.
+    pub fn build_policy<F>(
+        &self,
+        inner: impl ExecutionPolicy + 'static,
+        resolve: F,
+    ) -> Result<AdaptivePolicy, AdaptiveConfigError>
+    where
+        F: Fn(&str) -> Option<&'static str>,
+    {
+        let mut names = std::collections::BTreeSet::new();
+        let theta = self
+            .theta
+            .iter()
+            .map(|parameter| {
+                if parameter.name.is_empty() || !names.insert(parameter.name.as_str()) {
+                    return Err(AdaptiveConfigError::InvalidParameter(parameter.name.clone()));
+                }
+                let name = resolve(&parameter.name).ok_or_else(|| {
+                    AdaptiveConfigError::UnknownParameter(parameter.name.clone())
+                })?;
+                Ok((name, parameter.value.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AdaptivePolicy::new(inner, theta)
+            .with_constraints(self.constraints)
+            .with_optimization_interval(self.optimization_interval)
+            .with_seed(self.seed))
+    }
 }
 
 impl AdaptiveConstraints {
@@ -1111,6 +1207,70 @@ mod tests {
             policy.descriptor().to_string(),
             "adaptive{update_count=0,seed=0,random_state=0,exploration=7,learning_rate=0.1}[composed{head_of_line=block}[fifo,unconstrained-admission,unbounded-batch,unbucketed-prefill]]"
         );
+    }
+
+    #[test]
+    fn serialized_config_round_trips_and_builds_with_an_explicit_key_resolver() {
+        let json = r#"{
+            "theta": [
+                {"name": "max_tokens", "value": "32"},
+                {"name": "max_prefill_tokens", "value": "8"}
+            ],
+            "optimization_interval": 4,
+            "seed": 19,
+            "constraints": {
+                "max_active_requests": 6,
+                "prefill_chunk_size": 16,
+                "available_memory_bytes": 4096
+            }
+        }"#;
+        let config: AdaptivePolicyConfig = serde_json::from_str(json).unwrap();
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: AdaptivePolicyConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, config);
+
+        let policy = config
+            .build_policy(AcceptingPolicy, |name| match name {
+                "max_tokens" => Some("max_tokens"),
+                "max_prefill_tokens" => Some("max_prefill_tokens"),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(policy.theta(), [("max_prefill_tokens", "8".into()), ("max_tokens", "32".into())]);
+        assert_eq!(policy.random_state(), 19);
+    }
+
+    #[test]
+    fn serialized_config_rejects_duplicate_and_unknown_parameters() {
+        let duplicate = AdaptivePolicyConfig {
+            theta: vec![
+                AdaptiveParameterConfig {
+                    name: "budget".into(),
+                    value: "1".into(),
+                },
+                AdaptiveParameterConfig {
+                    name: "budget".into(),
+                    value: "2".into(),
+                },
+            ],
+            ..AdaptivePolicyConfig::default()
+        };
+        assert!(matches!(
+            duplicate.build_policy(AcceptingPolicy, |_| Some("budget")),
+            Err(AdaptiveConfigError::InvalidParameter(name)) if name == "budget"
+        ));
+
+        let unknown = AdaptivePolicyConfig {
+            theta: vec![AdaptiveParameterConfig {
+                name: "unknown".into(),
+                value: "1".into(),
+            }],
+            ..AdaptivePolicyConfig::default()
+        };
+        assert!(matches!(
+            unknown.build_policy(AcceptingPolicy, |_| None),
+            Err(AdaptiveConfigError::UnknownParameter(name)) if name == "unknown"
+        ));
     }
 
     #[test]

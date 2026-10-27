@@ -1104,6 +1104,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
   remains explicit code by design until its safe serialization boundary is
   defined.
 
+- **2026-10-27 — working tree on `d32eeb9`:** Added the adaptive policy data
+  configuration boundary. `AdaptivePolicyConfig` serializes θ, seed,
+  optimization interval, and runtime constraints, then resolves parameter names
+  explicitly before building an executable policy. Duplicate and unknown names
+  are rejected; factories, optimizers, validators, and hooks remain code-only.
+  Two focused round-trip/validation tests pass.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
