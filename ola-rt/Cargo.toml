@@ -29,6 +29,7 @@ burn-cubecl = { version = "0.22.0", default-features = false }
 burn-store = { version = "0.22.0", default-features = false, features = ["std", "safetensors", "pytorch"] }
 crossterm = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+good_lp = { version = "1.15.3", default-features = false, features = ["microlp"] }
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
 ola-cli = { path = "crates/ola-cli" }

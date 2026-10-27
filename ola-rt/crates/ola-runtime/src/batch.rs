@@ -451,6 +451,16 @@ impl MixedTokenBudgetPolicy {
             _ => None,
         }
     }
+
+    /// Returns the total per-iteration token budget.
+    pub const fn max_tokens(self) -> usize {
+        self.max_tokens.get()
+    }
+
+    /// Returns the prompt-token share of the budget.
+    pub const fn max_prefill_tokens(self) -> usize {
+        self.max_prefill_tokens.get()
+    }
 }
 
 impl BatchPolicy for MixedTokenBudgetPolicy {

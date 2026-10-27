@@ -19,10 +19,14 @@
 //! - **deadline missed**: a request with a deadline that did not complete by
 //!   it, including requests that never completed.
 
-use std::time::Duration;
+use std::{error::Error, fmt, time::Duration};
+
+use ola_core::Timestamp;
 
 use ola_runtime::{
-    ComposedPolicy, ExecutionPolicy, ExecutorIteration, MemoryAwareAdmission, RuntimeState,
+    AdaptiveIntegerDomain, AdaptiveObjectiveMetrics, AdaptiveObjectiveWeights,
+    AdaptiveOptimizationError, ComposedPolicy, ExecutionPolicy, ExecutorIteration,
+    FiniteCandidateOptimizer, MemoryAwareAdmission, PolicyError, RuntimeState,
 };
 
 use crate::{
@@ -36,6 +40,214 @@ pub const DEFAULT_STARVATION_FACTOR: u64 = 10;
 
 /// Prompts at least this long belong to the `long` size class.
 pub const LONG_PROMPT_TOKENS: usize = 64;
+
+/// Error returned when a virtual-time adaptive candidate cannot be evaluated.
+#[derive(Debug, Eq, PartialEq)]
+pub enum VirtualTimeOptimizationError {
+    /// Candidate policy construction failed.
+    Policy(String),
+    /// The virtual-time trial failed.
+    Simulation(SimulationError),
+    /// The optimizer found no feasible candidate or rejected its model.
+    Optimization(AdaptiveOptimizationError),
+}
+
+impl fmt::Display for VirtualTimeOptimizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Policy(error) => write!(formatter, "candidate policy failed: {error}"),
+            Self::Simulation(error) => error.fmt(formatter),
+            Self::Optimization(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for VirtualTimeOptimizationError {}
+
+/// Result of selecting one policy configuration by replaying virtual time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualTimeCandidateEvaluation {
+    /// Selected adaptive parameter vector.
+    pub theta: Vec<(&'static str, String)>,
+    /// Objective score assigned to the selected replay.
+    pub objective: i64,
+    /// Full virtual-time replay for the selected candidate.
+    pub run: SchedulingRun,
+}
+
+/// Paired objective scores for one held-out seeded trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualTimeHeldOutScore {
+    /// Seed identifying the held-out trace.
+    pub seed: u64,
+    /// Objective score for the selected adaptive θ.
+    pub adaptive_objective: i64,
+    /// Objective score for the fixed baseline.
+    pub baseline_objective: i64,
+}
+
+/// Train-on-one-trace, evaluate-on-held-out-traces result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualTimeHeldOutStudy {
+    /// θ selected using only the training trace.
+    pub theta: Vec<(&'static str, String)>,
+    /// Training objective used for selection.
+    pub training_objective: i64,
+    /// Paired held-out scores, in caller-provided trace order.
+    pub held_out: Vec<VirtualTimeHeldOutScore>,
+}
+
+/// Evaluates bounded integer candidates by replaying each one in virtual time.
+///
+/// The finite optimizer supplies deterministic candidate ordering; this
+/// function supplies the expensive objective evaluation from actual simulator
+/// outcomes. It is intentionally benchmark-side and does not run during
+/// production `plan` calls.
+pub fn optimize_virtual_time_candidate<F>(
+    trace: &SchedulingTrace,
+    config: &SimulationConfig,
+    domains: Vec<AdaptiveIntegerDomain>,
+    current: Vec<(&'static str, String)>,
+    factory: F,
+    weights: AdaptiveObjectiveWeights,
+) -> Result<VirtualTimeCandidateEvaluation, VirtualTimeOptimizationError>
+where
+    F: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>
+        + Send
+        + Sync,
+{
+    let factory_ref = &factory;
+    let mut optimizer = FiniteCandidateOptimizer::new(
+        domains,
+        move |candidate: &[(&'static str, String)],
+              _: &[ola_runtime::AdaptiveRequestObservation],
+              _: ola_runtime::AdaptiveConstraints|
+              -> Result<Option<i64>, AdaptiveOptimizationError> {
+            let policy = match (factory_ref)(candidate) {
+                Ok(policy) => policy,
+                Err(_) => return Ok(None),
+            };
+            let run = run_scheduling_trial(trace, policy, config)
+                .map_err(|error| AdaptiveOptimizationError::Infeasible(error.to_string()))?;
+            let observations = run_observations(&run);
+            Ok(AdaptiveObjectiveMetrics::from_observations(&observations).score(weights))
+        },
+    )
+    .map_err(VirtualTimeOptimizationError::Optimization)?;
+    let theta = optimizer
+        .propose(&current, &[], ola_runtime::AdaptiveConstraints::default())
+        .map_err(VirtualTimeOptimizationError::Optimization)?;
+    let policy = factory(&theta).map_err(|error| VirtualTimeOptimizationError::Policy(error.to_string()))?;
+    let run = run_scheduling_trial(trace, policy, config)
+        .map_err(VirtualTimeOptimizationError::Simulation)?;
+    let observations = run_observations(&run);
+    let objective = AdaptiveObjectiveMetrics::from_observations(&observations)
+        .score(weights)
+        .ok_or(VirtualTimeOptimizationError::Optimization(
+            AdaptiveOptimizationError::NoCandidate,
+        ))?;
+    Ok(VirtualTimeCandidateEvaluation {
+        theta,
+        objective,
+        run,
+    })
+}
+
+/// Selects θ on one trace and evaluates that fixed θ against a baseline on
+/// independent held-out traces. No held-out result influences selection.
+pub fn evaluate_virtual_time_held_out<F, G>(
+    training_trace: &SchedulingTrace,
+    held_out_traces: &[SchedulingTrace],
+    config: &SimulationConfig,
+    domains: Vec<AdaptiveIntegerDomain>,
+    current: Vec<(&'static str, String)>,
+    adaptive_factory: F,
+    baseline_factory: G,
+    weights: AdaptiveObjectiveWeights,
+) -> Result<VirtualTimeHeldOutStudy, VirtualTimeOptimizationError>
+where
+    F: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>
+        + Send
+        + Sync,
+    G: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>
+        + Send
+        + Sync,
+{
+    let selected = optimize_virtual_time_candidate(
+        training_trace,
+        config,
+        domains,
+        current,
+        &adaptive_factory,
+        weights,
+    )?;
+    let held_out = held_out_traces
+        .iter()
+        .map(|trace| {
+            let adaptive = adaptive_factory(&selected.theta)
+                .map_err(|error| VirtualTimeOptimizationError::Policy(error.to_string()))?;
+            let baseline = baseline_factory(&[])
+                .map_err(|error| VirtualTimeOptimizationError::Policy(error.to_string()))?;
+            let adaptive_run = run_scheduling_trial(trace, adaptive, config)
+                .map_err(VirtualTimeOptimizationError::Simulation)?;
+            let baseline_run = run_scheduling_trial(trace, baseline, config)
+                .map_err(VirtualTimeOptimizationError::Simulation)?;
+            let adaptive_objective = AdaptiveObjectiveMetrics::from_observations(&run_observations(
+                &adaptive_run,
+            ))
+            .score(weights)
+            .ok_or(VirtualTimeOptimizationError::Optimization(
+                AdaptiveOptimizationError::NoCandidate,
+            ))?;
+            let baseline_objective = AdaptiveObjectiveMetrics::from_observations(&run_observations(
+                &baseline_run,
+            ))
+            .score(weights)
+            .ok_or(VirtualTimeOptimizationError::Optimization(
+                AdaptiveOptimizationError::NoCandidate,
+            ))?;
+            Ok(VirtualTimeHeldOutScore {
+                seed: trace.parameters.seed,
+                adaptive_objective,
+                baseline_objective,
+            })
+        })
+        .collect::<Result<Vec<_>, VirtualTimeOptimizationError>>()?;
+    Ok(VirtualTimeHeldOutStudy {
+        theta: selected.theta,
+        training_objective: selected.objective,
+        held_out,
+    })
+}
+
+fn run_observations(run: &SchedulingRun) -> Vec<ola_runtime::AdaptiveRequestObservation> {
+    run.requests
+        .iter()
+        .map(|request| {
+            let arrived_at = Timestamp::from_micros(request.arrival_micros);
+            let first_token_at = request
+                .first_token_micros
+                .map(Timestamp::from_micros);
+            let completed_at = request
+                .completed_micros
+                .map(Timestamp::from_micros);
+            ola_runtime::AdaptiveRequestObservation {
+                request_id: request.request_id,
+                arrived_at,
+                first_token_at,
+                completed_at,
+                time_to_first_token_micros: first_token_at
+                    .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
+                completion_latency_micros: completed_at
+                    .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
+                deadline_missed: request
+                    .deadline_micros
+                    .is_some_and(|deadline| completed_at.is_none_or(|at| at.as_micros() > deadline)),
+                capability_fallback: false,
+            }
+        })
+        .collect()
+}
 
 /// Distribution of slowdowns and their fairness.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -535,8 +747,9 @@ fn to_f64(value: impl TryInto<u64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use ola_runtime::{
-        AdaptivePolicy, EarliestDeadlineFirst, HeadOfLine, JobCost, PriorityScheduler,
-        ShortestJobFirst,
+        AdaptiveConstraints, AdaptiveObjectiveMetrics, AdaptivePolicy, AdaptiveIntegerDomain,
+        EarliestDeadlineFirst, FifoTokenBudgetPolicy, HeadOfLine, JobCost,
+        MilpCandidateOptimizer, PriorityScheduler, ShortestJobFirst,
     };
 
     use super::*;
@@ -632,6 +845,185 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.summaries[0].policy.starts_with("adaptive{"));
         assert_eq!(first.summaries[0].completed, first.summaries[1].completed);
+    }
+
+    #[test]
+    fn virtual_time_harness_runs_milp_adaptive_policy_against_a_fixed_baseline() {
+        let trace = SchedulingTrace::overload(TraceParameters {
+            requests: 30,
+            ..parameters(2_000)
+        });
+        let config = SimulationConfig::default();
+        let adaptive_factory = || {
+            AdaptivePolicy::new(
+                fifo().with_batch(FifoTokenBudgetPolicy::new(4).unwrap()),
+                vec![("max_tokens", "4".into())],
+            )
+            .with_fallback(fifo())
+            .with_constraints(AdaptiveConstraints {
+                max_active_requests: Some(config.max_active_requests),
+                prefill_chunk_size: config.prefill_chunk_size,
+                available_memory_bytes: None,
+            })
+            .with_optimizer(
+                MilpCandidateOptimizer::new(
+                    vec![AdaptiveIntegerDomain {
+                        name: "max_tokens",
+                        min: 1,
+                        max: 16,
+                        step: 1,
+                    }],
+                    vec![("max_tokens", 1)],
+                )
+                .unwrap()
+                .with_objective_builder(|observations, _| {
+                    let metrics = AdaptiveObjectiveMetrics::from_observations(observations);
+                    if metrics.starved_requests > 0 {
+                        vec![("max_tokens", -1)]
+                    } else {
+                        vec![("max_tokens", 1)]
+                    }
+                }),
+            )
+            .with_factory(|theta: &[(&'static str, String)]| {
+                let max_tokens = theta
+                    .iter()
+                    .find(|(name, _)| *name == "max_tokens")
+                    .and_then(|(_, value)| value.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        ola_runtime::PolicyError::InvalidCandidate("missing max_tokens".into())
+                    })?;
+                let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
+                    ola_runtime::PolicyError::InvalidCandidate(
+                        "max_tokens must be positive".into(),
+                    )
+                })?;
+                Ok(Box::new(fifo().with_batch(batch)) as Box<dyn ExecutionPolicy>)
+            })
+        };
+        let policies = || {
+            vec![
+                Box::new(adaptive_factory()) as Box<dyn ExecutionPolicy>,
+                Box::new(fifo()) as Box<dyn ExecutionPolicy>,
+            ]
+        };
+
+        let first = compare(&trace, &config, policies());
+        let second = compare(&trace, &config, policies());
+
+        assert_eq!(first, second);
+        assert!(first.summaries[0].policy.starts_with("adaptive{"));
+        assert_eq!(first.summaries[0].completed, first.summaries[1].completed);
+    }
+
+    #[test]
+    fn virtual_time_candidate_search_ranks_replayed_policy_outcomes() {
+        let trace = SchedulingTrace::overload(TraceParameters {
+            requests: 12,
+            ..parameters(2_000)
+        });
+        let config = SimulationConfig::default();
+        let factory = |theta: &[(&'static str, String)]| {
+            let max_tokens = theta
+                .iter()
+                .find(|(name, _)| *name == "max_tokens")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .ok_or_else(|| PolicyError::InvalidCandidate("missing max_tokens".into()))?;
+            let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
+                PolicyError::InvalidCandidate("max_tokens must be positive".into())
+            })?;
+            Ok(Box::new(fifo().with_batch(batch)) as Box<dyn ExecutionPolicy>)
+        };
+        let weights = AdaptiveObjectiveWeights {
+            ttft: 1,
+            completion: 1,
+            ..AdaptiveObjectiveWeights::default()
+        };
+        let first = optimize_virtual_time_candidate(
+            &trace,
+            &config,
+            vec![AdaptiveIntegerDomain {
+                name: "max_tokens",
+                min: 1,
+                max: 4,
+                step: 1,
+            }],
+            vec![("max_tokens", "1".into())],
+            factory,
+            weights,
+        )
+        .unwrap();
+        let second = optimize_virtual_time_candidate(
+            &trace,
+            &config,
+            vec![AdaptiveIntegerDomain {
+                name: "max_tokens",
+                min: 1,
+                max: 4,
+                step: 1,
+            }],
+            vec![("max_tokens", "1".into())],
+            factory,
+            weights,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.run.requests.len(), trace.requests.len());
+        assert_eq!(first.run.final_live_requests, 0);
+        assert!(first.objective > 0);
+    }
+
+    #[test]
+    fn held_out_study_does_not_use_evaluation_traces_for_selection() {
+        let base = parameters(2_000);
+        let training = SchedulingTrace::overload(TraceParameters { seed: 1, ..base });
+        let held_out = vec![
+            SchedulingTrace::overload(TraceParameters { seed: 2, ..base }),
+            SchedulingTrace::overload(TraceParameters { seed: 3, ..base }),
+        ];
+        let config = SimulationConfig::default();
+        let adaptive_factory = |theta: &[(&'static str, String)]| {
+            let max_tokens = theta
+                .iter()
+                .find(|(name, _)| *name == "max_tokens")
+                .and_then(|(_, value)| value.parse::<usize>().ok())
+                .ok_or_else(|| PolicyError::InvalidCandidate("missing max_tokens".into()))?;
+            let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
+                PolicyError::InvalidCandidate("max_tokens must be positive".into())
+            })?;
+            Ok(Box::new(fifo().with_batch(batch)) as Box<dyn ExecutionPolicy>)
+        };
+        let baseline_factory = |_: &[(&'static str, String)]| {
+            Ok(Box::new(fifo()) as Box<dyn ExecutionPolicy>)
+        };
+
+        let study = evaluate_virtual_time_held_out(
+            &training,
+            &held_out,
+            &config,
+            vec![AdaptiveIntegerDomain {
+                name: "max_tokens",
+                min: 1,
+                max: 4,
+                step: 1,
+            }],
+            vec![("max_tokens", "1".into())],
+            adaptive_factory,
+            baseline_factory,
+            AdaptiveObjectiveWeights {
+                ttft: 1,
+                completion: 1,
+                ..AdaptiveObjectiveWeights::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(study.held_out.iter().map(|score| score.seed).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(study.theta.len(), 1);
+        assert!(study.held_out.iter().all(|score| {
+            score.adaptive_objective > 0 && score.baseline_objective > 0
+        }));
     }
 
     #[test]

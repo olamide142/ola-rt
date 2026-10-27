@@ -23,7 +23,13 @@ pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
     UnconstrainedAdmission, WatermarkAdmission,
 };
-pub use adaptive::{AdaptivePolicy, AdaptiveRequestObservation};
+pub use adaptive::{
+    AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveLinearConstraint, AdaptiveMemoryConstraint,
+    AdaptiveObjectiveMetrics,
+    AdaptiveObjectiveWeights, AdaptiveOptimizationError, AdaptiveOptimizer, AdaptivePolicy,
+    AdaptivePolicyFactory, AdaptiveRequestObservation, FiniteCandidateOptimizer,
+    MilpCandidateOptimizer,
+};
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,
     CostAwarePrefillBatcher, CostAwarePrefillDecision, ExecutedKernel, ExecutionBatch,

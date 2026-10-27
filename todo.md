@@ -244,8 +244,9 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
   single-query `PagedAttentionInput` contract.
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs. (The
   versioned `paged-attention-kernel` study now covers page-size, batch latency,
-  partial-final-page padding, and conformance on CPU/WGPU; accelerator
-  occupancy and broader KV fragmentation remain.)
+  partial-final-page padding, conformance on CPU/WGPU, and configurable
+  physical-pool slack/fragmentation; accelerator occupancy still requires a
+  hardware-profiler run.)
 - [x] Compare optimized paths against the single-request oracle. (Single and
   ragged batched CubeCL outputs are checked against portable single-request
   execution.)

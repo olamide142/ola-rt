@@ -1,6 +1,6 @@
 # Mathematical adaptive-policy optimization plan
 
-Status: **design approved; implementation not started** (2026-10-26).
+Status: **solver-first adaptive optimization path implemented** (finite oracle, MILP adapter, runtime policy installation, resource constraints, stability controls, full objective metrics, and held-out virtual-time study; 2026-10-27).
 
 The adaptive route is optimization-first. No learned model is required for
 the runtime to adapt, and model training is not a prerequisite for any
@@ -50,9 +50,19 @@ trait AdaptiveOptimizer: Send {
 }
 ```
 
-`AdaptivePolicy::observe` will call the optimizer, build a candidate policy,
-validate it against the next planning boundary, and retain the previous policy
-if optimization, construction, or validation fails. `plan` remains immutable.
+The first refactor now provides `AdaptivePolicyFactory` and stores the active
+policy behind `Box<dyn ExecutionPolicy>`. `AdaptiveOptimizer` and
+`AdaptiveConstraints` now define the observation-time solver boundary.
+`observe` can propose θ, rebuild the active policy from it, and do so without
+changing the plan already committed. The next `plan` validates the rebuilt
+candidate before it can reach the executor; construction failures keep the
+previous policy, while invalid plans use the existing safe fallback (or return
+a typed error when no fallback is present). `plan` remains immutable. Typed
+integer domains and automatic slot/chunk ceiling enforcement are now in place;
+ memory-demand constraints are now available for fixed plus per-parameter byte
+ demand; candidate installation is transactional and solver updates can be
+ rate-limited. The runtime chooses MILP as its mathematical programming path;
+ LP/convex and stochastic extensions remain optional research variants.
 
 ## Mathematical formulation
 
@@ -99,8 +109,10 @@ oracle for later solver-backed implementations.
 
 Introduce an internal model representation for binary/integer variables,
 linear constraints, and a linear objective. Keep the runtime independent of a
-specific solver initially; add an adapter only after the finite optimizer and
-conformance tests agree on solutions.
+specific solver initially; add a `good_lp` adapter using its pure-Rust
+`microlp` backend only after the finite optimizer and conformance tests agree
+on solutions. This keeps native solver libraries optional while allowing the
+runtime to use a maintained MILP modeling API.
 
 ### Stage 3: LP/convex optimization
 
@@ -117,15 +129,28 @@ against the exact finite optimizer on seeded traces.
 
 ## Verification milestones
 
-1. Add typed parameter domains, constraints, and objective components.
-2. Refactor the wrapper around a policy factory and optimizer trait.
-3. Implement the exact finite candidate optimizer.
-4. Test candidate rejection, fallback, deterministic ties, and boundary caps.
-5. Evaluate fixed baselines versus adaptive candidates on held-out seeded
-   virtual-time traces.
-6. Add MILP/LP adapters only when they reproduce the exact optimizer on small
-   cases.
-7. Keep learned policies as an optional later experiment, never as a runtime
+1. Add typed parameter domains, constraints, and objective components. (Integer
+   domains, objective components, slot/chunk ceilings, and optional memory
+   constraints are implemented; richer parameter types remain.)
+2. Refactor the wrapper around a policy factory and optimizer trait. (The
+   factory and optimizer boundaries are now implemented.)
+3. Implement the exact finite candidate optimizer. (Implemented.)
+4. Add the `good_lp`/`microlp` MILP adapter and compare it with the finite
+   oracle on small domains. (Adapter implemented and compared, including
+   memory-constrained candidates.)
+5. Wire solver parameters into real runtime components. (The adaptive study
+   now selects both total and prefill token budgets; `AdaptiveConstraints::from_snapshot`
+   exposes live executor and memory facts to callers.)
+6. Test candidate rejection, fallback, deterministic ties, and boundary caps.
+   (Implemented for solver and factory paths; rejected factory candidates are
+   skipped by offline search and cannot partially update runtime θ.)
+7. Evaluate fixed baselines versus adaptive candidates on held-out seeded
+   virtual-time traces. (Implemented with train/evaluation separation and
+   paired scores; broader experiment coverage remains.)
+8. Add LP/convex adapters only when they reproduce the exact optimizer on small
+   cases. (Optional: MILP is the selected production route, and LP/convex
+   adapters are not required for the runtime path.)
+9. Keep learned policies as an optional later experiment, never as a runtime
    requirement.
 
 ## Explicit non-goals

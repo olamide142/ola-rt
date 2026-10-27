@@ -154,8 +154,9 @@ implementations.
    Implement conformance tests across diverse page counts and head configurations.
    Single-request and ragged batched CubeCL outputs are now checked against the
    portable single-request oracle. The versioned `ola-bench` study evaluates
-   portable versus CubeCL execution across page sizes, batch sizes, and partial
-   final pages; accelerator occupancy and broader fragmentation studies remain.
+   portable versus CubeCL execution across page sizes, batch sizes, partial
+   final pages, and configurable physical-pool slack; accelerator occupancy
+   still requires profiler-backed measurement.
 
 ## Out of scope
 

@@ -414,6 +414,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         "prefill-bucketing",
         "adaptive-prefill-cost",
         "scheduler-comparison",
+        "adaptive-policy-study",
         "kv-pressure",
         "prefix-cache",
         "kv-page-size",
@@ -451,6 +452,7 @@ fn paged_attention_study_runs_on_wgpu() {
         &[
             ("page_sizes", "2"),
             ("batch", "1"),
+            ("pool_slack_blocks", "3"),
             ("warmups", "1"),
             ("repetitions", "5"),
         ],

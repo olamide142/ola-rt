@@ -61,8 +61,10 @@ pub use report::{
 };
 pub use scheduling_summary::{
     ClassSummary, DEFAULT_STARVATION_FACTOR, LONG_PROMPT_TOKENS, SchedulingComparison,
-    SchedulingSummary, SlowdownSummary, compare_schedulers, compare_schedulers_observed,
-    isolated_end_to_end, summarize_run,
+    SchedulingSummary, SlowdownSummary, VirtualTimeCandidateEvaluation,
+    VirtualTimeHeldOutScore, VirtualTimeHeldOutStudy, VirtualTimeOptimizationError,
+    compare_schedulers, compare_schedulers_observed, evaluate_virtual_time_held_out,
+    isolated_end_to_end, optimize_virtual_time_candidate, summarize_run,
 };
 pub use simulation::{
     CostModel, Perturbation, SchedulingRun, SimulationConfig, SimulationError, TrialIteration,

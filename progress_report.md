@@ -1079,6 +1079,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
   the runtime/model item is complete. A separate follow-up remains for a
   causal multi-position kernel launch with per-query valid-length metadata.
 
+- **2026-10-27 — working tree on `3363e15`:** Extended the versioned
+  paged-attention study with configurable unused physical KV blocks. Reports
+  now include physical block count, unused blocks, and pool-fragmentation ratio
+  alongside page padding and latency. The study deliberately does not infer
+  accelerator occupancy from host timing; profiler-backed occupancy remains.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
