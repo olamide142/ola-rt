@@ -107,7 +107,9 @@ cost-aware knobs.
 - [x] Give `observe` arrival times (or the planning snapshot) so rewards can use TTFT and completion latency. (Decision records retain all planning-visible arrival timestamps.)
 - [x] Decide whether slot count and chunk size stay executor ceilings or move into the plan. (Keep them as executor hard ceilings; adaptive policies may choose lower effective values.)
 - [x] Keep randomness seeded and consumed only in `observe`.
-- [ ] Pretrain and evaluate offline in the P3 virtual-time harness against the baselines.
+- [x] Pretrain and evaluate offline in the P3 virtual-time harness against the
+  baselines. `adaptive-policy-study` selects θ on seed 0 and evaluates the
+  fixed candidate against FIFO on held-out seeded traces with report samples.
 
 Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures.
 

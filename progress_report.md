@@ -1085,6 +1085,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
   alongside page padding and latency. The study deliberately does not infer
   accelerator occupancy from host timing; profiler-backed occupancy remains.
 
+- **2026-10-27 — working tree on `6ef1f7a`:** Closed the offline adaptive
+  evaluation TODO. `adaptive-policy-study` trains θ on seed 0, evaluates the
+  fixed candidate against FIFO on held-out seeded virtual-time traces, and
+  records reproducible p95 latency, throughput, and starvation samples. The
+  feature-enabled registry test passed.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
