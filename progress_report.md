@@ -1097,6 +1097,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
   batching, cached-prefix, and preemption paths with focused session/factory
   coverage.
 
+- **2026-10-27 — working tree on `cb89dad`:** Closed the experiment
+  configuration portion of the remaining P5 configuration item. JSON
+  `ExperimentRunConfig` already selects a registered experiment and applies
+  parameter overrides with validation; adaptive θ/domain/factory construction
+  remains explicit code by design until its safe serialization boundary is
+  defined.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and

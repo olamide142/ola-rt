@@ -208,8 +208,12 @@ Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, 
 - [x] Load configuration for model definitions and stable batch policies.
   (Model definitions use Serde; `ExecutorConfig` selects unbounded,
   FIFO-token-budget, or mixed-token-budget batching.)
-- [ ] Load configuration for experiments and remaining adaptive policy
-  components.
+- [x] Load configuration for experiments. (`ExperimentRunConfig` accepts JSON
+  experiment IDs and parameter overrides and is covered by round-trip and
+  CLI/UI registry tests.)
+- [ ] Load configuration for remaining adaptive policy components. Adaptive
+  θ, domains, factories, and optimizer choices still require explicit policy
+  construction so validation and safe fallback remain visible.
 - [x] Load model definitions from JSON/Serde. (Descriptors, identifiers,
   modalities, and local/Hugging Face sources now round-trip; device, policy,
   and experiment configuration remain separate follow-ups.)
