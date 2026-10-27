@@ -188,7 +188,10 @@ Done when, under a replayed cache-pressure trace, the runtime reclaims, evicts, 
 - [x] Support configured attention and MLP projection biases. (Activation
   variants remain explicitly limited to `silu` until a checkpoint-backed
   conformance case establishes the intended gated-MLP semantics.)
-- [ ] Add a second architecture through the architecture registry.
+- [x] Add a second architecture through the architecture registry. Burn now
+  provides a Mistral factory/model/session/cache implementation alongside
+  Llama, with both factories exposing stable architecture IDs and conformance
+  coverage for cached generation and preemption.
 - [x] Define model load and unload operations. (Executors can attach, safely
   unload only drained models, enumerate loaded IDs, and attach again.)
 - [x] Define model placement and residency operations. (Resident executables

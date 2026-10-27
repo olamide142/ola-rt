@@ -1091,6 +1091,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
   records reproducible p95 latency, throughput, and starvation samples. The
   feature-enabled registry test passed.
 
+- **2026-10-27 — working tree on `ec0dac0`:** Closed the second-architecture
+  TODO. The architecture registry now has tested Burn Llama and Mistral
+  factories; Mistral includes configuration, model, tokenizer, paged KV cache,
+  batching, cached-prefix, and preemption paths with focused session/factory
+  coverage.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
