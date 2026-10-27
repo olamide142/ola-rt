@@ -240,11 +240,11 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 - [x] Optimize request-local tensor-batched decode attention. (CubeCL now
   stacks request queries and consumes padded device block tables in one
   dispatch; portable providers retain the request-local fallback.)
-- [ ] Investigate ragged multi-request decode attention. (Ragged logical
-  lengths now work within one physical KV geometry; explicit pool identity
-  partitions cross-pool or incompatible groups safely, and the CubeCL
-  provider now partitions mixed batches into homogeneous launches while
-  preserving request order; scheduler-side launch grouping remains.)
+- [x] Investigate ragged multi-request decode attention. Ragged logical
+  lengths work within one physical KV geometry; explicit pool identity
+  partitions cross-pool or incompatible groups, and CubeCL partitions mixed
+  batches into homogeneous launches while preserving request order. Scheduler
+  grouping can still reduce avoidable fallback groups.
 - [x] Validate ragged multi-position prefill chunks at the runtime/model
   boundary. Unequal chunks and absolute cursors are processed by active offset
   with batched one-position attention; a fused multi-position kernel contract

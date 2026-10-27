@@ -1111,6 +1111,12 @@ Update this file whenever a meaningful capability is merged. Each update should:
   are rejected; factories, optimizers, validators, and hooks remain code-only.
   Two focused round-trip/validation tests pass.
 
+- **2026-10-27 — working tree on `09c6f71`:** Closed the ragged multi-request
+  decode investigation. CubeCL now partitions mixed batches into homogeneous
+  same-pool launches, handles incompatible and cross-pool inputs safely, and
+  restores the caller's request order. Focused CPU conformance covers ragged
+  logical lengths, incompatible geometry, and same-shaped independent pools.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
