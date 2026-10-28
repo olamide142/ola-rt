@@ -249,9 +249,11 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
   boundary. Unequal chunks and absolute cursors are processed by active offset
   with batched one-position attention; a fused multi-position kernel contract
   remains a separate optimization.
-- [ ] Fuse multiple ragged prefill positions into one attention kernel launch.
-  This requires causal valid-length metadata rather than the current
-  single-query `PagedAttentionInput` contract.
+- [x] Fuse multiple ragged prefill positions into one attention kernel launch.
+  Llama and Mistral now project and cache each layer's full ragged chunk, then
+  flatten valid request-position queries into one grouped `execute_batch`
+  dispatch with per-position causal prefixes. Padding remains outside the
+  attention work.
 - [ ] Benchmark page-size, occupancy, and fragmentation trade-offs. (The
   versioned `paged-attention-kernel` study now covers page-size, batch latency,
   partial-final-page padding, conformance on CPU/WGPU, and configurable

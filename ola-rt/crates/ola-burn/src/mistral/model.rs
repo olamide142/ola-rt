@@ -231,61 +231,29 @@ impl MistralModel {
             .collect::<Vec<_>>();
 
         MistralKvCache::reserve_batch_lengths(caches, sequence_lengths)?;
-        let mut final_hidden = (0..batch_size).map(|_| None).collect::<Vec<_>>();
-        for offset in 0..padded_length {
-            let active_indices = sequence_lengths
-                .iter()
-                .enumerate()
-                .filter_map(|(index, length)| (offset < *length).then_some(index))
-                .collect::<Vec<_>>();
-            if active_indices.is_empty() {
-                break;
-            }
-            let token_rows = active_indices
-                .iter()
-                .map(|index| {
-                    input_ids
-                        .clone()
-                        .slice([*index..*index + 1, offset..offset + 1])
-                })
-                .collect::<Vec<_>>();
-            let token_ids = Tensor::cat(token_rows, 0);
-            let positions = active_indices
-                .iter()
-                .map(|index| start_positions[*index] + offset)
-                .collect::<Vec<_>>();
-            let active_caches = caches
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(index, cache)| {
-                    active_indices.contains(&index).then_some(&mut **cache)
-                })
-                .collect::<Vec<_>>();
-            let mut hidden_states = self.embed_tokens.forward(token_ids);
-            for (layer_index, layer) in self.layers.iter().enumerate() {
-                hidden_states = layer.prefill_chunk_batch(
-                    hidden_states,
-                    active_caches.as_slice(),
-                    layer_index,
-                    positions.as_slice(),
-                    kernel,
-                );
-            }
-            let hidden_states = self.norm.forward(hidden_states);
-            for (row, index) in active_indices.into_iter().enumerate() {
-                if offset + 1 == sequence_lengths[index] {
-                    final_hidden[index] = Some(hidden_states.clone().slice([
-                        row..row + 1,
-                        0..1,
-                        0..hidden_states.dims()[2],
-                    ]));
-                }
-            }
+        let mut hidden_states = self.embed_tokens.forward(input_ids);
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.prefill_chunk_batch(
+                hidden_states,
+                caches,
+                layer_index,
+                start_positions.as_slice(),
+                sequence_lengths,
+                kernel,
+            );
         }
+        let hidden_states = self.norm.forward(hidden_states);
         Ok(Tensor::cat(
-            final_hidden
-                .into_iter()
-                .map(|row| row.expect("every non-empty chunk has a final hidden row"))
+            sequence_lengths
+                .iter()
+                .enumerate()
+                .map(|(index, length)| {
+                    hidden_states.clone().slice([
+                        index..index + 1,
+                        length - 1..*length,
+                        0..hidden_states.dims()[2],
+                    ])
+                })
                 .collect(),
             0,
         ))
@@ -435,7 +403,8 @@ impl MistralDecoderLayer {
         hidden_states: Tensor<3>,
         caches: &[&mut MistralKvCache],
         layer: usize,
-        positions: &[usize],
+        start_positions: &[usize],
+        sequence_lengths: &[usize],
         kernel: &dyn PagedAttentionKernel,
     ) -> Tensor<3> {
         let residual = hidden_states.clone();
@@ -444,7 +413,8 @@ impl MistralDecoderLayer {
                 self.input_layernorm.forward(hidden_states),
                 caches,
                 layer,
-                positions,
+                start_positions,
+                sequence_lengths,
                 kernel,
             );
         let residual = hidden_states.clone();
@@ -639,44 +609,80 @@ impl MistralAttention {
         hidden_states: Tensor<3>,
         caches: &[&mut MistralKvCache],
         layer: usize,
-        positions: &[usize],
+        start_positions: &[usize],
+        sequence_lengths: &[usize],
         kernel: &dyn PagedAttentionKernel,
     ) -> Tensor<3> {
         let (query, key, value) = self.project(hidden_states);
         let batch_size = query.dims()[0];
         debug_assert_eq!(batch_size, caches.len());
-        debug_assert_eq!(batch_size, positions.len());
-        let mut inputs = Vec::with_capacity(batch_size);
+        debug_assert_eq!(batch_size, start_positions.len());
+        debug_assert_eq!(batch_size, sequence_lengths.len());
+        let mut inputs = Vec::with_capacity(sequence_lengths.iter().sum());
         for index in 0..batch_size {
-            let query = query.clone().slice([
-                index..index + 1,
-                0..self.num_attention_heads,
-                0..1,
-                0..self.head_dim,
-            ]);
-            let key = key.clone().slice([
+            let length = sequence_lengths[index];
+            let query_row = self.rotary_embedding.forward(
+                query.clone().slice([
+                    index..index + 1,
+                    0..self.num_attention_heads,
+                    0..length,
+                    0..self.head_dim,
+                ]),
+                start_positions[index],
+            );
+            let key_row = self.rotary_embedding.forward(
+                key.clone().slice([
+                    index..index + 1,
+                    0..self.num_key_value_heads,
+                    0..length,
+                    0..self.head_dim,
+                ]),
+                start_positions[index],
+            );
+            let value_row = value.clone().slice([
                 index..index + 1,
                 0..self.num_key_value_heads,
-                0..1,
+                0..length,
                 0..self.head_dim,
             ]);
-            let value = value.clone().slice([
-                index..index + 1,
-                0..self.num_key_value_heads,
-                0..1,
-                0..self.head_dim,
-            ]);
-            let query = self.rotary_embedding.forward(query, positions[index]);
-            let key = self.rotary_embedding.forward(key, positions[index]);
-            caches[index].write_layer(layer, positions[index], key, value);
-            let cache_view =
-                self.read_layer_for_decode(caches[index], layer, positions[index] + 1);
-            inputs.push(self.paged_attention_input(query, cache_view));
+            caches[index].write_layer(layer, start_positions[index], key_row, value_row);
+            for offset in 0..length {
+                let cache_view = self.read_layer_for_decode(
+                    caches[index],
+                    layer,
+                    start_positions[index] + offset + 1,
+                );
+                inputs.push(self.paged_attention_input(
+                    query_row.clone().slice([
+                        0..1,
+                        0..self.num_attention_heads,
+                        offset..offset + 1,
+                        0..self.head_dim,
+                    ]),
+                    cache_view,
+                ));
+            }
         }
         let contexts = kernel
             .execute_batch(inputs)
             .expect("the planned paged-attention provider must execute batched Mistral input");
-        self.project_attention_output(Tensor::cat(contexts, 0))
+        let projected = self.project_attention_output(Tensor::cat(contexts, 0));
+        let [_, _, hidden_size] = projected.dims();
+        let mut output = Tensor::zeros(
+            [batch_size, sequence_lengths.iter().copied().max().unwrap(), hidden_size],
+            &projected.device(),
+        );
+        let mut row = 0;
+        for (index, &length) in sequence_lengths.iter().enumerate() {
+            for offset in 0..length {
+                output = output.slice_assign(
+                    [index..index + 1, offset..offset + 1, 0..hidden_size],
+                    projected.clone().slice([row..row + 1, 0..1, 0..hidden_size]),
+                );
+                row += 1;
+            }
+        }
+        output
     }
 
     fn decode_batch(

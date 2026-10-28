@@ -1117,6 +1117,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
   restores the caller's request order. Focused CPU conformance covers ragged
   logical lengths, incompatible geometry, and same-shaped independent pools.
 
+- **2026-10-28 — working tree on `dd32b65`:** Fused ragged multi-position
+  resumable prefill at the model layer. Llama and Mistral now process each
+  transformer layer's valid chunk positions together, write contiguous K/V
+  ranges, and issue one grouped paged-attention batch with a causal prefix per
+  position. Full Llama (15) and Mistral (13) session suites pass, including
+  unequal chunks, cached prefixes, sliding windows, and preemption.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and

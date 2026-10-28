@@ -85,10 +85,10 @@ implementations.
      same-pool requests retain the fused launch while incompatible or
      cross-pool groups fall back to independent launches safely.
    - Resumable prefill: Active requests at each offset now share the batched
-     one-position dispatch, including unequal chunk lengths; runtime/model
-     conformance covers unequal absolute cursors. Fusing multiple positions
-     into one launch remains a separate contract because each query position
-     has a different causal valid length.
+     one-position dispatch, including unequal chunk lengths; Llama and Mistral
+     now flatten all valid positions in a layer into one grouped dispatch with
+     per-position causal token counts. Runtime/model conformance covers unequal
+     absolute cursors; padding stays outside attention work.
 
 6. **Observability and report integration.**
    - Update `TraceEvent::Invocation` in `ola-observe` to record the selected
