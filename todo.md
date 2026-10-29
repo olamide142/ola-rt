@@ -272,14 +272,39 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
 
 Done when policy selects an optimized paged-attention kernel with a portable fallback, it matches the reference within tolerance, and a study-grade report measures its effect.
 
+## P9: Distributed execution
+
+Design: `ola-rt/crates/DISTRIBUTED.md`. New crates `ola-cluster` (sans-IO
+coordinator and cluster policy) and `ola-net` (wire protocol and transports).
+
+- [ ] D0: Cluster vocabulary, `ClusterPlan` validation, sans-IO
+  `Coordinator`, in-process transport, round-robin/least-loaded routing over N
+  executors in one process.
+- [ ] D1: Multi-worker virtual-time simulation with a network cost model and
+  routing baselines (round-robin, JSQ, power-of-two, KV-headroom,
+  prefix-affinity) as registered experiments.
+- [ ] D2: TCP transport, worker and gateway roles, `InferenceBackend`,
+  heartbeats/leases, CLI and cluster config; loopback multi-process tests.
+- [ ] D3: `export_request`/`import_request`, recompute migration, drain, and
+  lease-expiry recovery with failure injection.
+- [ ] D4: KV session export/import in Burn models, binary KV frames,
+  prefill/decode disaggregation, transfer-vs-recompute policy choice.
+- [ ] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
+  placement and batch routing, link calibration.
+- [ ] D6 (research): pipeline parallelism across workers.
+
+Done when a seeded workload served by a gateway and two worker processes
+matches single-executor outputs, every routing, migration, and recovery
+decision is traced with reasons, and an adaptive cluster policy beats the best
+fixed routing baseline on held-out traces in simulation and on a loopback
+cluster.
+
 ## Later inference-engine work
 
 - [ ] Quantized weights and KV caches
 - [ ] Speculative decoding
-- [ ] Multi-GPU placement
-- [ ] Tensor and pipeline parallelism
-- [ ] Distributed request routing
-- [ ] Distributed KV-cache management
+- [ ] Multi-GPU placement (single host; cross-host placement is P9)
+- [ ] Tensor parallelism within one host (cross-host pipeline parallelism is P9 D6)
 - [ ] Heterogeneous CPU/GPU execution
 - [ ] VLM and multimodal execution
 - [ ] Vision and OlaDetection workloads
@@ -313,7 +338,8 @@ Section numbers are stable identifiers; this list is the order of work.
 7. P6: Complete observability needed to explain policy outcomes.
 8. P7: Add memory and cache policies.
 9. Kernel track: Use the framework to select and evaluate optimized kernels.
-10. P8: Expand model support, then move toward distributed and multimodal research.
+10. P8: Expand model support.
+11. P9: Distribute execution across workers and machines, then multimodal research.
 
 The adaptive execution policy is an optional research track. It became
 available after P4 and blocks no milestone above.

@@ -1131,6 +1131,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
   path. Accelerator occupancy is intentionally split into a profiler-only
   follow-up.
 
+- **2026-10-29 — working tree on `39e1d24`:** Proposed P9 distributed
+  execution in `ola-rt/crates/DISTRIBUTED.md`: a sans-IO `ola-cluster`
+  coordinator with routing and placement policies, an `ola-net` wire protocol
+  and transports, worker/gateway serving roles, recompute and KV-transfer
+  migration, lease-based recovery, and a hierarchical optimization loop that
+  reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
