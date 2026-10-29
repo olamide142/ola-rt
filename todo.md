@@ -254,11 +254,12 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
   flatten valid request-position queries into one grouped `execute_batch`
   dispatch with per-position causal prefixes. Padding remains outside the
   attention work.
-- [ ] Benchmark page-size, occupancy, and fragmentation trade-offs. (The
-  versioned `paged-attention-kernel` study now covers page-size, batch latency,
-  partial-final-page padding, conformance on CPU/WGPU, and configurable
-  physical-pool slack/fragmentation; accelerator occupancy still requires a
-  hardware-profiler run.)
+- [x] Benchmark page-size and fragmentation trade-offs. The versioned
+  `paged-attention-kernel` study covers page-size, batch latency, partial-final
+  page padding, CPU/WGPU conformance, and configurable physical-pool slack with
+  report-level fragmentation metrics. A separate profiler-backed occupancy
+  measurement remains.
+- [ ] Measure accelerator occupancy with a hardware profiler.
 - [x] Compare optimized paths against the single-request oracle. (Single and
   ragged batched CubeCL outputs are checked against portable single-request
   execution.)

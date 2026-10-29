@@ -463,6 +463,28 @@ fn paged_attention_study_runs_on_wgpu() {
     outcome.report.validate().unwrap();
 }
 
+#[cfg(feature = "cubecl-cpu")]
+#[test]
+fn paged_attention_study_records_pool_fragmentation_on_cpu() {
+    let outcome = run(
+        "paged-attention-kernel",
+        &[
+            ("page_sizes", "2"),
+            ("sequence_tokens", "5"),
+            ("batch", "1"),
+            ("pool_slack_blocks", "3"),
+            ("warmups", "1"),
+            ("repetitions", "5"),
+        ],
+    )
+    .unwrap();
+    outcome.report.validate().unwrap();
+    let summary = outcome.report.summary("cubecl-page=2").unwrap();
+    assert_eq!(summary.estimates["physical_blocks"].mean, 7.0);
+    assert_eq!(summary.estimates["unused_blocks"].mean, 4.0);
+    assert_eq!(summary.estimates["pool_fragmentation"].mean, 4.0 / 7.0);
+}
+
 #[test]
 fn ported_probes_keep_their_results() {
     let bucketing = run("prefill-bucketing", &[]).unwrap();

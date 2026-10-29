@@ -1124,6 +1124,13 @@ Update this file whenever a meaningful capability is merged. Each update should:
   position. Full Llama (15) and Mistral (13) session suites pass, including
   unequal chunks, cached prefixes, sliding windows, and preemption.
 
+- **2026-10-28 — working tree on `4d12980`:** Closed the page-size and KV
+  fragmentation benchmark portion. The CPU study regression now exercises
+  nonzero physical-pool slack and validates reported physical-block,
+  unused-block, and fragmentation metrics; WGPU retains the same workload
+  path. Accelerator occupancy is intentionally split into a profiler-only
+  follow-up.
+
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and
   token lengths sharing one physical KV geometry. Per-request token counts and
