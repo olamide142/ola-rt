@@ -8,14 +8,14 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, State},
+    Json, Router,
+    extract::{State, rejection::JsonRejection},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Json, Router,
 };
 use futures_util::stream;
 use ola_cluster::{
@@ -143,6 +143,12 @@ impl ClusterGateway {
     }
 }
 
+impl crate::InferenceBackend for ClusterGateway {
+    fn router(&self) -> Router {
+        self.router()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GenerateBody {
@@ -265,19 +271,19 @@ async fn generate(
                     text,
                     token_ids,
                 })
-                .into_response())
+                .into_response());
             }
             Some(ClientEvent::Failed { message }) => {
-                return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, message))
+                return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, message));
             }
             Some(ClientEvent::Cancelled) => {
-                return Err(error_response(StatusCode::CONFLICT, "cancelled"))
+                return Err(error_response(StatusCode::CONFLICT, "cancelled"));
             }
             None => {
                 return Err(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "worker connection closed",
-                ))
+                ));
             }
         }
     }

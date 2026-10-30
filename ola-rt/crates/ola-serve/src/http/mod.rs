@@ -54,6 +54,12 @@ pub fn router(runtime: RuntimeHandle) -> Router {
         .with_state(runtime)
 }
 
+impl crate::InferenceBackend for RuntimeHandle {
+    fn router(&self) -> Router {
+        router(self.clone())
+    }
+}
+
 /// Serves [`router`] on `listener` until `shutdown` resolves, then waits for
 /// open connections to finish.
 ///
