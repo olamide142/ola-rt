@@ -294,8 +294,8 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   heartbeats/leases, CLI and cluster config; loopback multi-process tests.
   TCP worker sessions, a tested `ClusterGateway` HTTP router, and
   `ola serve --role gateway --worker HOST:PORT` plus
-  `ola serve --role worker` are implemented; the local HTTP backend
-  abstraction remains.
+  `ola serve --role worker` are implemented; native and OpenAI gateway
+  routes are covered, while deeper request-level backend unification remains.
 - [~] D3: `export_request`/`import_request`, recompute migration, drain, and
   lease-expiry recovery with failure injection. Runtime and worker protocol
   hooks plus coordinator requeue recovery are implemented; end-to-end
