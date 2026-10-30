@@ -20,6 +20,11 @@ request routing, worker execution, and response completion. The CLI accepts
 The same command now supports `--role worker`, loading the configured model
 and exposing a TCP worker session on the requested address.
 
+The wire crate also has a separate length-prefixed binary frame for opaque
+session/KV payloads, with independent size validation and round-trip tests.
+Coordinator links record heartbeat-derived clock-offset samples for later
+transfer-cost and placement calibration.
+
 **Source revision:** working tree based on `3363e15` on `master`
 
 **2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered
