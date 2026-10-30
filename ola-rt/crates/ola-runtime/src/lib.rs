@@ -48,7 +48,7 @@ pub use decision::{
 pub use error::RuntimeError;
 pub use executor::{
     ExecutionPhase, ExecutionResult, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
-    ModelLifecycleEvent, ModelPlacement,
+    MigratedRequest, ModelLifecycleEvent, ModelPlacement,
 };
 pub use kv_cache::{
     KvBlockError, KvBlockId, KvBlockManager, KvBlockMetrics, KvRelease, KvSequenceId, PrefixMatch,

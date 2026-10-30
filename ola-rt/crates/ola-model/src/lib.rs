@@ -14,6 +14,7 @@ pub use execution::{
     BatchCapabilities, CachedPrefix, CausalLanguageModel, CausalModel, ExecutionStage,
     GeneratedToken, GenerationSession, KvCacheProfile, KvPoolStatus, ModelExecutionContext,
     ModelExecutionError, ModelMemoryProfile, PrefillOutcome, SessionMetrics, Tokenizer,
+    SessionState,
 };
 pub use factory::{ArchitectureFactory, ArchitectureRegistry, LoadedModel};
 pub use streaming::IncrementalDecoder;

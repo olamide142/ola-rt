@@ -259,7 +259,11 @@ Design: `ola-rt/crates/ola-kernel/KERNELS.md`.
   page padding, CPU/WGPU conformance, and configurable physical-pool slack with
   report-level fragmentation metrics. A separate profiler-backed occupancy
   measurement remains.
-- [ ] Measure accelerator occupancy with a hardware profiler.
+- [ ] Measure accelerator occupancy with a hardware profiler. The
+  `paged-attention-occupancy` study sweeps page, batch, and sequence shapes and
+  attaches Nsight Compute occupancy/utilization counters from a matched capture
+  (workflow and limitations in `ola-bench/README.md`). Remaining: record a
+  profiled CUDA report once the local NVIDIA driver is available.
 - [x] Compare optimized paths against the single-request oracle. (Single and
   ragged batched CubeCL outputs are checked against portable single-request
   execution.)
@@ -288,8 +292,10 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   equivalence are covered by tests.
 - [ ] D2: TCP transport, worker and gateway roles, `InferenceBackend`,
   heartbeats/leases, CLI and cluster config; loopback multi-process tests.
-- [ ] D3: `export_request`/`import_request`, recompute migration, drain, and
-  lease-expiry recovery with failure injection.
+- [~] D3: `export_request`/`import_request`, recompute migration, drain, and
+  lease-expiry recovery with failure injection. Runtime and worker protocol
+  hooks plus coordinator requeue recovery are implemented; end-to-end
+  ownership handoff and simulator failure injection remain.
 - [ ] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
 - [ ] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP

@@ -41,6 +41,61 @@ fn spec(prompt_tokens: usize, max_new_tokens: usize, eos_after: Option<usize>) -
     spec
 }
 
+#[test]
+fn level_one_migration_exports_and_resumes_on_another_worker() {
+    let request = ClusterRequestId::new(77);
+    let mut source = WorkerHost::new("source", executor());
+    let mut target = WorkerHost::new("target", executor());
+    let request_spec = spec(5, 4, None);
+
+    let accepted = source
+        .handle(
+            WorkerCommand::Admit {
+                request,
+                spec: request_spec.clone(),
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    assert!(matches!(accepted.as_slice(), [WorkerMessage::Accepted { .. }]));
+    source.step(at(1)).unwrap();
+
+    let exported = source
+        .handle(WorkerCommand::MigrateOut { request }, at(2))
+        .unwrap();
+    let WorkerMessage::Migrated { request: id, state } = exported.into_iter().next().unwrap()
+    else {
+        panic!("migration did not produce a payload");
+    };
+    assert_eq!(id, request);
+    assert!(!state.generated_tokens.is_empty());
+    assert!(source.local_id(request).is_none());
+
+    let imported = target
+        .handle(
+            WorkerCommand::AdmitMigrated {
+                request,
+                state,
+                arrival_at: at(0),
+            },
+            at(2),
+        )
+        .unwrap();
+    assert!(matches!(imported.as_slice(), [WorkerMessage::Accepted { .. }]));
+    for tick in 3..20 {
+        if let Some((_, messages)) = target.step(at(tick)).unwrap() {
+            if messages
+                .iter()
+                .any(|message| matches!(message, WorkerMessage::Finished { request: id, .. } if *id == request))
+            {
+                return;
+            }
+        }
+    }
+    panic!("migrated request did not finish");
+}
+
 /// (arrival, spec) pairs with varied lengths, early stops, and arrivals.
 fn workload() -> Vec<(u64, RequestSpec)> {
     (0..12_u64)

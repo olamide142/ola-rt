@@ -140,6 +140,31 @@ impl WorkerHost {
                 self.unmap(local);
                 Ok(vec![WorkerMessage::Cancelled { request }])
             }
+            WorkerCommand::MigrateOut { request } => {
+                let Some(local) = self.by_cluster.get(&request).copied() else {
+                    return Ok(Vec::new());
+                };
+                let state = self.executor.export_request(local, at)?;
+                self.unmap(local);
+                Ok(vec![WorkerMessage::Migrated { request, state }])
+            }
+            WorkerCommand::AdmitMigrated {
+                request,
+                state,
+                arrival_at,
+            } => {
+                if self.health != WorkerHealth::Ready {
+                    return Ok(vec![WorkerMessage::Refused {
+                        request,
+                        message: format!("worker `{}` is draining", self.id),
+                    }]);
+                }
+                let local = self.executor.import_request(state, arrival_at)?;
+                self.admitted += 1;
+                self.by_local.insert(local, request);
+                self.by_cluster.insert(request, local);
+                Ok(vec![WorkerMessage::Accepted { request, local }])
+            }
         }
     }
 

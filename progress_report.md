@@ -2,6 +2,16 @@
 
 **Last updated:** 2026-10-24 14:18 BST (Europe/London)
 
+**2026-10-30 distributed continuation:** The TCP worker session now uses a
+dedicated frame reader so cancellation-safe heartbeats and payloads cannot
+corrupt length-prefixed reads; loopback handshake, lease refresh, command
+dispatch, and graceful close pass in `ola-cluster/tests/session.rs`. The
+runtime now exposes serializable level-1 `MigratedRequest` export/import
+hooks, and workers expose migrate-out/admit-migrated protocol commands.
+Coordinator lease recovery requeues requests owned by expired workers for
+replanning, while preserving the original cluster request ID. Full gateway
+backend abstraction and level-2 KV transfer remain open D2–D5 work.
+
 **Source revision:** working tree based on `3363e15` on `master`
 
 **2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered

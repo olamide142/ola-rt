@@ -41,6 +41,29 @@ pub struct ExecutionResult {
     pub token_times: Vec<Timestamp>,
 }
 
+/// Serializable request state used to move an unfinished generation between
+/// executors. The destination reconstructs the model session by prefilling
+/// `prompt_tokens` followed by `generated_tokens`; no device-local KV blocks
+/// cross the boundary.
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct MigratedRequest {
+    /// The original request, including generation controls and attributes.
+    pub spec: RequestSpec,
+    /// Tokenized prompt as seen by the source model frontend.
+    pub prompt_tokens: Vec<u32>,
+    /// Tokens already emitted before migration.
+    pub generated_tokens: Vec<u32>,
+    /// Completion timestamps for the emitted tokens.
+    pub token_times: Vec<Timestamp>,
+    /// Number of preemptions observed before export.
+    pub preemptions: u32,
+}
+
+// RequestSpec contains floating-point generation controls and therefore
+// cannot derive Eq. The payload's equality follows RequestSpec's existing
+// structural equality contract and is useful for protocol message tests.
+impl Eq for MigratedRequest {}
+
 /// Model work represented by a token event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionPhase {
@@ -766,6 +789,78 @@ impl Executor {
     /// executor does not retain every output for its lifetime.
     pub fn take_result(&mut self, request_id: RequestId) -> Option<ExecutionResult> {
         self.results.remove(&request_id)
+    }
+
+    /// Releases an unfinished request and returns the state needed to resume
+    /// it on another executor. The request remains queued in this executor
+    /// until the caller cancels or forgets it; callers performing a handoff
+    /// should only expose the payload after the destination accepts it.
+    pub fn export_request(
+        &mut self,
+        request_id: RequestId,
+        at: Timestamp,
+    ) -> Result<MigratedRequest, ExecutorError> {
+        if self.active.contains_key(&request_id) || self.prefilling.contains_key(&request_id) {
+            self.preempt(request_id, PreemptionReason::AllocationFailed, at)?;
+        }
+        let (spec, preemptions) = {
+            let record = self
+                .state()
+                .request(request_id)
+                .ok_or(RuntimeError::UnknownRequest(request_id))?;
+            if record.status != crate::RequestStatus::Queued {
+                return Err(ExecutorError::Runtime(RuntimeError::InvalidTransition {
+                    request: request_id,
+                    operation: "migrate",
+                }));
+            }
+            (record.request.spec.clone(), record.preemptions)
+        };
+        if self.resumed.get(&request_id).is_none() {
+            return Err(ExecutorError::Runtime(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "migrate",
+            }));
+        }
+        let resumed = self.resumed.remove(&request_id).ok_or_else(|| {
+            ExecutorError::Runtime(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "migrate",
+            })
+        })?;
+        self.prepared.remove(&request_id);
+        Ok(MigratedRequest {
+            spec,
+            prompt_tokens: resumed.prompt,
+            generated_tokens: resumed.generated,
+            token_times: resumed.token_times,
+            preemptions,
+        })
+    }
+
+    /// Imports an unfinished request, reconstructing its next prefill from
+    /// the serialized prompt and generated output. The returned ID is local
+    /// to this executor; cluster protocols should retain their own request ID
+    /// alongside the payload.
+    pub fn import_request(
+        &mut self,
+        migrated: MigratedRequest,
+        arrival_at: Timestamp,
+    ) -> Result<RequestId, ExecutorError> {
+        migrated.spec.validate().map_err(RuntimeError::InvalidRequest)?;
+        let request_id = self.submit(migrated.spec, arrival_at)?;
+        let mut prefill = migrated.prompt_tokens.clone();
+        prefill.extend_from_slice(&migrated.generated_tokens);
+        self.prepared.insert(request_id, Ok(prefill));
+        self.resumed.insert(
+            request_id,
+            Resumed {
+                prompt: migrated.prompt_tokens,
+                generated: migrated.generated_tokens,
+                token_times: migrated.token_times,
+            },
+        );
+        Ok(request_id)
     }
 
     /// Removes everything retained for a terminal request: its runtime

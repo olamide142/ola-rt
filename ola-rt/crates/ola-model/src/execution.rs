@@ -188,6 +188,16 @@ pub trait CausalModel: Send + Sync {
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError>;
 
+    /// Imports an architecture-specific session snapshot when supported.
+    /// Returning `None` selects the portable prompt/token recompute path.
+    fn import_session(
+        &self,
+        _generation: GenerationConfig,
+        _state: SessionState,
+    ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+        Ok(None)
+    }
+
     /// Returns whether sessions created by this model can resume prefill.
     ///
     /// The runtime only divides prompts when this returns true. The default
@@ -495,6 +505,13 @@ pub trait GenerationSession: Send {
         Ok(0)
     }
 
+    /// Exports optional opaque KV/session state for disaggregated execution.
+    /// The default deliberately declines transfer and lets the runtime
+    /// recompute from the token log.
+    fn export_state(&self) -> Result<Option<SessionState>, ModelExecutionError> {
+        Ok(None)
+    }
+
     /// Returns a cheap snapshot suitable for telemetry and policy state.
     fn metrics(&self) -> SessionMetrics;
 
@@ -505,6 +522,20 @@ pub trait GenerationSession: Send {
     /// reserved for the same architecture implementation that created the
     /// session.
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// Device-independent envelope for an optional model session snapshot.
+///
+/// `payload` is intentionally opaque to the generic runtime. Architecture
+/// implementations own its encoding and must validate `format` before import.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct SessionState {
+    /// Architecture-owned wire/schema version.
+    pub format: String,
+    /// Absolute token cursor represented by the snapshot.
+    pub cursor: usize,
+    /// Encoded per-layer K/V state or a backend-specific reference.
+    pub payload: Vec<u8>,
 }
 
 /// Resident memory facts supplied by an architecture loader.
@@ -636,6 +667,15 @@ impl CausalLanguageModel {
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
         self.model.create_session(generation)
+    }
+
+    /// Attempts to import an architecture-specific session snapshot.
+    pub fn import_session(
+        &self,
+        generation: GenerationConfig,
+        state: SessionState,
+    ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+        self.model.import_session(generation, state)
     }
 
     /// Attempts a model-specific tensor-batched prefill.

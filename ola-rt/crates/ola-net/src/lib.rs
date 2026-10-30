@@ -11,6 +11,7 @@ use ola_core::WorkerId;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Current control-plane protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -175,6 +176,12 @@ impl TcpPeer {
     /// Returns the remote socket address.
     pub fn peer_addr(&self) -> Result<std::net::SocketAddr, WireError> {
         Ok(self.stream.peer_addr()?)
+    }
+
+    /// Splits the connection so a reader task and a writer loop can progress
+    /// independently without cancelling an in-progress frame read.
+    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf) {
+        self.stream.into_split()
     }
 }
 

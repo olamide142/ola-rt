@@ -8,7 +8,7 @@ use std::{
 };
 
 use ola_core::{ClusterRequestId, RequestError, RequestId, RequestSpec, Timestamp, WorkerId};
-use ola_runtime::{ExecutionPhase, PolicyDescriptor};
+use ola_runtime::{ExecutionPhase, MigratedRequest, PolicyDescriptor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -34,6 +34,20 @@ pub enum WorkerCommand {
     Cancel {
         /// Request to cancel.
         request: ClusterRequestId,
+    },
+    /// Export an unfinished request, releasing its local KV/session state.
+    MigrateOut {
+        /// Cluster-wide identity.
+        request: ClusterRequestId,
+    },
+    /// Import a request exported by another worker.
+    AdmitMigrated {
+        /// Cluster-wide identity.
+        request: ClusterRequestId,
+        /// Device-independent resumable state.
+        state: MigratedRequest,
+        /// Original coordinator arrival time.
+        arrival_at: Timestamp,
     },
 }
 
@@ -90,6 +104,13 @@ pub enum WorkerMessage {
     Cancelled {
         /// Cluster-wide identity.
         request: ClusterRequestId,
+    },
+    /// An unfinished request was exported and can be admitted elsewhere.
+    Migrated {
+        /// Cluster-wide identity.
+        request: ClusterRequestId,
+        /// Device-independent resumable state.
+        state: MigratedRequest,
     },
 }
 
@@ -502,6 +523,35 @@ impl Coordinator {
         expired
     }
 
+    /// Requeues requests owned by workers whose leases have expired.
+    ///
+    /// The request specification remains in coordinator state, so a new plan
+    /// can admit it on another worker. This is the recompute recovery path;
+    /// callers that have a [`MigratedRequest`] may instead use the explicit
+    /// worker migration commands to preserve generated tokens.
+    pub fn recover_lost_requests(
+        &mut self,
+        now: Timestamp,
+        timeout: Duration,
+    ) -> Vec<ClusterRequestId> {
+        let expired = self.expire_workers(now, timeout);
+        if expired.is_empty() {
+            return Vec::new();
+        }
+        let lost = expired.iter().collect::<std::collections::BTreeSet<_>>();
+        let mut recovered = Vec::new();
+        for (request, entry) in &mut self.requests {
+            let owner = entry.status.owner();
+            if owner.is_some_and(|worker| lost.contains(worker)) {
+                entry.status = ClusterRequestStatus::Pending;
+                self.pending.push(*request);
+                recovered.push(*request);
+            }
+        }
+        self.generation += recovered.len() as u64;
+        recovered
+    }
+
     /// Latest summary of each joined worker, in ID order.
     pub fn workers(&self) -> impl ExactSizeIterator<Item = &WorkerSummary> {
         self.workers.values().map(|entry| &entry.summary)
@@ -881,6 +931,11 @@ impl Coordinator {
                     },
                 );
                 request
+            }
+            WorkerMessage::Migrated { .. } => {
+                // Migration payloads are consumed by the recovery controller;
+                // the normal client stream has no terminal event yet.
+                return Ok(output);
             }
         };
         debug_assert!(self.requests.contains_key(&request));
