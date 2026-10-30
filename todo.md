@@ -290,16 +290,23 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   prefix-affinity) as registered experiments. Reproducibility, coordinator
   latency, bandwidth delay, prefix affinity, and single-executor output
   equivalence are covered by tests.
-- [ ] D2: TCP transport, worker and gateway roles, `InferenceBackend`,
+- [~] D2: TCP transport, worker and gateway roles, `InferenceBackend`,
   heartbeats/leases, CLI and cluster config; loopback multi-process tests.
+  TCP worker sessions, a tested `ClusterGateway` HTTP router, and
+  `ola serve --role gateway --worker HOST:PORT` are implemented; the local
+  HTTP backend abstraction and CLI worker launcher remain.
 - [~] D3: `export_request`/`import_request`, recompute migration, drain, and
   lease-expiry recovery with failure injection. Runtime and worker protocol
   hooks plus coordinator requeue recovery are implemented; end-to-end
   ownership handoff and simulator failure injection remain.
-- [ ] D4: KV session export/import in Burn models, binary KV frames,
+- [~] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
-- [ ] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
-  placement and batch routing, link calibration.
+  The optional `SessionState` model hook and migration envelope are present;
+  architecture implementations and binary framing remain.
+- [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
+  placement and batch routing, link calibration. A transactional adaptive
+  load/KV routing policy is present; optimizer push, placement, and
+  calibration remain.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

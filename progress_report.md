@@ -12,6 +12,12 @@ Coordinator lease recovery requeues requests owned by expired workers for
 replanning, while preserving the original cluster request ID. Full gateway
 backend abstraction and level-2 KV transfer remain open D2–D5 work.
 
+**2026-10-30 gateway continuation:** `ola-serve::cluster::ClusterGateway`
+now connects to network workers through `TcpCoordinator` and serves native
+JSON/SSE generation over HTTP. A loopback integration test covers handshake,
+request routing, worker execution, and response completion. The CLI accepts
+`ola serve --role gateway --worker HOST:PORT`; standalone serving is unchanged.
+
 **Source revision:** working tree based on `3363e15` on `master`
 
 **2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered
