@@ -58,7 +58,10 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
             at(0),
         )
         .unwrap();
-    assert!(matches!(accepted.as_slice(), [WorkerMessage::Accepted { .. }]));
+    assert!(matches!(
+        accepted.as_slice(),
+        [WorkerMessage::Accepted { .. }]
+    ));
     source.step(at(1)).unwrap();
 
     let exported = source
@@ -82,7 +85,10 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
             at(2),
         )
         .unwrap();
-    assert!(matches!(imported.as_slice(), [WorkerMessage::Accepted { .. }]));
+    assert!(matches!(
+        imported.as_slice(),
+        [WorkerMessage::Accepted { .. }]
+    ));
     for tick in 3..20 {
         if let Some((_, messages)) = target.step(at(tick)).unwrap() {
             if messages
@@ -94,6 +100,29 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
         }
     }
     panic!("migrated request did not finish");
+}
+
+#[test]
+fn worker_accepts_and_acknowledges_adaptive_policy_updates() {
+    let mut host = WorkerHost::new("worker", executor());
+    let messages = host
+        .handle(
+            WorkerCommand::PolicyUpdate {
+                load_weight: 3,
+                kv_headroom_weight: 7,
+            },
+            at(0),
+        )
+        .unwrap();
+    assert_eq!(host.policy_weights().load, 3);
+    assert_eq!(host.policy_weights().kv_headroom, 7);
+    assert!(matches!(
+        messages.as_slice(),
+        [WorkerMessage::PolicyUpdated {
+            load_weight: 3,
+            kv_headroom_weight: 7
+        }]
+    ));
 }
 
 /// (arrival, spec) pairs with varied lengths, early stops, and arrivals.
@@ -304,19 +333,32 @@ fn worker_leases_expire_and_new_epochs_revive_them() {
     let mut coordinator = Coordinator::new(RoundRobinRouting);
     coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
 
-    assert!(coordinator
-        .expire_workers(at(9), std::time::Duration::from_micros(10))
-        .is_empty());
-    assert_eq!(coordinator.workers().next().unwrap().health, WorkerHealth::Ready);
+    assert!(
+        coordinator
+            .expire_workers(at(9), std::time::Duration::from_micros(10))
+            .is_empty()
+    );
+    assert_eq!(
+        coordinator.workers().next().unwrap().health,
+        WorkerHealth::Ready
+    );
 
     assert_eq!(
         coordinator.expire_workers(at(10), std::time::Duration::from_micros(10)),
         [WorkerId::new("a")]
     );
-    assert_eq!(coordinator.workers().next().unwrap().health, WorkerHealth::Lost);
+    assert_eq!(
+        coordinator.workers().next().unwrap().health,
+        WorkerHealth::Lost
+    );
 
-    coordinator.heartbeat(&WorkerId::new("a"), 3, at(11)).unwrap();
-    assert_eq!(coordinator.workers().next().unwrap().health, WorkerHealth::Ready);
+    coordinator
+        .heartbeat(&WorkerId::new("a"), 3, at(11))
+        .unwrap();
+    assert_eq!(
+        coordinator.workers().next().unwrap().health,
+        WorkerHealth::Ready
+    );
     assert_eq!(
         coordinator.heartbeat(&WorkerId::new("a"), 2, at(12)),
         Err(CoordinatorError::StaleWorkerEpoch {

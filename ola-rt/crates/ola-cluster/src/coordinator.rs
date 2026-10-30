@@ -51,6 +51,13 @@ pub enum WorkerCommand {
         /// Original coordinator arrival time.
         arrival_at: Timestamp,
     },
+    /// Pushes a validated adaptive-routing parameter update to a worker.
+    PolicyUpdate {
+        /// Load-pressure weight.
+        load_weight: u64,
+        /// KV-headroom weight.
+        kv_headroom_weight: u64,
+    },
 }
 
 /// A report from one worker to the coordinator.
@@ -113,6 +120,13 @@ pub enum WorkerMessage {
         request: ClusterRequestId,
         /// Device-independent resumable state.
         state: MigratedRequest,
+    },
+    /// Confirms a worker accepted an adaptive-routing parameter update.
+    PolicyUpdated {
+        /// Load-pressure weight.
+        load_weight: u64,
+        /// KV-headroom weight.
+        kv_headroom_weight: u64,
     },
 }
 
@@ -939,6 +953,7 @@ impl Coordinator {
                 // the normal client stream has no terminal event yet.
                 return Ok(output);
             }
+            WorkerMessage::PolicyUpdated { .. } => return Ok(output),
         };
         debug_assert!(self.requests.contains_key(&request));
         self.generation += 1;

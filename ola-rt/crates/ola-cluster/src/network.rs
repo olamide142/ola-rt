@@ -161,6 +161,24 @@ impl TcpCoordinator {
         Ok(())
     }
 
+    /// Pushes adaptive routing weights to a worker over its control link.
+    pub async fn update_worker_policy(
+        &mut self,
+        worker: &WorkerId,
+        weights: crate::ClusterWeights,
+    ) -> Result<(), TcpCoordinatorError> {
+        let link = self
+            .links
+            .get_mut(worker)
+            .ok_or_else(|| TcpCoordinatorError::MissingLink(worker.clone()))?;
+        link.send_command(&WorkerCommand::PolicyUpdate {
+            load_weight: weights.load,
+            kv_headroom_weight: weights.kv_headroom,
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Receives one message from a worker and applies it to coordinator state.
     pub async fn receive(
         &mut self,

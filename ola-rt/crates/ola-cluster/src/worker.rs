@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use ola_core::{ClusterRequestId, RequestId, Timestamp, WorkerId};
 use ola_runtime::{Executor, ExecutorError, ExecutorEvent, ExecutorIteration, RequestStatus};
 
-use crate::{WorkerCommand, WorkerHealth, WorkerMessage, WorkerSummary};
+use crate::{
+    AdaptiveClusterPolicy, ClusterWeights, WorkerCommand, WorkerHealth, WorkerMessage,
+    WorkerSummary,
+};
 
 /// Wraps one [`Executor`] as a cluster worker.
 ///
@@ -19,6 +22,7 @@ pub struct WorkerHost {
     admitted: u64,
     by_local: BTreeMap<RequestId, ClusterRequestId>,
     by_cluster: BTreeMap<ClusterRequestId, RequestId>,
+    policy_weights: ClusterWeights,
 }
 
 impl WorkerHost {
@@ -31,6 +35,7 @@ impl WorkerHost {
             admitted: 0,
             by_local: BTreeMap::new(),
             by_cluster: BTreeMap::new(),
+            policy_weights: ClusterWeights::default(),
         }
     }
 
@@ -53,6 +58,11 @@ impl WorkerHost {
     /// to completion either way.
     pub fn set_health(&mut self, health: WorkerHealth) {
         self.health = health;
+    }
+
+    /// Returns the last adaptive-routing weights accepted by this worker.
+    pub const fn policy_weights(&self) -> ClusterWeights {
+        self.policy_weights
     }
 
     /// The worker's runtime-local ID for a cluster request it owns.
@@ -173,6 +183,23 @@ impl WorkerHost {
                 self.by_local.insert(local, request);
                 self.by_cluster.insert(request, local);
                 Ok(vec![WorkerMessage::Accepted { request, local }])
+            }
+            WorkerCommand::PolicyUpdate {
+                load_weight,
+                kv_headroom_weight,
+            } => {
+                let weights = ClusterWeights {
+                    load: load_weight,
+                    kv_headroom: kv_headroom_weight,
+                };
+                AdaptiveClusterPolicy::new(weights).map_err(|error| {
+                    ExecutorError::InvalidPolicyConfiguration(error.to_string())
+                })?;
+                self.policy_weights = weights;
+                Ok(vec![WorkerMessage::PolicyUpdated {
+                    load_weight,
+                    kv_headroom_weight,
+                }])
             }
         }
     }

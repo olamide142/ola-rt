@@ -254,10 +254,11 @@ fn command_bytes(command: &WorkerCommand) -> u64 {
         WorkerCommand::Cancel { .. } => MESSAGE_HEADER_BYTES,
         WorkerCommand::Drain => MESSAGE_HEADER_BYTES,
         WorkerCommand::MigrateOut { .. } => MESSAGE_HEADER_BYTES,
-        WorkerCommand::AdmitMigrated { state, .. } => MESSAGE_HEADER_BYTES
-            .saturating_add(TOKEN_BYTES.saturating_mul(
-                (state.prompt_tokens.len() + state.generated_tokens.len()) as u64,
-            )),
+        WorkerCommand::AdmitMigrated { state, .. } => MESSAGE_HEADER_BYTES.saturating_add(
+            TOKEN_BYTES
+                .saturating_mul((state.prompt_tokens.len() + state.generated_tokens.len()) as u64),
+        ),
+        WorkerCommand::PolicyUpdate { .. } => MESSAGE_HEADER_BYTES,
     }
 }
 
@@ -273,10 +274,11 @@ fn message_bytes(message: &WorkerMessage) -> u64 {
         WorkerMessage::Accepted { .. }
         | WorkerMessage::Token { .. }
         | WorkerMessage::Cancelled { .. } => MESSAGE_HEADER_BYTES,
-        WorkerMessage::Migrated { state, .. } => MESSAGE_HEADER_BYTES
-            .saturating_add(TOKEN_BYTES.saturating_mul(
-                (state.prompt_tokens.len() + state.generated_tokens.len()) as u64,
-            )),
+        WorkerMessage::Migrated { state, .. } => MESSAGE_HEADER_BYTES.saturating_add(
+            TOKEN_BYTES
+                .saturating_mul((state.prompt_tokens.len() + state.generated_tokens.len()) as u64),
+        ),
+        WorkerMessage::PolicyUpdated { .. } => MESSAGE_HEADER_BYTES,
     }
 }
 
