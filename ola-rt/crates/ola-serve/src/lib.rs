@@ -3,6 +3,7 @@
 mod driver;
 mod error;
 pub mod http;
+pub mod cluster;
 
 pub use driver::{
     Driver, DriverConfig, FinishReason, GenerationOutput, Health, Instruments, ModelStatus, Reply,

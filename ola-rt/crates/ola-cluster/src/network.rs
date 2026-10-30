@@ -77,6 +77,11 @@ impl TcpCoordinator {
         &self.coordinator
     }
 
+    /// Returns the current status of a cluster request.
+    pub fn status(&self, request: ClusterRequestId) -> Option<&crate::ClusterRequestStatus> {
+        self.coordinator.status(request)
+    }
+
     /// Expires silent worker leases without performing network I/O.
     pub fn expire_workers(&mut self, now: Timestamp, timeout: Duration) -> Vec<WorkerId> {
         self.coordinator.expire_workers(now, timeout)
