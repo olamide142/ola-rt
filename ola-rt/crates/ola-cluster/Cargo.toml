@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+good_lp.workspace = true
 ola-core.workspace = true
 ola-model.workspace = true
 ola-runtime.workspace = true

@@ -5,6 +5,7 @@ mod client;
 mod coordinator;
 mod local;
 mod network;
+mod placement;
 mod plan;
 mod policy;
 mod routing;
@@ -21,6 +22,9 @@ pub use coordinator::{
 };
 pub use local::{LocalCluster, LocalClusterError, LocalClusterStep};
 pub use network::{LinkCalibration, TcpCoordinator, TcpCoordinatorError};
+pub use placement::{
+    PlacementError, PlacementModel, PlacementSolution, PlacementWorker, optimize_placement,
+};
 pub use plan::{ClusterAction, ClusterPlan, ClusterPlanError, DeferReason, RejectReason};
 pub use policy::{
     ClusterDecision, ClusterDecisionRecord, ClusterPolicy, ClusterPolicyError, RouteCandidate,
