@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use ola_bench::{KvGeometry, synthetic_artifact};
-use ola_cluster::{ClusterRequestStatus, RoundRobinRouting, TcpCoordinator, WorkerHealth, WorkerHost, WorkerSession};
+use ola_cluster::{
+    ClusterRequestStatus, RoundRobinRouting, TcpCoordinator, WorkerHealth, WorkerHost,
+    WorkerSession,
+};
 use ola_core::{Input, ModelDescriptor, RequestSpec, Timestamp, WorkerId};
 use ola_net::TcpPeer;
 use ola_runtime::{Executor, Runtime};
@@ -46,9 +49,16 @@ async fn worker_session_announces_summarizes_and_closes() {
         .receive(&worker_id, Timestamp::from_micros(10))
         .await
         .unwrap();
-    assert!(coordinator
-        .expire_workers(Timestamp::from_micros(19), Duration::from_micros(10))
-        .is_empty());
+    assert!(
+        coordinator
+            .link_calibration(&worker_id)
+            .is_some_and(|calibration| calibration.samples > 0)
+    );
+    assert!(
+        coordinator
+            .expire_workers(Timestamp::from_micros(19), Duration::from_micros(10))
+            .is_empty()
+    );
 
     let mut spec = RequestSpec::text("synthetic", "");
     spec.inputs = vec![Input::Tokens(vec![1, 2, 3])];

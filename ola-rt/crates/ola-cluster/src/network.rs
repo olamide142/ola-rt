@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, error::Error, fmt, time::Duration};
 use ola_core::{ClusterRequestId, RequestSpec, Timestamp, WorkerId};
 
 use crate::{
-    Coordinator, CoordinatorError, CoordinatorLinkError, CoordinatorOutput, ClusterPolicy,
-    CoordinatorLinkEvent, CoordinatorWorkerLink, WorkerCommand,
+    ClusterPolicy, Coordinator, CoordinatorError, CoordinatorLinkError, CoordinatorLinkEvent,
+    CoordinatorOutput, CoordinatorWorkerLink, WorkerCommand,
 };
 
 /// Errors raised while coordinating connected TCP workers.
@@ -18,6 +18,15 @@ pub enum TcpCoordinatorError {
     Link(CoordinatorLinkError),
     /// No connected link exists for a worker selected by the coordinator.
     MissingLink(WorkerId),
+}
+
+/// Coordinator-side link timing estimate from worker heartbeats.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkCalibration {
+    /// Number of heartbeat samples incorporated.
+    pub samples: u64,
+    /// Estimated coordinator-minus-worker clock offset in microseconds.
+    pub offset_us: i64,
 }
 
 impl fmt::Display for TcpCoordinatorError {
@@ -48,6 +57,7 @@ impl From<CoordinatorLinkError> for TcpCoordinatorError {
 pub struct TcpCoordinator {
     coordinator: Coordinator,
     links: BTreeMap<WorkerId, CoordinatorWorkerLink>,
+    calibration: BTreeMap<WorkerId, LinkCalibration>,
 }
 
 impl TcpCoordinator {
@@ -56,6 +66,7 @@ impl TcpCoordinator {
         Self {
             coordinator: Coordinator::new(policy),
             links: BTreeMap::new(),
+            calibration: BTreeMap::new(),
         }
     }
 
@@ -68,6 +79,8 @@ impl TcpCoordinator {
         let (link, summary) = CoordinatorWorkerLink::connect(address, expected_worker).await?;
         let worker = link.worker().clone();
         self.coordinator.join(summary)?;
+        self.calibration
+            .insert(worker.clone(), LinkCalibration::default());
         self.links.insert(worker.clone(), link);
         Ok(worker)
     }
@@ -80,6 +93,11 @@ impl TcpCoordinator {
     /// Returns the current status of a cluster request.
     pub fn status(&self, request: ClusterRequestId) -> Option<&crate::ClusterRequestStatus> {
         self.coordinator.status(request)
+    }
+
+    /// Returns the latest heartbeat-derived timing estimate for a worker.
+    pub fn link_calibration(&self, worker: &WorkerId) -> Option<LinkCalibration> {
+        self.calibration.get(worker).copied()
     }
 
     /// Expires silent worker leases without performing network I/O.
@@ -158,8 +176,19 @@ impl TcpCoordinator {
                 CoordinatorLinkEvent::Message(message) => {
                     return Ok(self.coordinator.handle(worker, message, at)?);
                 }
-                CoordinatorLinkEvent::Heartbeat { epoch, .. } => {
+                CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
                     self.coordinator.heartbeat(worker, epoch, at)?;
+                    let offset = i128::from(at.as_micros()) - i128::from(sent_at_us);
+                    let offset = offset.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+                    if let Some(calibration) = self.calibration.get_mut(worker) {
+                        calibration.samples = calibration.samples.saturating_add(1);
+                        let samples = i128::from(calibration.samples);
+                        let previous =
+                            i128::from(calibration.offset_us) * samples.saturating_sub(1);
+                        calibration.offset_us = ((previous + i128::from(offset)) / samples)
+                            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                            as i64;
+                    }
                 }
             }
         }
@@ -175,7 +204,10 @@ impl TcpCoordinator {
         Ok(())
     }
 
-    async fn dispatch(&mut self, commands: &[(WorkerId, WorkerCommand)]) -> Result<(), TcpCoordinatorError> {
+    async fn dispatch(
+        &mut self,
+        commands: &[(WorkerId, WorkerCommand)],
+    ) -> Result<(), TcpCoordinatorError> {
         for (worker, command) in commands {
             let link = self
                 .links
