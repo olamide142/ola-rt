@@ -307,8 +307,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive
   load/KV routing policy, a microlp-backed model placement optimizer, and
-  heartbeat link calibration are present; optimizer push and batch-level
-  routing adaptation remain.
+  heartbeat link calibration are present; validated routing-weight pushes are
+  now carried over worker control links, while batch-level routing adaptation
+  remains.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

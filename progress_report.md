@@ -32,6 +32,9 @@ The network gateway now exposes `/v1/completions` in addition to native
 generation, including JSON and SSE response paths over the same worker event
 stream.
 
+Adaptive routing weights can now be validated and pushed to workers over the
+control protocol, with worker acknowledgements and a direct unit test.
+
 **Source revision:** working tree based on `3363e15` on `master`
 
 **2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered
