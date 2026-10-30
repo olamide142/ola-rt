@@ -210,7 +210,7 @@ async fn generate(
     let stream_response = body.stream;
     let spec =
         request_spec(body).map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-    let (request, first) = {
+    let request = {
         let mut state = gateway.state.lock().await;
         let now = state.clock.now();
         let (request, output) = state
@@ -221,18 +221,15 @@ async fn generate(
         for (id, event) in output.client {
             state.buffered.entry(id).or_default().push_back(event);
         }
-        (
-            request,
-            state
-                .coordinator
-                .status(request)
-                .and_then(|status| status.owner().cloned())
-                .ok_or_else(|| {
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, "request was not assigned")
-                })?,
-        )
+        state
+            .coordinator
+            .status(request)
+            .and_then(|status| status.owner().cloned())
+            .ok_or_else(|| {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "request was not assigned")
+            })?;
+        request
     };
-    let _ = first;
     if stream_response {
         let events = stream::unfold(Some((gateway, request)), |state| async move {
             let (gateway, request) = state?;
