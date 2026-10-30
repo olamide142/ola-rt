@@ -12,7 +12,7 @@ use ola_core::{
 use ola_kernel::KernelExecutionMetrics;
 use ola_model::{
     CausalLanguageModel, GeneratedToken, GenerationSession, ModelExecutionContext,
-    ModelExecutionError, ModelMemoryProfile, PrefillOutcome, SessionMetrics,
+    ModelExecutionError, ModelMemoryProfile, PrefillOutcome, SessionMetrics, SessionState,
 };
 
 use crate::{
@@ -42,9 +42,9 @@ pub struct ExecutionResult {
 }
 
 /// Serializable request state used to move an unfinished generation between
-/// executors. The destination reconstructs the model session by prefilling
-/// `prompt_tokens` followed by `generated_tokens`; no device-local KV blocks
-/// cross the boundary.
+/// executors. The destination may use `session_state` when the model supports
+/// it; otherwise it reconstructs the session by prefilling `prompt_tokens`
+/// followed by `generated_tokens`.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MigratedRequest {
     /// The original request, including generation controls and attributes.
@@ -57,6 +57,10 @@ pub struct MigratedRequest {
     pub token_times: Vec<Timestamp>,
     /// Number of preemptions observed before export.
     pub preemptions: u32,
+    /// Optional architecture-specific session/KV state. When absent, the
+    /// destination must use token recompute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<SessionState>,
 }
 
 // RequestSpec contains floating-point generation controls and therefore
@@ -339,6 +343,7 @@ struct Resumed {
     prompt: Vec<u32>,
     generated: Vec<u32>,
     token_times: Vec<Timestamp>,
+    session_state: Option<SessionState>,
 }
 
 #[derive(Default)]
@@ -800,6 +805,15 @@ impl Executor {
         request_id: RequestId,
         at: Timestamp,
     ) -> Result<MigratedRequest, ExecutorError> {
+        let session_state = self
+            .active
+            .get_mut(&request_id)
+            .and_then(|active| active.session.export_state().ok().flatten())
+            .or_else(|| {
+                self.prefilling
+                    .get_mut(&request_id)
+                    .and_then(|pending| pending.session.export_state().ok().flatten())
+            });
         if self.active.contains_key(&request_id) || self.prefilling.contains_key(&request_id) {
             self.preempt(request_id, PreemptionReason::AllocationFailed, at)?;
         }
@@ -822,19 +836,21 @@ impl Executor {
                 operation: "migrate",
             }));
         }
-        let resumed = self.resumed.remove(&request_id).ok_or_else(|| {
+        let mut resumed = self.resumed.remove(&request_id).ok_or_else(|| {
             ExecutorError::Runtime(RuntimeError::InvalidTransition {
                 request: request_id,
                 operation: "migrate",
             })
         })?;
         self.prepared.remove(&request_id);
+        resumed.session_state = session_state;
         Ok(MigratedRequest {
             spec,
             prompt_tokens: resumed.prompt,
             generated_tokens: resumed.generated,
             token_times: resumed.token_times,
             preemptions,
+            session_state: resumed.session_state,
         })
     }
 
@@ -847,7 +863,10 @@ impl Executor {
         migrated: MigratedRequest,
         arrival_at: Timestamp,
     ) -> Result<RequestId, ExecutorError> {
-        migrated.spec.validate().map_err(RuntimeError::InvalidRequest)?;
+        migrated
+            .spec
+            .validate()
+            .map_err(RuntimeError::InvalidRequest)?;
         let request_id = self.submit(migrated.spec, arrival_at)?;
         let mut prefill = migrated.prompt_tokens.clone();
         prefill.extend_from_slice(&migrated.generated_tokens);
@@ -858,6 +877,7 @@ impl Executor {
                 prompt: migrated.prompt_tokens,
                 generated: migrated.generated_tokens,
                 token_times: migrated.token_times,
+                session_state: migrated.session_state,
             },
         );
         Ok(request_id)
@@ -1780,6 +1800,7 @@ impl Executor {
                 prompt,
                 generated,
                 token_times,
+                session_state: None,
             },
         );
         self.refresh_kv_memory();

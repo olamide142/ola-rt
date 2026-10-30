@@ -32,6 +32,10 @@ The network gateway now exposes `/v1/completions` in addition to native
 generation, including JSON and SSE response paths over the same worker event
 stream.
 
+Migration envelopes now preserve optional architecture-specific
+`SessionState` alongside the portable token log; unsupported backends still
+select recompute without changing the handoff path.
+
 Adaptive routing weights can now be validated and pushed to workers over the
 control protocol, with worker acknowledgements and a direct unit test.
 

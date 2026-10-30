@@ -302,8 +302,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   ownership handoff and simulator failure injection remain.
 - [~] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
-  The optional `SessionState` model hook, migration envelope, and binary
-  frame transport are present; architecture implementations remain.
+  The optional `SessionState` model hook is now carried through migration
+  envelopes alongside the recompute fallback; architecture-specific KV
+  producers/consumers and disaggregation remain.
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive
   load/KV routing policy, a microlp-backed model placement optimizer, and
