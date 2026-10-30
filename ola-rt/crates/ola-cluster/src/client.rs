@@ -78,7 +78,11 @@ impl CoordinatorWorkerLink {
         let hello = peer.receive().await?;
         let worker = match hello.body {
             WireBody::Hello { worker } => worker,
-            other => return Err(CoordinatorLinkError::UnexpectedMessage(other.kind_name_for_error())),
+            other => {
+                return Err(CoordinatorLinkError::UnexpectedMessage(
+                    other.kind_name_for_error(),
+                ));
+            }
         };
         if let Some(expected) = expected_worker {
             if expected != worker {
@@ -115,7 +119,10 @@ impl CoordinatorWorkerLink {
     }
 
     /// Sends a coordinator command to the worker.
-    pub async fn send_command(&mut self, command: &WorkerCommand) -> Result<(), CoordinatorLinkError> {
+    pub async fn send_command(
+        &mut self,
+        command: &WorkerCommand,
+    ) -> Result<(), CoordinatorLinkError> {
         let correlation = self.next_correlation;
         self.next_correlation = self.next_correlation.saturating_add(1);
         self.peer

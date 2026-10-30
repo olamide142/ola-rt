@@ -18,7 +18,10 @@ pub struct ClusterWeights {
 
 impl Default for ClusterWeights {
     fn default() -> Self {
-        Self { load: 1, kv_headroom: 1 }
+        Self {
+            load: 1,
+            kv_headroom: 1,
+        }
     }
 }
 
@@ -42,7 +45,10 @@ impl AdaptiveClusterPolicy {
                 "adaptive cluster weights cannot both be zero".into(),
             ));
         }
-        Ok(Self { weights, observations: 0 })
+        Ok(Self {
+            weights,
+            observations: 0,
+        })
     }
 
     /// Returns the currently committed weights.
@@ -92,4 +98,3 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
         self.observations = self.observations.saturating_add(1);
     }
 }
-

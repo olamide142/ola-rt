@@ -3,7 +3,7 @@
 use std::{error::Error, fmt, time::Duration};
 
 use ola_core::{Clock, MonotonicClock};
-use ola_net::{read_message, write_message, TcpPeer, WireBody, WireError, WireMessage};
+use ola_net::{TcpPeer, WireBody, WireError, WireMessage, read_message, write_message};
 use ola_runtime::ExecutorError;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
@@ -85,13 +85,7 @@ impl WorkerSession {
         )
         .await?;
         let summary = summary_body(&self.worker, &self.clock)?;
-        send_body(
-            &mut writer,
-            self.epoch,
-            &mut self.next_correlation,
-            summary,
-        )
-        .await?;
+        send_body(&mut writer, self.epoch, &mut self.next_correlation, summary).await?;
 
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -174,7 +168,9 @@ fn summary_body(
     worker: &WorkerHost,
     clock: &MonotonicClock,
 ) -> Result<WireBody, WorkerSessionError> {
-    Ok(WireBody::json_payload(&WorkerMessage::Summary(worker.summary(clock.now())))?)
+    Ok(WireBody::json_payload(&WorkerMessage::Summary(
+        worker.summary(clock.now()),
+    ))?)
 }
 
 async fn send_messages(
