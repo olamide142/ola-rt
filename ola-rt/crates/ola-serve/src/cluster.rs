@@ -15,7 +15,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use futures_util::stream;
 use ola_cluster::{
@@ -128,6 +128,7 @@ impl ClusterGateway {
             .route("/health", get(health))
             .route("/ready", get(ready))
             .route("/v1/generate", post(generate))
+            .route("/v1/requests/{id}", delete(cancel))
             .with_state(self.clone())
     }
 
@@ -284,6 +285,20 @@ async fn generate(
             }
         }
     }
+}
+
+async fn cancel(
+    State(gateway): State<ClusterGateway>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let mut state = gateway.state.lock().await;
+    let now = state.clock.now();
+    state
+        .coordinator
+        .cancel(ClusterRequestId::new(id), now)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn next_event(
