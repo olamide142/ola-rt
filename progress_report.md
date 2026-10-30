@@ -25,6 +25,9 @@ session/KV payloads, with independent size validation and round-trip tests.
 Coordinator links record heartbeat-derived clock-offset samples for later
 transfer-cost and placement calibration.
 
+The cluster crate now also exposes a capacity-constrained `microlp` model
+placement optimizer with deterministic feasible/infeasible tests.
+
 **Source revision:** working tree based on `3363e15` on `master`
 
 **2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered
