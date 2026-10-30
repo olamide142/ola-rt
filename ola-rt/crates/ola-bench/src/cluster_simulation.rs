@@ -252,6 +252,7 @@ fn command_bytes(command: &WorkerCommand) -> u64 {
         WorkerCommand::Admit { spec, .. } => MESSAGE_HEADER_BYTES
             .saturating_add(TOKEN_BYTES.saturating_mul(ola_cluster::token_demand(spec) as u64)),
         WorkerCommand::Cancel { .. } => MESSAGE_HEADER_BYTES,
+        WorkerCommand::Drain => MESSAGE_HEADER_BYTES,
         WorkerCommand::MigrateOut { .. } => MESSAGE_HEADER_BYTES,
         WorkerCommand::AdmitMigrated { state, .. } => MESSAGE_HEADER_BYTES
             .saturating_add(TOKEN_BYTES.saturating_mul(

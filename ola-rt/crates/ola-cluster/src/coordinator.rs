@@ -35,6 +35,8 @@ pub enum WorkerCommand {
         /// Request to cancel.
         request: ClusterRequestId,
     },
+    /// Stop accepting new work while allowing owned requests to finish.
+    Drain,
     /// Export an unfinished request, releasing its local KV/session state.
     MigrateOut {
         /// Cluster-wide identity.

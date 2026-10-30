@@ -127,6 +127,17 @@ impl TcpCoordinator {
         Ok(output)
     }
 
+    /// Places a worker into draining mode. Existing requests continue, while
+    /// subsequent plans exclude it from admission.
+    pub async fn drain_worker(&mut self, worker: &WorkerId) -> Result<(), TcpCoordinatorError> {
+        let link = self
+            .links
+            .get_mut(worker)
+            .ok_or_else(|| TcpCoordinatorError::MissingLink(worker.clone()))?;
+        link.send_command(&WorkerCommand::Drain).await?;
+        Ok(())
+    }
+
     /// Receives one message from a worker and applies it to coordinator state.
     pub async fn receive(
         &mut self,

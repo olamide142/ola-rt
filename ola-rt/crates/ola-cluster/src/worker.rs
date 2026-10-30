@@ -140,6 +140,10 @@ impl WorkerHost {
                 self.unmap(local);
                 Ok(vec![WorkerMessage::Cancelled { request }])
             }
+            WorkerCommand::Drain => {
+                self.health = WorkerHealth::Draining;
+                Ok(vec![WorkerMessage::Summary(self.summary(at))])
+            }
             WorkerCommand::MigrateOut { request } => {
                 let Some(local) = self.by_cluster.get(&request).copied() else {
                     return Ok(Vec::new());
