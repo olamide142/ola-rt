@@ -17,6 +17,8 @@ now connects to network workers through `TcpCoordinator` and serves native
 JSON/SSE generation over HTTP. A loopback integration test covers handshake,
 request routing, worker execution, and response completion. The CLI accepts
 `ola serve --role gateway --worker HOST:PORT`; standalone serving is unchanged.
+The same command now supports `--role worker`, loading the configured model
+and exposing a TCP worker session on the requested address.
 
 **Source revision:** working tree based on `3363e15` on `master`
 
