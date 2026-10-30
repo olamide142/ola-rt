@@ -8,16 +8,45 @@
 use std::{error::Error, fmt};
 
 use ola_core::WorkerId;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
 
 /// Current control-plane protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Maximum encoded control-plane message size.
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum encoded binary session/KV frame size.
+pub const MAX_BINARY_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// A binary data-plane frame referenced by a control-plane message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BinaryFrame {
+    /// Protocol version of the frame envelope.
+    pub version: u16,
+    /// Sender process epoch.
+    pub sender_epoch: u64,
+    /// Correlation with a migration/control request.
+    pub correlation: u64,
+    /// Architecture-owned media type.
+    pub content_type: String,
+    /// Small opaque metadata header, such as KV geometry and cursor.
+    pub metadata: Vec<u8>,
+    /// Opaque binary payload, typically serialized K/V blocks.
+    pub data: Vec<u8>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct BinaryHeader {
+    version: u16,
+    sender_epoch: u64,
+    correlation: u64,
+    content_type: String,
+    metadata_len: u32,
+}
 
 /// A versioned control-plane envelope.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -92,13 +121,12 @@ impl WireBody {
     /// Decodes a JSON payload into its domain value.
     pub fn decode_json<T: DeserializeOwned>(&self) -> Result<T, WireError> {
         match self {
-            Self::Payload {
-                content_type,
-                data,
-            } if content_type == "application/json" => Ok(serde_json::from_slice(data)?),
-            Self::Payload { content_type, .. } => Err(WireError::UnexpectedContentType(
-                content_type.clone(),
-            )),
+            Self::Payload { content_type, data } if content_type == "application/json" => {
+                Ok(serde_json::from_slice(data)?)
+            }
+            Self::Payload { content_type, .. } => {
+                Err(WireError::UnexpectedContentType(content_type.clone()))
+            }
             other => Err(WireError::ExpectedPayload(other.kind_name())),
         }
     }
@@ -112,6 +140,69 @@ impl WireBody {
             Self::Goodbye { .. } => "goodbye",
         }
     }
+}
+
+/// Writes one independently framed binary session/KV payload.
+pub async fn write_binary_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &BinaryFrame,
+) -> Result<(), WireError> {
+    let header = serde_json::to_vec(&BinaryHeader {
+        version: frame.version,
+        sender_epoch: frame.sender_epoch,
+        correlation: frame.correlation,
+        content_type: frame.content_type.clone(),
+        metadata_len: u32::try_from(frame.metadata.len())
+            .map_err(|_| WireError::InvalidLength(u32::MAX))?,
+    })?;
+    let payload_len = 4usize
+        .saturating_add(header.len())
+        .saturating_add(frame.metadata.len())
+        .saturating_add(frame.data.len());
+    if payload_len > MAX_BINARY_FRAME_BYTES || payload_len > u32::MAX as usize {
+        return Err(WireError::InvalidLength(u32::MAX));
+    }
+    writer.write_u32(payload_len as u32).await?;
+    writer.write_u32(header.len() as u32).await?;
+    writer.write_all(&header).await?;
+    writer.write_all(&frame.metadata).await?;
+    writer.write_all(&frame.data).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Reads one independently framed binary session/KV payload.
+pub async fn read_binary_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<BinaryFrame, WireError> {
+    let payload_len = reader.read_u32().await? as usize;
+    if payload_len > MAX_BINARY_FRAME_BYTES || payload_len < 4 {
+        return Err(WireError::InvalidLength(payload_len as u32));
+    }
+    let header_len = reader.read_u32().await? as usize;
+    if header_len > payload_len.saturating_sub(4) {
+        return Err(WireError::InvalidLength(header_len as u32));
+    }
+    let mut header_bytes = vec![0; header_len];
+    reader.read_exact(&mut header_bytes).await?;
+    let header: BinaryHeader = serde_json::from_slice(&header_bytes)?;
+    let metadata_len = header.metadata_len as usize;
+    let remaining = payload_len.saturating_sub(4).saturating_sub(header_len);
+    if metadata_len > remaining {
+        return Err(WireError::InvalidLength(header.metadata_len));
+    }
+    let mut metadata = vec![0; metadata_len];
+    reader.read_exact(&mut metadata).await?;
+    let mut data = vec![0; remaining - metadata_len];
+    reader.read_exact(&mut data).await?;
+    Ok(BinaryFrame {
+        version: header.version,
+        sender_epoch: header.sender_epoch,
+        correlation: header.correlation,
+        content_type: header.content_type,
+        metadata,
+        data,
+    })
 }
 
 /// Errors raised while framing or decoding a message.
@@ -293,7 +384,9 @@ mod tests {
     async fn rejects_oversized_frames_before_allocating_payload() {
         let (mut left, mut right) = duplex(16);
         let write = tokio::spawn(async move {
-            left.write_u32((MAX_MESSAGE_BYTES as u32) + 1).await.unwrap();
+            left.write_u32((MAX_MESSAGE_BYTES as u32) + 1)
+                .await
+                .unwrap();
         });
         assert!(matches!(
             read_message(&mut right).await,
@@ -334,7 +427,9 @@ mod tests {
             peer.send(&WireMessage::new(
                 9,
                 message.correlation,
-                WireBody::HeartbeatAck { received_at_us: 123 },
+                WireBody::HeartbeatAck {
+                    received_at_us: 123,
+                },
             ))
             .await
             .unwrap();
@@ -352,9 +447,29 @@ mod tests {
         let reply = client.receive().await.unwrap();
         assert_eq!(
             reply.body,
-            WireBody::HeartbeatAck { received_at_us: 123 }
+            WireBody::HeartbeatAck {
+                received_at_us: 123
+            }
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trips_an_opaque_binary_session_frame() {
+        let (mut left, mut right) = duplex(4096);
+        let expected = BinaryFrame {
+            version: PROTOCOL_VERSION,
+            sender_epoch: 4,
+            correlation: 19,
+            content_type: "application/x-ola-kv".into(),
+            metadata: vec![1, 2, 3],
+            data: (0..128).collect(),
+        };
+        let sent = expected.clone();
+        let write = tokio::spawn(async move { write_binary_frame(&mut left, &sent).await });
+        let received = read_binary_frame(&mut right).await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(received, expected);
     }
 
     #[test]
@@ -365,7 +480,10 @@ mod tests {
         }
 
         let body = WireBody::json_payload(&Command { sequence: 3 }).unwrap();
-        assert_eq!(body.decode_json::<Command>().unwrap(), Command { sequence: 3 });
+        assert_eq!(
+            body.decode_json::<Command>().unwrap(),
+            Command { sequence: 3 }
+        );
         assert!(matches!(
             WireBody::Heartbeat { sent_at_us: 1 }.decode_json::<Command>(),
             Err(WireError::ExpectedPayload("heartbeat"))
