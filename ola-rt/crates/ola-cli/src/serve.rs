@@ -4,7 +4,7 @@ use std::{
     fs::OpenOptions,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::{Arc, mpsc},
+    sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
@@ -12,10 +12,10 @@ use std::{
 use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
-use ola_serve::{Driver, DriverConfig, Instruments, http};
 use ola_serve::cluster::ClusterGateway;
+use ola_serve::{http, Driver, DriverConfig, Instruments};
 
-use crate::{EXIT_OK, USAGE, load_model, write_line};
+use crate::{load_model, write_line, EXIT_OK, USAGE};
 
 struct Options {
     role: String,
@@ -80,7 +80,9 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
     if options.role != "gateway" {
         options.model = model.ok_or_else(|| format!("serve needs --model DIR\n\n{USAGE}"))?;
     } else if options.workers.is_empty() {
-        return Err(format!("gateway serve needs at least one --worker HOST:PORT\n\n{USAGE}"));
+        return Err(format!(
+            "gateway serve needs at least one --worker HOST:PORT\n\n{USAGE}"
+        ));
     }
     Ok(options)
 }
@@ -106,7 +108,9 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
         return gateway(options, out);
     }
     if options.role != "standalone" {
-        return Err(format!("unsupported serve role `{}`", options.role));
+        if options.role != "worker" {
+            return Err(format!("unsupported serve role `{}`", options.role));
+        }
     }
     let model = load_model(&options.model, &options.backend)?;
     let name = options.name.clone().unwrap_or_else(|| {
@@ -123,6 +127,9 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
     executor
         .register_model(ModelDescriptor::language(name.as_str(), "llama"), model)
         .map_err(|error| error.to_string())?;
+    if options.role == "worker" {
+        return worker(options, name, executor, out);
+    }
     // Traces of live and recently finished requests are always kept for
     // `GET /v1/requests/{id}/trace`; `--trace` also writes every record.
     let config = DriverConfig {
@@ -190,6 +197,43 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
         .map_err(|_| "the driver thread panicked".to_owned())?;
     served?;
     stopped.map_err(|error| error.to_string())?;
+    write_line(out, "stopped".into())?;
+    Ok(EXIT_OK)
+}
+
+fn worker(
+    options: Options,
+    name: String,
+    executor: Executor,
+    out: &mut impl Write,
+) -> Result<u8, String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(&options.address)
+            .await
+            .map_err(|error| format!("could not bind {}: {error}", options.address))?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        write_line(
+            out,
+            format!("serving worker `{name}` on tcp://{address} (Ctrl-C stops)"),
+        )?;
+        let _ = out.flush();
+        ola_serve::cluster::serve_worker(
+            listener,
+            name,
+            executor,
+            1,
+            Duration::from_millis(100),
+            async {
+                let _ = tokio::signal::ctrl_c().await;
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })?;
     write_line(out, "stopped".into())?;
     Ok(EXIT_OK)
 }

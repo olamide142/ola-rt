@@ -11,6 +11,7 @@ futures-util.workspace = true
 ola-cluster.workspace = true
 ola-core.workspace = true
 ola-model.workspace = true
+ola-net.workspace = true
 ola-observe.workspace = true
 ola-runtime.workspace = true
 serde.workspace = true

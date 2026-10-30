@@ -18,7 +18,10 @@ use axum::{
     Json, Router,
 };
 use futures_util::stream;
-use ola_cluster::{AdaptiveClusterPolicy, ClientEvent, TcpCoordinator, TcpCoordinatorError};
+use ola_cluster::{
+    AdaptiveClusterPolicy, ClientEvent, TcpCoordinator, TcpCoordinatorError, WorkerHost,
+    WorkerSession, WorkerSessionError,
+};
 use ola_core::{
     Clock, ClusterRequestId, GenerationConfig, Input, MonotonicClock, Priority, RequestSpec,
     WorkerId,
@@ -48,6 +51,8 @@ pub enum ClusterGatewayError {
     BadRequest(String),
     /// A request could not be admitted or completed.
     Request(String),
+    /// The worker session failed while serving a connection.
+    Worker(WorkerSessionError),
 }
 
 impl std::fmt::Display for ClusterGatewayError {
@@ -55,6 +60,7 @@ impl std::fmt::Display for ClusterGatewayError {
         match self {
             Self::Cluster(error) => error.fmt(f),
             Self::BadRequest(message) | Self::Request(message) => f.write_str(message),
+            Self::Worker(error) => error.fmt(f),
         }
     }
 }
@@ -64,6 +70,35 @@ impl std::error::Error for ClusterGatewayError {}
 impl From<TcpCoordinatorError> for ClusterGatewayError {
     fn from(error: TcpCoordinatorError) -> Self {
         Self::Cluster(error)
+    }
+}
+
+impl From<WorkerSessionError> for ClusterGatewayError {
+    fn from(error: WorkerSessionError) -> Self {
+        Self::Worker(error)
+    }
+}
+
+/// Serves one worker process endpoint using an existing configured executor.
+///
+/// The worker accepts one coordinator connection and runs until that
+/// connection closes or `shutdown` resolves. A supervisor may call this
+/// function again after a restart with a new epoch.
+pub async fn serve_worker(
+    listener: TcpListener,
+    worker_id: impl Into<ola_core::WorkerId>,
+    executor: ola_runtime::Executor,
+    epoch: u64,
+    heartbeat: std::time::Duration,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), ClusterGatewayError> {
+    let (peer, _) = ola_net::TcpPeer::accept(&listener)
+        .await
+        .map_err(ola_cluster::WorkerSessionError::from)?;
+    let session = WorkerSession::new(peer, WorkerHost::new(worker_id, executor), epoch, heartbeat);
+    tokio::select! {
+        result = session.run() => { result.map(|_| ()).map_err(Into::into) }
+        _ = shutdown => Ok(()),
     }
 }
 
