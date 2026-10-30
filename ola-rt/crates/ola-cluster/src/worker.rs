@@ -145,6 +145,11 @@ impl WorkerHost {
                     return Ok(Vec::new());
                 };
                 let state = self.executor.export_request(local, at)?;
+                // This worker-level command is the committed handoff path:
+                // the source must not continue executing after the payload
+                // leaves its ownership map. A future two-phase transport can
+                // defer this cancellation until the target acknowledges.
+                self.executor.cancel(local, at)?;
                 self.unmap(local);
                 Ok(vec![WorkerMessage::Migrated { request, state }])
             }
