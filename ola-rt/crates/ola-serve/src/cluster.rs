@@ -128,6 +128,7 @@ impl ClusterGateway {
             .route("/health", get(health))
             .route("/ready", get(ready))
             .route("/v1/generate", post(generate))
+            .route("/v1/completions", post(completions))
             .route("/v1/requests/{id}", delete(cancel))
             .with_state(self.clone())
     }
@@ -180,6 +181,45 @@ struct GenerateResponse {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionBody {
+    model: String,
+    prompt: String,
+    #[serde(default = "default_completion_tokens")]
+    max_tokens: usize,
+    #[serde(default)]
+    stream: bool,
+}
+
+const fn default_completion_tokens() -> usize {
+    16
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<CompletionChoice>,
+    usage: CompletionUsage,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionChoice {
+    text: String,
+    index: u8,
+    finish_reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletionUsage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
 }
 
 async fn health(State(gateway): State<ClusterGateway>) -> Json<serde_json::Value> {
@@ -299,6 +339,130 @@ async fn cancel(
         .await
         .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn completions(
+    State(gateway): State<ClusterGateway>,
+    body: Result<Json<CompletionBody>, JsonRejection>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    let Json(body) =
+        body.map_err(|error| error_response(StatusCode::BAD_REQUEST, error.body_text()))?;
+    let CompletionBody {
+        model,
+        prompt,
+        max_tokens,
+        stream: stream_response,
+    } = body;
+    let spec = RequestSpec {
+        model: model.clone().into(),
+        inputs: vec![Input::Text(prompt)],
+        generation: GenerationConfig {
+            max_new_tokens: max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+        },
+        priority: Priority::NORMAL,
+        deadline: None,
+        attributes: BTreeMap::new(),
+    };
+    let request = submit(&gateway, spec).await?;
+    let id = format!("cmpl-{}", request.get());
+    if stream_response {
+        let events = stream::unfold(
+            Some((gateway, request, id, model, false)),
+            |state| async move {
+                let (gateway, request, id, model, done) = state?;
+                if done {
+                    return Some((Ok::<_, Infallible>(Event::default().data("[DONE]")), None));
+                }
+                loop {
+                    match next_event(&gateway, request).await {
+                        Ok(Some(ClientEvent::Token { .. })) => continue,
+                        Ok(Some(ClientEvent::Finished { text, .. })) => {
+                            let chunk = serde_json::json!({
+                                "id": id,
+                                "object": "text_completion",
+                                "created": 0,
+                                "model": model,
+                                "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
+                            });
+                            return Some((
+                                Ok(Event::default().data(chunk.to_string())),
+                                Some((gateway, request, id, model, true)),
+                            ));
+                        }
+                        Ok(Some(ClientEvent::Failed { message })) => {
+                            let error = serde_json::json!({"error": message});
+                            return Some((Ok(Event::default().data(error.to_string())), None));
+                        }
+                        Ok(Some(ClientEvent::Cancelled)) | Ok(None) | Err(_) => return None,
+                    }
+                }
+            },
+        );
+        return Ok(Sse::new(events)
+            .keep_alive(KeepAlive::default())
+            .into_response());
+    }
+    loop {
+        match next_event(&gateway, request)
+            .await
+            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?
+        {
+            Some(ClientEvent::Token { .. }) => {}
+            Some(ClientEvent::Finished { token_ids, text }) => {
+                let completion_tokens = token_ids.len();
+                return Ok(Json(CompletionResponse {
+                    id,
+                    object: "text_completion",
+                    created: 0,
+                    model,
+                    choices: vec![CompletionChoice {
+                        text,
+                        index: 0,
+                        finish_reason: "stop",
+                    }],
+                    usage: CompletionUsage {
+                        prompt_tokens: 0,
+                        completion_tokens,
+                        total_tokens: completion_tokens,
+                    },
+                })
+                .into_response());
+            }
+            Some(ClientEvent::Failed { message }) => {
+                return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, message));
+            }
+            Some(ClientEvent::Cancelled) | None => {
+                return Err(error_response(StatusCode::CONFLICT, "cancelled"));
+            }
+        }
+    }
+}
+
+async fn submit(
+    gateway: &ClusterGateway,
+    spec: RequestSpec,
+) -> Result<ClusterRequestId, (StatusCode, Json<ErrorBody>)> {
+    let mut state = gateway.state.lock().await;
+    let now = state.clock.now();
+    let (request, output) = state
+        .coordinator
+        .submit_and_plan(spec, now)
+        .await
+        .map_err(cluster_error)?;
+    for (id, event) in output.client {
+        state.buffered.entry(id).or_default().push_back(event);
+    }
+    state
+        .coordinator
+        .status(request)
+        .and_then(|status| status.owner())
+        .ok_or_else(|| {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "request was not assigned")
+        })?;
+    Ok(request)
 }
 
 async fn next_event(

@@ -7,7 +7,7 @@ use axum::{
     http::{Request, StatusCode},
     response::Response,
 };
-use ola_bench::{synthetic_artifact, KvGeometry};
+use ola_bench::{KvGeometry, synthetic_artifact};
 use ola_cluster::{WorkerHost, WorkerSession};
 use ola_core::ModelDescriptor;
 use ola_net::TcpPeer;
@@ -59,9 +59,18 @@ async fn gateway_serves_a_network_worker() {
             r#"{"model":"synthetic","tokens":[1,2,3],"max_new_tokens":2}"#,
         ))
         .unwrap();
-    let output = json_response(app.oneshot(request).await.unwrap()).await;
+    let output = json_response(app.clone().oneshot(request).await.unwrap()).await;
     assert_eq!(output["id"].as_u64(), Some(1));
     assert!(!output["token_ids"].as_array().unwrap().is_empty());
+
+    let invalid_completion = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"model":"synthetic"}"#))
+        .unwrap();
+    let completion = app.oneshot(invalid_completion).await.unwrap();
+    assert_eq!(completion.status(), StatusCode::BAD_REQUEST);
 
     drop(gateway);
     worker_task.abort();
