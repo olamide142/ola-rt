@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
-mod admission;
 mod adaptive;
+mod admission;
 mod batch;
 mod builder;
 mod composed;
@@ -19,17 +19,16 @@ mod scheduler;
 mod snapshot;
 mod state;
 
+pub use adaptive::{
+    AdaptiveConfigError, AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveLinearConstraint,
+    AdaptiveMemoryConstraint, AdaptiveObjectiveMetrics, AdaptiveObjectiveWeights,
+    AdaptiveOptimizationError, AdaptiveOptimizer, AdaptiveParameterConfig, AdaptivePolicy,
+    AdaptivePolicyConfig, AdaptivePolicyFactory, AdaptiveRequestObservation,
+    FiniteCandidateOptimizer, MilpCandidateOptimizer,
+};
 pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
     UnconstrainedAdmission, WatermarkAdmission,
-};
-pub use adaptive::{
-    AdaptiveConfigError, AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveLinearConstraint,
-    AdaptiveMemoryConstraint, AdaptiveObjectiveMetrics, AdaptiveParameterConfig,
-    AdaptivePolicyConfig,
-    AdaptiveObjectiveWeights, AdaptiveOptimizationError, AdaptiveOptimizer, AdaptivePolicy,
-    AdaptivePolicyFactory, AdaptiveRequestObservation, FiniteCandidateOptimizer,
-    MilpCandidateOptimizer,
 };
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,

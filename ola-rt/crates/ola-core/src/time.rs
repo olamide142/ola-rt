@@ -10,7 +10,11 @@ use std::{
 /// Monotonic time relative to the start of a runtime or workload replay.
 ///
 /// Keeping wall-clock time out of the core API makes experiments deterministic.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize,
+    serde::Serialize,
+)]
+#[serde(transparent)]
 pub struct Timestamp(u64);
 
 impl Timestamp {

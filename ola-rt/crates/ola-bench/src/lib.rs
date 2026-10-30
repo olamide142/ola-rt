@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod calibration;
+mod cluster_simulation;
 mod experiment;
 mod plan_report;
 mod random;
@@ -31,18 +32,22 @@ pub use calibration::{
     CALIBRATION_RESAMPLES, COST_CALIBRATION, CalibrationError, CostFit, CostIntervals,
     CostObservation, fit_cost_model, measure_iteration_costs,
 };
+pub use cluster_simulation::{
+    ClusterRun, ClusterSimulationConfig, ClusterSimulationError, ClusterSummary,
+    MESSAGE_HEADER_BYTES, NetworkModel, SUMMARY_BYTES, TOKEN_BYTES, WorkerRun, run_cluster_trial,
+    summarize_cluster_run,
+};
 pub use experiment::{
-    AdaptivePrefillCost, BOOTSTRAP_RESAMPLES, BuildInfo, Change, ChunkedPrefill, CompareError,
-    CompareOptions, CostCalibration, Direction, EXPERIMENT_SCHEMA, Estimate, Experiment,
-    ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
+    AdaptivePrefillCost, BOOTSTRAP_RESAMPLES, BuildInfo, Change, ChunkedPrefill, ClusterRouting,
+    CompareError, CompareOptions, CostCalibration, Direction, EXPERIMENT_SCHEMA, Estimate,
+    Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
     ExperimentIdentity, ExperimentKind, ExperimentOutcome, ExperimentRegistry, ExperimentReport,
     ExperimentRunConfig, ExperimentTrace, FifoWorkload, HOST_STUDY_MIN_REPETITIONS,
-    HOST_STUDY_MIN_WARMUPS,
-    IdentityDifference, Interval, KvBlockPressure, KvPageSize, KvPressure, LlamaGeneration,
-    MetricComparison, MetricSpec, PagedAttentionKernelStudy, ParameterSpec, ParameterValue,
-    Parameters, PrefillBucketing, PrefillStrategies, PrefixCache, Protocol, ReportComparison,
-    ReportError, ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample,
-    SchedulerComparison, TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity,
+    HOST_STUDY_MIN_WARMUPS, IdentityDifference, Interval, KvBlockPressure, KvPageSize, KvPressure,
+    LlamaGeneration, MetricComparison, MetricSpec, PagedAttentionKernelStudy, ParameterSpec,
+    ParameterValue, Parameters, PrefillBucketing, PrefillStrategies, PrefixCache, Protocol,
+    ReportComparison, ReportError, ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS,
+    Sample, SchedulerComparison, TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity,
     compare_reports, content_digest,
 };
 pub use plan_report::{
@@ -61,10 +66,10 @@ pub use report::{
 };
 pub use scheduling_summary::{
     ClassSummary, DEFAULT_STARVATION_FACTOR, LONG_PROMPT_TOKENS, SchedulingComparison,
-    SchedulingSummary, SlowdownSummary, VirtualTimeCandidateEvaluation,
-    VirtualTimeHeldOutScore, VirtualTimeHeldOutStudy, VirtualTimeOptimizationError,
-    compare_schedulers, compare_schedulers_observed, evaluate_virtual_time_held_out,
-    isolated_end_to_end, optimize_virtual_time_candidate, summarize_run,
+    SchedulingSummary, SlowdownSummary, VirtualTimeCandidateEvaluation, VirtualTimeHeldOutScore,
+    VirtualTimeHeldOutStudy, VirtualTimeOptimizationError, compare_schedulers,
+    compare_schedulers_observed, evaluate_virtual_time_held_out, isolated_end_to_end,
+    optimize_virtual_time_candidate, summarize_run,
 };
 pub use simulation::{
     CostModel, Perturbation, SchedulingRun, SimulationConfig, SimulationError, TrialIteration,
@@ -72,8 +77,8 @@ pub use simulation::{
     trace_request_spec,
 };
 pub use synthetic::{
-    KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_prompt,
-    synthetic_shared_prompt, synthetic_token,
+    KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_group_prompt,
+    synthetic_prompt, synthetic_shared_prompt, synthetic_token,
 };
 pub use trace::{SchedulingTrace, SharedPrefix, TraceParameters, TraceRequest};
 

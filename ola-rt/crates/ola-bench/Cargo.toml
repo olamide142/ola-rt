@@ -12,6 +12,7 @@ wgpu = ["dep:burn", "ola-kernel/wgpu"]
 
 [dependencies]
 burn = { workspace = true, optional = true }
+ola-cluster.workspace = true
 ola-core.workspace = true
 ola-kernel.workspace = true
 ola-model.workspace = true

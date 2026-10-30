@@ -277,12 +277,15 @@ Done when policy selects an optimized paged-attention kernel with a portable fal
 Design: `ola-rt/crates/DISTRIBUTED.md`. New crates `ola-cluster` (sans-IO
 coordinator and cluster policy) and `ola-net` (wire protocol and transports).
 
-- [ ] D0: Cluster vocabulary, `ClusterPlan` validation, sans-IO
+- [x] D0: Cluster vocabulary, `ClusterPlan` validation, sans-IO
   `Coordinator`, in-process transport, round-robin/least-loaded routing over N
-  executors in one process.
-- [ ] D1: Multi-worker virtual-time simulation with a network cost model and
+  executors in one process. `ola-cluster` validates plans before commit and
+  joins coordinator ownership traces with worker-local IDs.
+- [x] D1: Multi-worker virtual-time simulation with a network cost model and
   routing baselines (round-robin, JSQ, power-of-two, KV-headroom,
-  prefix-affinity) as registered experiments.
+  prefix-affinity) as registered experiments. Reproducibility, coordinator
+  latency, bandwidth delay, prefix affinity, and single-executor output
+  equivalence are covered by tests.
 - [ ] D2: TCP transport, worker and gateway roles, `InferenceBackend`,
   heartbeats/leases, CLI and cluster config; loopback multi-process tests.
 - [ ] D3: `export_request`/`import_request`, recompute migration, drain, and

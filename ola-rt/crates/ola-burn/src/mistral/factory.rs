@@ -121,7 +121,10 @@ impl MistralFactory {
     }
 
     /// Loads configuration and weights while leaving tokenization to the caller.
-    pub fn load_native(&self, directory: impl AsRef<Path>) -> Result<LoadedMistral, MistralLoadError> {
+    pub fn load_native(
+        &self,
+        directory: impl AsRef<Path>,
+    ) -> Result<LoadedMistral, MistralLoadError> {
         let directory = directory.as_ref();
         if !directory.is_dir() {
             return Err(MistralLoadError::NotDirectory(directory.to_path_buf()));
@@ -193,9 +196,11 @@ fn find_safetensors_files(directory: &Path) -> Result<Vec<PathBuf>, MistralLoadE
 }
 
 fn read_safetensors_index(index: &Path) -> Result<Vec<PathBuf>, MistralLoadError> {
-    let bytes = std::fs::read(index).map_err(|error| MistralLoadError::Weights(error.to_string()))?;
-    let document: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|error| MistralLoadError::Weights(format!("invalid SafeTensors index: {error}")))?;
+    let bytes =
+        std::fs::read(index).map_err(|error| MistralLoadError::Weights(error.to_string()))?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        MistralLoadError::Weights(format!("invalid SafeTensors index: {error}"))
+    })?;
     let weight_map = document
         .get("weight_map")
         .and_then(serde_json::Value::as_object)

@@ -592,12 +592,7 @@ mod tests {
         let device = Default::default();
         let config = tiny_config();
         let pool = Arc::new(Mutex::new(
-            MistralKvPool::new(
-                &config,
-                MistralKvCacheConfig::new(16, 2),
-                device,
-            )
-            .unwrap(),
+            MistralKvPool::new(&config, MistralKvCacheConfig::new(16, 2), device).unwrap(),
         ));
 
         let mut first = MistralKvCache::allocate(pool.clone()).unwrap();
@@ -609,16 +604,15 @@ mod tests {
 
         let head_dim = config.attention_head_dim();
         let key = Tensor::<4>::from_data(
-            TensorData::new(vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], [
-                1, 1, 4, head_dim,
-            ]),
+            TensorData::new(
+                vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                [1, 1, 4, head_dim],
+            ),
             &Default::default(),
         );
         let value = Tensor::<4>::from_data(
             TensorData::new(
-                vec![
-                    10.0_f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
-                ],
+                vec![10.0_f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0],
                 [1, 1, 4, head_dim],
             ),
             &Default::default(),
@@ -644,12 +638,7 @@ mod tests {
         let device = Default::default();
         let config = tiny_config();
         let pool = Arc::new(Mutex::new(
-            MistralKvPool::new(
-                &config,
-                MistralKvCacheConfig::new(16, 2),
-                device,
-            )
-            .unwrap(),
+            MistralKvPool::new(&config, MistralKvCacheConfig::new(16, 2), device).unwrap(),
         ));
 
         let mut cache = MistralKvCache::allocate(pool).unwrap();
@@ -689,12 +678,7 @@ mod tests {
         let device = Default::default();
         let config = tiny_config();
         let pool = Arc::new(Mutex::new(
-            MistralKvPool::new(
-                &config,
-                MistralKvCacheConfig::new(4, 2),
-                device,
-            )
-            .unwrap(),
+            MistralKvPool::new(&config, MistralKvCacheConfig::new(4, 2), device).unwrap(),
         ));
 
         let first = MistralKvCache::allocate(pool.clone()).unwrap();
@@ -710,7 +694,10 @@ mod tests {
         assert_eq!(third.block_ids(), vec![1]);
 
         let overflow = third.reserve(4);
-        assert!(matches!(overflow, Err(KvBlockError::InsufficientCapacity { .. })));
+        assert!(matches!(
+            overflow,
+            Err(KvBlockError::InsufficientCapacity { .. })
+        ));
         assert_eq!(third.block_ids(), vec![1]);
         assert_eq!(third.tokens(), 2);
     }
@@ -720,12 +707,7 @@ mod tests {
         let device = Default::default();
         let config = tiny_config();
         let pool = Arc::new(Mutex::new(
-            MistralKvPool::new(
-                &config,
-                MistralKvCacheConfig::new(6, 2),
-                device,
-            )
-            .unwrap(),
+            MistralKvPool::new(&config, MistralKvCacheConfig::new(6, 2), device).unwrap(),
         ));
 
         let mut first = MistralKvCache::allocate(pool.clone()).unwrap();
@@ -739,7 +721,10 @@ mod tests {
 
         let failure =
             MistralKvCache::reserve_batch_lengths(&mut [&mut first, &mut second], &[2, 2]);
-        assert!(matches!(failure, Err(KvBlockError::BatchInsufficientCapacity { .. })));
+        assert!(matches!(
+            failure,
+            Err(KvBlockError::BatchInsufficientCapacity { .. })
+        ));
         assert_eq!(first.tokens(), 2);
         assert_eq!(first.block_ids(), vec![0]);
         assert_eq!(second.tokens(), 3);

@@ -21,8 +21,7 @@ pub trait AdaptivePolicyFactory: Send {
 
 impl<F> AdaptivePolicyFactory for F
 where
-    F: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>
-        + Send,
+    F: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError> + Send,
 {
     fn build(
         &self,
@@ -102,8 +101,12 @@ pub enum AdaptiveConfigError {
 impl fmt::Display for AdaptiveConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidParameter(message) => write!(formatter, "invalid adaptive parameter: {message}"),
-            Self::UnknownParameter(name) => write!(formatter, "unknown adaptive parameter `{name}`"),
+            Self::InvalidParameter(message) => {
+                write!(formatter, "invalid adaptive parameter: {message}")
+            }
+            Self::UnknownParameter(name) => {
+                write!(formatter, "unknown adaptive parameter `{name}`")
+            }
         }
     }
 }
@@ -127,11 +130,12 @@ impl AdaptivePolicyConfig {
             .iter()
             .map(|parameter| {
                 if parameter.name.is_empty() || !names.insert(parameter.name.as_str()) {
-                    return Err(AdaptiveConfigError::InvalidParameter(parameter.name.clone()));
+                    return Err(AdaptiveConfigError::InvalidParameter(
+                        parameter.name.clone(),
+                    ));
                 }
-                let name = resolve(&parameter.name).ok_or_else(|| {
-                    AdaptiveConfigError::UnknownParameter(parameter.name.clone())
-                })?;
+                let name = resolve(&parameter.name)
+                    .ok_or_else(|| AdaptiveConfigError::UnknownParameter(parameter.name.clone()))?;
                 Ok((name, parameter.value.clone()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -172,7 +176,9 @@ impl fmt::Display for AdaptiveOptimizationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidDomain(message) => write!(formatter, "invalid adaptive domain: {message}"),
-            Self::Infeasible(message) => write!(formatter, "adaptive candidate infeasible: {message}"),
+            Self::Infeasible(message) => {
+                write!(formatter, "adaptive candidate infeasible: {message}")
+            }
             Self::NoCandidate => formatter.write_str("adaptive optimizer produced no candidate"),
         }
     }
@@ -249,10 +255,7 @@ impl AdaptiveIntegerDomain {
     }
 }
 
-fn runtime_domain_max(
-    domain: AdaptiveIntegerDomain,
-    constraints: AdaptiveConstraints,
-) -> i64 {
+fn runtime_domain_max(domain: AdaptiveIntegerDomain, constraints: AdaptiveConstraints) -> i64 {
     match domain.name {
         "max_active_requests" | "effective_slots" | "slots" => constraints
             .max_active_requests
@@ -300,7 +303,13 @@ pub struct MilpCandidateOptimizer {
     domains: Vec<AdaptiveIntegerDomain>,
     objective: Vec<(&'static str, i64)>,
     objective_builder: Option<
-        Box<dyn FnMut(&[AdaptiveRequestObservation], AdaptiveConstraints) -> Vec<(&'static str, i64)> + Send>,
+        Box<
+            dyn FnMut(
+                    &[AdaptiveRequestObservation],
+                    AdaptiveConstraints,
+                ) -> Vec<(&'static str, i64)>
+                + Send,
+        >,
     >,
     constraints: Vec<AdaptiveLinearConstraint>,
     memory_constraints: Vec<AdaptiveMemoryConstraint>,
@@ -408,12 +417,7 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
             .zip(&domain_maxima)
             .map(|(domain, max)| {
                 let steps = (max - domain.min) / domain.step;
-                variables.add(
-                    variable()
-                        .integer()
-                        .min(0.0)
-                        .max(steps as f64),
-                )
+                variables.add(variable().integer().min(0.0).max(steps as f64))
             })
             .collect::<Vec<_>>();
 
@@ -433,7 +437,9 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
             objective += *coefficient as f64 * domain.step as f64 * decision_variables[index];
         }
 
-        let mut model = variables.minimise(objective).using(good_lp::solvers::microlp::microlp);
+        let mut model = variables
+            .minimise(objective)
+            .using(good_lp::solvers::microlp::microlp);
         for constraint in &self.constraints {
             let mut expression = Expression::from(0.0);
             for (name, coefficient) in &constraint.terms {
@@ -467,7 +473,8 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
                         })?;
                     let domain = self.domains[index];
                     expression += *coefficient as f64 * domain.min as f64;
-                    expression += *coefficient as f64 * domain.step as f64 * decision_variables[index];
+                    expression +=
+                        *coefficient as f64 * domain.step as f64 * decision_variables[index];
                 }
                 model = model.with(expression.leq(available_bytes as f64));
             }
@@ -480,7 +487,9 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
         for (index, domain) in self.domains.iter().enumerate() {
             let step_count = solution.value(decision_variables[index]).round() as i64;
             let value = domain.min + step_count * domain.step;
-            if let Some((_, current_value)) = candidate.iter_mut().find(|(key, _)| *key == domain.name) {
+            if let Some((_, current_value)) =
+                candidate.iter_mut().find(|(key, _)| *key == domain.name)
+            {
                 *current_value = value.to_string();
             } else {
                 candidate.push((domain.name, value.to_string()));
@@ -615,7 +624,8 @@ where
             }
             let mut candidate = current.to_vec();
             for (name, value) in assignments.iter().copied() {
-                if let Some((_, current_value)) = candidate.iter_mut().find(|(key, _)| *key == name) {
+                if let Some((_, current_value)) = candidate.iter_mut().find(|(key, _)| *key == name)
+                {
                     *current_value = value.to_string();
                 } else {
                     candidate.push((name, value.to_string()));
@@ -717,18 +727,23 @@ impl AdaptiveObjectiveMetrics {
         completion.sort_unstable();
 
         let completed_requests = completion.len();
-        let earliest_arrival = observations.iter().map(|observation| observation.arrived_at).min();
-        let latest_completion = observations.iter().filter_map(|observation| observation.completed_at).max();
-        let throughput_milli_per_second = earliest_arrival
-            .zip(latest_completion)
-            .and_then(|(start, end)| {
-                let elapsed_micros = end.as_micros().saturating_sub(start.as_micros());
-                (elapsed_micros > 0).then(|| {
-                    (completed_requests as u64)
-                        .saturating_mul(1_000_000_000)
-                        / elapsed_micros
-                })
-            });
+        let earliest_arrival = observations
+            .iter()
+            .map(|observation| observation.arrived_at)
+            .min();
+        let latest_completion = observations
+            .iter()
+            .filter_map(|observation| observation.completed_at)
+            .max();
+        let throughput_milli_per_second =
+            earliest_arrival
+                .zip(latest_completion)
+                .and_then(|(start, end)| {
+                    let elapsed_micros = end.as_micros().saturating_sub(start.as_micros());
+                    (elapsed_micros > 0).then(|| {
+                        (completed_requests as u64).saturating_mul(1_000_000_000) / elapsed_micros
+                    })
+                });
 
         Self {
             observed_requests: observations.len(),
@@ -757,15 +772,10 @@ impl AdaptiveObjectiveMetrics {
         let ttft = weighted_metric(weights.ttft, self.p95_ttft_micros)?;
         let completion = weighted_metric(weights.completion, self.p95_completion_latency_micros)?;
         let throughput = weighted_metric(weights.throughput, self.throughput_milli_per_second)?;
-        let score = i128::from(ttft)
-            + i128::from(completion)
-            - i128::from(throughput)
-            + i128::from(weights.starvation)
-                * i128::try_from(self.starved_requests).ok()?
-            + i128::from(weights.deadline)
-                * i128::try_from(self.deadline_misses).ok()?
-            + i128::from(weights.fallback)
-                * i128::try_from(self.capability_fallbacks).ok()?;
+        let score = i128::from(ttft) + i128::from(completion) - i128::from(throughput)
+            + i128::from(weights.starvation) * i128::try_from(self.starved_requests).ok()?
+            + i128::from(weights.deadline) * i128::try_from(self.deadline_misses).ok()?
+            + i128::from(weights.fallback) * i128::try_from(self.capability_fallbacks).ok()?;
         i64::try_from(score).ok()
     }
 }
@@ -842,20 +852,19 @@ impl ExecutorIteration {
             .into_iter()
             .enumerate()
             .map(
-                |(
-                    observation_index,
-                    (request_id, (arrived_at, first_token_at, completed_at)),
-                )| AdaptiveRequestObservation {
-                    request_id,
-                    arrived_at,
-                    time_to_first_token_micros: first_token_at
-                        .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
-                    completion_latency_micros: completed_at
-                        .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
-                    deadline_missed: false,
-                    capability_fallback: observation_index < fallback_count,
-                    first_token_at,
-                    completed_at,
+                |(observation_index, (request_id, (arrived_at, first_token_at, completed_at)))| {
+                    AdaptiveRequestObservation {
+                        request_id,
+                        arrived_at,
+                        time_to_first_token_micros: first_token_at
+                            .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
+                        completion_latency_micros: completed_at
+                            .map(|at| at.as_micros().saturating_sub(arrived_at.as_micros())),
+                        deadline_missed: false,
+                        capability_fallback: observation_index < fallback_count,
+                        first_token_at,
+                        completed_at,
+                    }
                 },
             )
             .collect()
@@ -876,8 +885,13 @@ pub struct AdaptivePolicy {
     constraints: AdaptiveConstraints,
     validator: Option<Box<dyn Fn(&PlanningSnapshot, &PolicyDecision) -> bool + Send + Sync>>,
     updater: Option<
-        Box<dyn FnMut(&ExecutorIteration, &[AdaptiveRequestObservation], &mut Vec<(&'static str, String)>)
-            + Send>,
+        Box<
+            dyn FnMut(
+                    &ExecutorIteration,
+                    &[AdaptiveRequestObservation],
+                    &mut Vec<(&'static str, String)>,
+                ) + Send,
+        >,
     >,
     theta: Vec<(&'static str, String)>,
     update_count: u64,
@@ -891,7 +905,10 @@ impl AdaptivePolicy {
     ///
     /// Parameter keys are sorted once so equivalent configurations produce the
     /// same descriptor regardless of construction order.
-    pub fn new(inner: impl ExecutionPolicy + 'static, mut theta: Vec<(&'static str, String)>) -> Self {
+    pub fn new(
+        inner: impl ExecutionPolicy + 'static,
+        mut theta: Vec<(&'static str, String)>,
+    ) -> Self {
         theta.sort_by_key(|(key, _)| *key);
         Self {
             inner: Box::new(inner),
@@ -965,8 +982,11 @@ impl AdaptivePolicy {
     #[must_use]
     pub fn with_update<F>(mut self, updater: F) -> Self
     where
-        F: FnMut(&ExecutorIteration, &[AdaptiveRequestObservation], &mut Vec<(&'static str, String)>)
-            + Send
+        F: FnMut(
+                &ExecutorIteration,
+                &[AdaptiveRequestObservation],
+                &mut Vec<(&'static str, String)>,
+            ) + Send
             + 'static,
     {
         self.updater = Some(Box::new(updater));
@@ -1030,7 +1050,6 @@ fn checked_plan(
 }
 
 impl ExecutionPolicy for AdaptivePolicy {
-
     fn descriptor(&self) -> PolicyDescriptor {
         self.adaptive_descriptor()
     }
@@ -1079,8 +1098,8 @@ impl ExecutionPolicy for AdaptivePolicy {
             updater(iteration, &observations, &mut self.theta);
             self.theta.sort_by_key(|(key, _)| *key);
         }
-        let should_optimize = (self.update_count.saturating_add(1))
-            .is_multiple_of(self.optimization_interval);
+        let should_optimize =
+            (self.update_count.saturating_add(1)).is_multiple_of(self.optimization_interval);
         let proposed_theta = if should_optimize {
             self.optimizer
                 .as_mut()
@@ -1236,7 +1255,13 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(policy.theta(), [("max_prefill_tokens", "8".into()), ("max_tokens", "32".into())]);
+        assert_eq!(
+            policy.theta(),
+            [
+                ("max_prefill_tokens", "8".into()),
+                ("max_tokens", "32".into())
+            ]
+        );
         assert_eq!(policy.random_state(), 19);
     }
 
@@ -1443,10 +1468,7 @@ mod tests {
                     assert_eq!(current, [("budget", "1".into())]);
                     assert!(observations.is_empty());
                     assert_eq!(constraints.max_active_requests, Some(8));
-                    Ok(vec![
-                        ("zeta", "3".into()),
-                        ("alpha", "2".into()),
-                    ])
+                    Ok(vec![("zeta", "3".into()), ("alpha", "2".into())])
                 },
             );
 
@@ -1524,8 +1546,9 @@ mod tests {
             }],
             |_: &[(&'static str, String)],
              _: &[AdaptiveRequestObservation],
-             _: AdaptiveConstraints|
-             Ok::<Option<i64>, AdaptiveOptimizationError>(Some(0)),
+             _: AdaptiveConstraints| {
+                Ok::<Option<i64>, AdaptiveOptimizationError>(Some(0))
+            },
         )
         .unwrap();
 
@@ -1547,8 +1570,9 @@ mod tests {
             }],
             |_: &[(&'static str, String)],
              _: &[AdaptiveRequestObservation],
-             _: AdaptiveConstraints|
-             Ok::<Option<i64>, AdaptiveOptimizationError>(Some(0)),
+             _: AdaptiveConstraints| {
+                Ok::<Option<i64>, AdaptiveOptimizationError>(Some(0))
+            },
         );
         let error = match result {
             Ok(_) => panic!("zero-step domain should be rejected"),
@@ -1712,7 +1736,7 @@ mod tests {
         let objective = |candidate: &[(&'static str, String)],
                          _: &[AdaptiveRequestObservation],
                          _: AdaptiveConstraints|
-                         -> Result<Option<i64>, AdaptiveOptimizationError> {
+         -> Result<Option<i64>, AdaptiveOptimizationError> {
             let value = |name: &'static str| {
                 candidate
                     .iter()
@@ -1752,34 +1776,34 @@ mod tests {
 
     #[test]
     fn milp_proposal_rebuilds_a_real_batch_policy_component() {
-        let mut policy = AdaptivePolicy::new(
-            ComposedPolicy::default(),
-            vec![("max_tokens", "1".into())],
-        )
-        .with_optimizer(
-            MilpCandidateOptimizer::new(
-                vec![AdaptiveIntegerDomain {
-                    name: "max_tokens",
-                    min: 1,
-                    max: 4,
-                    step: 1,
-                }],
-                vec![("max_tokens", -1)],
-            )
-            .unwrap(),
-        )
-        .with_factory(|theta: &[(&'static str, String)]| {
-            let max_tokens = theta
-                .iter()
-                .find(|(name, _)| *name == "max_tokens")
-                .and_then(|(_, value)| value.parse::<usize>().ok())
-                .ok_or_else(|| PolicyError::InvalidCandidate("missing max_tokens".into()))?;
-            let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
-                PolicyError::InvalidCandidate("max_tokens must be positive".into())
-            })?;
-            Ok(Box::new(ComposedPolicy::default().with_batch(batch))
-                as Box<dyn ExecutionPolicy>)
-        });
+        let mut policy =
+            AdaptivePolicy::new(ComposedPolicy::default(), vec![("max_tokens", "1".into())])
+                .with_optimizer(
+                    MilpCandidateOptimizer::new(
+                        vec![AdaptiveIntegerDomain {
+                            name: "max_tokens",
+                            min: 1,
+                            max: 4,
+                            step: 1,
+                        }],
+                        vec![("max_tokens", -1)],
+                    )
+                    .unwrap(),
+                )
+                .with_factory(|theta: &[(&'static str, String)]| {
+                    let max_tokens = theta
+                        .iter()
+                        .find(|(name, _)| *name == "max_tokens")
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                        .ok_or_else(|| {
+                            PolicyError::InvalidCandidate("missing max_tokens".into())
+                        })?;
+                    let batch = FifoTokenBudgetPolicy::new(max_tokens).ok_or_else(|| {
+                        PolicyError::InvalidCandidate("max_tokens must be positive".into())
+                    })?;
+                    Ok(Box::new(ComposedPolicy::default().with_batch(batch))
+                        as Box<dyn ExecutionPolicy>)
+                });
 
         let iteration = ExecutorIteration {
             id: crate::IterationId::new(1),
@@ -1796,11 +1820,13 @@ mod tests {
         };
         policy.observe(&iteration);
 
-        assert!(policy
-            .inner()
-            .descriptor()
-            .to_string()
-            .contains("fifo-token-budget{max_tokens=4}"));
+        assert!(
+            policy
+                .inner()
+                .descriptor()
+                .to_string()
+                .contains("fifo-token-budget{max_tokens=4}")
+        );
     }
 
     #[test]
@@ -2009,7 +2035,8 @@ mod tests {
 
     #[test]
     fn invalid_candidate_plans_are_replaced_before_returning() {
-        let policy = AdaptivePolicy::new(StalePolicy, vec![]).with_fallback(ComposedPolicy::default());
+        let policy =
+            AdaptivePolicy::new(StalePolicy, vec![]).with_fallback(ComposedPolicy::default());
         let snapshot = PlanningSnapshot {
             at: Timestamp::ZERO,
             generation: 0,

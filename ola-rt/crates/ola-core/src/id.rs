@@ -117,3 +117,78 @@ impl From<String> for ArchitectureId {
         Self::new(value)
     }
 }
+
+/// Uniquely identifies a request across a cluster of executors.
+///
+/// A cluster coordinator issues these; each worker keeps its own
+/// runtime-local [`RequestId`] for the same request.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
+pub struct ClusterRequestId(u64);
+
+impl ClusterRequestId {
+    /// Creates an identifier from its cluster-wide numeric representation.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the cluster-wide numeric representation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ClusterRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Stable, human-readable identifier for one executor in a cluster.
+///
+/// Workers are ordered by identifier, which gives cluster policies a
+/// deterministic tie-break.
+#[derive(
+    Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
+pub struct WorkerId(String);
+
+impl WorkerId {
+    /// Creates a worker identifier.
+    ///
+    /// Validation occurs when a worker joins a coordinator.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the identifier as text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns whether the identifier contains no non-whitespace characters.
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+}
+
+impl fmt::Display for WorkerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl From<&str> for WorkerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for WorkerId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}

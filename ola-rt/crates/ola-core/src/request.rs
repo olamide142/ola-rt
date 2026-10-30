@@ -16,7 +16,7 @@ pub enum Modality {
 }
 
 /// Image payload and shape presented to a future preprocessing stage.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ImageInput {
     /// Encoded or raw image bytes; interpretation belongs to the model frontend.
     pub bytes: Vec<u8>,
@@ -29,7 +29,7 @@ pub struct ImageInput {
 }
 
 /// One typed input in a potentially multimodal request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum Input {
     /// Untokenized text.
     Text(String),
@@ -50,7 +50,10 @@ impl Input {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
+#[serde(transparent)]
 /// Relative service priority; larger values represent higher priority.
 ///
 /// FIFO ignores this field. Later priority-aware policies may use it while the
@@ -78,7 +81,7 @@ impl Default for Priority {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 /// Backend-neutral controls for autoregressive generation.
 pub struct GenerationConfig {
     /// Maximum number of tokens the runtime may generate.
@@ -106,7 +109,7 @@ impl Default for GenerationConfig {
 }
 
 /// A request before the runtime assigns identity and arrival time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct RequestSpec {
     /// Registered model that should execute the request.
     pub model: ModelId,

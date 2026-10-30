@@ -4848,6 +4848,7 @@ name = "ola-bench"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "ola-cluster",
  "ola-core",
  "ola-kernel",
  "ola-model",
@@ -4891,6 +4892,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ola-cluster"
+version = "0.1.0"
+dependencies = [
+ "ola-bench",
+ "ola-core",
+ "ola-model",
+ "ola-net",
+ "ola-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ola-core"
 version = "0.1.0"
 dependencies = [
@@ -4915,6 +4929,16 @@ dependencies = [
  "ola-kernel",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ola-net"
+version = "0.1.0"
+dependencies = [
+ "ola-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

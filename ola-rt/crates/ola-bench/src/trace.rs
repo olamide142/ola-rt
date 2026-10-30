@@ -31,12 +31,30 @@ pub struct TraceRequest {
 }
 
 /// A prompt made of a common prefix and a request-specific remainder.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct SharedPrefix {
-    /// Prompt tokens identical across requests.
+    /// Prompt tokens identical across requests in the same group.
     pub tokens: usize,
     /// Seed for this request's unique remainder.
     pub seed: u64,
+    /// Which prefix the request shares; requests in different groups share
+    /// no prompt tokens beyond the first.
+    pub group: u64,
+}
+
+// Written out so group 0 prints, and therefore digests, exactly as it did
+// before the field existed.
+impl std::fmt::Debug for SharedPrefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("SharedPrefix");
+        debug
+            .field("tokens", &self.tokens)
+            .field("seed", &self.seed);
+        if self.group != 0 {
+            debug.field("group", &self.group);
+        }
+        debug.finish()
+    }
 }
 
 // Written out so a trace without shared prefixes prints, and therefore
@@ -121,6 +139,25 @@ impl SchedulingTrace {
             request.shared_prefix = Some(SharedPrefix {
                 tokens: prefix_tokens,
                 seed: random.between_u64(0, u64::MAX - 1),
+                group: 0,
+            });
+            request
+        })
+    }
+
+    /// Like [`shared_prefix`](Self::shared_prefix), but each request draws
+    /// one of `groups` distinct `prefix_tokens`-token prefixes uniformly, as
+    /// tenants with different system prompts would. Routing that keeps a
+    /// group on one worker lets its prefix cache serve the group.
+    pub fn prefix_groups(parameters: TraceParameters, groups: u64, prefix_tokens: usize) -> Self {
+        Self::generate("prefix_groups", parameters, |random, _| {
+            let mut request = shaped(random, 8..=32, 8..=32);
+            request.prompt_tokens += prefix_tokens;
+            let group = random.between_u64(0, groups.max(1) - 1);
+            request.shared_prefix = Some(SharedPrefix {
+                tokens: prefix_tokens,
+                seed: random.between_u64(0, u64::MAX - 1),
+                group,
             });
             request
         })

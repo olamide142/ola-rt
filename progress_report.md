@@ -4,6 +4,14 @@
 
 **Source revision:** working tree based on `3363e15` on `master`
 
+**2026-10-29 continuation:** P9 distributed execution D0–D1 are now covered
+in the working tree. `ola-cluster` provides sans-IO coordinator ownership,
+validated cluster plans, deterministic local workers, and round-robin,
+least-loaded, power-of-two, KV-headroom, and prefix-affinity routing.
+`ola-bench` adds multi-worker virtual-time/network-cost simulation with
+reproducibility, latency/bandwidth, trace, and single-executor output-
+equivalence tests. D2 network roles and transport remain next.
+
 **Repository state at update:** P1 (execution-plan IR), P2 (composable
 execution policy), P3 (scheduler and policy baselines), P4 (experiment
 framework), and P5 (runtime driver and serving) are complete. Every

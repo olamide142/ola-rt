@@ -151,7 +151,9 @@ pub struct CachedPrefix {
 }
 
 /// Occupancy of a model's shared, block-granular KV-cache pool.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize,
+)]
 pub struct KvPoolStatus {
     /// Blocks the pool can hold.
     pub total_blocks: usize,

@@ -25,7 +25,7 @@ use crate::{
     synthetic_prompt,
 };
 
-const MODEL_ID: &str = "synthetic";
+pub(crate) const MODEL_ID: &str = "synthetic";
 
 /// Virtual cost of one executor iteration.
 ///
@@ -281,9 +281,10 @@ impl From<ExecutorError> for SimulationError {
 pub fn trace_request_spec(request: &crate::TraceRequest) -> RequestSpec {
     let mut spec = RequestSpec::text(MODEL_ID, "");
     spec.inputs = vec![Input::Tokens(match request.shared_prefix {
-        Some(shared) => crate::synthetic::synthetic_shared_prompt(
+        Some(shared) => crate::synthetic::synthetic_group_prompt(
             request.prompt_tokens,
             shared.tokens,
+            shared.group,
             shared.seed,
         ),
         None => synthetic_prompt(request.prompt_tokens, request.eos_after),
@@ -364,20 +365,7 @@ where
     let mut pending = pending.into_iter().peekable();
     let mut injected_ids = Vec::new();
     let descriptor = policy.descriptor();
-    let mut executor =
-        Executor::with_max_active_requests(Runtime::default(), config.max_active_requests)?
-            .with_policy(policy);
-    if let Some(chunk) = config.prefill_chunk_size {
-        executor = executor.with_prefill_chunk_size(chunk)?;
-    }
-    executor.register_model(
-        ModelDescriptor::language(MODEL_ID, "synthetic"),
-        if config.prefix_cache {
-            synthetic_artifact_with_prefix_cache(config.kv)
-        } else {
-            synthetic_artifact(config.kv)
-        },
-    )?;
+    let mut executor = simulation_executor(policy, config)?;
 
     let mut ids = Vec::with_capacity(trace.requests.len());
     let mut rejected = BTreeSet::new();
@@ -474,55 +462,7 @@ where
             }
         }
         let duration = config.cost.iteration_micros(&iteration.execution_batches);
-        let estimates = iteration.execution_plan.estimates();
-        let count = |kind: fn(&PlannedDeferral) -> bool| {
-            iteration
-                .execution_plan
-                .deferrals
-                .iter()
-                .filter(|deferral| kind(deferral))
-                .count()
-        };
-        let pool = executor
-            .model(&MODEL_ID.into())
-            .and_then(ola_model::CausalLanguageModel::kv_pool_status);
-        iterations.push(TrialIteration {
-            at_micros: clock,
-            duration_micros: duration,
-            input_tokens: iteration
-                .execution_batches
-                .iter()
-                .map(|batch| batch.input_tokens)
-                .sum(),
-            padding_tokens: iteration
-                .execution_batches
-                .iter()
-                .map(|batch| batch.padding_tokens)
-                .sum(),
-            invocations: iteration.execution_batches.len(),
-            admission_deferrals: count(|deferral| {
-                matches!(deferral, PlannedDeferral::Admission { .. })
-            }),
-            budget_deferrals: estimates.budget_deferrals,
-            slot_deferrals: count(|deferral| matches!(deferral, PlannedDeferral::Slots { .. })),
-            backfill_skips: iteration.decision.backfill_skips.len(),
-            preemptions: iteration
-                .events
-                .iter()
-                .filter(|event| matches!(event, ExecutorEvent::Preempted { .. }))
-                .count(),
-            capability_fallbacks: iteration.decision.capability_fallbacks.len(),
-            queued_requests: iteration.queued_requests,
-            live_requests: iteration.active_requests,
-            kv_cache_bytes: iteration.kv_cache_bytes,
-            reserved_kv_bytes: iteration.reserved_kv_bytes,
-            kv_allocated_bytes: pool.map_or(0, |pool| {
-                (pool.allocated_blocks as u64)
-                    .saturating_mul(config.kv.tokens_per_block as u64)
-                    .saturating_mul(config.kv.bytes_per_token)
-            }),
-            prefix_hit_tokens: pool.map_or(0, |pool| pool.prefix_hit_tokens),
-        });
+        iterations.push(trial_iteration(&iteration, &executor, config, clock));
 
         if iteration.execution_batches.is_empty() {
             // Nothing could run (for example, every queued request is
@@ -627,6 +567,91 @@ where
         final_reserved_kv_bytes: executor.reserved_kv_bytes(),
         final_kv_cache_bytes: executor.state().memory.kv_cache_bytes,
     })
+}
+
+/// Builds an executor running `policy` with the synthetic model configured
+/// as `config` describes.
+pub(crate) fn simulation_executor<P>(
+    policy: P,
+    config: &SimulationConfig,
+) -> Result<Executor, ExecutorError>
+where
+    P: ExecutionPolicy + 'static,
+{
+    let mut executor =
+        Executor::with_max_active_requests(Runtime::default(), config.max_active_requests)?
+            .with_policy(policy);
+    if let Some(chunk) = config.prefill_chunk_size {
+        executor = executor.with_prefill_chunk_size(chunk)?;
+    }
+    executor.register_model(
+        ModelDescriptor::language(MODEL_ID, "synthetic"),
+        if config.prefix_cache {
+            synthetic_artifact_with_prefix_cache(config.kv)
+        } else {
+            synthetic_artifact(config.kv)
+        },
+    )?;
+    Ok(executor)
+}
+
+/// Counters for one executor iteration that started at `clock`, with pool
+/// state read from `executor` right after it.
+pub(crate) fn trial_iteration(
+    iteration: &ExecutorIteration,
+    executor: &Executor,
+    config: &SimulationConfig,
+    clock: u64,
+) -> TrialIteration {
+    let estimates = iteration.execution_plan.estimates();
+    let count = |kind: fn(&PlannedDeferral) -> bool| {
+        iteration
+            .execution_plan
+            .deferrals
+            .iter()
+            .filter(|deferral| kind(deferral))
+            .count()
+    };
+    let pool = executor
+        .model(&MODEL_ID.into())
+        .and_then(ola_model::CausalLanguageModel::kv_pool_status);
+    TrialIteration {
+        at_micros: clock,
+        duration_micros: config.cost.iteration_micros(&iteration.execution_batches),
+        input_tokens: iteration
+            .execution_batches
+            .iter()
+            .map(|batch| batch.input_tokens)
+            .sum(),
+        padding_tokens: iteration
+            .execution_batches
+            .iter()
+            .map(|batch| batch.padding_tokens)
+            .sum(),
+        invocations: iteration.execution_batches.len(),
+        admission_deferrals: count(|deferral| {
+            matches!(deferral, PlannedDeferral::Admission { .. })
+        }),
+        budget_deferrals: estimates.budget_deferrals,
+        slot_deferrals: count(|deferral| matches!(deferral, PlannedDeferral::Slots { .. })),
+        backfill_skips: iteration.decision.backfill_skips.len(),
+        preemptions: iteration
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutorEvent::Preempted { .. }))
+            .count(),
+        capability_fallbacks: iteration.decision.capability_fallbacks.len(),
+        queued_requests: iteration.queued_requests,
+        live_requests: iteration.active_requests,
+        kv_cache_bytes: iteration.kv_cache_bytes,
+        reserved_kv_bytes: iteration.reserved_kv_bytes,
+        kv_allocated_bytes: pool.map_or(0, |pool| {
+            (pool.allocated_blocks as u64)
+                .saturating_mul(config.kv.tokens_per_block as u64)
+                .saturating_mul(config.kv.bytes_per_token)
+        }),
+        prefix_hit_tokens: pool.map_or(0, |pool| pool.prefix_hit_tokens),
+    }
 }
 
 #[cfg(test)]

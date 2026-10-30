@@ -61,16 +61,37 @@ pub fn synthetic_prompt(prompt_tokens: usize, eos_after: Option<usize>) -> Vec<u
 /// `seed`. Prompt tokens stay below the output floor; the first token is the
 /// no-early-stop marker.
 pub fn synthetic_shared_prompt(prompt_tokens: usize, shared_tokens: usize, seed: u64) -> Vec<u32> {
+    synthetic_group_prompt(prompt_tokens, shared_tokens, 0, seed)
+}
+
+/// Like [`synthetic_shared_prompt`], with the shared prefix chosen by
+/// `group`: prompts share their first `shared_tokens` exactly when their
+/// groups match. Group 0 is [`synthetic_shared_prompt`]'s prefix.
+pub fn synthetic_group_prompt(
+    prompt_tokens: usize,
+    shared_tokens: usize,
+    group: u64,
+    seed: u64,
+) -> Vec<u32> {
     let mut prompt = synthetic_prompt(prompt_tokens, None);
+    let shared = shared_tokens.max(1).min(prompt.len());
+    if group != 0 {
+        fill(&mut prompt[1..shared], group);
+    }
+    fill(&mut prompt[shared..], seed);
+    prompt
+}
+
+/// Overwrites `tokens` with a sequence derived from `seed`.
+fn fill(tokens: &mut [u32], seed: u64) {
     let mut state = seed;
-    for token in prompt.iter_mut().skip(shared_tokens.max(1)) {
+    for token in tokens {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         // 2..=999: distinct from the shared filler and below output tokens.
         *token = 2 + u32::try_from((state >> 33) % 998).unwrap_or(0);
     }
-    prompt
 }
 
 /// Every output token is at least this; prompt tokens (and end-of-sequence

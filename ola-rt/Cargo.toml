@@ -4,9 +4,11 @@ members = [
     "crates/ola-bench",
     "crates/ola-burn",
     "crates/ola-cli",
+    "crates/ola-cluster",
     "crates/ola-core",
     "crates/ola-kernel",
     "crates/ola-model",
+    "crates/ola-net",
     "crates/ola-observe",
     "crates/ola-runtime",
     "crates/ola-serve",
@@ -33,9 +35,11 @@ good_lp = { version = "1.15.3", default-features = false, features = ["microlp"]
 ola-bench = { path = "crates/ola-bench" }
 ola-burn = { path = "crates/ola-burn" }
 ola-cli = { path = "crates/ola-cli" }
+ola-cluster = { path = "crates/ola-cluster" }
 ola-core = { path = "crates/ola-core" }
 ola-kernel = { path = "crates/ola-kernel" }
 ola-model = { path = "crates/ola-model" }
+ola-net = { path = "crates/ola-net" }
 ola-observe = { path = "crates/ola-observe" }
 ola-runtime = { path = "crates/ola-runtime" }
 ola-serve = { path = "crates/ola-serve" }

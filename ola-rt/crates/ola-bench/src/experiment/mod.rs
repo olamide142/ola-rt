@@ -3,6 +3,7 @@
 //! See `EXPERIMENTS.md` in this crate.
 
 mod builtin;
+mod cluster;
 mod compare;
 mod metric;
 mod model;
@@ -14,6 +15,7 @@ pub use builtin::{
     AdaptivePrefillCost, FifoWorkload, KvBlockPressure, KvPageSize, KvPressure,
     PagedAttentionKernelStudy, PrefillBucketing, PrefixCache, SchedulerComparison,
 };
+pub use cluster::ClusterRouting;
 pub use compare::{
     Change, CompareError, CompareOptions, IdentityDifference, MetricComparison, ReportComparison,
     compare_reports,
@@ -23,8 +25,8 @@ pub use model::{ChunkedPrefill, CostCalibration, LlamaGeneration, PrefillStrateg
 pub use registry::{
     Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
     ExperimentOutcome, ExperimentRegistry, ExperimentRunConfig, ExperimentTrace,
-    HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS, ParameterSpec, ParameterValue,
-    Parameters, Requirement, STUDY_MIN_REPETITIONS,
+    HOST_STUDY_MIN_REPETITIONS, HOST_STUDY_MIN_WARMUPS, ParameterSpec, ParameterValue, Parameters,
+    Requirement, STUDY_MIN_REPETITIONS,
 };
 pub use report::{
     BuildInfo, EXPERIMENT_SCHEMA, Estimate, ExperimentIdentity, ExperimentKind, ExperimentReport,

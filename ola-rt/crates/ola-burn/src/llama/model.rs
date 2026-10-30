@@ -678,8 +678,7 @@ impl LlamaAttention {
                         offset..offset + 1,
                         0..self.head_dim,
                     ]),
-                    caches[index]
-                        .read_layer_prefix(layer, start_positions[index] + offset + 1),
+                    caches[index].read_layer_prefix(layer, start_positions[index] + offset + 1),
                 ));
             }
         }
@@ -689,7 +688,11 @@ impl LlamaAttention {
         let projected = self.project_attention_output(Tensor::cat(contexts, 0));
         let [_, _, hidden_size] = projected.dims();
         let mut output = Tensor::zeros(
-            [batch_size, sequence_lengths.iter().copied().max().unwrap(), hidden_size],
+            [
+                batch_size,
+                sequence_lengths.iter().copied().max().unwrap(),
+                hidden_size,
+            ],
             &projected.device(),
         );
         let mut row = 0;
@@ -697,7 +700,9 @@ impl LlamaAttention {
             for offset in 0..length {
                 output = output.slice_assign(
                     [index..index + 1, offset..offset + 1, 0..hidden_size],
-                    projected.clone().slice([row..row + 1, 0..1, 0..hidden_size]),
+                    projected
+                        .clone()
+                        .slice([row..row + 1, 0..1, 0..hidden_size]),
                 );
                 row += 1;
             }

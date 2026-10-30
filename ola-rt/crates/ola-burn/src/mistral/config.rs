@@ -303,7 +303,11 @@ mod tests {
         let json = MINIMAL.replace("\"sliding_window\": 16,", "\"sliding_window\": 0,");
         let error = MistralConfig::from_json(json.as_bytes()).unwrap_err();
 
-        assert!(error.to_string().contains("sliding_window must be greater than zero"));
+        assert!(
+            error
+                .to_string()
+                .contains("sliding_window must be greater than zero")
+        );
     }
 
     #[test]
@@ -314,7 +318,10 @@ mod tests {
         );
         let error = MistralConfig::from_json(json.as_bytes()).unwrap_err();
 
-        assert_eq!(error, MistralConfigError::Unsupported("RoPE scaling".into()));
+        assert_eq!(
+            error,
+            MistralConfigError::Unsupported("RoPE scaling".into())
+        );
     }
 
     #[test]

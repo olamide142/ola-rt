@@ -935,9 +935,7 @@ mod tests {
     fn run_with_preemption(model: BurnMistralModel, prompts: &[&str]) -> (Vec<Vec<u32>>, usize) {
         let mut executor = Executor::with_max_active_requests(Runtime::default(), prompts.len())
             .unwrap()
-            .with_policy(
-                ComposedPolicy::default().with_preemption(NewestFirst),
-            );
+            .with_policy(ComposedPolicy::default().with_preemption(NewestFirst));
         executor
             .register_model(
                 ModelDescriptor::language("tiny", "mistral"),
@@ -999,10 +997,7 @@ mod tests {
         }
     }
 
-    fn make_model(
-        config: &MistralConfig,
-        cache_config: MistralKvCacheConfig,
-    ) -> BurnMistralModel {
+    fn make_model(config: &MistralConfig, cache_config: MistralKvCacheConfig) -> BurnMistralModel {
         let device = burn::tensor::Device::default();
         let module = MistralForCausalLM::init(config, &device);
         BurnMistralModel::with_kv_cache(module, config.clone(), device, cache_config).unwrap()

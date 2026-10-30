@@ -10,9 +10,9 @@ use burn::tensor::{Device, Tensor, TensorData};
 use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
     AdaptiveIntegerDomain, AdaptiveObjectiveWeights, ComposedPolicy, EarliestDeadlineFirst,
-    ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager,
-    MemoryAwareAdmission, NewestFirst, PolicyError, PriorityScheduler, Runtime,
-    ShortestJobFirst, WatermarkAdmission, MixedTokenBudgetPolicy,
+    ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager, MemoryAwareAdmission,
+    MixedTokenBudgetPolicy, NewestFirst, PolicyError, PriorityScheduler, Runtime, ShortestJobFirst,
+    WatermarkAdmission,
 };
 
 use super::{
@@ -51,6 +51,7 @@ impl ExperimentRegistry {
             Box::new(KvPressure),
             Box::new(PrefixCache),
             Box::new(KvPageSize),
+            Box::new(super::ClusterRouting),
         ];
         #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
         experiments.push(Box::new(PagedAttentionKernelStudy));
@@ -743,7 +744,9 @@ impl Experiment for SchedulerComparison {
 pub struct AdaptivePolicyStudy;
 
 impl AdaptivePolicyStudy {
-    fn adaptive_policy(theta: &[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
+    fn adaptive_policy(
+        theta: &[(&'static str, String)],
+    ) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
         let max_tokens = theta
             .iter()
             .find(|(name, _)| *name == "max_tokens")
@@ -754,11 +757,12 @@ impl AdaptivePolicyStudy {
             .find(|(name, _)| *name == "max_prefill_tokens")
             .and_then(|(_, value)| value.parse::<usize>().ok())
             .ok_or_else(|| PolicyError::InvalidCandidate("missing max_prefill_tokens".into()))?;
-        let batch = MixedTokenBudgetPolicy::new(max_tokens, max_prefill_tokens).ok_or_else(|| {
-            PolicyError::InvalidCandidate(
-                "max_prefill_tokens must be positive and no greater than max_tokens".into(),
-            )
-        })?;
+        let batch =
+            MixedTokenBudgetPolicy::new(max_tokens, max_prefill_tokens).ok_or_else(|| {
+                PolicyError::InvalidCandidate(
+                    "max_prefill_tokens must be positive and no greater than max_tokens".into(),
+                )
+            })?;
         Ok(Box::new(
             ComposedPolicy::default()
                 .with_admission(MemoryAwareAdmission)
@@ -766,7 +770,9 @@ impl AdaptivePolicyStudy {
         ))
     }
 
-    fn baseline_policy(_: &[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
+    fn baseline_policy(
+        _: &[(&'static str, String)],
+    ) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
         Ok(Box::new(
             ComposedPolicy::default().with_admission(MemoryAwareAdmission),
         ))
@@ -833,17 +839,20 @@ impl Experiment for AdaptivePolicyStudy {
             &training,
             &held_out,
             &config,
-            vec![AdaptiveIntegerDomain {
-                name: "max_tokens",
-                min: 16,
-                max: 32,
-                step: 8,
-            }, AdaptiveIntegerDomain {
-                name: "max_prefill_tokens",
-                min: 2,
-                max: 16,
-                step: 2,
-            }],
+            vec![
+                AdaptiveIntegerDomain {
+                    name: "max_tokens",
+                    min: 16,
+                    max: 32,
+                    step: 8,
+                },
+                AdaptiveIntegerDomain {
+                    name: "max_prefill_tokens",
+                    min: 2,
+                    max: 16,
+                    step: 2,
+                },
+            ],
             vec![
                 ("max_tokens", "16".into()),
                 ("max_prefill_tokens", "8".into()),
@@ -894,7 +903,10 @@ impl Experiment for AdaptivePolicyStudy {
                 variant.push(values(&[
                     ("completion_p95", as_f64(summary.completion.p95_micros)),
                     ("ttft_p95", as_f64(summary.time_to_first_token.p95_micros)),
-                    ("throughput", summary.output_tokens_per_second().unwrap_or(0.0)),
+                    (
+                        "throughput",
+                        summary.output_tokens_per_second().unwrap_or(0.0),
+                    ),
                     ("starved", as_f64(summary.starved)),
                 ]));
             }
@@ -907,15 +919,30 @@ impl Experiment for AdaptivePolicyStudy {
             "adaptive-policy-study",
             seeds.clone(),
             vec![
-                metric("completion_p95", Unit::Micros, TimeDomain::Virtual, Direction::Lower),
-                metric("ttft_p95", Unit::Micros, TimeDomain::Virtual, Direction::Lower),
+                metric(
+                    "completion_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+                metric(
+                    "ttft_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
                 metric(
                     "throughput",
                     Unit::TokensPerSecond,
                     TimeDomain::Virtual,
                     Direction::Higher,
                 ),
-                metric("starved", Unit::Count, TimeDomain::Virtual, Direction::Lower),
+                metric(
+                    "starved",
+                    Unit::Count,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
             ],
             labels
                 .into_iter()
@@ -1852,7 +1879,7 @@ impl Experiment for KvPageSize {
 impl ExperimentOutcome {
     /// Replaces the workload digest with one over the generated content,
     /// keeping the report valid.
-    fn with_content_digest(mut self, content: &str) -> Self {
+    pub(super) fn with_content_digest(mut self, content: &str) -> Self {
         self.report.workload.digest = content_digest(content.as_bytes());
         self
     }

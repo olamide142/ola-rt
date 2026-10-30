@@ -42,7 +42,7 @@ pub struct ExecutionResult {
 }
 
 /// Model work represented by a token event.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ExecutionPhase {
     /// Prompt processing and first-token selection.
     Prefill,

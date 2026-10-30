@@ -2,8 +2,7 @@ use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
     tensor::{
-        Bool, Device, Int, Tensor, activation::silu, module::attention,
-        ops::AttentionModuleOptions,
+        Bool, Device, Int, Tensor, activation::silu, module::attention, ops::AttentionModuleOptions,
     },
 };
 use ola_kernel::{
@@ -669,7 +668,11 @@ impl MistralAttention {
         let projected = self.project_attention_output(Tensor::cat(contexts, 0));
         let [_, _, hidden_size] = projected.dims();
         let mut output = Tensor::zeros(
-            [batch_size, sequence_lengths.iter().copied().max().unwrap(), hidden_size],
+            [
+                batch_size,
+                sequence_lengths.iter().copied().max().unwrap(),
+                hidden_size,
+            ],
             &projected.device(),
         );
         let mut row = 0;
@@ -677,7 +680,9 @@ impl MistralAttention {
             for offset in 0..length {
                 output = output.slice_assign(
                     [index..index + 1, offset..offset + 1, 0..hidden_size],
-                    projected.clone().slice([row..row + 1, 0..1, 0..hidden_size]),
+                    projected
+                        .clone()
+                        .slice([row..row + 1, 0..1, 0..hidden_size]),
                 );
                 row += 1;
             }
@@ -778,7 +783,11 @@ impl MistralAttention {
         let mask = if is_causal {
             if let Some(window) = self.sliding_window {
                 if sequence_length > window {
-                    Some(sliding_window_mask(sequence_length, window, &query.device()))
+                    Some(sliding_window_mask(
+                        sequence_length,
+                        window,
+                        &query.device(),
+                    ))
                 } else {
                     None
                 }
@@ -866,10 +875,18 @@ impl MistralAttention {
 /// causal masking (`is_causal = true`), token `i` attends to `j` if and only if
 /// `j <= i` and `i - j < window`.
 fn sliding_window_mask(sequence_length: usize, window: usize, device: &Device) -> Tensor<4, Bool> {
-    let rows = Tensor::<1, Int>::arange(0..sequence_length as i64, device)
-        .reshape([1, 1, sequence_length, 1]);
-    let cols = Tensor::<1, Int>::arange(0..sequence_length as i64, device)
-        .reshape([1, 1, 1, sequence_length]);
+    let rows = Tensor::<1, Int>::arange(0..sequence_length as i64, device).reshape([
+        1,
+        1,
+        sequence_length,
+        1,
+    ]);
+    let cols = Tensor::<1, Int>::arange(0..sequence_length as i64, device).reshape([
+        1,
+        1,
+        1,
+        sequence_length,
+    ]);
     (rows - cols).greater_equal_elem(window as i64)
 }
 
@@ -1039,7 +1056,11 @@ mod tests {
             );
             let prefill_logits = model.prefill(prompt, &mut cache).unwrap();
             let expected_last_logit = prefill_logits
-                .slice([0..1, all_tokens.len() - 1..all_tokens.len(), 0..config.vocab_size])
+                .slice([
+                    0..1,
+                    all_tokens.len() - 1..all_tokens.len(),
+                    0..config.vocab_size,
+                ])
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
@@ -1050,7 +1071,11 @@ mod tests {
             );
             let full_logits = model.forward(full_prompt);
             let full_last_logit = full_logits
-                .slice([0..1, all_tokens.len() - 1..all_tokens.len(), 0..config.vocab_size])
+                .slice([
+                    0..1,
+                    all_tokens.len() - 1..all_tokens.len(),
+                    0..config.vocab_size,
+                ])
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
@@ -1069,7 +1094,11 @@ mod tests {
                 );
                 let full_logits = model.forward(full_input);
                 let full_last_logit = full_logits
-                    .slice([0..1, all_tokens.len() - 1..all_tokens.len(), 0..config.vocab_size])
+                    .slice([
+                        0..1,
+                        all_tokens.len() - 1..all_tokens.len(),
+                        0..config.vocab_size,
+                    ])
                     .into_data()
                     .try_to_vec::<f32>()
                     .unwrap();
@@ -1118,7 +1147,11 @@ mod tests {
             );
             let full_logits = model.forward(full_input);
             let full_last_logit = full_logits
-                .slice([0..1, all_tokens.len() - 1..all_tokens.len(), 0..config.vocab_size])
+                .slice([
+                    0..1,
+                    all_tokens.len() - 1..all_tokens.len(),
+                    0..config.vocab_size,
+                ])
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
@@ -1127,7 +1160,9 @@ mod tests {
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
-            for (index, (actual, expected)) in actual_decode.iter().zip(full_last_logit.iter()).enumerate() {
+            for (index, (actual, expected)) in
+                actual_decode.iter().zip(full_last_logit.iter()).enumerate()
+            {
                 assert!(
                     (actual - expected).abs() < 2e-4,
                     "at token {index}: actual {actual}, expected {expected}"
