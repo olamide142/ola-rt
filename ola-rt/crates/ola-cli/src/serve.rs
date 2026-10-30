@@ -13,10 +13,12 @@ use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
 use ola_serve::{Driver, DriverConfig, Instruments, http};
+use ola_serve::cluster::ClusterGateway;
 
 use crate::{EXIT_OK, USAGE, load_model, write_line};
 
 struct Options {
+    role: String,
     model: PathBuf,
     backend: String,
     name: Option<String>,
@@ -25,11 +27,13 @@ struct Options {
     max_in_flight: usize,
     drain: Duration,
     trace: Option<PathBuf>,
+    workers: Vec<String>,
 }
 
 fn parse(rest: &[&str]) -> Result<Options, String> {
     let mut model = None;
     let mut options = Options {
+        role: "standalone".into(),
         model: PathBuf::new(),
         backend: "cpu".into(),
         name: None,
@@ -38,6 +42,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
         max_in_flight: DriverConfig::default().max_in_flight,
         drain: Duration::from_secs(30),
         trace: None,
+        workers: Vec::new(),
     };
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
@@ -53,6 +58,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
                 .ok_or_else(|| format!("{flag} expects a positive integer, got `{text}`"))
         };
         match *flag {
+            "--role" => options.role = value()?,
             "--model" => model = Some(PathBuf::from(value()?)),
             "--backend" => options.backend = value()?,
             "--name" => options.name = Some(value()?),
@@ -60,6 +66,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             "--max-active" => options.max_active = number(value()?)?,
             "--max-in-flight" => options.max_in_flight = number(value()?)?,
             "--trace" => options.trace = Some(PathBuf::from(value()?)),
+            "--worker" => options.workers.push(value()?),
             "--drain-secs" => {
                 let text = value()?;
                 let seconds = text
@@ -70,7 +77,11 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }
-    options.model = model.ok_or_else(|| format!("serve needs --model DIR\n\n{USAGE}"))?;
+    if options.role != "gateway" {
+        options.model = model.ok_or_else(|| format!("serve needs --model DIR\n\n{USAGE}"))?;
+    } else if options.workers.is_empty() {
+        return Err(format!("gateway serve needs at least one --worker HOST:PORT\n\n{USAGE}"));
+    }
     Ok(options)
 }
 
@@ -91,6 +102,12 @@ fn telemetry(backend: &str) -> Option<Arc<dyn DeviceTelemetry>> {
 /// accepted requests finish for up to `--drain-secs` before the rest end.
 pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
     let options = parse(rest)?;
+    if options.role == "gateway" {
+        return gateway(options, out);
+    }
+    if options.role != "standalone" {
+        return Err(format!("unsupported serve role `{}`", options.role));
+    }
     let model = load_model(&options.model, &options.backend)?;
     let name = options.name.clone().unwrap_or_else(|| {
         options
@@ -173,6 +190,37 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
         .map_err(|_| "the driver thread panicked".to_owned())?;
     served?;
     stopped.map_err(|error| error.to_string())?;
+    write_line(out, "stopped".into())?;
+    Ok(EXIT_OK)
+}
+
+fn gateway(options: Options, out: &mut impl Write) -> Result<u8, String> {
+    let workers = options
+        .workers
+        .into_iter()
+        .map(|address| (address, None))
+        .collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    runtime.block_on(async {
+        let gateway = ClusterGateway::connect(workers)
+            .await
+            .map_err(|error| format!("could not connect to workers: {error}"))?;
+        let listener = tokio::net::TcpListener::bind(&options.address)
+            .await
+            .map_err(|error| format!("could not bind {}: {error}", options.address))?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        write_line(out, format!("serving cluster gateway on http://{address}"))?;
+        let _ = out.flush();
+        gateway
+            .serve(listener, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await
+            .map_err(|error| error.to_string())
+    })?;
     write_line(out, "stopped".into())?;
     Ok(EXIT_OK)
 }
