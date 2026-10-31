@@ -1245,6 +1245,22 @@ Update this file whenever a meaningful capability is merged. Each update should:
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
 
+- **2026-10-31 — online adaptive optimization:** Added `ReplayOptimizer`
+  (`ola-bench`), which rebuilds the recent completed workload from adaptive
+  observations and replays it per candidate in virtual time, switching only
+  past a margin. Observations now carry prompt length, output limit, and
+  generated tokens, and `AdaptivePolicy` passes the optimizer every
+  observation since its last call (previously only the proposal iteration's,
+  which hid most of the workload). Found and fixed a misleading result:
+  `adaptive-policy-study`'s grid stopped at 32 tokens, so its "adaptive"
+  policy ran at about 2.4× FIFO's p95 latency; the log-scale grid now ties
+  FIFO (payload version 2). New `online-adaptive-policy-study` on a
+  regime-shifting trace, 10 held-out seeds: best fixed 73.7 ms, online from
+  a good budget 74.5 ms, online from the worst budget 80.0 ms, FIFO 73.7 ms.
+  Online adaptation recovers and is stable but does not beat the best fixed
+  budget, because the best budget does not change on these traces; the
+  adaptive track's done-when criterion remains unmet.
+
 - **2026-10-31 — distributed follow-up:** Migrated KV snapshots no longer
   ride inside JSON. `ola-net` messages can carry one attached `BinaryFrame`
   (`write_attached`/`read_attached`), and worker sessions and coordinator

@@ -1,6 +1,6 @@
 # Mathematical adaptive-policy optimization plan
 
-Status: **solver-first adaptive optimization path implemented** (finite oracle, MILP adapter, runtime policy installation, resource constraints, stability controls, full objective metrics, and held-out virtual-time study; 2026-10-27).
+Status: **solver-first adaptive optimization path implemented** (finite oracle, MILP adapter, runtime policy installation, resource constraints, stability controls, full objective metrics, and held-out virtual-time study; 2026-10-27). Online replay optimization and corrected study results added 2026-10-31.
 
 The adaptive route is optimization-first. No learned model is required for
 the runtime to adapt, and model training is not a prerequisite for any
@@ -127,6 +127,58 @@ solutions. Randomness is consumed only in `observe`; `plan` stays a pure
 function of the snapshot and installed policy. Exploration must be compared
 against the exact finite optimizer on seeded traces.
 
+### Online replay optimization
+
+Online, an optimizer only sees the vector it is running, so it cannot score
+the others from live metrics. `ola_bench::ReplayOptimizer` scores them the
+way the offline study does: it rebuilds the recent completed workload from
+adaptive observations (arrival, prompt length and output limit from the
+admitting iteration, tokens generated), replays it once per candidate in the
+virtual-time simulator, and switches to the best candidate only if it beats
+the current vector's own replay by `min_improvement_percent`.
+
+`AdaptivePolicy` passes the optimizer every observation since its previous
+call, not just the current iteration's; with an interval of N, the latter
+would miss most admissions and completions.
+
+Replays are as good as the simulator's `CostModel`. In the studies below the
+"live" executor is the same simulator, so the model is exact; on hardware it
+must come from `cost-calibration`. Nothing installs an adaptive policy in
+`ola serve` yet.
+
+### Results (2026-10-31)
+
+Both studies share a log-scale token-budget grid: 2^4 to 2^10 tokens per
+iteration, 25–100% of it prompt work, 28 candidates. The objective is p95
+completion plus p95 time to first token, in virtual time.
+
+An earlier grid allowed only 16–32 tokens. Under the default cost model,
+iterations are expensive relative to tokens, so larger batches win, and that
+grid excluded the best region: `adaptive-policy-study` then reported its
+"adaptive" policy at about 2.4× FIFO's p95 latency. With the wider grid it
+selects 256 tokens and ties FIFO (p95 completion 42.3 ms against 41.7 ms).
+
+`online-adaptive-policy-study` runs a mixed short/long phase followed by an
+overload burst (80 requests, 8 slots). Objective means, 10 held-out seeds:
+
+| Variant | Objective | Notes |
+| --- | --- | --- |
+| `fifo` | 73.7 ms | unbounded batching |
+| `fixed` | 73.7 ms | best budget for the training trace, chosen with hindsight (512 tokens) |
+| `online-warm` | 74.5 ms | online, starting from `fixed`'s budget |
+| `online` | 80.0 ms | online, starting from the smallest budget (16 tokens) |
+
+So online replay recovers most of the gap from a bad starting point and
+leaves a good one essentially alone, but it does not beat the best fixed
+budget: on these traces the best budget does not change between phases, so
+there is nothing for adaptation to gain. With a 24-request window and a 5%
+margin it switched away from the good budget on noise (`online-warm`
+81.3 ms on seeds 1–5); the 64-request default was picked on seeds 1–5 and
+held on seeds 6–10 (80.6 and 74.6 ms against 73.0 ms fixed). Online
+adaptation will only pay where the best configuration moves with the
+workload, for example cost models where per-token work dominates, or knobs
+whose best value depends on load.
+
 ## Verification milestones
 
 1. Add typed parameter domains, constraints, and objective components. (Integer
@@ -146,7 +198,8 @@ against the exact finite optimizer on seeded traces.
    skipped by offline search and cannot partially update runtime θ.)
 7. Evaluate fixed baselines versus adaptive candidates on held-out seeded
    virtual-time traces. (Implemented with train/evaluation separation and
-   paired scores; broader experiment coverage remains.)
+   paired scores, offline and online; see Results. No variant yet beats the
+   best fixed configuration.)
 8. Add LP/convex adapters only when they reproduce the exact optimizer on small
    cases. (Optional: MILP is the selected production route, and LP/convex
    adapters are not required for the runtime path.)

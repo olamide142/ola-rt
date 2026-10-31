@@ -110,8 +110,18 @@ cost-aware knobs.
 - [x] Pretrain and evaluate offline in the P3 virtual-time harness against the
   baselines. `adaptive-policy-study` selects θ on seed 0 and evaluates the
   fixed candidate against FIFO on held-out seeded traces with report samples.
+  (2026-10-31: its token-budget grid excluded large budgets, so the selected
+  policy was about 2.4× FIFO's p95 latency; with the log-scale grid it ties
+  FIFO.)
+- [x] Optimize online. `ReplayOptimizer` replays recent observed work per
+  candidate in virtual time; `online-adaptive-policy-study` shows it recovers
+  from a poor starting budget (80.0 ms against 73.7 ms best fixed) and keeps
+  a good one (74.5 ms). See `ADAPTIVE_OPTIMIZATION_PLAN.md`.
+- [ ] Find a regime where the best configuration moves with the workload,
+  and show online adaptation beating the best fixed configuration there.
+- [ ] Install an adaptive policy in `ola serve` with a calibrated cost model.
 
-Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures.
+Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures. **Not met:** offline selection ties the best fixed baseline and online replay comes within 1–9% of it.
 
 ## P5: Runtime driver and serving
 

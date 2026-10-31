@@ -256,6 +256,28 @@ EDF helps under moderate contention but not overload). The terminal
 workbench's *Scheduler comparison* experiment runs FIFO, SJF, and priority
 on two seeded traces.
 
+## Adaptive policy studies
+
+`adaptive-policy-study` and `online-adaptive-policy-study` tune a
+`MixedTokenBudgetPolicy` over a log-scale grid (2^4 to 2^10 tokens per
+iteration, 25–100% prompt work) to minimize p95 completion plus p95 time to
+first token, in virtual time.
+
+- `adaptive-policy-study` picks the budget offline: it replays a training
+  trace (seed 0) under every candidate, then compares the winner with FIFO
+  on held-out seeds.
+- `online-adaptive-policy-study` uses `ReplayOptimizer` inside an
+  `AdaptivePolicy`: every `optimization_interval` iterations it replays the
+  last `window` completed requests under each candidate and switches when
+  one beats the current budget by `min_improvement_percent`. It reports
+  `online` (from the smallest budget), `online-warm` (from the offline
+  choice), `fixed` (the offline choice), and `fifo`, on traces whose
+  workload shifts from mixed short/long requests to an overload burst.
+
+Results and their limits are in `../ola-runtime/ADAPTIVE_OPTIMIZATION_PLAN.md`.
+Replays use the simulator's `CostModel`, so on hardware the optimizer is only
+as good as a calibrated one.
+
 ## JSON reports
 
 `PrefillBenchmarkReport` converts a completed repeated comparison into a
