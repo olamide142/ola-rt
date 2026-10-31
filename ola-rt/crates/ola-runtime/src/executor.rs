@@ -335,6 +335,9 @@ struct PendingPrefill {
     max_new_tokens: usize,
     last_step_at: Timestamp,
     reserved_kv_bytes: u64,
+    /// The session was restored from architecture-specific migration state;
+    /// it already owns the prompt/output KV cursor and must skip recompute.
+    restored: bool,
 }
 
 /// What a preempted request keeps while queued, to resume without
@@ -1120,14 +1123,32 @@ impl Executor {
                     let lease = self.runtime.start_selected(*request_id, at)?;
                     let (event_index, cached) = admit_events[request_id];
                     // The plan starts the first prefill after the cached
-                    // prefix it saw; attach exactly that much or fail.
-                    let session = model.create_session(generation).and_then(|mut session| {
-                        if cached == 0 {
-                            return Ok(session);
+                    // prefix it saw; attach exactly that much or fail. A
+                    // supported architecture-specific migration snapshot is
+                    // already at its decode cursor, so it bypasses recompute.
+                    let imported_state = self
+                        .resumed
+                        .get(request_id)
+                        .and_then(|resumed| resumed.session_state.clone());
+                    let session = match imported_state {
+                        Some(state) => match model.import_session(generation.clone(), state) {
+                            Ok(Some(session)) => Ok((session, true)),
+                            Ok(None) => model
+                                .create_session(generation)
+                                .map(|session| (session, false)),
+                            Err(error) => Err(error),
+                        },
+                        None => model
+                            .create_session(generation)
+                            .map(|session| (session, false)),
+                    }
+                    .and_then(|(mut session, restored)| {
+                        if restored || cached == 0 {
+                            return Ok((session, restored));
                         }
                         let attached = session.attach_prefix(&prompt_tokens[..cached])?;
                         if attached == cached {
-                            Ok(session)
+                            Ok((session, restored))
                         } else {
                             Err(ModelExecutionError::new(
                                 ola_model::ExecutionStage::SessionCreation,
@@ -1138,7 +1159,7 @@ impl Executor {
                         }
                     });
                     match session {
-                        Ok(session) => {
+                        Ok((session, restored)) => {
                             admitted.insert(
                                 *request_id,
                                 PendingPrefill {
@@ -1151,6 +1172,7 @@ impl Executor {
                                     max_new_tokens,
                                     last_step_at: at,
                                     reserved_kv_bytes: *reserved_kv_bytes,
+                                    restored,
                                 },
                             );
                         }
@@ -1271,6 +1293,22 @@ impl Executor {
                     // Rows whose session creation failed already emitted an
                     // event; the rest still execute together.
                     let mut batch = batch.clone();
+                    let restored = batch
+                        .rows
+                        .iter()
+                        .filter_map(|row| {
+                            admitted
+                                .get(&row.request_id)
+                                .filter(|pending| pending.restored)
+                                .map(|_| row.request_id)
+                        })
+                        .collect::<Vec<_>>();
+                    for request_id in restored {
+                        let pending = admitted
+                            .remove(&request_id)
+                            .expect("restored admission retains its pending session");
+                        self.activate_restored(pending, at)?;
+                    }
                     batch
                         .rows
                         .retain(|row| admitted.contains_key(&row.request_id));
@@ -1546,6 +1584,60 @@ impl Executor {
             reserved_kv_bytes: pending.reserved_kv_bytes,
         };
         self.observe_token(active, ExecutionPhase::Prefill, at)
+    }
+
+    /// Promotes a migrated architecture-specific session directly to the
+    /// decode-ready set. Its last emitted token is already represented in the
+    /// migration envelope, so no synthetic prefill event is emitted.
+    fn activate_restored(
+        &mut self,
+        pending: PendingPrefill,
+        at: Timestamp,
+    ) -> Result<(), ExecutorError> {
+        let PendingPrefill {
+            request_id,
+            model_id,
+            model,
+            session,
+            max_new_tokens,
+            reserved_kv_bytes,
+            ..
+        } = pending;
+        let resumed = self.resumed.remove(&request_id).ok_or_else(|| {
+            ExecutorError::Runtime(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "restore migrated session",
+            })
+        })?;
+        let last_token = resumed.generated.last().copied().ok_or_else(|| {
+            ExecutorError::Runtime(RuntimeError::InvalidTransition {
+                request: request_id,
+                operation: "restore migrated session without generated token",
+            })
+        })?;
+        self.active.insert(
+            request_id,
+            ActiveGeneration {
+                request_id,
+                model_id,
+                model,
+                session,
+                prompt_tokens: resumed.prompt.len(),
+                prompt: resumed.prompt,
+                generated: resumed.generated,
+                token_times: resumed.token_times,
+                last_token: GeneratedToken {
+                    id: last_token,
+                    is_end_of_sequence: false,
+                },
+                max_new_tokens,
+                last_step_at: at,
+                reserved_kv_bytes,
+            },
+        );
+        self.ready.push_back(request_id);
+        self.refresh_kv_memory();
+        Ok(())
     }
 
     /// Executes one planned decode invocation. A declared tensor hook that
