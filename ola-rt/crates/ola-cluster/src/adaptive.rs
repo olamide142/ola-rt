@@ -161,7 +161,7 @@ mod tests {
     use ola_core::{ModelId, Priority, Timestamp, WorkerId};
 
     use super::*;
-    use crate::{PendingRequest, WorkerHealth, WorkerSummary, WorkerView};
+    use crate::{PendingRequest, WorkerHealth, WorkerRole, WorkerSummary, WorkerView};
 
     fn worker(id: &str, queued: usize) -> (WorkerId, WorkerView) {
         let model = ModelId::from("tiny");
@@ -173,6 +173,7 @@ mod tests {
                     generation: 0,
                     reported_at: Timestamp::ZERO,
                     health: WorkerHealth::Ready,
+                    role: WorkerRole::Mixed,
                     models: BTreeSet::from([model]),
                     max_active_requests: 2,
                     queued_requests: queued,

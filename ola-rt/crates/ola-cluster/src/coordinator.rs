@@ -750,7 +750,7 @@ impl Coordinator {
             .workers
             .get_mut(&target)
             .ok_or_else(|| CoordinatorError::UnknownWorker(target.clone()))?;
-        if !worker.summary.accepts(&entry.spec.model) {
+        if !worker.summary.accepts_migrated(&entry.spec.model) {
             return Err(CoordinatorError::UnexpectedMessage {
                 from: target,
                 request,
@@ -1156,7 +1156,16 @@ impl Coordinator {
                 // the normal client stream has no terminal event yet.
                 return Ok(output);
             }
-            WorkerMessage::PolicyUpdated { .. } | WorkerMessage::RoleUpdated { .. } => {
+            WorkerMessage::PolicyUpdated { .. } => {
+                return Ok(output);
+            }
+            WorkerMessage::RoleUpdated { role } => {
+                let entry = self
+                    .workers
+                    .get_mut(from)
+                    .ok_or_else(|| CoordinatorError::UnknownWorker(from.clone()))?;
+                entry.summary.role = role;
+                self.generation = self.generation.saturating_add(1);
                 return Ok(output);
             }
         };

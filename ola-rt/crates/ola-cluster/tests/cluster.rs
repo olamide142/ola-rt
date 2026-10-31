@@ -184,6 +184,27 @@ fn worker_roles_gate_new_and_migrated_admissions() {
         refused.as_slice(),
         [WorkerMessage::Refused { .. }]
     ));
+    let accepted_migration = host
+        .handle(
+            WorkerCommand::AdmitMigrated {
+                request: ClusterRequestId::new(3),
+                state: MigratedRequest {
+                    spec: spec(4, 3, None),
+                    prompt_tokens: vec![1, 2, 3, 4],
+                    generated_tokens: Vec::new(),
+                    token_times: Vec::new(),
+                    preemptions: 0,
+                    session_state: None,
+                },
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted_migration.as_slice(),
+        [WorkerMessage::Accepted { .. }]
+    ));
     host.set_role(WorkerRole::Prefill);
     let refused_migration = host
         .handle(

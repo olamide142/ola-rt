@@ -125,6 +125,13 @@ impl WorkerSummary {
             && self.models.contains(model)
     }
 
+    /// Whether the worker can receive an already-running session.
+    pub fn accepts_migrated(&self, model: &ModelId) -> bool {
+        self.health == WorkerHealth::Ready
+            && self.role != WorkerRole::Prefill
+            && self.models.contains(model)
+    }
+
     /// KV tokens `model`'s pool could still give out, counting evictable
     /// prefix-cache blocks as free and queued requests at their worst case;
     /// `None` when the model reports no pool.
