@@ -9,9 +9,11 @@ mod placement;
 mod plan;
 mod policy;
 mod routing;
+mod routing_optimizer;
 mod session;
 mod snapshot;
 mod summary;
+mod transfer;
 mod worker;
 
 pub use adaptive::{AdaptiveClusterPolicy, ClusterWeights};
@@ -34,7 +36,12 @@ pub use routing::{
     KvHeadroomRouting, LeastLoadedRouting, PowerOfTwoRouting, PrefixAffinityRouting,
     RoundRobinRouting,
 };
+pub use routing_optimizer::{
+    RoutingOptimizationError, RoutingRequest, RoutingSolution, RoutingWorker,
+    optimize_batch_routing,
+};
 pub use session::{WorkerSession, WorkerSessionError};
 pub use snapshot::{ClusterSnapshot, PendingRequest, WorkerView, token_demand};
 pub use summary::{WorkerHealth, WorkerSummary};
+pub use transfer::{HandoffCostModel, SessionHandoffMode, choose_handoff, session_state_bytes};
 pub use worker::WorkerHost;

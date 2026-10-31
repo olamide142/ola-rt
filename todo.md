@@ -305,13 +305,17 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
   Llama and Mistral now export and import versioned recompute-safe session
   snapshots through the runtime migration path; raw architecture-specific KV
-  producers/consumers and disaggregation remain.
+  producers/consumers and disaggregation remain. `ola-cluster` now exposes a
+  calibrated, deterministic transfer-vs-recompute selector for the handoff
+  controller.
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive
   load/KV routing policy, a microlp-backed model placement optimizer, and
   heartbeat link calibration are present; validated routing-weight pushes are
-  now carried over worker control links, while batch-level routing adaptation
-  remains.
+  now carried over worker control links. A microlp-backed batch assignment
+  optimizer now enforces worker request and KV capacities; integrating its
+  result into the live coordinator policy and held-out adaptive evaluation
+  remain.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

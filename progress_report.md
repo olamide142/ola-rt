@@ -11,6 +11,12 @@ token. Burn Llama and Mistral both have versioned session export/import tests.
 The remaining D3/D4 gaps are coordinator-managed two-phase ownership handoff,
 raw KV-byte transfer/disaggregation, and simulator failure injection.
 
+The cluster crate now also exposes calibrated transfer-vs-recompute selection
+and an exact small-batch MILP router with request/KV capacity constraints;
+both have deterministic feasibility and objective tests. The live coordinator
+still uses the established routing policies until batch-level adaptive
+evaluation is integrated.
+
 **2026-10-30 distributed continuation:** The TCP worker session now uses a
 dedicated frame reader so cancellation-safe heartbeats and payloads cannot
 corrupt length-prefixed reads; loopback handshake, lease refresh, command
