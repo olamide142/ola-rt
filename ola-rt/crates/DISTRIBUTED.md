@@ -1,6 +1,6 @@
 # Distributed execution design
 
-Status: **implemented through the D5 foundation; final D3–D5 integration gaps
+Status: **implemented through the D5 foundation; final D4–D5 integration gaps
 remain** (2026-10-31). Covers `todo.md` P9, which replaces the
 "multi-GPU placement", "distributed request routing", "distributed KV-cache
 management", and "tensor and pipeline parallelism" bullets under later work.
@@ -172,7 +172,10 @@ Three control loops, as in `notes/fomalism.md` §4:
      drop/partition model. Used by `ola-bench`.
    - `TcpTransport`: tokio, length-prefixed frames. Control messages are
      serde JSON (debuggable, matches existing reports); KV payloads travel as
-     separate binary frames that a JSON header references. No gRPC/tonic
+     separate binary frames that a JSON header references. `ola-cluster`
+     provides a typed `SessionState` adapter for those frames, validating the
+     media type and protocol version before a backend imports the opaque
+     payload. No gRPC/tonic
      dependency until a reason appears.
    Every message carries a protocol version, sender epoch, and correlation
    ID. The gateway logs messages to JSON Lines so a live run can be replayed

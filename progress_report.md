@@ -32,6 +32,13 @@ now applies the batch assignment refinement transactionally with baseline
 fallback, and the registered cluster study includes it as a comparison
 variant; held-out improvement measurement remains.
 
+`ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
+the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries
+format/cursor metadata separately from opaque architecture bytes and rejects
+wrong media types or protocol versions before import. This closes the generic
+binary session-frame hook; backend-specific raw KV producers/consumers and
+explicit prefill/decode worker roles remain D4 work.
+
 **2026-10-30 distributed continuation:** The TCP worker session now uses a
 dedicated frame reader so cancellation-safe heartbeats and payloads cannot
 corrupt length-prefixed reads; loopback handshake, lease refresh, command

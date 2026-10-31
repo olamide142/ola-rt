@@ -308,10 +308,11 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
 - [~] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
   Llama and Mistral now export and import versioned recompute-safe session
-  snapshots through the runtime migration path; raw architecture-specific KV
-  producers/consumers and disaggregation remain. `ola-cluster` now exposes a
-  calibrated, deterministic transfer-vs-recompute selector for the handoff
-  controller.
+  snapshots through the runtime migration path; `ola-cluster` now adapts those
+  snapshots to validated versioned `ola-net::BinaryFrame` data-plane frames,
+  with raw architecture-specific KV producers/consumers and prefill/decode
+  worker roles still remaining. It also exposes a calibrated, deterministic
+  transfer-vs-recompute selector for the handoff controller.
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive
   load/KV routing policy, a microlp-backed model placement optimizer, and

@@ -1,6 +1,87 @@
 //! Session handoff cost selection for migration and disaggregation.
 
+use std::{error::Error, fmt};
+
 use ola_model::SessionState;
+use ola_net::{BinaryFrame, PROTOCOL_VERSION};
+use serde::{Deserialize, Serialize};
+
+/// Media type used for architecture-owned session/KV frames.
+pub const SESSION_STATE_CONTENT_TYPE: &str = "application/vnd.ola.session-state";
+
+#[derive(Deserialize, Serialize)]
+struct SessionFrameMetadata {
+    format: String,
+    cursor: usize,
+}
+
+/// Failure while converting a binary session frame into a model session.
+#[derive(Debug)]
+pub enum SessionFrameError {
+    /// The frame is not an OlaRT session frame.
+    UnexpectedContentType(String),
+    /// The frame uses a protocol version this adapter cannot interpret.
+    UnsupportedVersion(u16),
+    /// The session metadata is malformed.
+    InvalidMetadata(serde_json::Error),
+}
+
+impl fmt::Display for SessionFrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedContentType(content_type) => {
+                write!(
+                    formatter,
+                    "unexpected session frame content type `{content_type}`"
+                )
+            }
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported session frame version {version}")
+            }
+            Self::InvalidMetadata(error) => write!(formatter, "invalid session metadata: {error}"),
+        }
+    }
+}
+
+impl Error for SessionFrameError {}
+
+/// Encodes a model-owned session snapshot as a binary data-plane frame.
+pub fn session_state_to_frame(
+    state: &SessionState,
+    sender_epoch: u64,
+    correlation: u64,
+) -> Result<BinaryFrame, serde_json::Error> {
+    Ok(BinaryFrame {
+        version: PROTOCOL_VERSION,
+        sender_epoch,
+        correlation,
+        content_type: SESSION_STATE_CONTENT_TYPE.into(),
+        metadata: serde_json::to_vec(&SessionFrameMetadata {
+            format: state.format.clone(),
+            cursor: state.cursor,
+        })?,
+        data: state.payload.clone(),
+    })
+}
+
+/// Decodes and validates a binary data-plane session frame.
+pub fn session_state_from_frame(frame: &BinaryFrame) -> Result<SessionState, SessionFrameError> {
+    if frame.version != PROTOCOL_VERSION {
+        return Err(SessionFrameError::UnsupportedVersion(frame.version));
+    }
+    if frame.content_type != SESSION_STATE_CONTENT_TYPE {
+        return Err(SessionFrameError::UnexpectedContentType(
+            frame.content_type.clone(),
+        ));
+    }
+    let metadata = serde_json::from_slice::<SessionFrameMetadata>(&frame.metadata)
+        .map_err(SessionFrameError::InvalidMetadata)?;
+    Ok(SessionState {
+        format: metadata.format,
+        cursor: metadata.cursor,
+        payload: frame.data.clone(),
+    })
+}
 
 /// The two supported ways to resume a request on another worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +147,32 @@ mod tests {
             cursor: 8,
             payload: vec![0; bytes],
         }
+    }
+
+    #[test]
+    fn session_state_round_trips_through_binary_frame() {
+        let original = state(128);
+        let frame = session_state_to_frame(&original, 7, 11).unwrap();
+        assert_eq!(frame.sender_epoch, 7);
+        assert_eq!(frame.correlation, 11);
+        assert_eq!(session_state_from_frame(&frame).unwrap(), original);
+    }
+
+    #[test]
+    fn session_state_frame_rejects_wrong_media_and_version() {
+        let original = state(4);
+        let mut frame = session_state_to_frame(&original, 0, 0).unwrap();
+        frame.content_type = "application/octet-stream".into();
+        assert!(matches!(
+            session_state_from_frame(&frame),
+            Err(SessionFrameError::UnexpectedContentType(_))
+        ));
+        frame.content_type = SESSION_STATE_CONTENT_TYPE.into();
+        frame.version = PROTOCOL_VERSION + 1;
+        assert!(matches!(
+            session_state_from_frame(&frame),
+            Err(SessionFrameError::UnsupportedVersion(_))
+        ));
     }
 
     #[test]

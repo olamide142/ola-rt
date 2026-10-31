@@ -12,6 +12,7 @@ ola-model.workspace = true
 ola-runtime.workspace = true
 ola-net.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
