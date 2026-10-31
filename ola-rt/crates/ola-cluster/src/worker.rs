@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use ola_core::{ClusterRequestId, RequestId, Timestamp, WorkerId};
+use ola_core::{ClusterRequestId, ModelId, RequestId, Timestamp, WorkerId};
+use ola_model::IncrementalDecoder;
 use ola_runtime::{
     Executor, ExecutorError, ExecutorEvent, ExecutorIteration, MigratedRequest, RequestStatus,
 };
@@ -24,6 +25,9 @@ pub struct WorkerHost {
     admitted: u64,
     by_local: BTreeMap<RequestId, ClusterRequestId>,
     by_cluster: BTreeMap<ClusterRequestId, RequestId>,
+    /// Per owned request: its model and the decoder turning its tokens into
+    /// streamed text.
+    decoders: BTreeMap<RequestId, (ModelId, IncrementalDecoder)>,
     pending_migrations: BTreeMap<ClusterRequestId, MigratedRequest>,
     policy_weights: ClusterWeights,
     role: WorkerRole,
@@ -39,6 +43,7 @@ impl WorkerHost {
             admitted: 0,
             by_local: BTreeMap::new(),
             by_cluster: BTreeMap::new(),
+            decoders: BTreeMap::new(),
             pending_migrations: BTreeMap::new(),
             policy_weights: ClusterWeights::default(),
             role: WorkerRole::Mixed,
@@ -148,10 +153,10 @@ impl WorkerHost {
                 // Recovery can hand a request back to a worker that still runs
                 // an older copy; only the new admission may stream.
                 self.drop_stale_copy(request, at)?;
+                let (model, generated) = (spec.model.clone(), Vec::new());
                 Ok(vec![match self.executor.submit(spec, arrival_at) {
                     Ok(local) => {
-                        self.by_local.insert(local, request);
-                        self.by_cluster.insert(request, local);
+                        self.track(local, request, model, &generated);
                         WorkerMessage::Accepted { request, local }
                     }
                     Err(error) => WorkerMessage::Refused {
@@ -214,14 +219,14 @@ impl WorkerHost {
                     }]);
                 }
                 self.drop_stale_copy(request, at)?;
+                let (model, generated) = (state.spec.model.clone(), state.generated_tokens.clone());
                 // An import the executor cannot take is a refusal the
                 // coordinator rolls back, not a reason to end the session.
                 Ok(vec![
                     match self.executor.import_request(state, arrival_at) {
                         Ok(local) => {
                             self.admitted += 1;
-                            self.by_local.insert(local, request);
-                            self.by_cluster.insert(request, local);
+                            self.track(local, request, model, &generated);
                             WorkerMessage::Accepted { request, local }
                         }
                         Err(error) => WorkerMessage::Refused {
@@ -239,10 +244,10 @@ impl WorkerHost {
                 let Some(state) = self.pending_migrations.remove(&request) else {
                     return Ok(Vec::new());
                 };
+                let (model, generated) = (state.spec.model.clone(), state.generated_tokens.clone());
                 Ok(vec![match self.executor.import_request(state, at) {
                     Ok(local) => {
-                        self.by_local.insert(local, request);
-                        self.by_cluster.insert(request, local);
+                        self.track(local, request, model, &generated);
                         WorkerMessage::Accepted { request, local }
                     }
                     Err(error) => WorkerMessage::Failed {
@@ -306,9 +311,11 @@ impl WorkerHost {
                     let Some(&request) = self.by_local.get(request_id) else {
                         continue;
                     };
+                    let text = self.decode(*request_id, token.id, *finished);
                     messages.push(WorkerMessage::Token {
                         request,
                         token_id: token.id,
+                        text,
                         generated_tokens: *generated_tokens,
                         phase: *phase,
                         at: *at,
@@ -321,6 +328,7 @@ impl WorkerHost {
                                 request,
                                 token_ids: result.token_ids,
                                 text: result.text,
+                                prompt_tokens: result.metrics.prompt_tokens,
                             },
                             None => WorkerMessage::Failed {
                                 request,
@@ -377,7 +385,44 @@ impl WorkerHost {
         Ok(())
     }
 
+    /// Records a newly owned request. `generated` are tokens it already
+    /// streamed elsewhere, so its text deltas continue where they left off.
+    fn track(
+        &mut self,
+        local: RequestId,
+        request: ClusterRequestId,
+        model: ModelId,
+        generated: &[u32],
+    ) {
+        let mut decoder = IncrementalDecoder::new();
+        if let Some(tokenizer) = self.executor.model(&model).map(|model| model.tokenizer()) {
+            for &token in generated {
+                let _ = decoder.push(tokenizer, token);
+            }
+        }
+        self.decoders.insert(local, (model, decoder));
+        self.by_local.insert(local, request);
+        self.by_cluster.insert(request, local);
+    }
+
+    /// The text `token` completes. Decoding is best effort: an error leaves
+    /// this delta empty, and the final result still carries the full text.
+    fn decode(&mut self, local: RequestId, token: u32, finished: bool) -> String {
+        let Some((model, decoder)) = self.decoders.get_mut(&local) else {
+            return String::new();
+        };
+        let Some(tokenizer) = self.executor.model(model).map(|model| model.tokenizer()) else {
+            return String::new();
+        };
+        let mut text = decoder.push(tokenizer, token).unwrap_or_default();
+        if finished {
+            text.push_str(&decoder.finish(tokenizer).unwrap_or_default());
+        }
+        text
+    }
+
     fn unmap(&mut self, local: RequestId) -> Option<ClusterRequestId> {
+        self.decoders.remove(&local);
         let request = self.by_local.remove(&local)?;
         self.by_cluster.remove(&request);
         Some(request)

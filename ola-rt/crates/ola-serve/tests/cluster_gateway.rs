@@ -291,3 +291,83 @@ async fn an_abandoned_request_frees_its_worker_and_health_stays_responsive() {
     );
     task.abort();
 }
+
+/// The `data:` payloads of an SSE body.
+async fn sse_data(response: Response) -> Vec<String> {
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: ").map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn streamed_completions_carry_text_deltas_and_usage() {
+    let (address, task) = spawn_worker(worker(), Duration::from_millis(5)).await;
+    let gateway = ClusterGateway::connect([(address, None)]).await.unwrap();
+    let app = gateway.router();
+    let completion = |stream: bool| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"synthetic","prompt":[0,2,3,4],"max_tokens":4,"stream":{stream}}}"#
+            )))
+            .unwrap()
+    };
+
+    let whole = json_response(app.clone().oneshot(completion(false)).await.unwrap()).await;
+    assert_eq!(whole["usage"]["prompt_tokens"].as_u64(), Some(4));
+    assert_eq!(whole["usage"]["completion_tokens"].as_u64(), Some(4));
+    assert_eq!(whole["usage"]["total_tokens"].as_u64(), Some(8));
+    assert_eq!(whole["choices"][0]["finish_reason"], "length");
+
+    let data = sse_data(app.oneshot(completion(true)).await.unwrap()).await;
+    assert_eq!(data.last().map(String::as_str), Some("[DONE]"));
+    let chunks = data[..data.len() - 1]
+        .iter()
+        .map(|chunk| serde_json::from_str::<serde_json::Value>(chunk).unwrap())
+        .collect::<Vec<_>>();
+    // Several text chunks, then one final chunk with the finish reason.
+    assert!(chunks.len() > 2, "{chunks:?}");
+    let streamed = chunks
+        .iter()
+        .map(|chunk| chunk["choices"][0]["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(streamed, whole["choices"][0]["text"].as_str().unwrap());
+    let last = chunks.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "length");
+    assert_eq!(last["usage"]["prompt_tokens"].as_u64(), Some(4));
+    task.abort();
+}
+
+#[tokio::test]
+async fn streamed_generation_tokens_carry_text() {
+    let (address, task) = spawn_worker(worker(), Duration::from_millis(5)).await;
+    let gateway = ClusterGateway::connect([(address, None)]).await.unwrap();
+    let app = gateway.router();
+    let response = app
+        .oneshot(generate(
+            r#"{"model":"synthetic","tokens":[0,2,3,4],"max_new_tokens":3,"stream":true}"#,
+        ))
+        .await
+        .unwrap();
+    let events = sse_data(response)
+        .await
+        .into_iter()
+        .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+        .collect::<Vec<_>>();
+    let (done, tokens) = events.split_last().unwrap();
+    let streamed = tokens
+        .iter()
+        .map(|token| token["text"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(streamed, done["text"].as_str().unwrap());
+    task.abort();
+}

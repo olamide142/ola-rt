@@ -377,11 +377,19 @@ struct ErrorBody {
 #[serde(deny_unknown_fields)]
 struct CompletionBody {
     model: String,
-    prompt: String,
+    prompt: CompletionPrompt,
     #[serde(default = "default_completion_tokens")]
     max_tokens: usize,
     #[serde(default)]
     stream: bool,
+}
+
+/// One prompt, as text or token IDs.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionPrompt {
+    Text(String),
+    Tokens(Vec<u32>),
 }
 
 const fn default_completion_tokens() -> usize {
@@ -403,6 +411,23 @@ struct CompletionChoice {
     text: String,
     index: u8,
     finish_reason: &'static str,
+}
+
+/// `length` when generation stopped at the token limit, else `stop`.
+const fn finish_reason(completion_tokens: usize, max_tokens: usize) -> &'static str {
+    if completion_tokens >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    }
+}
+
+const fn usage(prompt_tokens: usize, completion_tokens: usize) -> CompletionUsage {
+    CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -475,16 +500,20 @@ async fn generate(
             let output = match event {
                 ClientEvent::Token {
                     token_id,
+                    text,
                     generated_tokens,
                     ..
                 } => Event::default()
                     .event("token")
                     .json_data(serde_json::json!({
                         "token_id": token_id,
+                        "text": text,
                         "generated_tokens": generated_tokens,
                     }))
                     .expect("token events serialize"),
-                ClientEvent::Finished { token_ids, text } => Event::default()
+                ClientEvent::Finished {
+                    token_ids, text, ..
+                } => Event::default()
                     .event("done")
                     .json_data(GenerateResponse {
                         id: request.get(),
@@ -507,7 +536,9 @@ async fn generate(
     loop {
         match events.recv().await {
             Some(ClientEvent::Token { .. }) => {}
-            Some(ClientEvent::Finished { token_ids, text }) => {
+            Some(ClientEvent::Finished {
+                token_ids, text, ..
+            }) => {
                 return Ok(Json(GenerateResponse {
                     id: request.get(),
                     text,
@@ -547,9 +578,9 @@ async fn cancel(
     }
 }
 
-/// OpenAI-style text completion. Streaming sends the whole completion as
-/// one chunk at the end: workers stream token IDs, and the gateway has no
-/// tokenizer to turn each into text.
+/// OpenAI-style text completion. Streaming sends one chunk per non-empty
+/// text delta (workers decode their tokens), then a final chunk with
+/// `finish_reason` and `usage`, then `[DONE]`.
 async fn completions(
     State(gateway): State<ClusterGateway>,
     body: Result<Json<CompletionBody>, JsonRejection>,
@@ -564,7 +595,10 @@ async fn completions(
     } = body;
     let spec = RequestSpec {
         model: model.clone().into(),
-        inputs: vec![Input::Text(prompt)],
+        inputs: vec![match prompt {
+            CompletionPrompt::Text(text) => Input::Text(text),
+            CompletionPrompt::Tokens(tokens) => Input::Tokens(tokens),
+        }],
         generation: GenerationConfig {
             max_new_tokens: max_tokens,
             temperature: 0.0,
@@ -581,26 +615,44 @@ async fn completions(
     } = submit(&gateway, spec).await?;
     let id = format!("cmpl-{}", request.get());
     if stream_response {
-        let events = stream::unfold(Some((events, id, model, false)), |state| async move {
+        let events = stream::unfold(Some((events, id, model, false)), move |state| async move {
             let (mut events, id, model, done) = state?;
             if done {
                 return Some((Ok::<_, Infallible>(Event::default().data("[DONE]")), None));
             }
+            let chunk =
+                |text: &str, finish_reason: Option<&str>, usage: Option<CompletionUsage>| {
+                    let mut chunk = serde_json::json!({
+                        "id": id,
+                        "object": "text_completion",
+                        "created": 0,
+                        "model": model,
+                        "choices": [{"text": text, "index": 0, "finish_reason": finish_reason}],
+                    });
+                    if let Some(usage) = usage {
+                        chunk["usage"] = serde_json::to_value(usage).expect("usage serializes");
+                    }
+                    Event::default().data(chunk.to_string())
+                };
             loop {
                 match events.recv().await? {
+                    // One chunk per non-empty text delta.
+                    ClientEvent::Token { text, .. } if !text.is_empty() => {
+                        let event = chunk(&text, None, None);
+                        return Some((Ok(event), Some((events, id, model, false))));
+                    }
                     ClientEvent::Token { .. } => {}
-                    ClientEvent::Finished { text, .. } => {
-                        let chunk = serde_json::json!({
-                            "id": id,
-                            "object": "text_completion",
-                            "created": 0,
-                            "model": model,
-                            "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
-                        });
-                        return Some((
-                            Ok(Event::default().data(chunk.to_string())),
-                            Some((events, id, model, true)),
-                        ));
+                    ClientEvent::Finished {
+                        token_ids,
+                        prompt_tokens,
+                        ..
+                    } => {
+                        let event = chunk(
+                            "",
+                            Some(finish_reason(token_ids.len(), max_tokens)),
+                            Some(usage(prompt_tokens, token_ids.len())),
+                        );
+                        return Some((Ok(event), Some((events, id, model, true))));
                     }
                     ClientEvent::Failed { message } => {
                         let error = serde_json::json!({"error": message});
@@ -617,8 +669,11 @@ async fn completions(
     loop {
         match events.recv().await {
             Some(ClientEvent::Token { .. }) => {}
-            Some(ClientEvent::Finished { token_ids, text }) => {
-                let completion_tokens = token_ids.len();
+            Some(ClientEvent::Finished {
+                token_ids,
+                text,
+                prompt_tokens,
+            }) => {
                 return Ok(Json(CompletionResponse {
                     id,
                     object: "text_completion",
@@ -627,15 +682,9 @@ async fn completions(
                     choices: vec![CompletionChoice {
                         text,
                         index: 0,
-                        finish_reason: "stop",
+                        finish_reason: finish_reason(token_ids.len(), max_tokens),
                     }],
-                    // Prompt tokens are counted on the worker, which does
-                    // not report them yet.
-                    usage: CompletionUsage {
-                        prompt_tokens: 0,
-                        completion_tokens,
-                        total_tokens: completion_tokens,
-                    },
+                    usage: usage(prompt_tokens, token_ids.len()),
                 })
                 .into_response());
             }

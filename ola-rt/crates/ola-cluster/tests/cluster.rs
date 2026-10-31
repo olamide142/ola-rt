@@ -861,6 +861,7 @@ fn coordinator_rejects_reports_from_non_owners_and_handles_refusals() {
                     request: id,
                     token_ids: Vec::new(),
                     text: String::new(),
+                    prompt_tokens: 0,
                 },
                 at(1),
             )
@@ -1015,6 +1016,7 @@ fn token(request: ClusterRequestId, generated_tokens: usize) -> WorkerMessage {
     WorkerMessage::Token {
         request,
         token_id: 7,
+        text: String::new(),
         generated_tokens,
         phase: ola_runtime::ExecutionPhase::Decode,
         at: at(1),
@@ -1106,6 +1108,7 @@ fn recovered_requests_do_not_replay_tokens_and_stale_copies_are_cancelled() {
                 request: id,
                 token_ids: vec![7; 3],
                 text: String::new(),
+                prompt_tokens: 0,
             },
             at(4),
         )
@@ -1205,4 +1208,39 @@ fn losing_a_migration_target_rolls_the_request_back_to_its_source() {
         [(source, WorkerCommand::AbortMigration { request: id })]
     );
     assert!(coordinator.staged_migration(id).is_none());
+}
+
+#[test]
+fn imported_requests_continue_their_text_stream() {
+    let mut host = WorkerHost::new("target", executor());
+    let request = ClusterRequestId::new(4);
+    let accepted = host
+        .handle(
+            WorkerCommand::AdmitMigrated {
+                request,
+                state: migrated(spec(4, 3, None)),
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        accepted.as_slice(),
+        [WorkerMessage::Accepted { .. }]
+    ));
+    let mut deltas = Vec::new();
+    let mut finished = None;
+    while finished.is_none() {
+        let (_, messages) = host.step(at(1)).unwrap().unwrap();
+        for message in messages {
+            match message {
+                WorkerMessage::Token { text, .. } => deltas.push(text),
+                WorkerMessage::Finished { text, .. } => finished = Some(text),
+                _ => {}
+            }
+        }
+    }
+    // The source already streamed "7"; the new owner picks up after it.
+    assert!(deltas[0].starts_with(' '), "{deltas:?}");
+    assert_eq!(format!("7{}", deltas.concat()), finished.unwrap());
 }

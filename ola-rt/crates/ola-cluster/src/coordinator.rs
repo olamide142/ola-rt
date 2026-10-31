@@ -103,6 +103,11 @@ pub enum WorkerMessage {
         request: ClusterRequestId,
         /// Selected token.
         token_id: u32,
+        /// Text this token completes, decoded on the worker; may be empty
+        /// while a multi-token character is incomplete. Concatenated deltas
+        /// equal the final text.
+        #[serde(default)]
+        text: String,
         /// Output tokens produced so far, including this one.
         generated_tokens: usize,
         /// Model phase that produced it.
@@ -118,6 +123,9 @@ pub enum WorkerMessage {
         token_ids: Vec<u32>,
         /// Tokenizer decoding of `token_ids`.
         text: String,
+        /// Prompt tokens the worker's model accepted.
+        #[serde(default)]
+        prompt_tokens: usize,
     },
     /// The request failed on the worker.
     Failed {
@@ -177,6 +185,8 @@ pub enum ClientEvent {
     Token {
         /// Selected token.
         token_id: u32,
+        /// Text this token completes; see [`WorkerMessage::Token`].
+        text: String,
         /// Output tokens produced so far, including this one.
         generated_tokens: usize,
         /// Model phase that produced it.
@@ -190,6 +200,8 @@ pub enum ClientEvent {
         token_ids: Vec<u32>,
         /// Tokenizer decoding of `token_ids`.
         text: String,
+        /// Prompt tokens the worker's model accepted.
+        prompt_tokens: usize,
     },
     /// The request failed.
     Failed {
@@ -1187,6 +1199,7 @@ impl Coordinator {
             WorkerMessage::Token {
                 request,
                 token_id,
+                text,
                 generated_tokens,
                 phase,
                 at: token_at,
@@ -1201,6 +1214,7 @@ impl Coordinator {
                     request,
                     ClientEvent::Token {
                         token_id,
+                        text,
                         generated_tokens,
                         phase,
                         at: token_at,
@@ -1212,6 +1226,7 @@ impl Coordinator {
                 request,
                 token_ids,
                 text,
+                prompt_tokens,
             } => {
                 let entry = self.owned(from, request, true)?;
                 entry.status = ClusterRequestStatus::Completed;
@@ -1224,9 +1239,14 @@ impl Coordinator {
                         tokens: token_ids.len(),
                     },
                 );
-                output
-                    .client
-                    .push((request, ClientEvent::Finished { token_ids, text }));
+                output.client.push((
+                    request,
+                    ClientEvent::Finished {
+                        token_ids,
+                        text,
+                        prompt_tokens,
+                    },
+                ));
                 request
             }
             WorkerMessage::Failed { request, message } => {
