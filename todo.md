@@ -296,6 +296,13 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   `ola serve --role gateway --worker HOST:PORT` plus
   `ola serve --role worker` are implemented; native and OpenAI gateway
   routes are covered, while deeper request-level backend unification remains.
+  The gateway is now a driver task that reads every worker continuously,
+  renews leases, recovers lost or disconnected workers, replans deferred
+  requests, and cancels requests whose clients disconnect; coordinator links
+  read frames on their own tasks, so an abandoned read cannot corrupt a
+  link. Remaining: KV payloads still travel as JSON inside control frames
+  (binary frames are not wired in), so transferable sessions are capped near
+  1.5 MB.
 - [~] D3: `export_request`/`import_request`, recompute migration, drain, and
   lease-expiry recovery with failure injection. Runtime and worker protocol
   hooks plus coordinator requeue recovery are implemented; supported session
@@ -330,6 +337,8 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   remains. Adaptive routing now also accepts calibrated per-worker network
   costs and records them in route candidates; the virtual network model now
   injects its latency/bandwidth-derived cost into every coordinator snapshot.
+  `AdaptiveClusterPolicy.observe` does not yet learn online, and pushed
+  weights are recorded but not used by worker execution policies.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

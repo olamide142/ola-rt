@@ -1,7 +1,9 @@
 # Distributed execution design
 
-Status: **implemented through the D5 foundation; automatic role scheduling
-remains** (2026-10-31). Covers `todo.md` P9, which replaces the
+Status: **D0–D1 done; D2–D5 partly implemented** (2026-10-31). What runs
+today, and how it departs from this design, is in
+[Implementation status](#implementation-status) at the end; `todo.md` P9
+tracks what remains. Covers `todo.md` P9, which replaces the
 "multi-GPU placement", "distributed request routing", "distributed KV-cache
 management", and "tensor and pipeline parallelism" bullets under later work.
 
@@ -86,9 +88,10 @@ Three control loops, as in `notes/fomalism.md` §4:
      `Coordinator` state machine. It consumes messages and returns messages
      and actions; it never opens a socket or reads a clock. Depends on
      `ola-core`, `ola-runtime`, `ola-kernel`; no tokio.
-   - `ola-net`: the network layer. Versioned `WireMessage`, a `Transport`
-     trait, and three transports (below). Depends on `ola-cluster` types,
-     serde, and tokio `net`.
+   - `ola-net`: the network layer. Versioned `WireMessage` framing and a TCP
+     peer. It depends only on `ola-core`, serde, and tokio; `ola-cluster`
+     depends on it, not the other way round, so cluster messages travel as
+     opaque JSON payloads.
 
    `ola-serve` gains `worker` and `gateway` roles; `ola-cli` exposes them.
    Keeping the coordinator sans-IO means the simulator, tests, and the live
@@ -165,7 +168,8 @@ Three control loops, as in `notes/fomalism.md` §4:
    RNG state with token batches so the checkpoint is never more than one
    batch old.
 
-9. **Transports.**
+9. **Transports.** *(As built there is no `Transport` trait, and the gateway
+   does not log messages; see [Implementation status](#implementation-status).)*
    - `InProcTransport`: channels, deterministic order. Unit tests and
      single-process multi-executor runs.
    - `SimTransport`: virtual time with a per-link latency, bandwidth, and
@@ -299,3 +303,116 @@ multiple processes; a second machine is only needed to measure real links.
   TLS and real authentication come later.
 - **Elastic autoscaling** of machines, as opposed to placement over a fixed
   worker set.
+
+## Implementation status
+
+This section describes the code as of 2026-10-31. Where it and the design
+above disagree, this is what runs.
+
+### Crates and transports
+
+| Piece | Where | Notes |
+| --- | --- | --- |
+| Sans-IO coordinator, plans, routing baselines | `ola-cluster` `Coordinator`, `routing.rs`, `plan.rs` | As designed. |
+| In-process cluster | `ola-cluster` `LocalCluster` | Synchronous, worker-ID order; the in-process transport. |
+| Virtual-time cluster | `ola-bench` `cluster_simulation.rs` | Latency/bandwidth link model and worker-failure injection. |
+| Wire framing | `ola-net` | Length-prefixed JSON `WireMessage`s and separate `BinaryFrame`s. |
+| TCP worker | `ola-cluster` `WorkerSession` wrapping a `WorkerHost` | |
+| TCP coordinator | `ola-cluster` `TcpCoordinator` over `CoordinatorWorkerLink`s | |
+| Gateway | `ola-serve` `cluster::ClusterGateway` | `ola serve --role gateway --worker HOST:PORT ...` |
+| Worker process | `ola-serve` `cluster::serve_worker` | `ola serve --role worker` |
+
+There is no `Transport` trait: `LocalCluster`, the simulator, and the TCP
+pair each deliver the same `WorkerCommand`/`WorkerMessage` vocabulary their
+own way.
+
+### Networked runtime
+
+**Worker.** A `WorkerSession` reads frames on a dedicated task and runs a
+loop that, in priority order, applies coordinator commands, sends a
+heartbeat plus a load summary every heartbeat interval (100 ms from the
+CLI), and otherwise runs executor iterations back to back while there is
+work. Iterations are synchronous and run on the session's task. A command
+the executor cannot apply (an import it rejects, an aborted migration it
+cannot restore) becomes a `Refused` or `Failed` reply rather than ending
+the session. The CLI uses the process start time as the worker epoch, so a
+restart replaces the old lease and late heartbeats from the old process are
+ignored.
+
+**Coordinator links.** Each `CoordinatorWorkerLink` owns its socket's write
+half; a task owns the read half and forwards frames into one channel shared
+by every link. `TcpCoordinator::next_frame` waits on that channel and is
+cancel-safe; `apply_frame` acknowledges heartbeats, applies messages,
+dispatches any commands they produce, and treats a failed link as a lost
+worker. `poll`, `receive`, and `migrate` keep the output of every frame they
+apply, whichever worker sent it.
+
+**Gateway.** A single driver task owns the `TcpCoordinator` and handles, one
+at a time: HTTP commands (submit, cancel, health) arriving over a channel,
+worker frames, and a supervision tick (default 50 ms) that expires leases
+older than 2 s, recovers their requests, and replans requests deferred while
+no worker was ready. Each submission gets its own event channel; when a
+client goes away, its request is cancelled on the worker at the next event.
+No lock is held across network I/O.
+
+### Recovery
+
+A worker is lost when its lease expires or its connection fails. Its
+requests return to pending and are replanned onto other workers by
+recompute: the new owner starts from the prompt.
+
+- The coordinator remembers the highest `generated_tokens` it delivered for
+  each request and drops replayed tokens, so a client sees each position
+  once. The replay matches the original only when generation is
+  deterministic: greedy decoding (what the gateway's routes use) or a fixed
+  seed. With unseeded sampling, a recovered stream can diverge from what was
+  already sent.
+- If a lost worker comes back still running a recovered request, its
+  reports are dropped and the coordinator cancels its copy. Reports from a
+  worker that never owned the request are still protocol errors.
+- A staged migration whose target is lost rolls back to the source, which
+  still holds the exported state, and the source is told to restore it.
+- Recovery does not yet use migration checkpoints; every recovered request
+  recomputes.
+
+### Migration
+
+`TcpCoordinator::migrate` runs the two-phase handoff:
+
+1. The source exports the request (`MigrateOut`) and keeps the exported
+   state until told otherwise.
+2. The coordinator stages ownership on the target and sends `AdmitMigrated`.
+3. The target's `Accepted` commits: the coordinator records `Migrated` and
+   tells the source `CommitMigration`. A `Refused`, or losing the target,
+   rolls back: ownership returns to the source, which gets
+   `AbortMigration` and re-imports the state.
+
+If the request finishes on the source before the export, `migrate` returns
+without moving anything. Nothing in the gateway calls `migrate` yet;
+draining and role changes are explicit operator calls.
+
+### Known limitations
+
+- **KV state crosses the network as JSON.** `MigratedRequest` (with any
+  `SessionState`) is serialized inside a `WorkerCommand`, whose JSON is in
+  turn carried as a JSON byte array in `WireBody::Payload`. Each KV byte
+  costs roughly ten bytes on the wire, and the 16 MiB message limit caps a
+  transferable session near 1.5 MB. `BinaryFrame` and
+  `session_state_to_frame` exist but are not yet wired into the worker
+  session or links.
+- **The adaptive cluster policy is not online.** `AdaptiveClusterPolicy`
+  routes with fixed weights plus the MILP batch assignment; its `observe`
+  only counts iterations. Weights are chosen offline by
+  `adaptive-cluster-routing-study` or set with `set_weights`.
+- **Pushed weights are recorded, not used.** `PolicyUpdate` validates and
+  stores routing weights on the worker; the worker's own execution policy
+  does not read them.
+- **Clock calibration is coarse.** `LinkCalibration::offset_us` is the mean
+  of coordinator receive time minus worker send time: offset plus one-way
+  delay, never decayed. Heartbeat acknowledgements echo the send time so a
+  round trip could be measured, but nothing measures it yet.
+- **The OpenAI streaming route sends one chunk.** Workers stream token IDs
+  and the gateway has no tokenizer, so `/v1/completions` with `stream`
+  delivers the whole text at the end; `usage.prompt_tokens` is 0.
+- **No authentication or TLS.** Bind workers to trusted interfaces.
+

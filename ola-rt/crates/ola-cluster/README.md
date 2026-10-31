@@ -30,9 +30,14 @@ Worker summaries can be stale. A snapshot counts assignments a worker has not
 yet reflected in its summary as in-flight load, so a burst of arrivals does
 not all land on the worker that last looked idle.
 
-Two baselines are provided: [`RoundRobinRouting`] and
-[`LeastLoadedRouting`]. Both only consider ready workers that host the
-request's model; ties break by worker ID.
+Routing baselines are [`RoundRobinRouting`], [`LeastLoadedRouting`],
+[`PowerOfTwoRouting`], [`KvHeadroomRouting`], and [`PrefixAffinityRouting`].
+[`AdaptiveClusterPolicy`] picks the least-loaded or KV-headroom baseline by
+its weights, then reassigns each model's batch with a MILP
+([`optimize_batch_routing`]) under worker request and KV capacity. Its
+weights are fixed between [`AdaptiveClusterPolicy::set_weights`] calls; it
+does not learn online. Every policy only considers ready workers that host
+the request's model; ties break by worker ID.
 
 ## Local clusters
 
@@ -41,9 +46,38 @@ vocabulary. [`LocalCluster`] connects a coordinator and several hosts in one
 process and delivers messages synchronously and in worker-ID order, so runs
 are deterministic. It is the in-process transport for tests and simulation.
 
+## Networked clusters
+
+[`WorkerSession`] serves one [`WorkerHost`] over TCP: it heartbeats and
+reports a summary every heartbeat interval and runs executor iterations
+whenever there is work. [`TcpCoordinator`] owns a coordinator and one
+[`CoordinatorWorkerLink`] per worker. Each link's frames are read by its own
+task into a shared channel, so [`TcpCoordinator::next_frame`] is cancel-safe
+and an event loop can `select!` on it, then call
+[`TcpCoordinator::apply_frame`]. A link that fails loses its worker. The
+`ola-serve` gateway is one such event loop.
+
+## Recovery and migration
+
+A lost worker's requests return to pending and are replanned by recompute.
+The coordinator drops tokens a recovered request replays, so a client sees
+each position once; that replay is faithful only for greedy or seeded
+generation. If a lost worker returns still running a recovered request, the
+coordinator cancels its copy and ignores its reports.
+
+[`TcpCoordinator::migrate`] moves a running request with a two-phase
+handoff: the source exports, the target admits, and only the target's
+acceptance commits. A refusal, or losing the target, rolls the request back
+to the source. The sans-IO steps are [`Coordinator::stage_migration`],
+[`Coordinator::finish_migration`], and [`Coordinator::rollback_migration`];
+commands produced during recovery are drained with
+[`Coordinator::take_commands`]. Details and known limitations are in
+`DISTRIBUTED.md`.
+
 ## Traces
 
 Every coordinator decision and ownership change produces a
 [`ClusterTraceRecord`] keyed by cluster request ID. `Accepted` records carry
 the worker and its local request ID, which join with `ola-observe` traces
-for that worker.
+for that worker. Migrations record `Migrated` with the handoff mode and
+bytes, and a cancelled stale copy records `Superseded`.

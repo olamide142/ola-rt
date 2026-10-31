@@ -119,3 +119,46 @@ with 400 instead of being silently ignored: `temperature` other than 0,
 unknown fields. `seed` is accepted and has no effect. Errors use OpenAI's
 shape, `{"error": {"message", "type", "param", "code"}}`, with `type` set to
 the native kind. Chat completions need prompt templates and are not offered.
+
+## Cluster roles
+
+`ola serve` also runs the two roles of a distributed deployment
+(`../DISTRIBUTED.md`):
+
+```text
+ola serve --role worker  --model DIR --name worker-a --addr 127.0.0.1:7001
+ola serve --role worker  --model DIR --name worker-b --addr 127.0.0.1:7002
+ola serve --role gateway --addr 127.0.0.1:8080 \
+          --worker 127.0.0.1:7001 --worker 127.0.0.1:7002
+```
+
+A **worker** (`cluster::serve_worker`) wraps one executor and waits for one
+coordinator connection. It heartbeats and reports its load every 100 ms,
+runs executor iterations whenever it has work, and uses its start time as
+its epoch, so a restarted worker replaces its old lease. Start workers
+before the gateway; the gateway connects to each listed address at startup.
+
+The **gateway** (`cluster::ClusterGateway`) owns the coordinator and serves
+`GET /health`, `GET /ready`, `POST /v1/generate`, `POST /v1/completions`, and
+`DELETE /v1/requests/{id}`. It routes with `AdaptiveClusterPolicy` by
+default (`ClusterGateway::connect_with` takes another policy and a
+`ClusterGatewayConfig`).
+
+- `/health` reports connected `workers` and `ready_workers`; `/ready` is 503
+  until at least one worker is ready.
+- A request waits in the coordinator while every worker hosting its model is
+  busy or draining, and fails if no worker hosts the model.
+- A worker silent for the lease (2 s by default, checked every 50 ms) or
+  whose connection drops is lost. Its requests restart on another worker by
+  recompute; clients already streaming see no repeated tokens, since the
+  gateway's routes decode greedily.
+- A client that disconnects has its request cancelled on the worker.
+- Cancelling an unknown request is 404.
+
+The gateway's request bodies match the single-process routes in shape but
+are narrower: `/v1/generate` takes `model`, exactly one of `prompt` or
+`tokens`, `max_new_tokens`, `priority`, and `stream`; `/v1/completions`
+takes `model`, a string `prompt`, `max_tokens`, and `stream`. Errors are
+`{"error": message}`. Completion streaming sends the whole text as one
+chunk, because workers stream token IDs and the gateway has no tokenizer,
+and `usage.prompt_tokens` is reported as 0.

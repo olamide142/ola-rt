@@ -1245,6 +1245,27 @@ Update this file whenever a meaningful capability is merged. Each update should:
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
 
+- **2026-10-31 — review of the distributed track:** Fixed networked-cluster
+  defects found in review. Coordinator links now read on per-link tasks into
+  one channel, so a cancelled HTTP read can no longer leave a half-read frame;
+  the gateway is a driver task instead of a mutex held across network reads,
+  so idle workers' heartbeats and summaries are consumed, leases expire,
+  deferred requests replan, and abandoned requests are cancelled. Worker
+  sessions run iterations whenever there is work rather than once per
+  100 ms heartbeat (an uncancelled 30 000-token synthetic request now takes
+  about 6 s in a debug build). The coordinator no longer undercounts a
+  migration source's in-flight load, rolls a migration back when its target
+  is lost, hides tokens a recovered request replays, and cancels stale copies
+  on returning workers; `migrate` no longer drops other requests' events or
+  hangs when the request finishes first. Worker imports that fail reply
+  `Refused` instead of ending the session, and the CLI worker epoch is its
+  start time. New loopback tests cover abandoned reads, worker disconnection
+  with recovery onto a survivor, heartbeat-independent generation, idle
+  lease renewal, dead-worker readiness, unknown-cancel 404, and abandoned
+  request cancellation. `DISTRIBUTED.md` gained an implementation-status
+  section and known limitations; `ola-net` and the cluster roles are
+  documented.
+
 - **2026-10-31 — `e2905d4`:** Added the profiler-backed
   `paged-attention-occupancy` study. It sweeps page size × batch size ×
   sequence length for CubeCL paged attention with configurable head geometry,

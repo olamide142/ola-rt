@@ -1,9 +1,4 @@
-//! Versioned, length-prefixed control-plane transport primitives.
-//!
-//! The protocol is deliberately independent of sockets: [`WireMessage`] is
-//! serialized by [`write_message`] and decoded by [`read_message`], so the
-//! same envelope can be used by TCP, deterministic in-process transports, and
-//! the virtual-time simulator.
+#![doc = include_str!("../README.md")]
 
 use std::{error::Error, fmt};
 
@@ -182,7 +177,7 @@ pub async fn read_binary_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<BinaryFrame, WireError> {
     let payload_len = reader.read_u32().await.map_err(truncated)? as usize;
-    if payload_len > MAX_BINARY_FRAME_BYTES || payload_len < 4 {
+    if !(4..=MAX_BINARY_FRAME_BYTES).contains(&payload_len) {
         return Err(WireError::InvalidLength(payload_len as u32));
     }
     let header_len = reader.read_u32().await.map_err(truncated)? as usize;
