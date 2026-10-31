@@ -1128,7 +1128,8 @@ Update this file whenever a meaningful capability is merged. Each update should:
   paged-attention study with configurable unused physical KV blocks. Reports
   now include physical block count, unused blocks, and pool-fragmentation ratio
   alongside page padding and latency. The study deliberately does not infer
-  accelerator occupancy from host timing; profiler-backed occupancy remains.
+  accelerator occupancy from host timing; the separate profiler-backed study
+  was added in `e2905d4`.
 
 - **2026-10-27 — working tree on `6ef1f7a`:** Closed the offline adaptive
   evaluation TODO. `adaptive-policy-study` trains θ on seed 0, evaluates the
@@ -1182,6 +1183,21 @@ Update this file whenever a meaningful capability is merged. Each update should:
   and transports, worker/gateway serving roles, recompute and KV-transfer
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
+
+- **2026-10-31 — `e2905d4`:** Added the profiler-backed
+  `paged-attention-occupancy` study. It sweeps page size × batch size ×
+  sequence length for CubeCL paged attention with configurable head geometry,
+  recording host latency, oracle error, padding, and work items. An Nsight
+  Compute `--csv --page raw` capture of an identical run attaches per-repetition
+  kernel duration, achieved/theoretical occupancy, SM and memory throughput,
+  and registers per thread; launches map to repetitions by order and are
+  rejected if their count or grid × block geometry does not match. Profiler
+  kernel time uses a new `Device` time domain so it never compares with host
+  time. `ola-bench` gains a `cuda` feature (enabled by `ola-cli/cuda`). Parser,
+  matching, and CubeCL-CPU end-to-end tests pass. No profiled report exists yet:
+  the local NVIDIA driver is unavailable, and the generated CUDA kernel name is
+  unverified against a real capture. The full `ola-bench` CubeCL-CPU suite
+  passes (98 tests, one WGPU-only test ignored).
 
 - **2026-10-24 14:18 BST — working tree on `3363e15`:** Extended batched
   CubeCL conformance to ragged requests with different logical block counts and

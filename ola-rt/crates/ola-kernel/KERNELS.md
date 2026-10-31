@@ -155,8 +155,10 @@ implementations.
    Single-request and ragged batched CubeCL outputs are now checked against the
    portable single-request oracle. The versioned `ola-bench` study evaluates
    portable versus CubeCL execution across page sizes, batch sizes, partial
-   final pages, and configurable physical-pool slack; accelerator occupancy
-   still requires profiler-backed measurement.
+   final pages, and configurable physical-pool slack. The separate
+   `paged-attention-occupancy` study attaches Nsight Compute occupancy and
+   utilization counters per page/batch/sequence shape (see
+   `ola-bench/README.md`); a recorded CUDA report is still pending.
 
 ## Out of scope
 
