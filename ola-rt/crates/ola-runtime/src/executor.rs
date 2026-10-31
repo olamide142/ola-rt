@@ -2146,7 +2146,7 @@ mod tests {
     use ola_core::GenerationConfig;
     use ola_model::{
         BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
-        KvCacheProfile, SessionMetrics, Tokenizer,
+        KvCacheProfile, SessionMetrics, SessionState, Tokenizer,
     };
 
     use super::*;
@@ -2199,6 +2199,25 @@ mod tests {
             _generation: GenerationConfig,
         ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
             Ok(Box::new(IncrementSession::default()))
+        }
+
+        fn import_session(
+            &self,
+            _generation: GenerationConfig,
+            state: SessionState,
+        ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+            if state.format != "test/increment-v1" {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(IncrementSession {
+                metrics: SessionMetrics {
+                    prompt_tokens: state.cursor,
+                    generated_tokens: 1,
+                    kv_cache_bytes: state.cursor as u64 * 8,
+                    ..SessionMetrics::default()
+                },
+                ready: true,
+            })))
         }
 
         fn prefill_batch(
@@ -2328,6 +2347,22 @@ mod tests {
             self.metrics
         }
 
+        fn export_state(&self) -> Result<Option<SessionState>, ModelExecutionError> {
+            self.ready
+                .then_some(SessionState {
+                    format: "test/increment-v1".into(),
+                    cursor: self.metrics.prompt_tokens,
+                    payload: Vec::new(),
+                })
+                .ok_or_else(|| {
+                    ModelExecutionError::new(
+                        ExecutionStage::SessionCreation,
+                        "cannot export an uninitialized test session",
+                    )
+                })
+                .map(Some)
+        }
+
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
             self
         }
@@ -2338,6 +2373,42 @@ mod tests {
 
     fn artifact() -> CausalLanguageModel {
         CausalLanguageModel::new(NumericTokenizer, IncrementModel)
+    }
+
+    #[test]
+    fn migration_uses_imported_session_before_decode() {
+        let mut source = Executor::default();
+        source
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let request_id = source.submit(request("1", 3), Timestamp::ZERO).unwrap();
+        let first = source.step_iteration(Timestamp::from_micros(1)).unwrap();
+        assert!(matches!(
+            first.events.as_slice(),
+            [ExecutorEvent::Token { phase: ExecutionPhase::Prefill, generated_tokens: 1, .. }]
+        ));
+        let migrated = source
+            .export_request(request_id, Timestamp::from_micros(2))
+            .unwrap();
+        assert!(migrated.session_state.is_some());
+
+        let mut destination = Executor::default();
+        destination
+            .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
+            .unwrap();
+        let local = destination.import_request(migrated, Timestamp::from_micros(3)).unwrap();
+        let restored = destination.step_iteration(Timestamp::from_micros(4)).unwrap();
+        assert!(restored.events.is_empty() || restored.is_idle());
+        let next = destination.step_iteration(Timestamp::from_micros(5)).unwrap();
+        assert!(matches!(
+            next.events.as_slice(),
+            [ExecutorEvent::Token {
+                request_id: id,
+                phase: ExecutionPhase::Decode,
+                generated_tokens: 2,
+                ..
+            }] if *id == local
+        ));
     }
 
     #[test]
