@@ -285,6 +285,20 @@ impl TcpCoordinator {
         Ok(())
     }
 
+    /// Changes a worker's prefill/decode disaggregation role.
+    pub async fn set_worker_role(
+        &mut self,
+        worker: &WorkerId,
+        role: crate::WorkerRole,
+    ) -> Result<(), TcpCoordinatorError> {
+        let link = self
+            .links
+            .get_mut(worker)
+            .ok_or_else(|| TcpCoordinatorError::MissingLink(worker.clone()))?;
+        link.send_command(&WorkerCommand::SetRole { role }).await?;
+        Ok(())
+    }
+
     /// Supplies a calibrated network cost for a worker to routing policy.
     pub fn set_worker_network_cost(&mut self, worker: WorkerId, cost_us: u64) {
         self.coordinator.set_network_cost(worker, cost_us);

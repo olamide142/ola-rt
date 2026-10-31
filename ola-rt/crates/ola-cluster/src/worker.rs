@@ -8,7 +8,7 @@ use ola_runtime::{
 };
 
 use crate::{
-    AdaptiveClusterPolicy, ClusterWeights, WorkerCommand, WorkerHealth, WorkerMessage,
+    AdaptiveClusterPolicy, ClusterWeights, WorkerCommand, WorkerHealth, WorkerMessage, WorkerRole,
     WorkerSummary,
 };
 
@@ -26,6 +26,7 @@ pub struct WorkerHost {
     by_cluster: BTreeMap<ClusterRequestId, RequestId>,
     pending_migrations: BTreeMap<ClusterRequestId, MigratedRequest>,
     policy_weights: ClusterWeights,
+    role: WorkerRole,
 }
 
 impl WorkerHost {
@@ -40,6 +41,7 @@ impl WorkerHost {
             by_cluster: BTreeMap::new(),
             pending_migrations: BTreeMap::new(),
             policy_weights: ClusterWeights::default(),
+            role: WorkerRole::Mixed,
         }
     }
 
@@ -56,6 +58,16 @@ impl WorkerHost {
     /// Whether the worker accepts new requests.
     pub const fn health(&self) -> WorkerHealth {
         self.health
+    }
+
+    /// Returns the role used for new and migrated admissions.
+    pub const fn role(&self) -> WorkerRole {
+        self.role
+    }
+
+    /// Changes the worker's disaggregation role.
+    pub fn set_role(&mut self, role: WorkerRole) {
+        self.role = role;
     }
 
     /// Changes whether the worker accepts new requests. Owned requests run
@@ -84,13 +96,15 @@ impl WorkerHost {
 
     /// Summarizes the worker's current load.
     pub fn summary(&self, at: Timestamp) -> WorkerSummary {
-        WorkerSummary::from_executor(
+        let mut summary = WorkerSummary::from_executor(
             self.id.clone(),
             &self.executor,
             self.health,
             self.admitted,
             at,
-        )
+        );
+        summary.role = self.role;
+        summary
     }
 
     /// Whether the executor has queued or live work.
@@ -118,10 +132,14 @@ impl WorkerHost {
                 arrival_at,
             } => {
                 self.admitted += 1;
-                if self.health != WorkerHealth::Ready {
+                if self.health != WorkerHealth::Ready || self.role == WorkerRole::Decode {
                     return Ok(vec![WorkerMessage::Refused {
                         request,
-                        message: format!("worker `{}` is draining", self.id),
+                        message: if self.role == WorkerRole::Decode {
+                            format!("worker `{}` only accepts migrated decode sessions", self.id)
+                        } else {
+                            format!("worker `{}` is draining", self.id)
+                        },
                     }]);
                 }
                 Ok(vec![match self.executor.submit(spec, arrival_at) {
@@ -179,10 +197,14 @@ impl WorkerHost {
                 state,
                 arrival_at,
             } => {
-                if self.health != WorkerHealth::Ready {
+                if self.health != WorkerHealth::Ready || self.role == WorkerRole::Prefill {
                     return Ok(vec![WorkerMessage::Refused {
                         request,
-                        message: format!("worker `{}` is draining", self.id),
+                        message: if self.role == WorkerRole::Prefill {
+                            format!("worker `{}` only accepts new prefill requests", self.id)
+                        } else {
+                            format!("worker `{}` is draining", self.id)
+                        },
                     }]);
                 }
                 let local = self.executor.import_request(state, arrival_at)?;
@@ -223,6 +245,10 @@ impl WorkerHost {
                     kv_headroom_weight,
                     network_weight,
                 }])
+            }
+            WorkerCommand::SetRole { role } => {
+                self.role = role;
+                Ok(vec![WorkerMessage::RoleUpdated { role }])
             }
         }
     }

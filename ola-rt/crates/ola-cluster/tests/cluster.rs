@@ -8,14 +8,14 @@ use ola_cluster::{
     ClusterSnapshot, ClusterTraceEvent, ClusterTraceRecord, Coordinator, CoordinatorError,
     DeferReason, KvHeadroomRouting, LeastLoadedRouting, LocalCluster, PowerOfTwoRouting,
     PrefixAffinityRouting, RejectReason, RoundRobinRouting, RouteReason, WorkerCommand,
-    WorkerHealth, WorkerHost, WorkerMessage, WorkerSummary,
+    WorkerHealth, WorkerHost, WorkerMessage, WorkerRole, WorkerSummary,
 };
 use ola_core::{
     ClusterRequestId, Input, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp, WorkerId,
 };
 use ola_model::KvPoolStatus;
 use ola_net::WireBody;
-use ola_runtime::{Executor, Runtime};
+use ola_runtime::{Executor, MigratedRequest, Runtime};
 
 const MODEL: &str = "synthetic";
 
@@ -163,6 +163,48 @@ fn worker_accepts_and_acknowledges_adaptive_policy_updates() {
             kv_headroom_weight: 7,
             network_weight: 0,
         }]
+    ));
+}
+
+#[test]
+fn worker_roles_gate_new_and_migrated_admissions() {
+    let mut host = WorkerHost::new("worker", executor());
+    host.set_role(WorkerRole::Decode);
+    let refused = host
+        .handle(
+            WorkerCommand::Admit {
+                request: ClusterRequestId::new(1),
+                spec: spec(4, 3, None),
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        refused.as_slice(),
+        [WorkerMessage::Refused { .. }]
+    ));
+    host.set_role(WorkerRole::Prefill);
+    let refused_migration = host
+        .handle(
+            WorkerCommand::AdmitMigrated {
+                request: ClusterRequestId::new(2),
+                state: MigratedRequest {
+                    spec: spec(4, 3, None),
+                    prompt_tokens: vec![1, 2, 3, 4],
+                    generated_tokens: Vec::new(),
+                    token_times: Vec::new(),
+                    preemptions: 0,
+                    session_state: None,
+                },
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    assert!(matches!(
+        refused_migration.as_slice(),
+        [WorkerMessage::Refused { .. }]
     ));
 }
 
@@ -359,6 +401,7 @@ fn summary(worker: &str, models: &[&str], queued: usize, live: usize) -> WorkerS
         generation: 0,
         reported_at: at(0),
         health: WorkerHealth::Ready,
+        role: WorkerRole::Mixed,
         models: models.iter().map(|model| ModelId::new(*model)).collect(),
         max_active_requests: 4,
         queued_requests: queued,

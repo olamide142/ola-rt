@@ -42,7 +42,7 @@ pub use routing_optimizer::{
 };
 pub use session::{WorkerSession, WorkerSessionError};
 pub use snapshot::{ClusterSnapshot, PendingRequest, WorkerView, token_demand};
-pub use summary::{WorkerHealth, WorkerSummary};
+pub use summary::{WorkerHealth, WorkerRole, WorkerSummary};
 pub use transfer::{
     HandoffCostModel, SESSION_STATE_CONTENT_TYPE, SessionFrameError, SessionHandoffMode,
     choose_handoff, session_state_bytes, session_state_from_frame, session_state_to_frame,

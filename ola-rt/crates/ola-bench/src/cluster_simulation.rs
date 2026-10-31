@@ -276,6 +276,7 @@ fn command_bytes(command: &WorkerCommand) -> u64 {
                 .saturating_mul((state.prompt_tokens.len() + state.generated_tokens.len()) as u64),
         ),
         WorkerCommand::PolicyUpdate { .. } => MESSAGE_HEADER_BYTES,
+        WorkerCommand::SetRole { .. } => MESSAGE_HEADER_BYTES,
     }
 }
 
@@ -296,6 +297,7 @@ fn message_bytes(message: &WorkerMessage) -> u64 {
                 .saturating_mul((state.prompt_tokens.len() + state.generated_tokens.len()) as u64),
         ),
         WorkerMessage::PolicyUpdated { .. } => MESSAGE_HEADER_BYTES,
+        WorkerMessage::RoleUpdated { .. } => MESSAGE_HEADER_BYTES,
     }
 }
 

@@ -22,6 +22,19 @@ pub enum WorkerHealth {
     Lost,
 }
 
+/// Execution role advertised by a worker.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRole {
+    /// Handles both ordinary admission and resumed sessions.
+    #[default]
+    Mixed,
+    /// Admits new requests and is intended to produce prefill state.
+    Prefill,
+    /// Accepts migrated sessions and is intended to serve decode work.
+    Decode,
+}
+
 /// A worker's view of its own load, as of one report.
 ///
 /// Summaries are estimates: by the time the coordinator plans with one, the
@@ -36,6 +49,9 @@ pub struct WorkerSummary {
     pub reported_at: Timestamp,
     /// Whether the worker accepts new requests.
     pub health: WorkerHealth,
+    /// Execution role used for admission/disaggregation routing.
+    #[serde(default)]
+    pub role: WorkerRole,
     /// Models the worker can execute.
     pub models: BTreeSet<ModelId>,
     /// The worker executor's ceiling on concurrently live requests.
@@ -81,6 +97,7 @@ impl WorkerSummary {
             generation: executor.generation(),
             reported_at: at,
             health,
+            role: WorkerRole::Mixed,
             models,
             max_active_requests: executor.max_active_requests(),
             queued_requests: executor.state().queued_len(),
@@ -103,7 +120,9 @@ impl WorkerSummary {
 
     /// Whether the worker would accept a new request for `model`.
     pub fn accepts(&self, model: &ModelId) -> bool {
-        self.health == WorkerHealth::Ready && self.models.contains(model)
+        self.health == WorkerHealth::Ready
+            && self.role != WorkerRole::Decode
+            && self.models.contains(model)
     }
 
     /// KV tokens `model`'s pool could still give out, counting evictable

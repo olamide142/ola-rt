@@ -8,8 +8,8 @@ carried in the migration envelope. The runtime promotes an imported session
 directly to decode-ready state and keeps token recompute as the fallback when a
 model returns `None`; a regression test proves there is no duplicate prefill
 token. Burn Llama and Mistral both have versioned session export/import tests.
-The remaining D4 gaps are raw architecture-specific KV-byte transfer/
-disaggregation and explicit prefill/decode worker roles.
+The remaining D4 gap is backend-specific raw architecture KV-byte ownership;
+the generic binary frame and explicit worker-role boundaries are now present.
 
 `TcpCoordinator::migrate` now waits for source export before staging ownership,
 waits for target `Accepted`, then commits the source; target refusal triggers
@@ -52,7 +52,13 @@ the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries
 format/cursor metadata separately from opaque architecture bytes and rejects
 wrong media types or protocol versions before import. This closes the generic
 binary session-frame hook; backend-specific raw KV producers/consumers and
-explicit prefill/decode worker roles remain D4 work.
+backend-specific raw KV producers/consumers remain D4 work.
+
+Workers now also advertise and accept explicit disaggregation roles. Role
+changes are protocol commands with acknowledgements; `decode` workers reject
+new request admissions, while `prefill` workers reject migrated sessions.
+This establishes the safe handoff boundary without claiming automatic
+pipeline scheduling or device-specific KV ownership.
 
 **2026-10-30 distributed continuation:** The TCP worker session now uses a
 dedicated frame reader so cancellation-safe heartbeats and payloads cannot

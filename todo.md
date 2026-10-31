@@ -310,9 +310,12 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   Llama and Mistral now export and import versioned recompute-safe session
   snapshots through the runtime migration path; `ola-cluster` now adapts those
   snapshots to validated versioned `ola-net::BinaryFrame` data-plane frames,
-  with raw architecture-specific KV producers/consumers and prefill/decode
-  worker roles still remaining. It also exposes a calibrated, deterministic
-  transfer-vs-recompute selector for the handoff controller.
+  and workers now advertise functional `mixed`, `prefill`, or `decode` roles:
+  decode workers reject new admissions while prefill workers reject migrated
+  sessions. Raw architecture-specific KV producers/consumers and automatic
+  role scheduling remain backend-specific extensions. It also exposes a
+  calibrated, deterministic transfer-vs-recompute selector for the handoff
+  controller.
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive
   load/KV routing policy, a microlp-backed model placement optimizer, and

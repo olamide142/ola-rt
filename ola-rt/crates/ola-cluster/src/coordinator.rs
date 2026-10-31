@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ClusterAction, ClusterDecision, ClusterDecisionRecord, ClusterPlan, ClusterPlanError,
     ClusterPolicy, ClusterPolicyError, ClusterSnapshot, DeferReason, PendingRequest, RejectReason,
-    RouteCandidate, RouteReason, WorkerHealth, WorkerSummary, WorkerView,
+    RouteCandidate, RouteReason, WorkerHealth, WorkerRole, WorkerSummary, WorkerView,
 };
 
 /// An instruction from the coordinator to one worker.
@@ -69,6 +69,11 @@ pub enum WorkerCommand {
         kv_headroom_weight: u64,
         /// Network-cost weight.
         network_weight: u64,
+    },
+    /// Changes the worker's prefill/decode disaggregation role.
+    SetRole {
+        /// New execution role.
+        role: WorkerRole,
     },
 }
 
@@ -141,6 +146,11 @@ pub enum WorkerMessage {
         kv_headroom_weight: u64,
         /// Network-cost weight.
         network_weight: u64,
+    },
+    /// Confirms a worker role change.
+    RoleUpdated {
+        /// Role now active on the worker.
+        role: WorkerRole,
     },
 }
 
@@ -1146,7 +1156,9 @@ impl Coordinator {
                 // the normal client stream has no terminal event yet.
                 return Ok(output);
             }
-            WorkerMessage::PolicyUpdated { .. } => return Ok(output),
+            WorkerMessage::PolicyUpdated { .. } | WorkerMessage::RoleUpdated { .. } => {
+                return Ok(output);
+            }
         };
         debug_assert!(self.requests.contains_key(&request));
         self.generation += 1;

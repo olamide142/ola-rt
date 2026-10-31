@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ola_bench::{KvGeometry, synthetic_artifact};
 use ola_cluster::{
-    ClusterTraceEvent, ClusterWeights, LeastLoadedRouting, TcpCoordinator, WorkerHost,
+    ClusterTraceEvent, ClusterWeights, LeastLoadedRouting, TcpCoordinator, WorkerHost, WorkerRole,
     WorkerSession,
 };
 use ola_core::{Input, ModelDescriptor, RequestSpec, Timestamp};
@@ -55,11 +55,20 @@ async fn adaptive_weights_are_pushed_and_acknowledged_over_tcp() {
         .receive(&worker_id, Timestamp::from_micros(1))
         .await
         .unwrap();
+    coordinator
+        .set_worker_role(&worker_id, WorkerRole::Decode)
+        .await
+        .unwrap();
+    coordinator
+        .receive(&worker_id, Timestamp::from_micros(2))
+        .await
+        .unwrap();
     coordinator.close_worker(&worker_id).await.unwrap();
     let worker = task.await.unwrap();
     assert_eq!(worker.policy_weights().load, 3);
     assert_eq!(worker.policy_weights().kv_headroom, 9);
     assert_eq!(worker.policy_weights().network, 2);
+    assert_eq!(worker.role(), WorkerRole::Decode);
 }
 
 fn request() -> RequestSpec {
