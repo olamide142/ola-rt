@@ -320,7 +320,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   now carried over worker control links. A microlp-backed batch assignment
   optimizer now enforces worker request and KV capacities in the adaptive
   policy, and the registered cluster study compares the adaptive variant;
-  held-out improvement claims and live-loop evaluation remain.
+  `adaptive-cluster-routing-study` now selects weights on seed 0 and reports
+  adaptive, least-loaded, and KV-headroom results on independent held-out
+  seeds; live-loop evaluation remains.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

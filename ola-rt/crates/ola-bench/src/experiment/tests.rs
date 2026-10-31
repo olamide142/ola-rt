@@ -390,6 +390,25 @@ fn a_json_run_config_selects_and_overrides_an_experiment() {
 }
 
 #[test]
+fn adaptive_cluster_study_runs_on_held_out_traces() {
+    let outcome = run(
+        "adaptive-cluster-routing-study",
+        &[
+            ("seeds", "3"),
+            ("requests", "8"),
+            ("mean_interarrival_micros", "100"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.report.experiment.id,
+        "adaptive-cluster-routing-study"
+    );
+    assert!(outcome.report.summary("adaptive").is_some());
+    assert!(outcome.report.summary("least-loaded").is_some());
+}
+
+#[test]
 fn a_json_run_config_rejects_malformed_json() {
     assert!(ExperimentRunConfig::from_json("{not-json").is_err());
 }
@@ -418,6 +437,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         "prefix-cache",
         "kv-page-size",
         "cluster-routing",
+        "adaptive-cluster-routing-study",
     ];
     #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
     expected.push("paged-attention-kernel");

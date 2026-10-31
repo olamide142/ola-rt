@@ -8,8 +8,8 @@ carried in the migration envelope. The runtime promotes an imported session
 directly to decode-ready state and keeps token recompute as the fallback when a
 model returns `None`; a regression test proves there is no duplicate prefill
 token. Burn Llama and Mistral both have versioned session export/import tests.
-The remaining D3/D4 gaps are raw KV-byte transfer/disaggregation and simulator
-failure injection.
+The remaining D4 gaps are raw architecture-specific KV-byte transfer/
+disaggregation and explicit prefill/decode worker roles.
 
 `TcpCoordinator::migrate` now waits for source export before staging ownership,
 waits for target `Accepted`, then commits the source; target refusal triggers
@@ -31,6 +31,13 @@ both have deterministic feasibility and objective tests. The adaptive policy
 now applies the batch assignment refinement transactionally with baseline
 fallback, and the registered cluster study includes it as a comparison
 variant; held-out improvement measurement remains.
+
+The registered `adaptive-cluster-routing-study` now performs a train/held-out
+split: it selects among calibrated load/KV weight candidates on seed 0 and
+reports the selected adaptive policy beside least-loaded and KV-headroom
+baselines on independent seeds. A regression test runs the study through the
+experiment registry and validates its reported variants; live-loop improvement
+evidence remains.
 
 `ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
 the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries

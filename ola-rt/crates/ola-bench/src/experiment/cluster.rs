@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use ola_cluster::{
-    AdaptiveClusterPolicy, ClusterPolicy, KvHeadroomRouting, LeastLoadedRouting, PowerOfTwoRouting,
-    PrefixAffinityRouting, RoundRobinRouting,
+    AdaptiveClusterPolicy, ClusterPolicy, ClusterWeights, KvHeadroomRouting, LeastLoadedRouting,
+    PowerOfTwoRouting, PrefixAffinityRouting, RoundRobinRouting,
 };
 
 use super::builtin::{as_f64, finish, run_error};
@@ -22,6 +22,190 @@ use crate::{
 /// Routing baselines over one topology, network, and trace generator, across
 /// several seeds.
 pub struct ClusterRouting;
+
+/// Selects adaptive cluster weights on one virtual trace and evaluates them on
+/// independent traces without letting held-out results influence selection.
+pub struct AdaptiveClusterRoutingStudy;
+
+impl Experiment for AdaptiveClusterRoutingStudy {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "adaptive-cluster-routing-study",
+            name: "Adaptive cluster routing study",
+            description: "Training-selected cluster weights evaluated on held-out traces",
+            category: ExperimentCategory::Experiment,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Virtual,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::integer("seeds", "Held-out trace seeds", 3),
+                ParameterSpec::integer("requests", "Requests per trace", 20),
+                ParameterSpec::integer(
+                    "mean_interarrival_micros",
+                    "Mean arrival gap in virtual microseconds",
+                    400,
+                ),
+            ],
+        }
+    }
+
+    fn traceable(&self) -> bool {
+        true
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let seeds = (1..=parameters.integer("seeds")?).collect::<Vec<_>>();
+        let base = TraceParameters {
+            seed: 0,
+            requests: parameters.size("requests")?,
+            mean_interarrival_micros: parameters.integer("mean_interarrival_micros")?,
+        };
+        let worker = SimulationConfig {
+            max_active_requests: 4,
+            ..SimulationConfig::default()
+        };
+        let config = ClusterSimulationConfig::uniform(2, worker, NetworkModel::default());
+        let generate = |seed| SchedulingTrace::overload(TraceParameters { seed, ..base });
+        let candidates = [
+            ClusterWeights {
+                load: 1,
+                kv_headroom: 1,
+            },
+            ClusterWeights {
+                load: 2,
+                kv_headroom: 1,
+            },
+            ClusterWeights {
+                load: 1,
+                kv_headroom: 2,
+            },
+            ClusterWeights {
+                load: 1,
+                kv_headroom: 4,
+            },
+        ];
+        let training = generate(0);
+        let training_isolated = vec![None; training.requests.len()];
+        let mut selected = candidates[0];
+        let mut selected_score = u128::MAX;
+        for weights in candidates {
+            let policy = AdaptiveClusterPolicy::new(weights).map_err(run_error)?;
+            let run = run_cluster_trial(&training, policy, &config).map_err(run_error)?;
+            let summary =
+                summarize_cluster_run(&run, &training_isolated, DEFAULT_STARVATION_FACTOR);
+            let score = u128::from(summary.scheduling.completion.p95_micros).saturating_add(
+                u128::from(summary.scheduling.time_to_first_token.p95_micros),
+            );
+            if score < selected_score {
+                selected = weights;
+                selected_score = score;
+            }
+        }
+        let adaptive_descriptor = AdaptiveClusterPolicy::new(selected)
+            .map_err(run_error)?
+            .descriptor()
+            .to_string();
+        let variants = [
+            ("adaptive", adaptive_descriptor),
+            ("least-loaded", LeastLoadedRouting.descriptor().to_string()),
+            ("kv-headroom", KvHeadroomRouting.descriptor().to_string()),
+        ];
+        let mut samples = variants
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<BTreeMap<String, f64>>>>();
+        let mut content = String::new();
+        for seed in &seeds {
+            let trace = generate(*seed);
+            for request in &trace.requests {
+                content.push_str(&format!("{request:?};"));
+            }
+            let isolated = vec![None; trace.requests.len()];
+            let policies: Vec<Box<dyn ClusterPolicy>> = vec![
+                Box::new(AdaptiveClusterPolicy::new(selected).map_err(run_error)?),
+                Box::new(LeastLoadedRouting),
+                Box::new(KvHeadroomRouting),
+            ];
+            for (variant, policy) in samples.iter_mut().zip(policies) {
+                let run = run_cluster_trial(&trace, policy, &config).map_err(run_error)?;
+                let summary = summarize_cluster_run(&run, &isolated, DEFAULT_STARVATION_FACTOR);
+                variant.push(
+                    [
+                        (
+                            "completion_p95",
+                            as_f64(summary.scheduling.completion.p95_micros),
+                        ),
+                        (
+                            "ttft_p95",
+                            as_f64(summary.scheduling.time_to_first_token.p95_micros),
+                        ),
+                        (
+                            "throughput",
+                            summary.scheduling.output_tokens_per_second().unwrap_or(0.0),
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value))
+                    .collect(),
+                );
+            }
+        }
+        let metrics = vec![
+            MetricSpec::new(
+                "completion_p95",
+                Unit::Micros,
+                TimeDomain::Virtual,
+                Direction::Lower,
+            ),
+            MetricSpec::new(
+                "ttft_p95",
+                Unit::Micros,
+                TimeDomain::Virtual,
+                Direction::Lower,
+            ),
+            MetricSpec::new(
+                "throughput",
+                Unit::TokensPerSecond,
+                TimeDomain::Virtual,
+                Direction::Higher,
+            ),
+        ];
+        let outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            "adaptive-cluster-routing-study",
+            seeds.clone(),
+            metrics,
+            variants
+                .into_iter()
+                .zip(samples)
+                .map(|((label, policy), values)| (Variant::policy(label, policy), values))
+                .collect(),
+            format!(
+                "train seed 0, {} held-out seeds, selected load_weight={}, kv_weight={}",
+                seeds.len(),
+                selected.load,
+                selected.kv_headroom
+            ),
+        )?
+        .with_content_digest(&content);
+        Ok(ExperimentOutcome {
+            summary: format!(
+                "{} held-out traces; selected adaptive weights load={} kv={}",
+                seeds.len(),
+                selected.load,
+                selected.kv_headroom
+            ),
+            ..outcome
+        })
+    }
+}
 
 impl ClusterRouting {
     fn policies(

@@ -17,6 +17,7 @@ use ola_runtime::{
     WatermarkAdmission,
 };
 
+use super::cluster::AdaptiveClusterRoutingStudy;
 use super::{
     Direction, Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor,
     ExperimentError, ExperimentIdentity, ExperimentKind, ExperimentOutcome, ExperimentRegistry,
@@ -56,6 +57,7 @@ impl ExperimentRegistry {
             Box::new(PrefixCache),
             Box::new(KvPageSize),
             Box::new(super::ClusterRouting),
+            Box::new(AdaptiveClusterRoutingStudy),
         ];
         #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
         experiments.push(Box::new(PagedAttentionKernelStudy));
