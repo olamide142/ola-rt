@@ -300,9 +300,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   renews leases, recovers lost or disconnected workers, replans deferred
   requests, and cancels requests whose clients disconnect; coordinator links
   read frames on their own tasks, so an abandoned read cannot corrupt a
-  link. Remaining: KV payloads still travel as JSON inside control frames
-  (binary frames are not wired in), so transferable sessions are capped near
-  1.5 MB.
+  link. Migrated KV snapshots travel as attached binary frames (up to
+  256 MiB), and workers stream decoded text deltas and prompt counts, so the
+  gateway's OpenAI streaming matches the single-process route.
 - [~] D3: `export_request`/`import_request`, recompute migration, drain, and
   lease-expiry recovery with failure injection. Runtime and worker protocol
   hooks plus coordinator requeue recovery are implemented; supported session

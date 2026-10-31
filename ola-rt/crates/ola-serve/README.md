@@ -158,7 +158,9 @@ default (`ClusterGateway::connect_with` takes another policy and a
 The gateway's request bodies match the single-process routes in shape but
 are narrower: `/v1/generate` takes `model`, exactly one of `prompt` or
 `tokens`, `max_new_tokens`, `priority`, and `stream`; `/v1/completions`
-takes `model`, a string `prompt`, `max_tokens`, and `stream`. Errors are
-`{"error": message}`. Completion streaming sends the whole text as one
-chunk, because workers stream token IDs and the gateway has no tokenizer,
-and `usage.prompt_tokens` is reported as 0.
+takes `model`, a `prompt` (one string or one token array), `max_tokens`, and
+`stream`. Errors are `{"error": message}`. Workers decode their own tokens,
+so `/v1/generate` stream events carry `token_id`, `text`, and
+`generated_tokens`, and completion streaming sends one chunk per non-empty
+text delta, a final chunk with `finish_reason` (`length` at the token
+limit, else `stop`) and `usage`, then `data: [DONE]`.

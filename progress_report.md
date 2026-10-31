@@ -1245,6 +1245,18 @@ Update this file whenever a meaningful capability is merged. Each update should:
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
 
+- **2026-10-31 — distributed follow-up:** Migrated KV snapshots no longer
+  ride inside JSON. `ola-net` messages can carry one attached `BinaryFrame`
+  (`write_attached`/`read_attached`), and worker sessions and coordinator
+  links move a `MigratedRequest`'s `SessionState` into it in both directions;
+  a 4 MiB snapshot, which previously encoded to about 24 MB of JSON and
+  exceeded the 16 MiB message limit, now crosses a link intact and a worker
+  admits it. Workers now decode text deltas per token (primed with earlier
+  tokens for imported requests) and report prompt token counts, so the
+  gateway streams `/v1/completions` per delta with `finish_reason` and
+  `usage`, `/v1/generate` stream events carry text, and completions accept
+  token-array prompts.
+
 - **2026-10-31 — review of the distributed track:** Fixed networked-cluster
   defects found in review. Coordinator links now read on per-link tasks into
   one channel, so a cancelled HTTP read can no longer leave a half-read frame;

@@ -37,6 +37,12 @@ JSON, a `WireMessage`:
 simple but costs several bytes per payload byte; large values belong in
 binary frames.
 
+A message may also set `"attachment": true` (omitted when false), meaning
+one binary frame follows it immediately. `write_attached` sends the pair and
+`read_attached` reads it; `write_message` and `read_message` refuse such
+messages with `MisplacedAttachment`, so a peer that does not expect a frame
+fails loudly instead of misreading the stream.
+
 ## Binary frames
 
 A `BinaryFrame` carries bulk data, such as serialized KV blocks, beside the
@@ -51,13 +57,12 @@ The JSON header holds `version`, `sender_epoch`, `correlation`,
 over `MAX_BINARY_FRAME_BYTES` (256 MiB) or with inconsistent lengths are
 rejected, and so is any version other than `PROTOCOL_VERSION`.
 `ola-cluster`'s `session_state_to_frame` and `session_state_from_frame`
-adapt model session snapshots to this format. The TCP worker session does
-not send binary frames yet; see the known limitations in
-`../DISTRIBUTED.md`.
+adapt model session snapshots to this format, and its worker sessions and
+coordinator links attach them to migration messages.
 
 ## Errors
 
-`read_message` and `read_binary_frame` report a stream that ends part-way
+`read_message`, `read_attached`, and `read_binary_frame` report a stream that ends part-way
 through a frame as `Truncated`, an oversized or inconsistent length as
 `InvalidLength`, and malformed JSON as `Json`.
 

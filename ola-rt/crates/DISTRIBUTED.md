@@ -316,7 +316,7 @@ above disagree, this is what runs.
 | Sans-IO coordinator, plans, routing baselines | `ola-cluster` `Coordinator`, `routing.rs`, `plan.rs` | As designed. |
 | In-process cluster | `ola-cluster` `LocalCluster` | Synchronous, worker-ID order; the in-process transport. |
 | Virtual-time cluster | `ola-bench` `cluster_simulation.rs` | Latency/bandwidth link model and worker-failure injection. |
-| Wire framing | `ola-net` | Length-prefixed JSON `WireMessage`s and separate `BinaryFrame`s. |
+| Wire framing | `ola-net` | Length-prefixed JSON `WireMessage`s, optionally followed by an attached `BinaryFrame`. |
 | TCP worker | `ola-cluster` `WorkerSession` wrapping a `WorkerHost` | |
 | TCP coordinator | `ola-cluster` `TcpCoordinator` over `CoordinatorWorkerLink`s | |
 | Gateway | `ola-serve` `cluster::ClusterGateway` | `ola serve --role gateway --worker HOST:PORT ...` |
@@ -346,6 +346,11 @@ cancel-safe; `apply_frame` acknowledges heartbeats, applies messages,
 dispatches any commands they produce, and treats a failed link as a lost
 worker. `poll`, `receive`, and `migrate` keep the output of every frame they
 apply, whichever worker sent it.
+
+**Streaming.** Workers decode their own tokens: each `Token` message
+carries the text delta it completes, and `Finished` carries the prompt
+token count. A worker that imports a request primes its decoder with the
+tokens already generated, so the stream continues seamlessly.
 
 **Gateway.** A single driver task owns the `TcpCoordinator` and handles, one
 at a time: HTTP commands (submit, cancel, health) arriving over a channel,
@@ -387,19 +392,16 @@ recompute: the new owner starts from the prompt.
    rolls back: ownership returns to the source, which gets
    `AbortMigration` and re-imports the state.
 
-If the request finishes on the source before the export, `migrate` returns
-without moving anything. Nothing in the gateway calls `migrate` yet;
+A `SessionState` snapshot does not travel in the JSON: the worker session
+and coordinator link move it into a `BinaryFrame` attached to the
+`Migrated` or `AdmitMigrated` message (`ola_net::write_attached`), up to
+256 MiB, and restore it on arrival. A snapshot that fails to decode leaves
+the request to recompute. If the request finishes on the source before the
+export, `migrate` returns without moving anything. Nothing in the gateway calls `migrate` yet;
 draining and role changes are explicit operator calls.
 
 ### Known limitations
 
-- **KV state crosses the network as JSON.** `MigratedRequest` (with any
-  `SessionState`) is serialized inside a `WorkerCommand`, whose JSON is in
-  turn carried as a JSON byte array in `WireBody::Payload`. Each KV byte
-  costs roughly ten bytes on the wire, and the 16 MiB message limit caps a
-  transferable session near 1.5 MB. `BinaryFrame` and
-  `session_state_to_frame` exist but are not yet wired into the worker
-  session or links.
 - **The adaptive cluster policy is not online.** `AdaptiveClusterPolicy`
   routes with fixed weights plus the MILP batch assignment; its `observe`
   only counts iterations. Weights are chosen offline by
@@ -411,8 +413,5 @@ draining and role changes are explicit operator calls.
   of coordinator receive time minus worker send time: offset plus one-way
   delay, never decayed. Heartbeat acknowledgements echo the send time so a
   round trip could be measured, but nothing measures it yet.
-- **The OpenAI streaming route sends one chunk.** Workers stream token IDs
-  and the gateway has no tokenizer, so `/v1/completions` with `stream`
-  delivers the whole text at the end; `usage.prompt_tokens` is 0.
 - **No authentication or TLS.** Bind workers to trusted interfaces.
 
