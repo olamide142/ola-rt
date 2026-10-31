@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use ola_core::{ClusterRequestId, RequestId, Timestamp, WorkerId};
-use ola_runtime::{Executor, ExecutorError, ExecutorEvent, ExecutorIteration, RequestStatus};
+use ola_runtime::{
+    Executor, ExecutorError, ExecutorEvent, ExecutorIteration, MigratedRequest, RequestStatus,
+};
 
 use crate::{
     AdaptiveClusterPolicy, ClusterWeights, WorkerCommand, WorkerHealth, WorkerMessage,
@@ -22,6 +24,7 @@ pub struct WorkerHost {
     admitted: u64,
     by_local: BTreeMap<RequestId, ClusterRequestId>,
     by_cluster: BTreeMap<ClusterRequestId, RequestId>,
+    pending_migrations: BTreeMap<ClusterRequestId, MigratedRequest>,
     policy_weights: ClusterWeights,
 }
 
@@ -35,6 +38,7 @@ impl WorkerHost {
             admitted: 0,
             by_local: BTreeMap::new(),
             by_cluster: BTreeMap::new(),
+            pending_migrations: BTreeMap::new(),
             policy_weights: ClusterWeights::default(),
         }
     }
@@ -155,16 +159,19 @@ impl WorkerHost {
                 Ok(vec![WorkerMessage::Summary(self.summary(at))])
             }
             WorkerCommand::MigrateOut { request } => {
+                if let Some(state) = self.pending_migrations.get(&request) {
+                    return Ok(vec![WorkerMessage::Migrated {
+                        request,
+                        state: state.clone(),
+                    }]);
+                }
                 let Some(local) = self.by_cluster.get(&request).copied() else {
                     return Ok(Vec::new());
                 };
                 let state = self.executor.export_request(local, at)?;
-                // This worker-level command is the committed handoff path:
-                // the source must not continue executing after the payload
-                // leaves its ownership map. A future two-phase transport can
-                // defer this cancellation until the target acknowledges.
                 self.executor.cancel(local, at)?;
                 self.unmap(local);
+                self.pending_migrations.insert(request, state.clone());
                 Ok(vec![WorkerMessage::Migrated { request, state }])
             }
             WorkerCommand::AdmitMigrated {
@@ -180,6 +187,19 @@ impl WorkerHost {
                 }
                 let local = self.executor.import_request(state, arrival_at)?;
                 self.admitted += 1;
+                self.by_local.insert(local, request);
+                self.by_cluster.insert(request, local);
+                Ok(vec![WorkerMessage::Accepted { request, local }])
+            }
+            WorkerCommand::CommitMigration { request } => {
+                self.pending_migrations.remove(&request);
+                Ok(Vec::new())
+            }
+            WorkerCommand::AbortMigration { request } => {
+                let Some(state) = self.pending_migrations.remove(&request) else {
+                    return Ok(Vec::new());
+                };
+                let local = self.executor.import_request(state, at)?;
                 self.by_local.insert(local, request);
                 self.by_cluster.insert(request, local);
                 Ok(vec![WorkerMessage::Accepted { request, local }])

@@ -51,6 +51,16 @@ pub enum WorkerCommand {
         /// Original coordinator arrival time.
         arrival_at: Timestamp,
     },
+    /// Finalize a source-side migration after the target accepted it.
+    CommitMigration {
+        /// Cluster-wide identity.
+        request: ClusterRequestId,
+    },
+    /// Restore a source-side migration after target admission failed.
+    AbortMigration {
+        /// Cluster-wide identity.
+        request: ClusterRequestId,
+    },
     /// Pushes a validated adaptive-routing parameter update to a worker.
     PolicyUpdate {
         /// Load-pressure weight.
@@ -278,6 +288,17 @@ pub enum ClusterTraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker: Option<WorkerId>,
     },
+    /// A migration was accepted by its target worker.
+    Migrated {
+        /// Source owner.
+        from: WorkerId,
+        /// Target owner.
+        to: WorkerId,
+        /// Handoff mode selected by the source payload.
+        mode: String,
+        /// Architecture-specific session bytes transferred, if any.
+        bytes: u64,
+    },
 }
 
 /// Everything the caller must deliver after one coordinator call.
@@ -436,6 +457,7 @@ pub struct Coordinator {
     routed: u64,
     generation: u64,
     iterations: u64,
+    migrations: BTreeMap<ClusterRequestId, (WorkerId, RequestId, WorkerId, String, u64)>,
 }
 
 impl Coordinator {
@@ -450,6 +472,7 @@ impl Coordinator {
             routed: 0,
             generation: 0,
             iterations: 0,
+            migrations: BTreeMap::new(),
         }
     }
 
@@ -685,11 +708,24 @@ impl Coordinator {
                 request,
             });
         }
+        let source_local = match &entry.status {
+            ClusterRequestStatus::Running { local, .. } => *local,
+            _ => unreachable!("status checked above"),
+        };
         let arrival_at = entry.arrival_at;
         let spec = entry.spec.clone();
         entry.status = ClusterRequestStatus::Assigned {
             worker: target.clone(),
         };
+        let (mode, bytes) = state
+            .session_state
+            .as_ref()
+            .map(|state| ("transfer".to_owned(), crate::session_state_bytes(state)))
+            .unwrap_or_else(|| ("recompute".to_owned(), 0));
+        self.migrations.insert(
+            request,
+            (source.clone(), source_local, target.clone(), mode, bytes),
+        );
         worker.assigned = worker.assigned.saturating_add(1);
         worker
             .in_flight_tokens
@@ -706,6 +742,67 @@ impl Coordinator {
         ));
         let _ = at;
         Ok(output)
+    }
+
+    /// Rolls a staged migration back to the source owner.
+    pub fn rollback_migration(
+        &mut self,
+        request: ClusterRequestId,
+        source: &WorkerId,
+    ) -> Result<(), CoordinatorError> {
+        let Some((original_source, local, target, _, _)) = self.migrations.get(&request).cloned()
+        else {
+            return Err(CoordinatorError::UnknownRequest(request));
+        };
+        if &original_source != source {
+            return Err(CoordinatorError::UnexpectedMessage {
+                from: source.clone(),
+                request,
+            });
+        }
+        self.migrations.remove(&request);
+        if let Some(worker) = self.workers.get_mut(&target) {
+            worker.assigned = worker.assigned.saturating_sub(1);
+            worker.in_flight_tokens.pop_back();
+        }
+        let entry = self
+            .requests
+            .get_mut(&request)
+            .ok_or(CoordinatorError::UnknownRequest(request))?;
+        entry.status = ClusterRequestStatus::Running {
+            worker: original_source,
+            local,
+        };
+        self.generation = self.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Clears the source-side bookkeeping after target admission succeeds.
+    pub fn finish_migration(
+        &mut self,
+        request: ClusterRequestId,
+        at: Timestamp,
+    ) -> CoordinatorOutput {
+        let mut output = CoordinatorOutput::default();
+        if let Some((source, _, target, mode, bytes)) = self.migrations.remove(&request) {
+            if let Some(worker) = self.workers.get_mut(&source) {
+                worker.assigned = worker.assigned.saturating_sub(1);
+                worker.in_flight_tokens.pop_back();
+            }
+            output.record(
+                request,
+                None,
+                at,
+                ClusterTraceEvent::Migrated {
+                    from: source,
+                    to: target,
+                    mode,
+                    bytes,
+                },
+            );
+        }
+        self.generation = self.generation.saturating_add(1);
+        output
     }
 
     /// Unowned requests waiting for a plan.

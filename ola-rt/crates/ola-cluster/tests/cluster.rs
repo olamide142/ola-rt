@@ -75,6 +75,13 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
     assert!(!state.generated_tokens.is_empty());
     assert!(source.local_id(request).is_none());
 
+    assert!(
+        source
+            .handle(WorkerCommand::CommitMigration { request }, at(2),)
+            .unwrap()
+            .is_empty()
+    );
+
     let imported = target
         .handle(
             WorkerCommand::AdmitMigrated {
@@ -100,6 +107,38 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
         }
     }
     panic!("migrated request did not finish");
+}
+
+#[test]
+fn aborted_migration_restores_the_source_owner() {
+    let request = ClusterRequestId::new(78);
+    let mut source = WorkerHost::new("source", executor());
+    source
+        .handle(
+            WorkerCommand::Admit {
+                request,
+                spec: spec(4, 3, None),
+                arrival_at: at(0),
+            },
+            at(0),
+        )
+        .unwrap();
+    source.step(at(1)).unwrap();
+    let exported = source
+        .handle(WorkerCommand::MigrateOut { request }, at(2))
+        .unwrap();
+    assert!(matches!(
+        exported.as_slice(),
+        [WorkerMessage::Migrated { request: id, .. }] if *id == request
+    ));
+    let restored = source
+        .handle(WorkerCommand::AbortMigration { request }, at(3))
+        .unwrap();
+    assert!(matches!(
+        restored.as_slice(),
+        [WorkerMessage::Accepted { request: id, .. }] if *id == request
+    ));
+    assert!(source.local_id(request).is_some());
 }
 
 #[test]

@@ -18,6 +18,13 @@ pub enum TcpCoordinatorError {
     Link(CoordinatorLinkError),
     /// No connected link exists for a worker selected by the coordinator.
     MissingLink(WorkerId),
+    /// A target rejected a migration and the source was restored.
+    MigrationRefused {
+        /// Worker that refused the target admission.
+        worker: WorkerId,
+        /// Worker-provided diagnostic.
+        message: String,
+    },
 }
 
 /// Coordinator-side link timing estimate from worker heartbeats.
@@ -35,6 +42,9 @@ impl fmt::Display for TcpCoordinatorError {
             Self::Coordinator(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),
             Self::MissingLink(worker) => write!(formatter, "no TCP link for worker `{worker}`"),
+            Self::MigrationRefused { worker, message } => {
+                write!(formatter, "worker `{worker}` refused migration: {message}")
+            }
         }
     }
 }
@@ -176,7 +186,9 @@ impl TcpCoordinator {
                 CoordinatorLinkEvent::Message(WorkerMessage::Migrated {
                     request: migrated_request,
                     state,
-                }) if migrated_request == request => break state,
+                }) if migrated_request == request => {
+                    break state;
+                }
                 CoordinatorLinkEvent::Message(message) => {
                     let _ = self.coordinator.handle(source, message, at)?;
                 }
@@ -186,11 +198,61 @@ impl TcpCoordinator {
                 }
             }
         };
-        let output = self
-            .coordinator
-            .stage_migration(request, source, target, state, at)?;
+        let output =
+            self.coordinator
+                .stage_migration(request, source, target.clone(), state, at)?;
         self.dispatch(&output.commands).await?;
-        Ok(output)
+        let mut output = output;
+        loop {
+            let event = self
+                .links
+                .get_mut(&target)
+                .ok_or_else(|| TcpCoordinatorError::MissingLink(target.clone()))?
+                .receive_event()
+                .await?;
+            match event {
+                CoordinatorLinkEvent::Message(WorkerMessage::Accepted {
+                    request: accepted_request,
+                    local,
+                }) if accepted_request == request => {
+                    output.extend(self.coordinator.handle(
+                        &target,
+                        WorkerMessage::Accepted { request, local },
+                        at,
+                    )?);
+                    output.extend(self.coordinator.finish_migration(request, at));
+                    self.links
+                        .get_mut(source)
+                        .ok_or_else(|| TcpCoordinatorError::MissingLink(source.clone()))?
+                        .send_command(&WorkerCommand::CommitMigration { request })
+                        .await?;
+                    return Ok(output);
+                }
+                CoordinatorLinkEvent::Message(WorkerMessage::Refused {
+                    request: refused_request,
+                    message,
+                }) if refused_request == request => {
+                    self.coordinator.rollback_migration(request, source)?;
+                    self.links
+                        .get_mut(source)
+                        .ok_or_else(|| TcpCoordinatorError::MissingLink(source.clone()))?
+                        .send_command(&WorkerCommand::AbortMigration { request })
+                        .await?;
+                    self.await_source_restore(request, source, at).await?;
+                    return Err(TcpCoordinatorError::MigrationRefused {
+                        worker: target,
+                        message,
+                    });
+                }
+                CoordinatorLinkEvent::Message(message) => {
+                    output.extend(self.coordinator.handle(&target, message, at)?);
+                }
+                CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
+                    self.coordinator.heartbeat(&target, epoch, at)?;
+                    self.record_calibration(&target, at, sent_at_us);
+                }
+            }
+        }
     }
 
     /// Places a worker into draining mode. Existing requests continue, while
@@ -281,6 +343,42 @@ impl TcpCoordinator {
             calibration.offset_us = ((previous + i128::from(offset)) / samples)
                 .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
                 as i64;
+        }
+    }
+
+    async fn await_source_restore(
+        &mut self,
+        request: ClusterRequestId,
+        source: &WorkerId,
+        at: Timestamp,
+    ) -> Result<(), TcpCoordinatorError> {
+        loop {
+            let event = self
+                .links
+                .get_mut(source)
+                .ok_or_else(|| TcpCoordinatorError::MissingLink(source.clone()))?
+                .receive_event()
+                .await?;
+            match event {
+                CoordinatorLinkEvent::Message(WorkerMessage::Accepted {
+                    request: restored_request,
+                    local,
+                }) if restored_request == request => {
+                    self.coordinator.handle(
+                        source,
+                        WorkerMessage::Accepted { request, local },
+                        at,
+                    )?;
+                    return Ok(());
+                }
+                CoordinatorLinkEvent::Message(message) => {
+                    self.coordinator.handle(source, message, at)?;
+                }
+                CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
+                    self.coordinator.heartbeat(source, epoch, at)?;
+                    self.record_calibration(source, at, sent_at_us);
+                }
+            }
         }
     }
 }

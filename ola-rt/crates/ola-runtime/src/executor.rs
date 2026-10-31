@@ -2385,7 +2385,11 @@ mod tests {
         let first = source.step_iteration(Timestamp::from_micros(1)).unwrap();
         assert!(matches!(
             first.events.as_slice(),
-            [ExecutorEvent::Token { phase: ExecutionPhase::Prefill, generated_tokens: 1, .. }]
+            [ExecutorEvent::Token {
+                phase: ExecutionPhase::Prefill,
+                generated_tokens: 1,
+                ..
+            }]
         ));
         let migrated = source
             .export_request(request_id, Timestamp::from_micros(2))
@@ -2396,10 +2400,16 @@ mod tests {
         destination
             .register_model(ModelDescriptor::language("tiny", "increment"), artifact())
             .unwrap();
-        let local = destination.import_request(migrated, Timestamp::from_micros(3)).unwrap();
-        let restored = destination.step_iteration(Timestamp::from_micros(4)).unwrap();
+        let local = destination
+            .import_request(migrated, Timestamp::from_micros(3))
+            .unwrap();
+        let restored = destination
+            .step_iteration(Timestamp::from_micros(4))
+            .unwrap();
         assert!(restored.events.is_empty() || restored.is_idle());
-        let next = destination.step_iteration(Timestamp::from_micros(5)).unwrap();
+        let next = destination
+            .step_iteration(Timestamp::from_micros(5))
+            .unwrap();
         assert!(matches!(
             next.events.as_slice(),
             [ExecutorEvent::Token {

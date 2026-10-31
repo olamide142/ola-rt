@@ -1,6 +1,6 @@
 # OlaRT Progress Report
 
-**Last updated:** 2026-10-24 14:18 BST (Europe/London)
+**Last updated:** 2026-10-31 16:00 GMT (Europe/London)
 
 **2026-10-31 distributed continuation:** Supported architecture-specific
 `SessionState` is now consumed during destination admission rather than merely
@@ -8,12 +8,16 @@ carried in the migration envelope. The runtime promotes an imported session
 directly to decode-ready state and keeps token recompute as the fallback when a
 model returns `None`; a regression test proves there is no duplicate prefill
 token. Burn Llama and Mistral both have versioned session export/import tests.
-The remaining D3/D4 gaps are full target-acknowledged two-phase rollback,
-raw KV-byte transfer/disaggregation, and simulator failure injection.
+The remaining D3/D4 gaps are raw KV-byte transfer/disaggregation and simulator
+failure injection.
 
-`TcpCoordinator::migrate` now waits for source export before moving coordinator
-ownership to the target and dispatching `AdmitMigrated`; ordinary worker
-messages and heartbeat calibration continue to be processed while waiting.
+`TcpCoordinator::migrate` now waits for source export before staging ownership,
+waits for target `Accepted`, then commits the source; target refusal triggers
+source abort/re-import. Completed handoffs emit a `Migrated` trace record, and
+ordinary worker messages and heartbeat calibration continue while waiting. A
+real two-worker TCP integration test now verifies handoff, trace emission, and
+completion after migration; coordinator accounting removes the staged target
+reservation on rollback and the source reservation on commit.
 
 The cluster crate now also exposes calibrated transfer-vs-recompute selection
 and an exact small-batch MILP router with request/KV capacity constraints;

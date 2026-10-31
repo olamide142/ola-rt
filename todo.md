@@ -300,8 +300,10 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   lease-expiry recovery with failure injection. Runtime and worker protocol
   hooks plus coordinator requeue recovery are implemented; supported session
   snapshots now enter the destination decode-ready path, while end-to-end
-  coordinator ownership handoff is now staged through `TcpCoordinator::migrate`;
-  simulator failure injection and full handoff tracing remain.
+  coordinator ownership handoff is now staged through `TcpCoordinator::migrate`
+  with explicit source commit/abort and target acknowledgement. A two-worker
+  TCP integration test covers the committed handoff and completion, and
+  simulator failure injection remains.
 - [~] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
   Llama and Mistral now export and import versioned recompute-safe session
