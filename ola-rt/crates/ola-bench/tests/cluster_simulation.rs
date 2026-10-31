@@ -129,6 +129,34 @@ fn latencies_are_measured_at_the_coordinator() {
 }
 
 #[test]
+fn simulated_link_costs_reach_routing_candidates() {
+    let trace = SchedulingTrace::mixed_short_long(TraceParameters {
+        requests: 4,
+        ..PARAMETERS
+    });
+    let network = NetworkModel {
+        latency_micros: 17,
+        bytes_per_micro: 8,
+    };
+    let run = run_cluster_trial(
+        &trace,
+        LeastLoadedRouting,
+        &ClusterSimulationConfig::uniform(2, worker(), network),
+    )
+    .unwrap();
+    let expected = network
+        .latency_micros
+        .saturating_add(network.transmit_micros(ola_bench::MESSAGE_HEADER_BYTES));
+    assert!(run.cluster_trace.iter().any(|record| {
+        matches!(
+            &record.event,
+            ClusterTraceEvent::Routed { candidates, .. }
+                if candidates.iter().all(|candidate| candidate.network_cost_us == expected)
+        )
+    }));
+}
+
+#[test]
 fn bandwidth_delays_large_messages() {
     let trace = SchedulingTrace::mixed_short_long(TraceParameters {
         requests: 10,

@@ -462,6 +462,13 @@ where
         simulation
             .coordinator
             .join(host.summary(Timestamp::from_micros(0)))?;
+        let network_cost_us = config
+            .network
+            .latency_micros
+            .saturating_add(config.network.transmit_micros(MESSAGE_HEADER_BYTES));
+        simulation
+            .coordinator
+            .set_network_cost(id.clone(), network_cost_us);
         simulation.index.insert(id.clone(), index);
         simulation.workers.push(SimWorker {
             host,

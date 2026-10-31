@@ -325,7 +325,8 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   seeds. A loopback TCP test now pushes weights through `TcpCoordinator` and
   verifies the worker acknowledgement/state; broader live workload evaluation
   remains. Adaptive routing now also accepts calibrated per-worker network
-  costs and records them in route candidates.
+  costs and records them in route candidates; the virtual network model now
+  injects its latency/bandwidth-derived cost into every coordinator snapshot.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

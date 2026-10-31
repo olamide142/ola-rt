@@ -42,6 +42,10 @@ live workload comparison remains. Network cost is now a first-class adaptive
 weight: the coordinator can supply per-worker calibrated costs, the batch
 optimizer includes them in its objective, and route candidates preserve the
 cost used for the decision.
+The virtual cluster simulator now derives the same cost from its configured
+latency and bandwidth and injects it into coordinator snapshots, so adaptive
+simulation decisions exercise the network-cost path rather than only testing
+the field in isolation.
 
 `ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
 the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries
