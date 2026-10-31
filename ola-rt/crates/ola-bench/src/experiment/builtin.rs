@@ -2,10 +2,12 @@
 
 use std::{collections::BTreeMap, time::Duration, time::Instant};
 
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+use burn::tensor::Device;
 #[cfg(feature = "wgpu")]
 use burn::tensor::DeviceKind;
-#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
-use burn::tensor::{Device, Tensor, TensorData};
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+use burn::tensor::{Tensor, TensorData};
 
 use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
@@ -28,9 +30,11 @@ use crate::{
 };
 
 #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
+use ola_kernel::{CubePagedAttention, KernelTarget, PortablePagedAttention};
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
 use ola_kernel::{
-    CubePagedAttention, KernelTarget, PagedAttentionConfig, PagedAttentionInput,
-    PagedAttentionKernel, PagedKvBlockTable, PagedKvBlocks, PagedKvPage, PortablePagedAttention,
+    PagedAttentionConfig, PagedAttentionInput, PagedAttentionKernel, PagedKvBlockTable,
+    PagedKvBlocks, PagedKvPage,
 };
 
 impl ExperimentRegistry {
@@ -55,6 +59,8 @@ impl ExperimentRegistry {
         ];
         #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
         experiments.push(Box::new(PagedAttentionKernelStudy));
+        #[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+        experiments.push(Box::new(super::PagedAttentionOccupancy));
         Self::new(experiments)
     }
 }
@@ -1458,7 +1464,14 @@ impl Experiment for PagedAttentionKernelStudy {
             let mut variants = Vec::new();
             let mut content = String::new();
             for page_size in page_sizes {
-                let input = kernel_input(&device, page_size, sequence_tokens, pool_slack_blocks)?;
+                let config = PagedAttentionConfig::new(4, 2, 4).map_err(run_error)?;
+                let input = kernel_input(
+                    &device,
+                    config,
+                    page_size,
+                    sequence_tokens,
+                    pool_slack_blocks,
+                )?;
                 let inputs = vec![input; batch];
                 let logical_pages = sequence_tokens.div_ceil(page_size);
                 let padding_tokens = logical_pages * page_size - sequence_tokens;
@@ -1614,9 +1627,10 @@ impl Experiment for PagedAttentionKernelStudy {
     }
 }
 
-#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
-fn kernel_input(
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+pub(super) fn kernel_input(
     device: &burn::tensor::Device,
+    config: PagedAttentionConfig,
     page_size: usize,
     sequence_tokens: usize,
     pool_slack_blocks: usize,
@@ -1626,11 +1640,15 @@ fn kernel_input(
             "page sizes and sequence tokens must be greater than zero".into(),
         ));
     }
-    let config = PagedAttentionConfig::new(4, 2, 4).map_err(run_error)?;
+    let heads = config.query_heads();
+    let kv_heads = config.key_value_heads();
+    let dim = config.head_dim();
     let query = Tensor::from_data(
         TensorData::new(
-            (0..16).map(|index| index as f32 * 0.01).collect::<Vec<_>>(),
-            [1, 4, 1, 4],
+            (0..heads * dim)
+                .map(|index| index as f32 * 0.01)
+                .collect::<Vec<_>>(),
+            [1, heads, 1, dim],
         ),
         device,
     );
@@ -1639,22 +1657,29 @@ fn kernel_input(
         .checked_add(1)
         .and_then(|blocks| blocks.checked_add(pool_slack_blocks))
         .ok_or_else(|| ExperimentError::Run("physical KV block count overflowed".into()))?;
-    let mut physical_key = Tensor::zeros([physical_blocks, 2, page_size, 4], device);
-    let mut physical_value = Tensor::zeros([physical_blocks, 2, page_size, 4], device);
+    let mut physical_key = Tensor::zeros([physical_blocks, kv_heads, page_size, dim], device);
+    let mut physical_value = Tensor::zeros([physical_blocks, kv_heads, page_size, dim], device);
     let mut pages = Vec::with_capacity(logical_pages);
     let mut block_ids = Vec::with_capacity(logical_pages);
     for logical in 0..logical_pages {
         let used = (sequence_tokens - logical * page_size).min(page_size);
-        let values = (0..2 * used * 4)
+        let values = (0..kv_heads * used * dim)
             .map(|index| ((index + logical * 7) % 17) as f32 * 0.02 - 0.1)
             .collect::<Vec<_>>();
-        let key = Tensor::from_data(TensorData::new(values.clone(), [1, 2, used, 4]), device);
-        let value = Tensor::from_data(TensorData::new(values, [1, 2, used, 4]), device);
+        let key = Tensor::from_data(
+            TensorData::new(values.clone(), [1, kv_heads, used, dim]),
+            device,
+        );
+        let value = Tensor::from_data(TensorData::new(values, [1, kv_heads, used, dim]), device);
         let physical = logical + 1;
-        physical_key =
-            physical_key.slice_assign([physical..physical + 1, 0..2, 0..used, 0..4], key.clone());
-        physical_value = physical_value
-            .slice_assign([physical..physical + 1, 0..2, 0..used, 0..4], value.clone());
+        physical_key = physical_key.slice_assign(
+            [physical..physical + 1, 0..kv_heads, 0..used, 0..dim],
+            key.clone(),
+        );
+        physical_value = physical_value.slice_assign(
+            [physical..physical + 1, 0..kv_heads, 0..used, 0..dim],
+            value.clone(),
+        );
         pages.push(PagedKvPage::new(key, value));
         block_ids.push(physical);
     }
@@ -1673,8 +1698,8 @@ fn kernel_input(
         .map_err(run_error)
 }
 
-#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
-fn run_kernel(
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+pub(super) fn run_kernel(
     kernel: &dyn PagedAttentionKernel,
     inputs: &[PagedAttentionInput],
 ) -> Result<(Duration, Vec<Vec<f32>>), ExperimentError> {
@@ -1687,8 +1712,8 @@ fn run_kernel(
     Ok((started.elapsed(), values))
 }
 
-#[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
-fn max_error(expected: &[Vec<f32>], actual: &[Vec<f32>]) -> f64 {
+#[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+pub(super) fn max_error(expected: &[Vec<f32>], actual: &[Vec<f32>]) -> f64 {
     expected
         .iter()
         .zip(actual)
@@ -1942,7 +1967,7 @@ pub(super) fn finish(
     Ok(ExperimentOutcome { report, summary })
 }
 
-fn metric(name: &str, unit: Unit, domain: TimeDomain, better: Direction) -> MetricSpec {
+pub(super) fn metric(name: &str, unit: Unit, domain: TimeDomain, better: Direction) -> MetricSpec {
     MetricSpec::new(name, unit, domain, better)
 }
 
@@ -1954,7 +1979,7 @@ pub(super) fn plain_variant(label: &str) -> Variant {
     }
 }
 
-fn values(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
+pub(super) fn values(pairs: &[(&str, f64)]) -> BTreeMap<String, f64> {
     pairs
         .iter()
         .map(|(name, value)| ((*name).to_owned(), *value))

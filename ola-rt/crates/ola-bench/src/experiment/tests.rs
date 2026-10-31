@@ -421,6 +421,8 @@ fn every_builtin_experiment_runs_with_its_defaults() {
     ];
     #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
     expected.push("paged-attention-kernel");
+    #[cfg(any(feature = "cubecl-cpu", feature = "wgpu", feature = "cuda"))]
+    expected.push("paged-attention-occupancy");
     assert_eq!(actual, expected);
     for descriptor in descriptors {
         if descriptor.requirements.contains(&Requirement::LoadedModel) {

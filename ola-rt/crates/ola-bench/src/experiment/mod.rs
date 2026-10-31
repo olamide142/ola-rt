@@ -7,6 +7,7 @@ mod cluster;
 mod compare;
 mod metric;
 mod model;
+mod occupancy;
 mod registry;
 mod report;
 mod statistics;
@@ -22,6 +23,7 @@ pub use compare::{
 };
 pub use metric::{Direction, MetricSpec, TimeDomain, Unit};
 pub use model::{ChunkedPrefill, CostCalibration, LlamaGeneration, PrefillStrategies};
+pub use occupancy::{PagedAttentionOccupancy, nsight_metrics};
 pub use registry::{
     Experiment, ExperimentCategory, ExperimentContext, ExperimentDescriptor, ExperimentError,
     ExperimentOutcome, ExperimentRegistry, ExperimentRunConfig, ExperimentTrace,

@@ -28,6 +28,9 @@ pub enum TimeDomain {
     Virtual,
     /// Host wall-clock time; noisy and machine specific.
     Host,
+    /// Accelerator time measured by a hardware profiler, such as kernel
+    /// duration under Nsight Compute replay.
+    Device,
     /// No time involved, such as counts or padding.
     Untimed,
 }

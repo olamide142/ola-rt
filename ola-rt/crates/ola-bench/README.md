@@ -98,8 +98,77 @@ performance claim.
 The feature-gated `paged-attention-kernel` study compares portable and CubeCL
 attention across page sizes, batches, partial final pages, and configurable
 unused physical KV blocks (`pool_slack_blocks`). It reports physical-pool
-fragmentation explicitly; accelerator occupancy still requires a hardware
-profiler and is not inferred from host latency.
+fragmentation explicitly; accelerator occupancy comes from the separate
+profiler-backed `paged-attention-occupancy` study below.
+
+## Accelerator occupancy
+
+The feature-gated `paged-attention-occupancy` study measures CubeCL paged
+attention over the cross product of `page_sizes`, `batch_sizes`, and
+`sequence_lengths` (one variant per shape, labelled
+`page=P,batch=B,seq=S`), with configurable `query_heads`, `kv_heads`, and
+`head_dim`. Every sample records host latency, oracle error against the
+portable kernel, page/padding counts, and the kernel's work-item count.
+
+Occupancy is never inferred from host time. It comes from an Nsight Compute
+capture of an identical run, attached with `profile=<csv>`. The study then
+adds, per measured repetition:
+
+| Metric | Nsight counter | Domain |
+| --- | --- | --- |
+| `gpu_duration_micros` | `gpu__time_duration.sum` | device |
+| `achieved_occupancy` | `sm__warps_active.avg.pct_of_peak_sustained_active` | untimed ratio |
+| `theoretical_occupancy` | `sm__maximum_warps_per_active_cycle_pct` | untimed ratio |
+| `sm_throughput` | `sm__throughput.avg.pct_of_peak_sustained_elapsed` | untimed ratio |
+| `memory_throughput` | `gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed` | untimed ratio |
+| `registers_per_thread` | `launch__registers_per_thread` | untimed count |
+
+Two-pass workflow on an NVIDIA machine (CUDA toolkit with NVRTC and Nsight
+Compute installed, and profiling permission: root or
+`NVreg_RestrictProfilingToAdminUsers=0`):
+
+```sh
+cargo build --release -p ola-cli --features cuda
+P="--set page_sizes=8,16,32 --set batch_sizes=1,8 --set sequence_lengths=64,256"
+
+# 1. Capture. Kernel replay serializes and perturbs latency, so this run's
+#    own report is discarded.
+ncu --kernel-name regex:paged_attention \
+    --metrics gpu__time_duration.sum,sm__warps_active.avg.pct_of_peak_sustained_active,sm__maximum_warps_per_active_cycle_pct,sm__throughput.avg.pct_of_peak_sustained_elapsed,gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,launch__registers_per_thread,launch__grid_size,launch__block_size \
+    --csv --page raw --log-file occupancy.csv \
+    target/release/ola experiment run paged-attention-occupancy $P
+
+# 2. Measure latency unprofiled with the same parameters, attaching the capture.
+target/release/ola experiment run paged-attention-occupancy $P \
+    --set profile=occupancy.csv --results-dir results
+```
+
+`nsight_metrics()` returns the exact `--metrics` list. If the generated CUDA
+kernel name differs on a toolchain, change both `--kernel-name` and the
+study's `profile_kernel` filter. Each shape launches
+one oracle-check dispatch, `warmups`, then `repetitions`, in page → batch →
+sequence order, and each homogeneous batch is exactly one `paged_attention`
+launch, so launches map onto samples by position. The capture is rejected
+before any dispatch if its launch count differs or a launch's
+`grid × block` thread count does not cover that shape's work items, which
+catches a capture made with different parameters. Percentages are stored as
+0–1 ratios and durations are normalized to microseconds from the unit row.
+The capture's digest, device name, and launch count go into
+`details.profiler` and the workload digest, so reports with different
+captures never compare as the same workload.
+
+Hardware limitations:
+
+- Nsight Compute counters exist only for NVIDIA GPUs through the `cuda`
+  feature. A WGPU run on an NVIDIA card goes through Vulkan, which `ncu`
+  does not profile; WGPU and `cubecl-cpu` builds produce latency-only
+  reports (summary ends with `no profile attached`).
+- Turing (the development GTX 1650) and newer support the counters above;
+  older architectures need `nvprof` and are not parsed.
+- Without the `profile` parameter the study is still a valid host-time study;
+  with it, occupancy reflects replayed launches, not the timed ones.
+- The development laptop's NVIDIA driver is currently unavailable
+  (`nvidia-smi` cannot reach it), so no profiled report has been recorded yet.
 
 ## Experiment framework
 

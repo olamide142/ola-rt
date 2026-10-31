@@ -44,12 +44,13 @@ Every measurement is a named metric with explicit semantics:
 pub struct Metric {
     pub name: MetricName,          // stable, e.g. "completion_p95"
     pub unit: Unit,                // Micros, Tokens, Bytes, Ratio, TokensPerSecond, Count
-    pub domain: TimeDomain,        // Virtual | Host | Untimed
+    pub domain: TimeDomain,        // Virtual | Host | Device | Untimed
     pub better: Direction,         // Lower | Higher | Neither
 }
 ```
 
-- `TimeDomain` keeps simulation time and host time apart. Comparisons and
+- `TimeDomain` keeps simulation time, host time, and profiler-measured
+  device time apart. Comparisons and
   displays never mix domains, and a report states which it contains.
 - `Direction` lets comparison decide what a regression is without
   per-experiment code.

@@ -349,6 +349,7 @@ const fn domain(domain: TimeDomain) -> &'static str {
     match domain {
         TimeDomain::Virtual => "virtual time",
         TimeDomain::Host => "host time",
+        TimeDomain::Device => "device time",
         TimeDomain::Untimed => "untimed",
     }
 }

@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-cuda = ["burn/cuda", "ola-burn/cuda", "ola-kernel/cuda"]
+cuda = ["burn/cuda", "ola-bench/cuda", "ola-burn/cuda", "ola-kernel/cuda"]
 wgpu = ["burn/wgpu", "ola-burn/wgpu", "ola-kernel/wgpu"]
 
 [dependencies]

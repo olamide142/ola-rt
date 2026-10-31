@@ -8,6 +8,7 @@ rust-version.workspace = true
 [features]
 default = []
 cubecl-cpu = ["dep:burn", "ola-kernel/cubecl-cpu"]
+cuda = ["dep:burn", "ola-kernel/cuda"]
 wgpu = ["dep:burn", "ola-kernel/wgpu"]
 
 [dependencies]

@@ -458,6 +458,7 @@ fn kind_label(kind: ExperimentKind, domain: TimeDomain) -> String {
     let domain = match domain {
         TimeDomain::Virtual => "virtual time",
         TimeDomain::Host => "host time",
+        TimeDomain::Device => "device time",
         TimeDomain::Untimed => "untimed",
     };
     format!("{kind}, {domain}")
