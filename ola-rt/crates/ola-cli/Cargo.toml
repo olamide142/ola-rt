@@ -12,7 +12,9 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["burn/cuda", "ola-bench/cuda", "ola-burn/cuda", "ola-kernel/cuda"]
-wgpu = ["burn/wgpu", "ola-burn/wgpu", "ola-kernel/wgpu"]
+# CubeCL kernels on the CPU, for the paged-attention experiments without a GPU.
+cubecl-cpu = ["ola-bench/cubecl-cpu"]
+wgpu = ["burn/wgpu", "ola-bench/wgpu", "ola-burn/wgpu", "ola-kernel/wgpu"]
 
 [dependencies]
 burn.workspace = true

@@ -877,6 +877,18 @@ impl Experiment for AdaptivePolicyStudy {
             for request in &trace.requests {
                 content.push_str(&format!("{request:?};"));
             }
+            // One trace run per variant and seed; the first write error is
+            // kept and reported after the trial.
+            let mut runs = labels
+                .iter()
+                .map(|(label, _)| {
+                    context
+                        .trace
+                        .as_ref()
+                        .map(|sink| sink.run(format!("{label}/seed={}", trace.parameters.seed)))
+                })
+                .collect::<Vec<_>>();
+            let mut trace_error = None;
             let comparison = compare_schedulers_observed(
                 trace,
                 &config,
@@ -885,9 +897,19 @@ impl Experiment for AdaptivePolicyStudy {
                     Self::baseline_policy(&[]).map_err(run_error)?,
                 ],
                 DEFAULT_STARVATION_FACTOR,
-                &mut |_, _, _| {},
+                &mut |index, iteration, state| {
+                    if let Some(Some(run)) = runs.get_mut(index)
+                        && trace_error.is_none()
+                        && let Err(error) = run.observe(iteration, state)
+                    {
+                        trace_error = Some(error);
+                    }
+                },
             )
             .map_err(run_error)?;
+            if let Some(error) = trace_error {
+                return Err(error);
+            }
             for (variant, summary) in samples.iter_mut().zip(&comparison.summaries) {
                 variant.push(values(&[
                     ("completion_p95", as_f64(summary.completion.p95_micros)),
@@ -1143,6 +1165,18 @@ impl Experiment for OnlineAdaptivePolicyStudy {
             for request in &trace.requests {
                 content.push_str(&format!("{request:?};"));
             }
+            // One trace run per variant and seed; the first write error is
+            // kept and reported after the trial.
+            let mut runs = labels
+                .iter()
+                .map(|(label, _)| {
+                    context
+                        .trace
+                        .as_ref()
+                        .map(|trace| trace.run(format!("{label}/seed={}", seed)))
+                })
+                .collect::<Vec<_>>();
+            let mut trace_error = None;
             let comparison = compare_schedulers_observed(
                 &trace,
                 &config,
@@ -1153,9 +1187,19 @@ impl Experiment for OnlineAdaptivePolicyStudy {
                     AdaptivePolicyStudy::baseline_policy(&[]).map_err(run_error)?,
                 ],
                 DEFAULT_STARVATION_FACTOR,
-                &mut |_, _, _| {},
+                &mut |index, iteration, state| {
+                    if let Some(Some(run)) = runs.get_mut(index)
+                        && trace_error.is_none()
+                        && let Err(error) = run.observe(iteration, state)
+                    {
+                        trace_error = Some(error);
+                    }
+                },
             )
             .map_err(run_error)?;
+            if let Some(error) = trace_error {
+                return Err(error);
+            }
             for (variant, summary) in samples.iter_mut().zip(&comparison.summaries) {
                 variant.push(values(&[
                     ("completion_p95", as_f64(summary.completion.p95_micros)),
