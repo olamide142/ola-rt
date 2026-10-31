@@ -10,13 +10,20 @@
 use std::{error::Error, fmt};
 
 use ola_core::WorkerId;
-use ola_net::{TcpPeer, WireBody, WireError, WireMessage, read_message, write_message};
+use ola_net::{
+    BinaryFrame, TcpPeer, WireBody, WireError, WireMessage, read_attached, write_attached,
+    write_message,
+};
 use tokio::{net::tcp::OwnedWriteHalf, sync::mpsc, task::JoinHandle};
 
 use crate::{WorkerCommand, WorkerMessage, WorkerSummary};
 
-/// A frame read from one worker, or the error that ended its reader.
-pub type LinkFrame = (WorkerId, Result<WireMessage, WireError>);
+/// A message read from one worker with any binary frame attached to it, or
+/// the error that ended that worker's reader.
+pub type LinkFrame = (
+    WorkerId,
+    Result<(WireMessage, Option<BinaryFrame>), WireError>,
+);
 
 /// Errors raised while connecting to or communicating with one worker.
 #[derive(Debug)]
@@ -124,7 +131,7 @@ impl CoordinatorWorkerLink {
         let reader_worker = worker.clone();
         let reader = tokio::spawn(async move {
             loop {
-                let frame = read_message(&mut reader).await;
+                let frame = read_attached(&mut reader).await;
                 let done = frame.is_err();
                 if frames.send((reader_worker.clone(), frame)).is_err() || done {
                     return;
@@ -152,10 +159,32 @@ impl CoordinatorWorkerLink {
     /// # Errors
     ///
     /// Fails if the command cannot be encoded or written.
+    ///
+    /// A migrated request's session snapshot travels as an attached binary
+    /// frame rather than inside the JSON.
     pub async fn send_command(
         &mut self,
         command: &WorkerCommand,
     ) -> Result<(), CoordinatorLinkError> {
+        if let WorkerCommand::AdmitMigrated {
+            request,
+            state,
+            arrival_at,
+        } = command
+            && state.session_state.is_some()
+        {
+            let mut state = state.clone();
+            if let Some(frame) = crate::transfer::detach_session(&mut state, 0, request.get()) {
+                let body = WireBody::json_payload(&WorkerCommand::AdmitMigrated {
+                    request: *request,
+                    state,
+                    arrival_at: *arrival_at,
+                })?;
+                let message = WireMessage::new(0, self.next_correlation(), body);
+                write_attached(&mut self.writer, &message, &frame).await?;
+                return Ok(());
+            }
+        }
         let body = WireBody::json_payload(command)?;
         self.send(body).await
     }
@@ -168,12 +197,22 @@ impl CoordinatorWorkerLink {
     /// coordinator link.
     pub async fn accept_frame(
         &mut self,
-        frame: Result<WireMessage, WireError>,
+        frame: Result<(WireMessage, Option<BinaryFrame>), WireError>,
     ) -> Result<CoordinatorLinkEvent, CoordinatorLinkError> {
-        let message = frame?;
+        let (message, attachment) = frame?;
         match message.body {
             WireBody::Payload { .. } => {
-                Ok(CoordinatorLinkEvent::Message(message.body.decode_json()?))
+                let mut decoded: WorkerMessage = message.body.decode_json()?;
+                match (&mut decoded, attachment) {
+                    (WorkerMessage::Migrated { state, .. }, Some(frame)) => {
+                        crate::transfer::attach_session(state, &frame);
+                    }
+                    (_, Some(_)) => {
+                        return Err(CoordinatorLinkError::UnexpectedMessage("attachment"));
+                    }
+                    (_, None) => {}
+                }
+                Ok(CoordinatorLinkEvent::Message(decoded))
             }
             WireBody::Heartbeat { sent_at_us } => {
                 self.send(WireBody::HeartbeatAck {
@@ -203,10 +242,15 @@ impl CoordinatorWorkerLink {
     }
 
     async fn send(&mut self, body: WireBody) -> Result<(), CoordinatorLinkError> {
-        let correlation = self.next_correlation;
-        self.next_correlation = self.next_correlation.saturating_add(1);
+        let correlation = self.next_correlation();
         write_message(&mut self.writer, &WireMessage::new(0, correlation, body)).await?;
         Ok(())
+    }
+
+    fn next_correlation(&mut self) -> u64 {
+        let correlation = self.next_correlation;
+        self.next_correlation = self.next_correlation.saturating_add(1);
+        correlation
     }
 }
 

@@ -83,6 +83,27 @@ pub fn session_state_from_frame(frame: &BinaryFrame) -> Result<SessionState, Ses
     })
 }
 
+/// Moves a migrated request's session snapshot out into a binary frame, so
+/// the JSON control message stays small. Returns `None`, leaving the state
+/// inline, when there is no snapshot or it cannot be framed.
+pub(crate) fn detach_session(
+    state: &mut ola_runtime::MigratedRequest,
+    sender_epoch: u64,
+    correlation: u64,
+) -> Option<BinaryFrame> {
+    let session = state.session_state.as_ref()?;
+    let frame = session_state_to_frame(session, sender_epoch, correlation).ok()?;
+    state.session_state = None;
+    Some(frame)
+}
+
+/// Restores a snapshot carried by [`detach_session`]. A frame that does not
+/// decode leaves the request without one, so its destination recomputes
+/// instead: slower, but the output is the same.
+pub(crate) fn attach_session(state: &mut ola_runtime::MigratedRequest, frame: &BinaryFrame) {
+    state.session_state = session_state_from_frame(frame).ok();
+}
+
 /// The two supported ways to resume a request on another worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionHandoffMode {

@@ -172,3 +172,143 @@ async fn generation_is_not_paced_by_the_heartbeat() {
     assert!(started.elapsed() < Duration::from_secs(2));
     task.abort();
 }
+
+#[tokio::test]
+async fn large_session_snapshots_cross_links_as_binary_frames() {
+    use ola_cluster::{CoordinatorLinkEvent, CoordinatorWorkerLink, WorkerCommand, WorkerMessage};
+    use ola_model::SessionState;
+    use ola_net::{WireBody, WireMessage, read_attached, write_attached};
+    use ola_runtime::MigratedRequest;
+
+    // Over 16 MiB once JSON writes each byte as a number.
+    let payload = (0..4 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let state = MigratedRequest {
+        spec: request(4),
+        prompt_tokens: vec![0, 2, 3, 4],
+        generated_tokens: vec![7],
+        token_times: vec![Timestamp::ZERO],
+        preemptions: 0,
+        session_state: Some(SessionState {
+            format: "test/v1".into(),
+            cursor: 5,
+            payload,
+        }),
+    };
+
+    // A bare worker: handshake, take one command, echo it back as an export.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let summary = worker("raw").summary(Timestamp::ZERO);
+    let raw = tokio::spawn(async move {
+        let (mut peer, _) = TcpPeer::accept(&listener).await.unwrap();
+        peer.send(&WireMessage::new(
+            1,
+            1,
+            WireBody::Hello {
+                worker: summary.worker.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+        peer.send(&WireMessage::new(
+            1,
+            2,
+            WireBody::json_payload(&WorkerMessage::Summary(summary)).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let (mut reader, mut writer) = peer.into_split();
+        let (message, frame) = read_attached(&mut reader).await.unwrap();
+        let control_bytes = serde_json::to_vec(&message).unwrap().len();
+        let WorkerCommand::AdmitMigrated { request, state, .. } =
+            message.body.decode_json().unwrap()
+        else {
+            panic!("expected a migrated admission");
+        };
+        assert!(state.session_state.is_none(), "snapshot stayed in the JSON");
+        assert!(
+            control_bytes < 64 * 1024,
+            "control message is {control_bytes} bytes"
+        );
+        let reply = WireMessage::new(
+            1,
+            3,
+            WireBody::json_payload(&WorkerMessage::Migrated { request, state }).unwrap(),
+        );
+        write_attached(&mut writer, &reply, &frame.unwrap())
+            .await
+            .unwrap();
+        (reader, writer)
+    });
+
+    let (frames, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (mut link, _) = CoordinatorWorkerLink::connect(address, None, frames)
+        .await
+        .unwrap();
+    link.send_command(&WorkerCommand::AdmitMigrated {
+        request: ClusterRequestId::new(9),
+        state: state.clone(),
+        arrival_at: Timestamp::ZERO,
+    })
+    .await
+    .unwrap();
+    let (_, frame) = received.recv().await.unwrap();
+    let CoordinatorLinkEvent::Message(WorkerMessage::Migrated {
+        state: returned, ..
+    }) = link.accept_frame(frame).await.unwrap()
+    else {
+        panic!("expected the exported request back");
+    };
+    assert_eq!(returned, state);
+    let _connection = raw.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_worker_session_admits_a_large_migrated_snapshot() {
+    use ola_cluster::{CoordinatorLinkEvent, CoordinatorWorkerLink, WorkerCommand, WorkerMessage};
+    use ola_model::SessionState;
+    use ola_runtime::MigratedRequest;
+
+    let (address, task) = spawn_worker("target", Duration::from_millis(5)).await;
+    let (frames, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (mut link, _) = CoordinatorWorkerLink::connect(address, None, frames)
+        .await
+        .unwrap();
+    let request_id = ClusterRequestId::new(5);
+    link.send_command(&WorkerCommand::AdmitMigrated {
+        request: request_id,
+        state: MigratedRequest {
+            spec: request(3),
+            prompt_tokens: vec![0, 2, 3, 4],
+            generated_tokens: vec![7],
+            token_times: vec![Timestamp::ZERO],
+            preemptions: 0,
+            // The synthetic model cannot import it and recomputes instead;
+            // what matters is that the snapshot arrives.
+            session_state: Some(SessionState {
+                format: "test/v1".into(),
+                cursor: 5,
+                payload: vec![3; 4 * 1024 * 1024],
+            }),
+        },
+        arrival_at: Timestamp::ZERO,
+    })
+    .await
+    .unwrap();
+    loop {
+        let (_, frame) = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("worker did not answer")
+            .unwrap();
+        if let CoordinatorLinkEvent::Message(message) = link.accept_frame(frame).await.unwrap() {
+            match message {
+                WorkerMessage::Accepted { request, .. } if request == request_id => break,
+                WorkerMessage::Refused { message, .. } => panic!("refused: {message}"),
+                _ => {}
+            }
+        }
+    }
+    task.abort();
+}

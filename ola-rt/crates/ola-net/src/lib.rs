@@ -52,8 +52,20 @@ pub struct WireMessage {
     pub sender_epoch: u64,
     /// Correlates requests and acknowledgements.
     pub correlation: u64,
+    /// Whether one [`BinaryFrame`] follows this message on the stream; see
+    /// [`write_attached`]. Absent in the JSON when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub attachment: bool,
     /// Message body.
     pub body: WireBody,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes a reference"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl WireMessage {
@@ -63,6 +75,7 @@ impl WireMessage {
             version: PROTOCOL_VERSION,
             sender_epoch,
             correlation,
+            attachment: false,
             body,
         }
     }
@@ -230,6 +243,9 @@ pub enum WireError {
     Io(std::io::Error),
     /// The peer used a protocol version this crate cannot interpret.
     UnsupportedVersion(u16),
+    /// A message's `attachment` flag disagrees with how it was written or
+    /// read; use [`write_attached`] and [`read_attached`].
+    MisplacedAttachment,
 }
 
 /// A TCP connection carrying [`WireMessage`] frames.
@@ -297,6 +313,9 @@ impl fmt::Display for WireError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported wire protocol version {version}")
             }
+            Self::MisplacedAttachment => {
+                formatter.write_str("message attachment flag does not match its frames")
+            }
         }
     }
 }
@@ -323,6 +342,17 @@ where
     if message.version != PROTOCOL_VERSION {
         return Err(WireError::UnsupportedVersion(message.version));
     }
+    if message.attachment {
+        // A reader would wait for a binary frame that never comes.
+        return Err(WireError::MisplacedAttachment);
+    }
+    write_frame(writer, message).await
+}
+
+async fn write_frame<W>(writer: &mut W, message: &WireMessage) -> Result<(), WireError>
+where
+    W: AsyncWrite + Unpin,
+{
     let payload = serde_json::to_vec(message)?;
     let length = u32::try_from(payload.len()).map_err(|_| WireError::InvalidLength(u32::MAX))?;
     if payload.len() > MAX_MESSAGE_BYTES {
@@ -335,7 +365,24 @@ where
 }
 
 /// Reads one big-endian length-prefixed JSON message.
+///
+/// # Errors
+///
+/// Fails on a malformed or truncated frame, and with
+/// [`WireError::MisplacedAttachment`] if a binary frame follows it; read
+/// such streams with [`read_attached`].
 pub async fn read_message<R>(reader: &mut R) -> Result<WireMessage, WireError>
+where
+    R: AsyncRead + Unpin,
+{
+    let message = read_frame(reader).await?;
+    if message.attachment {
+        return Err(WireError::MisplacedAttachment);
+    }
+    Ok(message)
+}
+
+async fn read_frame<R>(reader: &mut R) -> Result<WireMessage, WireError>
 where
     R: AsyncRead + Unpin,
 {
@@ -350,6 +397,57 @@ where
         return Err(WireError::UnsupportedVersion(message.version));
     }
     Ok(message)
+}
+
+/// Writes a message followed by the binary frame it carries.
+///
+/// Bulk data such as KV blocks belongs here rather than in a JSON payload,
+/// where every byte becomes a decimal number. The message is sent with
+/// `attachment` set, so [`read_attached`] knows to read the frame too.
+///
+/// # Errors
+///
+/// Fails if either frame is invalid or cannot be written.
+pub async fn write_attached<W>(
+    writer: &mut W,
+    message: &WireMessage,
+    frame: &BinaryFrame,
+) -> Result<(), WireError>
+where
+    W: AsyncWrite + Unpin,
+{
+    if message.version != PROTOCOL_VERSION {
+        return Err(WireError::UnsupportedVersion(message.version));
+    }
+    let message = WireMessage {
+        attachment: true,
+        ..message.clone()
+    };
+    write_frame(writer, &message).await?;
+    write_binary_frame(writer, frame).await
+}
+
+/// Reads one message and, if it says one follows, its binary frame.
+///
+/// Use this, not [`read_message`], on any stream whose peer may use
+/// [`write_attached`].
+///
+/// # Errors
+///
+/// As [`read_message`] and [`read_binary_frame`].
+pub async fn read_attached<R>(
+    reader: &mut R,
+) -> Result<(WireMessage, Option<BinaryFrame>), WireError>
+where
+    R: AsyncRead + Unpin,
+{
+    let message = read_frame(reader).await?;
+    let frame = if message.attachment {
+        Some(read_binary_frame(reader).await?)
+    } else {
+        None
+    };
+    Ok((message, frame))
 }
 
 /// Maps an early end of stream to [`WireError::Truncated`].
@@ -406,6 +504,7 @@ mod tests {
             version: PROTOCOL_VERSION + 1,
             sender_epoch: 0,
             correlation: 0,
+            attachment: false,
             body: WireBody::Goodbye { reason: None },
         };
         let write = tokio::spawn(async move {
@@ -506,6 +605,75 @@ mod tests {
         assert!(matches!(
             read_binary_frame(&mut short_reader).await,
             Err(WireError::Truncated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn attached_frames_travel_with_their_message() {
+        let (mut left, mut right) = duplex(1 << 20);
+        let message = WireMessage::new(1, 2, WireBody::Goodbye { reason: None });
+        let frame = BinaryFrame {
+            version: PROTOCOL_VERSION,
+            sender_epoch: 1,
+            correlation: 2,
+            content_type: "application/x-ola-kv".into(),
+            metadata: vec![9],
+            data: vec![7; 4096],
+        };
+        let sent = frame.clone();
+        let write = tokio::spawn(async move {
+            write_attached(&mut left, &message, &sent).await.unwrap();
+            write_message(
+                &mut left,
+                &WireMessage::new(
+                    1,
+                    3,
+                    WireBody::Hello {
+                        worker: WorkerId::new("after"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            left
+        });
+        let (received, attached) = read_attached(&mut right).await.unwrap();
+        assert!(received.attachment);
+        assert_eq!(attached, Some(frame));
+        // The stream stays aligned for the next ordinary message.
+        let (next, none) = read_attached(&mut right).await.unwrap();
+        assert_eq!(next.correlation, 3);
+        assert!(none.is_none());
+        let mut left = write.await.unwrap();
+
+        // A plain reader refuses a message that carries a frame, and a plain
+        // writer refuses to send one without it.
+        let (mut writer, mut reader) = duplex(1 << 20);
+        let flagged = WireMessage {
+            attachment: true,
+            ..WireMessage::new(0, 0, WireBody::Goodbye { reason: None })
+        };
+        assert!(matches!(
+            write_message(&mut left, &flagged).await,
+            Err(WireError::MisplacedAttachment)
+        ));
+        write_attached(
+            &mut writer,
+            &WireMessage::new(0, 0, WireBody::Goodbye { reason: None }),
+            &BinaryFrame {
+                version: PROTOCOL_VERSION,
+                sender_epoch: 0,
+                correlation: 0,
+                content_type: String::new(),
+                metadata: Vec::new(),
+                data: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_message(&mut reader).await,
+            Err(WireError::MisplacedAttachment)
         ));
     }
 

@@ -3,7 +3,10 @@
 use std::{error::Error, fmt, time::Duration};
 
 use ola_core::{Clock, MonotonicClock};
-use ola_net::{TcpPeer, WireBody, WireError, WireMessage, read_message, write_message};
+use ola_net::{
+    BinaryFrame, TcpPeer, WireBody, WireError, WireMessage, read_attached, write_attached,
+    write_message,
+};
 use ola_runtime::ExecutorError;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::mpsc;
@@ -103,11 +106,16 @@ impl WorkerSession {
                 biased;
                 received = received_rx.recv() => {
                     let Some(received) = received else { break };
-                    let message = received?;
+                    let (message, attachment) = received?;
                     let now = self.clock.now();
                     match message.body {
                         WireBody::Payload { .. } => {
-                            let command: WorkerCommand = message.body.decode_json()?;
+                            let mut command: WorkerCommand = message.body.decode_json()?;
+                            if let (WorkerCommand::AdmitMigrated { state, .. }, Some(frame)) =
+                                (&mut command, attachment.as_ref())
+                            {
+                                crate::transfer::attach_session(state, frame);
+                            }
                             let messages = self.worker.handle(command, now)?;
                             send_messages(&mut writer, self.epoch, &mut self.next_correlation, messages).await?;
                         }
@@ -156,10 +164,10 @@ impl WorkerSession {
 
 async fn read_frames(
     mut reader: OwnedReadHalf,
-    sender: mpsc::Sender<Result<WireMessage, WireError>>,
+    sender: mpsc::Sender<Result<(WireMessage, Option<BinaryFrame>), WireError>>,
 ) {
     loop {
-        let result = read_message(&mut reader).await;
+        let result = read_attached(&mut reader).await;
         let done = result.is_err() || sender.send(result).await.is_err();
         if done {
             return;
@@ -194,14 +202,24 @@ async fn send_messages(
     next_correlation: &mut u64,
     messages: Vec<WorkerMessage>,
 ) -> Result<(), WorkerSessionError> {
-    for message in messages {
-        send_body(
-            writer,
-            epoch,
-            next_correlation,
-            WireBody::json_payload(&message)?,
-        )
-        .await?;
+    for mut message in messages {
+        // An exported session snapshot travels as a binary frame beside the
+        // JSON, not inside it.
+        let frame = match &mut message {
+            WorkerMessage::Migrated { request, state } => {
+                crate::transfer::detach_session(state, epoch, request.get())
+            }
+            _ => None,
+        };
+        let body = WireBody::json_payload(&message)?;
+        match frame {
+            Some(frame) => {
+                let correlation = *next_correlation;
+                *next_correlation = next_correlation.saturating_add(1);
+                write_attached(writer, &WireMessage::new(epoch, correlation, body), &frame).await?;
+            }
+            None => send_body(writer, epoch, next_correlation, body).await?,
+        }
     }
     Ok(())
 }
