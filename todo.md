@@ -322,7 +322,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   policy, and the registered cluster study compares the adaptive variant;
   `adaptive-cluster-routing-study` now selects weights on seed 0 and reports
   adaptive, least-loaded, and KV-headroom results on independent held-out
-  seeds; live-loop evaluation remains.
+  seeds. A loopback TCP test now pushes weights through `TcpCoordinator` and
+  verifies the worker acknowledgement/state; broader live workload evaluation
+  remains.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

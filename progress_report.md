@@ -37,7 +37,8 @@ split: it selects among calibrated load/KV weight candidates on seed 0 and
 reports the selected adaptive policy beside least-loaded and KV-headroom
 baselines on independent seeds. A regression test runs the study through the
 experiment registry and validates its reported variants; live-loop improvement
-evidence remains.
+evidence now includes a TCP weight-push/acknowledgement test, while broader
+live workload comparison remains.
 
 `ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
 the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries

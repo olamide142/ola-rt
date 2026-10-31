@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use ola_bench::{KvGeometry, synthetic_artifact};
 use ola_cluster::{
-    ClusterTraceEvent, LeastLoadedRouting, TcpCoordinator, WorkerHost, WorkerSession,
+    ClusterTraceEvent, ClusterWeights, LeastLoadedRouting, TcpCoordinator, WorkerHost,
+    WorkerSession,
 };
 use ola_core::{Input, ModelDescriptor, RequestSpec, Timestamp};
 use ola_net::TcpPeer;
@@ -20,6 +21,43 @@ fn worker(id: &'static str) -> WorkerHost {
         )
         .unwrap();
     WorkerHost::new(id, executor)
+}
+
+#[tokio::test]
+async fn adaptive_weights_are_pushed_and_acknowledged_over_tcp() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (peer, _) = TcpPeer::accept(&listener).await.unwrap();
+        WorkerSession::new(peer, worker("adaptive-worker"), 1, Duration::from_millis(2))
+            .run()
+            .await
+            .unwrap()
+    });
+
+    let mut coordinator = TcpCoordinator::new(LeastLoadedRouting);
+    let worker_id = coordinator
+        .connect_worker(address.to_string(), None)
+        .await
+        .unwrap();
+    coordinator
+        .update_worker_policy(
+            &worker_id,
+            ClusterWeights {
+                load: 3,
+                kv_headroom: 9,
+            },
+        )
+        .await
+        .unwrap();
+    coordinator
+        .receive(&worker_id, Timestamp::from_micros(1))
+        .await
+        .unwrap();
+    coordinator.close_worker(&worker_id).await.unwrap();
+    let worker = task.await.unwrap();
+    assert_eq!(worker.policy_weights().load, 3);
+    assert_eq!(worker.policy_weights().kv_headroom, 9);
 }
 
 fn request() -> RequestSpec {
