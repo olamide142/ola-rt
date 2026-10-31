@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use burn::tensor::Tensor;
+use burn::tensor::{Tensor, TensorData};
 use ola_kernel::{PagedKvBlockTable, PagedKvBlocks};
 use ola_model::KvCacheProfile;
 use ola_runtime::{KvBlockError, KvBlockManager, KvSequenceId};
@@ -246,6 +246,64 @@ impl MistralKvCache {
             .expect("a live cache owns a block table")
             .len() as u64;
         blocks * pool.manager.metrics().block_bytes
+    }
+
+    pub(crate) fn export_layers(&self) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let layer_count = lock_pool(&self.pool).layers.len();
+        (0..layer_count)
+            .map(|layer| {
+                let (pages, _) = self.read_layer_prefix(layer, self.tokens);
+                let keys = pages
+                    .iter()
+                    .flat_map(|(keys, _)| keys.clone().into_data().try_to_vec::<f32>().unwrap())
+                    .collect();
+                let values = pages
+                    .iter()
+                    .flat_map(|(_, values)| values.clone().into_data().try_to_vec::<f32>().unwrap())
+                    .collect();
+                (keys, values)
+            })
+            .collect()
+    }
+
+    pub(crate) fn import_layers(
+        &mut self,
+        layers: &[(Vec<f32>, Vec<f32>)],
+        token_count: usize,
+    ) -> Result<(), KvBlockError> {
+        let (heads, head_dim, device) = {
+            let pool = lock_pool(&self.pool);
+            (pool.num_key_value_heads, pool.head_dim, pool.device.clone())
+        };
+        self.reserve(token_count)?;
+        let expected = heads
+            .checked_mul(token_count)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or(KvBlockError::TokenCountOverflow(self.sequence))?;
+        if layers.len() != lock_pool(&self.pool).layers.len()
+            || layers
+                .iter()
+                .any(|(keys, values)| keys.len() != expected || values.len() != expected)
+        {
+            return Err(KvBlockError::InvalidConfiguration(
+                "KV session layer shape does not match the destination cache",
+            ));
+        }
+        for (layer, (keys, values)) in layers.iter().enumerate() {
+            self.write_layer(
+                layer,
+                0,
+                Tensor::from_data(
+                    TensorData::new(keys.clone(), [1, heads, token_count, head_dim]),
+                    &device,
+                ),
+                Tensor::from_data(
+                    TensorData::new(values.clone(), [1, heads, token_count, head_dim]),
+                    &device,
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn refresh_block_table(&mut self) {

@@ -34,6 +34,22 @@ struct MistralSessionState {
     cursor: usize,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MistralKvLayer {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct MistralKvSessionState {
+    tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    rng_state: u64,
+    prompt_tokens: usize,
+    cursor: usize,
+    layers: Vec<MistralKvLayer>,
+}
+
 impl BurnMistralModel {
     pub(crate) fn with_kv_cache(
         module: MistralForCausalLM,
@@ -208,6 +224,46 @@ impl CausalModel for BurnMistralModel {
         generation: GenerationConfig,
         state: SessionState,
     ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+        if state.format == "ola-burn/mistral-kv-v1" {
+            let state: MistralKvSessionState =
+                serde_json::from_slice(&state.payload).map_err(|error| {
+                    ModelExecutionError::new(
+                        ExecutionStage::SessionCreation,
+                        format!("invalid Mistral KV session state: {error}"),
+                    )
+                })?;
+            if state.tokens.is_empty()
+                || state.generated_tokens.is_empty()
+                || state.cursor != state.tokens.len()
+                || state.prompt_tokens > state.tokens.len()
+            {
+                return Ok(None);
+            }
+            let mut session = self.new_session(generation)?;
+            let layers = state
+                .layers
+                .iter()
+                .map(|layer| (layer.keys.clone(), layer.values.clone()))
+                .collect::<Vec<_>>();
+            session
+                .cache
+                .as_mut()
+                .expect("a live Mistral session owns a cache")
+                .import_layers(&layers, state.tokens.len())
+                .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
+            session.tokens = state.tokens;
+            session.generated_tokens = state.generated_tokens.clone();
+            session.rng_state = state.rng_state;
+            session.last_generated = state.generated_tokens.last().copied();
+            session.metrics.prompt_tokens = state.prompt_tokens;
+            session.metrics.generated_tokens = state.generated_tokens.len();
+            session.metrics.kv_cache_bytes = session.cache.as_ref().unwrap().bytes();
+            session.terminal = session
+                .last_generated
+                .is_some_and(|token| session.config.eos_token_id.contains(&token))
+                || session.metrics.generated_tokens >= session.generation.max_new_tokens;
+            return Ok(Some(Box::new(session)));
+        }
         if state.format != "ola-burn/mistral-recompute-v1" {
             return Ok(None);
         }
@@ -883,29 +939,30 @@ impl GenerationSession for MistralSession {
     }
 
     fn export_state(&self) -> Result<Option<SessionState>, ModelExecutionError> {
-        #[derive(serde::Serialize)]
-        struct State<'a> {
-            tokens: &'a [u32],
-            generated_tokens: &'a [u32],
-            rng_state: u64,
-            prompt_tokens: usize,
-            cursor: usize,
-        }
-        let payload = serde_json::to_vec(&State {
-            tokens: &self.tokens,
-            generated_tokens: &self.generated_tokens,
+        let layers = self
+            .cache
+            .as_ref()
+            .expect("a live Mistral session owns a cache")
+            .export_layers()
+            .into_iter()
+            .map(|(keys, values)| MistralKvLayer { keys, values })
+            .collect();
+        let payload = serde_json::to_vec(&MistralKvSessionState {
+            tokens: self.tokens.clone(),
+            generated_tokens: self.generated_tokens.clone(),
             rng_state: self.rng_state,
             prompt_tokens: self.metrics.prompt_tokens,
             cursor: self.tokens.len(),
+            layers,
         })
         .map_err(|error| {
             ModelExecutionError::new(
                 ExecutionStage::SessionCreation,
-                format!("could not serialize Mistral session state: {error}"),
+                format!("could not serialize Mistral KV session state: {error}"),
             )
         })?;
         Ok(Some(SessionState {
-            format: "ola-burn/mistral-recompute-v1".into(),
+            format: "ola-burn/mistral-kv-v1".into(),
             cursor: self.tokens.len(),
             payload,
         }))

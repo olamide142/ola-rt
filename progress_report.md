@@ -8,8 +8,11 @@ carried in the migration envelope. The runtime promotes an imported session
 directly to decode-ready state and keeps token recompute as the fallback when a
 model returns `None`; a regression test proves there is no duplicate prefill
 token. Burn Llama and Mistral both have versioned session export/import tests.
-The remaining D4 gap is backend-specific raw architecture KV-byte ownership;
-the generic binary frame and explicit worker-role boundaries are now present.
+Burn Llama and Mistral now serialize architecture-owned KV tensors in versioned
+session snapshots and restore them directly into destination cache pages; the
+earlier token-log recompute snapshots remain import-compatible. The generic
+binary frame and explicit worker-role boundaries are now present; automatic
+role scheduling remains intentionally backend-specific.
 
 `TcpCoordinator::migrate` now waits for source export before staging ownership,
 waits for target `Accepted`, then commits the source; target refusal triggers
@@ -50,9 +53,9 @@ the field in isolation.
 `ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
 the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries
 format/cursor metadata separately from opaque architecture bytes and rejects
-wrong media types or protocol versions before import. This closes the generic
-binary session-frame hook; backend-specific raw KV producers/consumers and
-backend-specific raw KV producers/consumers remain D4 work.
+wrong media types or protocol versions before import. Burn's Llama and Mistral
+adapters now populate that payload with raw KV tensors and restore them without
+prompt recomputation.
 
 Workers now also advertise and accept explicit disaggregation roles. Role
 changes are protocol commands with acknowledgements; `decode` workers reject

@@ -34,6 +34,22 @@ struct LlamaSessionState {
     cursor: usize,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LlamaKvLayer {
+    keys: Vec<f32>,
+    values: Vec<f32>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LlamaKvSessionState {
+    tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    rng_state: u64,
+    prompt_tokens: usize,
+    cursor: usize,
+    layers: Vec<LlamaKvLayer>,
+}
+
 impl BurnLlamaModel {
     pub(crate) fn with_kv_cache(
         module: LlamaForCausalLM,
@@ -207,6 +223,46 @@ impl CausalModel for BurnLlamaModel {
         generation: GenerationConfig,
         state: SessionState,
     ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+        if state.format == "ola-burn/llama-kv-v1" {
+            let state: LlamaKvSessionState =
+                serde_json::from_slice(&state.payload).map_err(|error| {
+                    ModelExecutionError::new(
+                        ExecutionStage::SessionCreation,
+                        format!("invalid Llama KV session state: {error}"),
+                    )
+                })?;
+            if state.tokens.is_empty()
+                || state.generated_tokens.is_empty()
+                || state.cursor != state.tokens.len()
+                || state.prompt_tokens > state.tokens.len()
+            {
+                return Ok(None);
+            }
+            let mut session = self.new_session(generation)?;
+            let layers = state
+                .layers
+                .iter()
+                .map(|layer| (layer.keys.clone(), layer.values.clone()))
+                .collect::<Vec<_>>();
+            session
+                .cache
+                .as_mut()
+                .expect("a live Llama session owns a cache")
+                .import_layers(&layers, state.tokens.len())
+                .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
+            session.tokens = state.tokens;
+            session.generated_tokens = state.generated_tokens.clone();
+            session.rng_state = state.rng_state;
+            session.last_generated = state.generated_tokens.last().copied();
+            session.metrics.prompt_tokens = state.prompt_tokens;
+            session.metrics.generated_tokens = state.generated_tokens.len();
+            session.metrics.kv_cache_bytes = session.cache.as_ref().unwrap().bytes();
+            session.terminal = session
+                .last_generated
+                .is_some_and(|token| session.config.eos_token_id.contains(&token))
+                || session.metrics.generated_tokens >= session.generation.max_new_tokens;
+            return Ok(Some(Box::new(session)));
+        }
         if state.format != "ola-burn/llama-recompute-v1" {
             return Ok(None);
         }
@@ -883,29 +939,30 @@ impl GenerationSession for LlamaSession {
     }
 
     fn export_state(&self) -> Result<Option<SessionState>, ModelExecutionError> {
-        #[derive(serde::Serialize)]
-        struct State<'a> {
-            tokens: &'a [u32],
-            generated_tokens: &'a [u32],
-            rng_state: u64,
-            prompt_tokens: usize,
-            cursor: usize,
-        }
-        let payload = serde_json::to_vec(&State {
-            tokens: &self.tokens,
-            generated_tokens: &self.generated_tokens,
+        let layers = self
+            .cache
+            .as_ref()
+            .expect("a live Llama session owns a cache")
+            .export_layers()
+            .into_iter()
+            .map(|(keys, values)| LlamaKvLayer { keys, values })
+            .collect();
+        let payload = serde_json::to_vec(&LlamaKvSessionState {
+            tokens: self.tokens.clone(),
+            generated_tokens: self.generated_tokens.clone(),
             rng_state: self.rng_state,
             prompt_tokens: self.metrics.prompt_tokens,
             cursor: self.tokens.len(),
+            layers,
         })
         .map_err(|error| {
             ModelExecutionError::new(
                 ExecutionStage::SessionCreation,
-                format!("could not serialize Llama session state: {error}"),
+                format!("could not serialize Llama KV session state: {error}"),
             )
         })?;
         Ok(Some(SessionState {
-            format: "ola-burn/llama-recompute-v1".into(),
+            format: "ola-burn/llama-kv-v1".into(),
             cursor: self.tokens.len(),
             payload,
         }))
@@ -1573,13 +1630,13 @@ mod tests {
     }
 
     #[test]
-    fn exports_versioned_recompute_safe_session_state() {
+    fn exports_versioned_kv_session_state() {
         let model = tiny_model();
         let mut session = model.create_session(greedy(3)).unwrap();
         let first = session.prefill(&[1, 4, 5]).unwrap();
         let _ = session.decode(first.id).unwrap();
         let state = session.export_state().unwrap().unwrap();
-        assert_eq!(state.format, "ola-burn/llama-recompute-v1");
+        assert_eq!(state.format, "ola-burn/llama-kv-v1");
         assert_eq!(state.cursor, 4);
         assert!(!state.payload.is_empty());
     }

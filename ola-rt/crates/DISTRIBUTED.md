@@ -1,7 +1,7 @@
 # Distributed execution design
 
-Status: **implemented through the D5 foundation; backend-specific D4 extensions
-remain** (2026-10-31). Covers `todo.md` P9, which replaces the
+Status: **implemented through the D5 foundation; automatic role scheduling
+remains** (2026-10-31). Covers `todo.md` P9, which replaces the
 "multi-GPU placement", "distributed request routing", "distributed KV-cache
 management", and "tensor and pipeline parallelism" bullets under later work.
 
