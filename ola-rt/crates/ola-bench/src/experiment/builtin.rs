@@ -11,10 +11,10 @@ use burn::tensor::{Tensor, TensorData};
 
 use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
-    AdaptiveIntegerDomain, AdaptiveObjectiveWeights, ComposedPolicy, EarliestDeadlineFirst,
-    ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager, MemoryAwareAdmission,
-    MixedTokenBudgetPolicy, NewestFirst, PolicyError, PriorityScheduler, Runtime, ShortestJobFirst,
-    WatermarkAdmission,
+    AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveObjectiveWeights, AdaptivePolicy,
+    ComposedPolicy, EarliestDeadlineFirst, ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager,
+    MemoryAwareAdmission, MixedTokenBudgetPolicy, NewestFirst, PolicyError, PriorityScheduler,
+    Runtime, ShortestJobFirst, WatermarkAdmission,
 };
 
 use super::cluster::AdaptiveClusterRoutingStudy;
@@ -25,9 +25,10 @@ use super::{
     Sample, TimeDomain, Unit, Variant, WorkloadIdentity, content_digest,
 };
 use crate::{
-    DEFAULT_STARVATION_FACTOR, FixedWorkload, KvGeometry, SchedulingTrace, SimulationConfig,
-    TraceParameters, analyze_cost_aware_prefill, compare_prefill_batching, compare_schedulers,
-    compare_schedulers_observed, evaluate_virtual_time_held_out,
+    DEFAULT_STARVATION_FACTOR, FixedWorkload, KvGeometry, ReplayOptimizer, ReplaySettings,
+    SchedulingTrace, SimulationConfig, TraceParameters, TraceRequest, analyze_cost_aware_prefill,
+    compare_prefill_batching, compare_schedulers, compare_schedulers_observed,
+    evaluate_virtual_time_held_out, optimize_virtual_time_candidate,
 };
 
 #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
@@ -53,6 +54,7 @@ impl ExperimentRegistry {
             Box::new(AdaptivePrefillCost),
             Box::new(SchedulerComparison),
             Box::new(AdaptivePolicyStudy),
+            Box::new(OnlineAdaptivePolicyStudy),
             Box::new(KvPressure),
             Box::new(PrefixCache),
             Box::new(KvPageSize),
@@ -752,19 +754,66 @@ impl Experiment for SchedulerComparison {
 pub struct AdaptivePolicyStudy;
 
 impl AdaptivePolicyStudy {
+    /// Candidate token budgets: 2^4 to 2^10 tokens per iteration, of which
+    /// 25% to 100% may be prompt work. The top of the range admits a whole
+    /// iteration's work at these trace sizes, so the unbounded baseline's
+    /// behaviour is always a candidate.
+    const DOMAINS: [AdaptiveIntegerDomain; 2] = [
+        AdaptiveIntegerDomain {
+            name: "log2_max_tokens",
+            min: 4,
+            max: 10,
+            step: 1,
+        },
+        AdaptiveIntegerDomain {
+            name: "prefill_share_percent",
+            min: 25,
+            max: 100,
+            step: 25,
+        },
+    ];
+
+    fn initial_theta() -> Vec<(&'static str, String)> {
+        vec![
+            ("log2_max_tokens", "4".into()),
+            ("prefill_share_percent", "50".into()),
+        ]
+    }
+
+    /// The `(max_tokens, max_prefill_tokens)` budget a parameter vector names.
+    fn budget(theta: &[(&'static str, String)]) -> Result<(usize, usize), PolicyError> {
+        let value = |name: &str| {
+            theta
+                .iter()
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.parse::<u32>().ok())
+                .ok_or_else(|| PolicyError::InvalidCandidate(format!("missing {name}")))
+        };
+        let log2 = value("log2_max_tokens")?;
+        let share = value("prefill_share_percent")?;
+        if log2 > 20 || !(1..=100).contains(&share) {
+            return Err(PolicyError::InvalidCandidate(
+                "budget parameters out of range".into(),
+            ));
+        }
+        let max_tokens = 1_usize << log2;
+        let max_prefill_tokens = (max_tokens * share as usize / 100).max(1);
+        Ok((max_tokens, max_prefill_tokens))
+    }
+
+    fn describe(theta: &[(&'static str, String)]) -> String {
+        Self::budget(theta).map_or_else(
+            |_| "?".into(),
+            |(max_tokens, max_prefill_tokens)| {
+                format!("max_tokens={max_tokens}, max_prefill_tokens={max_prefill_tokens}")
+            },
+        )
+    }
+
     fn adaptive_policy(
         theta: &[(&'static str, String)],
     ) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
-        let max_tokens = theta
-            .iter()
-            .find(|(name, _)| *name == "max_tokens")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .ok_or_else(|| PolicyError::InvalidCandidate("missing max_tokens".into()))?;
-        let max_prefill_tokens = theta
-            .iter()
-            .find(|(name, _)| *name == "max_prefill_tokens")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .ok_or_else(|| PolicyError::InvalidCandidate("missing max_prefill_tokens".into()))?;
+        let (max_tokens, max_prefill_tokens) = Self::budget(theta)?;
         let batch =
             MixedTokenBudgetPolicy::new(max_tokens, max_prefill_tokens).ok_or_else(|| {
                 PolicyError::InvalidCandidate(
@@ -796,7 +845,7 @@ impl Experiment for AdaptivePolicyStudy {
             category: ExperimentCategory::Experiment,
             kind: ExperimentKind::Study,
             domain: TimeDomain::Virtual,
-            payload_version: 1,
+            payload_version: 2,
             requirements: Vec::new(),
             parameters: vec![
                 ParameterSpec::integer("seeds", "Held-out trace seeds", 5),
@@ -847,24 +896,8 @@ impl Experiment for AdaptivePolicyStudy {
             &training,
             &held_out,
             &config,
-            vec![
-                AdaptiveIntegerDomain {
-                    name: "max_tokens",
-                    min: 16,
-                    max: 32,
-                    step: 8,
-                },
-                AdaptiveIntegerDomain {
-                    name: "max_prefill_tokens",
-                    min: 2,
-                    max: 16,
-                    step: 2,
-                },
-            ],
-            vec![
-                ("max_tokens", "16".into()),
-                ("max_prefill_tokens", "8".into()),
-            ],
+            Self::DOMAINS.to_vec(),
+            Self::initial_theta(),
             Self::adaptive_policy,
             Self::baseline_policy,
             AdaptiveObjectiveWeights {
@@ -967,21 +1000,306 @@ impl Experiment for AdaptivePolicyStudy {
                 })
                 .collect(),
             format!(
-                "train seed 0, {} held-out seeds, selected max_tokens={}, max_prefill_tokens={}",
+                "train seed 0, {} held-out seeds, selected {}",
                 seeds.len(),
-                study
-                    .theta
-                    .iter()
-                    .find(|(name, _)| *name == "max_tokens")
-                    .map_or("?", |(_, value)| value.as_str()),
-                study
-                    .theta
-                    .iter()
-                    .find(|(name, _)| *name == "max_prefill_tokens")
-                    .map_or("?", |(_, value)| value.as_str())
+                Self::describe(&study.theta)
             ),
         )?;
         Ok(outcome.with_content_digest(&content))
+    }
+}
+
+/// A mixed short/long workload followed by an overload burst, so the best
+/// token budget changes partway through.
+fn phased_trace(seed: u64, requests: usize, mean_interarrival_micros: u64) -> SchedulingTrace {
+    let calm_requests = requests / 2;
+    let calm = SchedulingTrace::mixed_short_long(TraceParameters {
+        seed,
+        requests: calm_requests,
+        mean_interarrival_micros: mean_interarrival_micros.saturating_mul(4),
+    });
+    let burst = SchedulingTrace::overload(TraceParameters {
+        seed: seed ^ 0x9e37_79b9_7f4a_7c15,
+        requests: requests - calm_requests,
+        mean_interarrival_micros,
+    });
+    let offset = calm
+        .requests
+        .last()
+        .map_or(0, |request| request.arrival_micros)
+        + mean_interarrival_micros.saturating_mul(4);
+    let mut combined = calm.requests;
+    combined.extend(burst.requests.into_iter().map(|request| TraceRequest {
+        arrival_micros: request.arrival_micros + offset,
+        ..request
+    }));
+    SchedulingTrace {
+        name: "phased",
+        parameters: TraceParameters {
+            seed,
+            requests,
+            mean_interarrival_micros,
+        },
+        requests: combined,
+    }
+}
+
+/// Online replay optimization of the token budget against the best fixed
+/// budget chosen offline, on workloads whose regime shifts.
+pub struct OnlineAdaptivePolicyStudy;
+
+impl OnlineAdaptivePolicyStudy {
+    const WEIGHTS: AdaptiveObjectiveWeights = AdaptiveObjectiveWeights {
+        ttft: 1,
+        completion: 1,
+        throughput: 0,
+        starvation: 0,
+        deadline: 0,
+        fallback: 0,
+    };
+
+    fn online_policy(
+        theta: Vec<(&'static str, String)>,
+        config: &SimulationConfig,
+        interval: u64,
+        window: usize,
+        min_improvement_percent: u64,
+    ) -> Result<Box<dyn ExecutionPolicy>, ExperimentError> {
+        let optimizer = ReplayOptimizer::new(
+            ReplaySettings {
+                domains: AdaptivePolicyStudy::DOMAINS.to_vec(),
+                weights: Self::WEIGHTS,
+                config: *config,
+                window,
+                min_requests: window.min(8),
+                min_improvement_percent,
+            },
+            AdaptivePolicyStudy::adaptive_policy,
+        )
+        .map_err(run_error)?;
+        let inner = AdaptivePolicyStudy::adaptive_policy(&theta).map_err(run_error)?;
+        Ok(Box::new(
+            AdaptivePolicy::new(inner, theta)
+                .with_fallback(AdaptivePolicyStudy::baseline_policy(&[]).map_err(run_error)?)
+                .with_constraints(AdaptiveConstraints {
+                    max_active_requests: Some(config.max_active_requests),
+                    prefill_chunk_size: config.prefill_chunk_size,
+                    available_memory_bytes: None,
+                })
+                .with_optimization_interval(interval)
+                .with_factory(AdaptivePolicyStudy::adaptive_policy)
+                .with_optimizer(optimizer),
+        ))
+    }
+}
+
+impl Experiment for OnlineAdaptivePolicyStudy {
+    fn descriptor(&self) -> ExperimentDescriptor {
+        ExperimentDescriptor {
+            id: "online-adaptive-policy-study",
+            name: "Online adaptive policy study",
+            description: "Token budgets re-optimized online by virtual-time replay of recent \
+                          work, against the best offline budget, on regime-shifting traces",
+            category: ExperimentCategory::Experiment,
+            kind: ExperimentKind::Study,
+            domain: TimeDomain::Virtual,
+            payload_version: 1,
+            requirements: Vec::new(),
+            parameters: vec![
+                ParameterSpec::integer("seeds", "Held-out trace seeds", 5),
+                ParameterSpec::integer("requests", "Requests per trace", 80),
+                ParameterSpec::integer(
+                    "mean_interarrival_micros",
+                    "Mean arrival gap during the burst, in virtual microseconds",
+                    2_000,
+                ),
+                ParameterSpec::integer("max_active_requests", "Executor slots", 8),
+                ParameterSpec::integer(
+                    "optimization_interval",
+                    "Executor iterations between online proposals",
+                    40,
+                ),
+                ParameterSpec::integer("window", "Completed requests replayed", 64),
+                ParameterSpec::integer(
+                    "min_improvement_percent",
+                    "Replay improvement required to switch",
+                    5,
+                ),
+            ],
+        }
+    }
+
+    fn traceable(&self) -> bool {
+        true
+    }
+
+    fn run(
+        &self,
+        context: &ExperimentContext,
+        parameters: &Parameters,
+    ) -> Result<ExperimentOutcome, ExperimentError> {
+        let seeds = (1..=parameters.integer("seeds")?).collect::<Vec<_>>();
+        let requests = parameters.size("requests")?;
+        let interarrival = parameters.integer("mean_interarrival_micros")?;
+        let interval = parameters.integer("optimization_interval")?.max(1);
+        let window = parameters.size("window")?;
+        let min_improvement = parameters.integer("min_improvement_percent")?;
+        let config = SimulationConfig {
+            max_active_requests: parameters.size("max_active_requests")?,
+            ..SimulationConfig::default()
+        };
+        // The fixed budget is the best one for a whole training trace, chosen
+        // with hindsight; the online policy only ever sees the past.
+        let training = phased_trace(0, requests, interarrival);
+        let fixed = optimize_virtual_time_candidate(
+            &training,
+            &config,
+            AdaptivePolicyStudy::DOMAINS.to_vec(),
+            AdaptivePolicyStudy::initial_theta(),
+            AdaptivePolicyStudy::adaptive_policy,
+            Self::WEIGHTS,
+        )
+        .map_err(run_error)?
+        .theta;
+        // `online` starts from the smallest budget and must find a good one;
+        // `online-warm` starts from the offline choice and must keep it.
+        let cold = AdaptivePolicyStudy::initial_theta();
+        let online = |theta: &[(&'static str, String)]| {
+            Self::online_policy(theta.to_vec(), &config, interval, window, min_improvement)
+        };
+        let labels = vec![
+            ("online", online(&cold)?.descriptor().to_string()),
+            ("online-warm", online(&fixed)?.descriptor().to_string()),
+            (
+                "fixed",
+                AdaptivePolicyStudy::adaptive_policy(&fixed)
+                    .map_err(run_error)?
+                    .descriptor()
+                    .to_string(),
+            ),
+            (
+                "fifo",
+                AdaptivePolicyStudy::baseline_policy(&[])
+                    .map_err(run_error)?
+                    .descriptor()
+                    .to_string(),
+            ),
+        ];
+        let mut samples = labels
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<BTreeMap<String, f64>>>>();
+        let mut content = String::new();
+        for &seed in &seeds {
+            let trace = phased_trace(seed, requests, interarrival);
+            for request in &trace.requests {
+                content.push_str(&format!("{request:?};"));
+            }
+            let comparison = compare_schedulers_observed(
+                &trace,
+                &config,
+                vec![
+                    online(&cold)?,
+                    online(&fixed)?,
+                    AdaptivePolicyStudy::adaptive_policy(&fixed).map_err(run_error)?,
+                    AdaptivePolicyStudy::baseline_policy(&[]).map_err(run_error)?,
+                ],
+                DEFAULT_STARVATION_FACTOR,
+                &mut |_, _, _| {},
+            )
+            .map_err(run_error)?;
+            for (variant, summary) in samples.iter_mut().zip(&comparison.summaries) {
+                variant.push(values(&[
+                    ("completion_p95", as_f64(summary.completion.p95_micros)),
+                    ("ttft_p95", as_f64(summary.time_to_first_token.p95_micros)),
+                    (
+                        "objective",
+                        as_f64(
+                            summary
+                                .completion
+                                .p95_micros
+                                .saturating_add(summary.time_to_first_token.p95_micros),
+                        ),
+                    ),
+                    (
+                        "throughput",
+                        summary.output_tokens_per_second().unwrap_or(0.0),
+                    ),
+                    ("starved", as_f64(summary.starved)),
+                ]));
+            }
+        }
+        let outcome = finish(
+            &self.descriptor(),
+            context,
+            parameters,
+            "online-adaptive-policy-study",
+            seeds.clone(),
+            vec![
+                metric(
+                    "completion_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+                metric(
+                    "ttft_p95",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+                metric(
+                    "objective",
+                    Unit::Micros,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+                metric(
+                    "throughput",
+                    Unit::TokensPerSecond,
+                    TimeDomain::Virtual,
+                    Direction::Higher,
+                ),
+                metric(
+                    "starved",
+                    Unit::Count,
+                    TimeDomain::Virtual,
+                    Direction::Lower,
+                ),
+            ],
+            labels
+                .into_iter()
+                .zip(samples)
+                .map(|((label, policy), samples)| {
+                    (
+                        Variant {
+                            label: label.into(),
+                            policy: Some(policy),
+                            kernel: None,
+                        },
+                        samples,
+                    )
+                })
+                .collect(),
+            String::new(),
+        )?;
+        let summary = format!(
+            "{} held-out phased traces; fixed {} · {}",
+            seeds.len(),
+            AdaptivePolicyStudy::describe(&fixed),
+            outcome
+                .report
+                .summaries
+                .iter()
+                .map(|summary| format!(
+                    "{}: objective {:.1} ms",
+                    summary.variant,
+                    summary.estimates["objective"].mean / 1_000.0
+                ))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+        Ok(ExperimentOutcome { summary, ..outcome }.with_content_digest(&content))
     }
 }
 

@@ -3,6 +3,7 @@
 mod calibration;
 mod cluster_simulation;
 mod experiment;
+mod online;
 mod plan_report;
 mod random;
 mod report;
@@ -44,12 +45,14 @@ pub use experiment::{
     ExperimentIdentity, ExperimentKind, ExperimentOutcome, ExperimentRegistry, ExperimentReport,
     ExperimentRunConfig, ExperimentTrace, FifoWorkload, HOST_STUDY_MIN_REPETITIONS,
     HOST_STUDY_MIN_WARMUPS, IdentityDifference, Interval, KvBlockPressure, KvPageSize, KvPressure,
-    LlamaGeneration, MetricComparison, MetricSpec, PagedAttentionKernelStudy,
-    PagedAttentionOccupancy, ParameterSpec, ParameterValue, Parameters, PrefillBucketing,
-    PrefillStrategies, PrefixCache, Protocol, ReportComparison, ReportError, ReportParts,
-    Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample, SchedulerComparison, TimeDomain, Unit,
-    Variant, VariantSummary, WorkloadIdentity, compare_reports, content_digest, nsight_metrics,
+    LlamaGeneration, MetricComparison, MetricSpec, OnlineAdaptivePolicyStudy,
+    PagedAttentionKernelStudy, PagedAttentionOccupancy, ParameterSpec, ParameterValue, Parameters,
+    PrefillBucketing, PrefillStrategies, PrefixCache, Protocol, ReportComparison, ReportError,
+    ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample, SchedulerComparison,
+    TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity, compare_reports, content_digest,
+    nsight_metrics,
 };
+pub use online::{ReplayOptimizer, ReplaySettings};
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,
     PlanReportBatchHook, PlanReportCandidate, PlanReportCapabilityFallback, PlanReportDecision,

@@ -14,7 +14,8 @@ mod statistics;
 
 pub use builtin::{
     AdaptivePrefillCost, FifoWorkload, KvBlockPressure, KvPageSize, KvPressure,
-    PagedAttentionKernelStudy, PrefillBucketing, PrefixCache, SchedulerComparison,
+    OnlineAdaptivePolicyStudy, PagedAttentionKernelStudy, PrefillBucketing, PrefixCache,
+    SchedulerComparison,
 };
 pub use cluster::ClusterRouting;
 pub use compare::{

@@ -433,6 +433,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         "adaptive-prefill-cost",
         "scheduler-comparison",
         "adaptive-policy-study",
+        "online-adaptive-policy-study",
         "kv-pressure",
         "prefix-cache",
         "kv-page-size",
@@ -454,7 +455,14 @@ fn every_builtin_experiment_runs_with_its_defaults() {
             ));
             continue;
         }
-        let outcome = run(descriptor.id, &[]).unwrap();
+        // Online replay runs a simulation per candidate per proposal; a
+        // smaller workload exercises the same path without dominating the
+        // suite in debug builds.
+        let overrides: &[(&str, &str)] = match descriptor.id {
+            "online-adaptive-policy-study" => &[("seeds", "3"), ("requests", "40")],
+            _ => &[],
+        };
+        let outcome = run(descriptor.id, overrides).unwrap();
         assert_eq!(outcome.report.experiment.id, descriptor.id);
         assert!(
             !outcome.summary.is_empty(),
