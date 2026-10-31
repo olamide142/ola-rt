@@ -8,11 +8,11 @@ use axum::{
     response::Response,
 };
 use ola_bench::{KvGeometry, synthetic_artifact};
-use ola_cluster::{WorkerHost, WorkerSession};
+use ola_cluster::{LeastLoadedRouting, WorkerHost, WorkerSession};
 use ola_core::ModelDescriptor;
 use ola_net::TcpPeer;
 use ola_runtime::{Executor, Runtime};
-use ola_serve::cluster::ClusterGateway;
+use ola_serve::cluster::{ClusterGateway, ClusterGatewayConfig};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -156,4 +156,138 @@ async fn gateway_routes_across_two_network_workers() {
     drop(gateway);
     first_task.abort();
     second_task.abort();
+}
+
+fn long_worker(id: &'static str) -> WorkerHost {
+    let mut executor = Executor::with_max_active_requests(Runtime::default(), 1).unwrap();
+    executor
+        .register_model(
+            ModelDescriptor::language("synthetic", "synthetic"),
+            synthetic_artifact(KvGeometry {
+                capacity_bytes: 64 * 32 * 1024,
+                ..KvGeometry::default()
+            }),
+        )
+        .unwrap();
+    WorkerHost::new(id, executor)
+}
+
+async fn spawn_worker(
+    host: WorkerHost,
+    heartbeat: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let task = tokio::spawn(async move {
+        let (peer, _) = TcpPeer::accept(&listener).await.unwrap();
+        let _ = WorkerSession::new(peer, host, 1, heartbeat).run().await;
+    });
+    (address, task)
+}
+
+fn generate(body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+async fn ready_workers(app: &axum::Router) -> u64 {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    body["ready_workers"].as_u64().unwrap()
+}
+
+fn fast_supervision() -> ClusterGatewayConfig {
+    ClusterGatewayConfig {
+        lease_timeout: Duration::from_millis(100),
+        tick: Duration::from_millis(10),
+    }
+}
+
+#[tokio::test]
+async fn an_idle_gateway_keeps_leases_and_drops_a_dead_worker() {
+    let (address, task) = spawn_worker(worker(), Duration::from_millis(5)).await;
+    let gateway =
+        ClusterGateway::connect_with([(address, None)], LeastLoadedRouting, fast_supervision())
+            .await
+            .unwrap();
+    let app = gateway.router();
+    // Several leases pass with no request in flight; heartbeats still count.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ready_workers(&app).await, 1);
+
+    task.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(ready_workers(&app).await, 0);
+}
+
+#[tokio::test]
+async fn cancelling_an_unknown_request_is_not_found() {
+    let (address, task) = spawn_worker(worker(), Duration::from_millis(5)).await;
+    let gateway = ClusterGateway::connect([(address, None)]).await.unwrap();
+    let response = gateway
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/requests/999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    task.abort();
+}
+
+#[tokio::test]
+async fn an_abandoned_request_frees_its_worker_and_health_stays_responsive() {
+    // One slot: the next request can only run if the abandoned one is gone.
+    let (address, task) = spawn_worker(long_worker("worker"), Duration::from_millis(5)).await;
+    let gateway = ClusterGateway::connect([(address, None)]).await.unwrap();
+    let app = gateway.router();
+
+    // A leading 0 tells the synthetic model never to stop early.
+    let long = r#"{"model":"synthetic","tokens":[0,2,3,4],"max_new_tokens":30000}"#;
+    let abandoned = tokio::time::timeout(
+        Duration::from_millis(100),
+        app.clone().oneshot(generate(long)),
+    )
+    .await;
+    assert!(
+        abandoned.is_err(),
+        "the long request should still be running"
+    );
+
+    // Health answers while the worker is busy streaming.
+    let started = std::time::Instant::now();
+    assert_eq!(ready_workers(&app).await, 1);
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    let short = r#"{"model":"synthetic","tokens":[0,5,6],"max_new_tokens":2}"#;
+    let started = std::time::Instant::now();
+    let output = json_response(app.oneshot(generate(short)).await.unwrap()).await;
+    assert_eq!(output["token_ids"].as_array().unwrap().len(), 2);
+    // Finishing 30 000 abandoned tokens first would take far longer.
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "short request waited {:?}",
+        started.elapsed()
+    );
+    task.abort();
 }

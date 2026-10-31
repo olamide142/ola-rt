@@ -4,7 +4,7 @@ use std::{
     fs::OpenOptions,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -13,9 +13,9 @@ use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
 use ola_serve::cluster::ClusterGateway;
-use ola_serve::{http, Driver, DriverConfig, Instruments};
+use ola_serve::{Driver, DriverConfig, Instruments, http};
 
-use crate::{load_model, write_line, EXIT_OK, USAGE};
+use crate::{EXIT_OK, USAGE, load_model, write_line};
 
 struct Options {
     role: String,
@@ -221,11 +221,19 @@ fn worker(
             format!("serving worker `{name}` on tcp://{address} (Ctrl-C stops)"),
         )?;
         let _ = out.flush();
+        // A restarted process must present a larger epoch than the one it
+        // replaces, so the coordinator can drop the old process's late
+        // heartbeats; the start time does that without stored state.
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |elapsed| {
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+            });
         ola_serve::cluster::serve_worker(
             listener,
             name,
             executor,
-            1,
+            epoch,
             Duration::from_millis(100),
             async {
                 let _ = tokio::signal::ctrl_c().await;

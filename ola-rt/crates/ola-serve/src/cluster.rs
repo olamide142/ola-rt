@@ -1,11 +1,14 @@
 //! HTTP gateway backed by networked [`ola_cluster`] workers.
+//!
+//! One driver task owns the [`TcpCoordinator`]. It reads every worker link
+//! continuously, so heartbeats renew leases and summaries reach routing even
+//! when no request is waiting on that worker. On a fixed tick it expires
+//! silent workers, recovers their requests, and replans requests deferred
+//! while no worker was ready. HTTP handlers talk to the driver over
+//! channels: a submission gets its own event stream, and nothing holds a lock
+//! across network I/O.
 
-use std::{
-    collections::{BTreeMap, VecDeque},
-    convert::Infallible,
-    future::Future,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, convert::Infallible, future::Future, time::Duration};
 
 use axum::{
     Json, Router,
@@ -19,27 +22,47 @@ use axum::{
 };
 use futures_util::stream;
 use ola_cluster::{
-    AdaptiveClusterPolicy, ClientEvent, TcpCoordinator, TcpCoordinatorError, WorkerHost,
-    WorkerSession, WorkerSessionError,
+    AdaptiveClusterPolicy, ClientEvent, ClusterPolicy, CoordinatorError, CoordinatorOutput,
+    TcpCoordinator, TcpCoordinatorError, WorkerHealth, WorkerHost, WorkerSession,
+    WorkerSessionError,
 };
 use ola_core::{
     Clock, ClusterRequestId, GenerationConfig, Input, MonotonicClock, Priority, RequestSpec,
     WorkerId,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::Mutex};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
 
-/// Shared state for a networked gateway.
-#[derive(Clone)]
-pub struct ClusterGateway {
-    state: Arc<Mutex<GatewayState>>,
+/// How the gateway's driver supervises workers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterGatewayConfig {
+    /// A worker silent for this long is lost: its requests are recovered on
+    /// other workers by recompute. Keep it several worker heartbeats long.
+    pub lease_timeout: Duration,
+    /// How often the driver checks leases and replans deferred requests.
+    pub tick: Duration,
 }
 
-struct GatewayState {
-    coordinator: TcpCoordinator,
-    workers: Vec<WorkerId>,
-    clock: MonotonicClock,
-    buffered: BTreeMap<ClusterRequestId, VecDeque<ClientEvent>>,
+impl Default for ClusterGatewayConfig {
+    /// A 2 s lease checked every 50 ms, for workers heartbeating every 100 ms
+    /// (the `ola serve --role worker` default).
+    fn default() -> Self {
+        Self {
+            lease_timeout: Duration::from_secs(2),
+            tick: Duration::from_millis(50),
+        }
+    }
+}
+
+/// Handle to a networked gateway. Clones, including routers, share one
+/// driver; when the last is dropped the driver says goodbye to every worker
+/// and stops.
+#[derive(Clone)]
+pub struct ClusterGateway {
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 /// Errors raised while connecting or serving the cluster gateway.
@@ -82,8 +105,13 @@ impl From<WorkerSessionError> for ClusterGatewayError {
 /// Serves one worker process endpoint using an existing configured executor.
 ///
 /// The worker accepts one coordinator connection and runs until that
-/// connection closes or `shutdown` resolves. A supervisor may call this
-/// function again after a restart with a new epoch.
+/// connection closes or `shutdown` resolves. `epoch` must grow across
+/// restarts of the same worker ID, so a coordinator can tell a restarted
+/// process from a delayed heartbeat of the old one; a start timestamp works.
+///
+/// # Errors
+///
+/// Fails if accepting the connection or serving it fails.
 pub async fn serve_worker(
     listener: TcpListener,
     worker_id: impl Into<ola_core::WorkerId>,
@@ -103,23 +131,40 @@ pub async fn serve_worker(
 }
 
 impl ClusterGateway {
-    /// Connects to all configured workers and completes their handshakes.
+    /// Connects to all configured workers with the default configuration
+    /// and the adaptive routing policy.
+    ///
+    /// # Errors
+    ///
+    /// Fails if any worker cannot be reached or fails its handshake.
     pub async fn connect(
         workers: impl IntoIterator<Item = (String, Option<WorkerId>)>,
     ) -> Result<Self, ClusterGatewayError> {
-        let mut coordinator = TcpCoordinator::new(AdaptiveClusterPolicy::default());
-        let mut ids = Vec::new();
+        Self::connect_with(
+            workers,
+            AdaptiveClusterPolicy::default(),
+            ClusterGatewayConfig::default(),
+        )
+        .await
+    }
+
+    /// Connects to all configured workers, routing with `policy`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if any worker cannot be reached or fails its handshake.
+    pub async fn connect_with<P: ClusterPolicy + 'static>(
+        workers: impl IntoIterator<Item = (String, Option<WorkerId>)>,
+        policy: P,
+        config: ClusterGatewayConfig,
+    ) -> Result<Self, ClusterGatewayError> {
+        let mut coordinator = TcpCoordinator::new(policy);
         for (address, expected) in workers {
-            ids.push(coordinator.connect_worker(address, expected).await?);
+            coordinator.connect_worker(address, expected).await?;
         }
-        Ok(Self {
-            state: Arc::new(Mutex::new(GatewayState {
-                coordinator,
-                workers: ids,
-                clock: MonotonicClock::start(),
-                buffered: BTreeMap::new(),
-            })),
-        })
+        let (commands, receiver) = mpsc::unbounded_channel();
+        tokio::spawn(drive(coordinator, receiver, config));
+        Ok(Self { commands })
     }
 
     /// Builds the gateway's native HTTP router.
@@ -134,6 +179,10 @@ impl ClusterGateway {
     }
 
     /// Serves the gateway until `shutdown` resolves.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the HTTP server fails.
     pub async fn serve(
         &self,
         listener: TcpListener,
@@ -143,11 +192,152 @@ impl ClusterGateway {
             .with_graceful_shutdown(shutdown)
             .await
     }
+
+    async fn ask<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
+        let (reply, response) = oneshot::channel();
+        self.commands.send(command(reply)).ok()?;
+        response.await.ok()
+    }
 }
 
 impl crate::InferenceBackend for ClusterGateway {
     fn router(&self) -> Router {
         self.router()
+    }
+}
+
+/// A request from an HTTP handler to the driver.
+enum Command {
+    Submit {
+        spec: RequestSpec,
+        reply: oneshot::Sender<Result<Subscription, SubmitError>>,
+    },
+    Cancel {
+        request: ClusterRequestId,
+        reply: oneshot::Sender<Result<(), CancelError>>,
+    },
+    Health {
+        reply: oneshot::Sender<GatewayHealth>,
+    },
+}
+
+/// A submitted request and the events the driver forwards for it.
+struct Subscription {
+    request: ClusterRequestId,
+    events: mpsc::UnboundedReceiver<ClientEvent>,
+}
+
+enum SubmitError {
+    Invalid(String),
+    Unavailable(String),
+}
+
+enum CancelError {
+    Unknown,
+    Failed(String),
+}
+
+#[derive(Clone, Copy)]
+struct GatewayHealth {
+    connected: usize,
+    ready: usize,
+}
+
+/// Owns the coordinator: applies worker frames, handler commands, and the
+/// supervision tick, one at a time, and forwards client events.
+async fn drive(
+    mut coordinator: TcpCoordinator,
+    mut commands: mpsc::UnboundedReceiver<Command>,
+    config: ClusterGatewayConfig,
+) {
+    let clock = MonotonicClock::start();
+    let mut subscribers = BTreeMap::<ClusterRequestId, mpsc::UnboundedSender<ClientEvent>>::new();
+    let mut tick = tokio::time::interval(config.tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // Every branch's future is cancel-safe; the work happens after one
+        // is chosen.
+        let output = tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                let now = clock.now();
+                match command {
+                    Command::Submit { spec, reply } => {
+                        match coordinator.submit_and_plan(spec, now).await {
+                            Ok((request, output)) => {
+                                let (sender, events) = mpsc::unbounded_channel();
+                                subscribers.insert(request, sender);
+                                // A handler that has gone away is cancelled
+                                // when its first event cannot be delivered.
+                                let _ = reply.send(Ok(Subscription { request, events }));
+                                Ok(output)
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                let _ = reply.send(Err(match error {
+                                    TcpCoordinatorError::Coordinator(
+                                        CoordinatorError::InvalidRequest(_),
+                                    ) => SubmitError::Invalid(message),
+                                    _ => SubmitError::Unavailable(message),
+                                }));
+                                Ok(CoordinatorOutput::default())
+                            }
+                        }
+                    }
+                    Command::Cancel { request, reply } => {
+                        let result = coordinator.cancel(request, now).await;
+                        let answer = match &result {
+                            Ok(_) => Ok(()),
+                            Err(TcpCoordinatorError::Coordinator(
+                                CoordinatorError::UnknownRequest(_),
+                            )) => Err(CancelError::Unknown),
+                            Err(error) => Err(CancelError::Failed(error.to_string())),
+                        };
+                        let _ = reply.send(answer);
+                        result
+                    }
+                    Command::Health { reply } => {
+                        let _ = reply.send(GatewayHealth {
+                            connected: coordinator.connected().count(),
+                            ready: coordinator
+                                .coordinator()
+                                .workers()
+                                .filter(|summary| summary.health == WorkerHealth::Ready)
+                                .count(),
+                        });
+                        Ok(CoordinatorOutput::default())
+                    }
+                }
+            }
+            frame = coordinator.next_frame() => coordinator.apply_frame(frame, clock.now()).await,
+            _ = tick.tick() => coordinator.recover_lost(clock.now(), config.lease_timeout).await,
+        };
+        // A rejected worker message or failed dispatch affects that one
+        // event; the driver keeps serving everything else.
+        let Ok(output) = output else { continue };
+        let mut abandoned = Vec::new();
+        for (request, event) in output.client {
+            let terminal = matches!(
+                event,
+                ClientEvent::Finished { .. } | ClientEvent::Failed { .. } | ClientEvent::Cancelled
+            );
+            let delivered = subscribers
+                .get(&request)
+                .is_some_and(|sender| sender.send(event).is_ok());
+            if terminal {
+                subscribers.remove(&request);
+            } else if !delivered && subscribers.remove(&request).is_some() {
+                abandoned.push(request);
+            }
+        }
+        // Nobody is listening any more, so stop spending a worker on it.
+        for request in abandoned {
+            let _ = coordinator.cancel(request, clock.now()).await;
+        }
+    }
+    let workers = coordinator.connected().cloned().collect::<Vec<_>>();
+    for worker in workers {
+        let _ = coordinator.close_worker(&worker).await;
     }
 }
 
@@ -222,86 +412,100 @@ struct CompletionUsage {
     total_tokens: usize,
 }
 
-async fn health(State(gateway): State<ClusterGateway>) -> Json<serde_json::Value> {
-    let state = gateway.state.lock().await;
-    Json(serde_json::json!({"state":"ready", "workers":state.workers.len()}))
+type HttpError = (StatusCode, Json<ErrorBody>);
+
+async fn gateway_health(gateway: &ClusterGateway) -> Result<GatewayHealth, HttpError> {
+    gateway
+        .ask(|reply| Command::Health { reply })
+        .await
+        .ok_or_else(stopped)
 }
 
-async fn ready(State(gateway): State<ClusterGateway>) -> (StatusCode, Json<serde_json::Value>) {
-    let state = gateway.state.lock().await;
-    let ready = !state.workers.is_empty();
-    (
+async fn health(
+    State(gateway): State<ClusterGateway>,
+) -> Result<Json<serde_json::Value>, HttpError> {
+    let health = gateway_health(&gateway).await?;
+    Ok(Json(serde_json::json!({
+        "state": "ready",
+        "workers": health.connected,
+        "ready_workers": health.ready,
+    })))
+}
+
+async fn ready(
+    State(gateway): State<ClusterGateway>,
+) -> Result<(StatusCode, Json<serde_json::Value>), HttpError> {
+    let health = gateway_health(&gateway).await?;
+    let ready = health.ready > 0;
+    Ok((
         if ready {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         },
-        Json(
-            serde_json::json!({"state": if ready {"ready"} else {"not_ready"}, "workers":state.workers.len()}),
-        ),
-    )
+        Json(serde_json::json!({
+            "state": if ready { "ready" } else { "not_ready" },
+            "workers": health.connected,
+            "ready_workers": health.ready,
+        })),
+    ))
 }
 
 async fn generate(
     State(gateway): State<ClusterGateway>,
     body: Result<Json<GenerateBody>, JsonRejection>,
-) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, HttpError> {
     let Json(body) =
         body.map_err(|error| error_response(StatusCode::BAD_REQUEST, error.body_text()))?;
     let stream_response = body.stream;
     let spec =
         request_spec(body).map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-    let request = {
-        let mut state = gateway.state.lock().await;
-        let now = state.clock.now();
-        let (request, output) = state
-            .coordinator
-            .submit_and_plan(spec, now)
-            .await
-            .map_err(cluster_error)?;
-        for (id, event) in output.client {
-            state.buffered.entry(id).or_default().push_back(event);
-        }
-        state
-            .coordinator
-            .status(request)
-            .and_then(|status| status.owner().cloned())
-            .ok_or_else(|| {
-                error_response(StatusCode::SERVICE_UNAVAILABLE, "request was not assigned")
-            })?;
-        request
-    };
+    let Subscription {
+        request,
+        mut events,
+    } = submit(&gateway, spec).await?;
     if stream_response {
-        let events = stream::unfold(Some((gateway, request)), |state| async move {
-            let (gateway, request) = state?;
-            let event = match next_event(&gateway, request).await {
-                Ok(Some(event)) => event,
-                Ok(None) | Err(_) => return None,
-            };
+        let events = stream::unfold(Some(events), move |events| async move {
+            let mut events = events?;
+            let event = events.recv().await?;
             let terminal = matches!(
                 event,
                 ClientEvent::Finished { .. } | ClientEvent::Failed { .. } | ClientEvent::Cancelled
             );
             let output = match event {
-                ClientEvent::Token { token_id, generated_tokens, .. } => Event::default().event("token").json_data(serde_json::json!({"token_id":token_id,"generated_tokens":generated_tokens})).unwrap(),
-                ClientEvent::Finished { token_ids, text } => Event::default().event("done").json_data(GenerateResponse { id: request.get(), text, token_ids }).unwrap(),
-                ClientEvent::Failed { message } => Event::default().event("error").json_data(ErrorBody { error: message }).unwrap(),
+                ClientEvent::Token {
+                    token_id,
+                    generated_tokens,
+                    ..
+                } => Event::default()
+                    .event("token")
+                    .json_data(serde_json::json!({
+                        "token_id": token_id,
+                        "generated_tokens": generated_tokens,
+                    }))
+                    .expect("token events serialize"),
+                ClientEvent::Finished { token_ids, text } => Event::default()
+                    .event("done")
+                    .json_data(GenerateResponse {
+                        id: request.get(),
+                        text,
+                        token_ids,
+                    })
+                    .expect("results serialize"),
+                ClientEvent::Failed { message } => Event::default()
+                    .event("error")
+                    .json_data(ErrorBody { error: message })
+                    .expect("errors serialize"),
                 ClientEvent::Cancelled => Event::default().event("cancelled"),
             };
-            Some((
-                Ok::<_, Infallible>(output),
-                (!terminal).then_some((gateway, request)),
-            ))
+            Some((Ok::<_, Infallible>(output), (!terminal).then_some(events)))
         });
         return Ok(Sse::new(events)
             .keep_alive(KeepAlive::default())
             .into_response());
     }
     loop {
-        match next_event(&gateway, request)
-            .await
-            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?
-        {
+        match events.recv().await {
             Some(ClientEvent::Token { .. }) => {}
             Some(ClientEvent::Finished { token_ids, text }) => {
                 return Ok(Json(GenerateResponse {
@@ -317,12 +521,7 @@ async fn generate(
             Some(ClientEvent::Cancelled) => {
                 return Err(error_response(StatusCode::CONFLICT, "cancelled"));
             }
-            None => {
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "worker connection closed",
-                ));
-            }
+            None => return Err(stopped()),
         }
     }
 }
@@ -330,21 +529,31 @@ async fn generate(
 async fn cancel(
     State(gateway): State<ClusterGateway>,
     axum::extract::Path(id): axum::extract::Path<u64>,
-) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
-    let mut state = gateway.state.lock().await;
-    let now = state.clock.now();
-    state
-        .coordinator
-        .cancel(ClusterRequestId::new(id), now)
+) -> Result<StatusCode, HttpError> {
+    let request = ClusterRequestId::new(id);
+    match gateway
+        .ask(|reply| Command::Cancel { request, reply })
         .await
-        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
+        .ok_or_else(stopped)?
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(CancelError::Unknown) => Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("unknown request `{id}`"),
+        )),
+        Err(CancelError::Failed(message)) => {
+            Err(error_response(StatusCode::SERVICE_UNAVAILABLE, message))
+        }
+    }
 }
 
+/// OpenAI-style text completion. Streaming sends the whole completion as
+/// one chunk at the end: workers stream token IDs, and the gateway has no
+/// tokenizer to turn each into text.
 async fn completions(
     State(gateway): State<ClusterGateway>,
     body: Result<Json<CompletionBody>, JsonRejection>,
-) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Response, HttpError> {
     let Json(body) =
         body.map_err(|error| error_response(StatusCode::BAD_REQUEST, error.body_text()))?;
     let CompletionBody {
@@ -366,50 +575,47 @@ async fn completions(
         deadline: None,
         attributes: BTreeMap::new(),
     };
-    let request = submit(&gateway, spec).await?;
+    let Subscription {
+        request,
+        mut events,
+    } = submit(&gateway, spec).await?;
     let id = format!("cmpl-{}", request.get());
     if stream_response {
-        let events = stream::unfold(
-            Some((gateway, request, id, model, false)),
-            |state| async move {
-                let (gateway, request, id, model, done) = state?;
-                if done {
-                    return Some((Ok::<_, Infallible>(Event::default().data("[DONE]")), None));
-                }
-                loop {
-                    match next_event(&gateway, request).await {
-                        Ok(Some(ClientEvent::Token { .. })) => continue,
-                        Ok(Some(ClientEvent::Finished { text, .. })) => {
-                            let chunk = serde_json::json!({
-                                "id": id,
-                                "object": "text_completion",
-                                "created": 0,
-                                "model": model,
-                                "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
-                            });
-                            return Some((
-                                Ok(Event::default().data(chunk.to_string())),
-                                Some((gateway, request, id, model, true)),
-                            ));
-                        }
-                        Ok(Some(ClientEvent::Failed { message })) => {
-                            let error = serde_json::json!({"error": message});
-                            return Some((Ok(Event::default().data(error.to_string())), None));
-                        }
-                        Ok(Some(ClientEvent::Cancelled)) | Ok(None) | Err(_) => return None,
+        let events = stream::unfold(Some((events, id, model, false)), |state| async move {
+            let (mut events, id, model, done) = state?;
+            if done {
+                return Some((Ok::<_, Infallible>(Event::default().data("[DONE]")), None));
+            }
+            loop {
+                match events.recv().await? {
+                    ClientEvent::Token { .. } => {}
+                    ClientEvent::Finished { text, .. } => {
+                        let chunk = serde_json::json!({
+                            "id": id,
+                            "object": "text_completion",
+                            "created": 0,
+                            "model": model,
+                            "choices": [{"text": text, "index": 0, "finish_reason": "stop"}],
+                        });
+                        return Some((
+                            Ok(Event::default().data(chunk.to_string())),
+                            Some((events, id, model, true)),
+                        ));
                     }
+                    ClientEvent::Failed { message } => {
+                        let error = serde_json::json!({"error": message});
+                        return Some((Ok(Event::default().data(error.to_string())), None));
+                    }
+                    ClientEvent::Cancelled => return None,
                 }
-            },
-        );
+            }
+        });
         return Ok(Sse::new(events)
             .keep_alive(KeepAlive::default())
             .into_response());
     }
     loop {
-        match next_event(&gateway, request)
-            .await
-            .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?
-        {
+        match events.recv().await {
             Some(ClientEvent::Token { .. }) => {}
             Some(ClientEvent::Finished { token_ids, text }) => {
                 let completion_tokens = token_ids.len();
@@ -423,6 +629,8 @@ async fn completions(
                         index: 0,
                         finish_reason: "stop",
                     }],
+                    // Prompt tokens are counted on the worker, which does
+                    // not report them yet.
                     usage: CompletionUsage {
                         prompt_tokens: 0,
                         completion_tokens,
@@ -434,63 +642,27 @@ async fn completions(
             Some(ClientEvent::Failed { message }) => {
                 return Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, message));
             }
-            Some(ClientEvent::Cancelled) | None => {
+            Some(ClientEvent::Cancelled) => {
                 return Err(error_response(StatusCode::CONFLICT, "cancelled"));
             }
+            None => return Err(stopped()),
         }
     }
 }
 
-async fn submit(
-    gateway: &ClusterGateway,
-    spec: RequestSpec,
-) -> Result<ClusterRequestId, (StatusCode, Json<ErrorBody>)> {
-    let mut state = gateway.state.lock().await;
-    let now = state.clock.now();
-    let (request, output) = state
-        .coordinator
-        .submit_and_plan(spec, now)
+/// Submits a request. It may wait in the coordinator until a worker is
+/// ready; a model no worker serves fails through the event stream.
+async fn submit(gateway: &ClusterGateway, spec: RequestSpec) -> Result<Subscription, HttpError> {
+    gateway
+        .ask(|reply| Command::Submit { spec, reply })
         .await
-        .map_err(cluster_error)?;
-    for (id, event) in output.client {
-        state.buffered.entry(id).or_default().push_back(event);
-    }
-    state
-        .coordinator
-        .status(request)
-        .and_then(|status| status.owner())
-        .ok_or_else(|| {
-            error_response(StatusCode::SERVICE_UNAVAILABLE, "request was not assigned")
-        })?;
-    Ok(request)
-}
-
-async fn next_event(
-    gateway: &ClusterGateway,
-    request: ClusterRequestId,
-) -> Result<Option<ClientEvent>, ClusterGatewayError> {
-    loop {
-        let mut state = gateway.state.lock().await;
-        if let Some(event) = state
-            .buffered
-            .get_mut(&request)
-            .and_then(VecDeque::pop_front)
-        {
-            return Ok(Some(event));
-        }
-        let owner = state
-            .coordinator
-            .status(request)
-            .and_then(|status| status.owner().cloned());
-        let Some(owner) = owner else {
-            return Ok(None);
-        };
-        let now = state.clock.now();
-        let output = state.coordinator.receive(&owner, now).await?;
-        for (id, event) in output.client {
-            state.buffered.entry(id).or_default().push_back(event);
-        }
-    }
+        .ok_or_else(stopped)?
+        .map_err(|error| match error {
+            SubmitError::Invalid(message) => error_response(StatusCode::BAD_REQUEST, message),
+            SubmitError::Unavailable(message) => {
+                error_response(StatusCode::SERVICE_UNAVAILABLE, message)
+            }
+        })
 }
 
 fn request_spec(body: GenerateBody) -> Result<RequestSpec, String> {
@@ -514,7 +686,7 @@ fn request_spec(body: GenerateBody) -> Result<RequestSpec, String> {
     })
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+fn error_response(status: StatusCode, message: impl Into<String>) -> HttpError {
     (
         status,
         Json(ErrorBody {
@@ -523,6 +695,6 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> (StatusCode
     )
 }
 
-fn cluster_error(error: TcpCoordinatorError) -> (StatusCode, Json<ErrorBody>) {
-    error_response(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+fn stopped() -> HttpError {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway driver stopped")
 }

@@ -16,7 +16,7 @@ ola-observe.workspace = true
 ola-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 ola-bench.workspace = true
