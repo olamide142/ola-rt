@@ -213,7 +213,9 @@ where
     })
 }
 
-fn run_observations(run: &SchedulingRun) -> Vec<ola_runtime::AdaptiveRequestObservation> {
+pub(crate) fn run_observations(
+    run: &SchedulingRun,
+) -> Vec<ola_runtime::AdaptiveRequestObservation> {
     run.requests
         .iter()
         .map(|request| {
@@ -233,6 +235,9 @@ fn run_observations(run: &SchedulingRun) -> Vec<ola_runtime::AdaptiveRequestObse
                     completed_at.is_none_or(|at| at.as_micros() > deadline)
                 }),
                 capability_fallback: false,
+                prompt_tokens: None,
+                max_new_tokens: None,
+                generated_tokens: None,
             }
         })
         .collect()

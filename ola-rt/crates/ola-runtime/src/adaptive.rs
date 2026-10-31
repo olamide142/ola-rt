@@ -689,6 +689,14 @@ pub struct AdaptiveRequestObservation {
     /// Whether execution used a capability fallback attributable to this
     /// request's iteration.
     pub capability_fallback: bool,
+    /// Prompt tokens, reported by the iteration that admitted the request.
+    pub prompt_tokens: Option<usize>,
+    /// Output limit, reported by the iteration that admitted the request.
+    pub max_new_tokens: Option<usize>,
+    /// Output tokens produced so far, reported by iterations that produced
+    /// one. Together with the two fields above, observations from successive
+    /// iterations describe the workload well enough to replay it.
+    pub generated_tokens: Option<usize>,
 }
 
 /// Aggregate metrics derived from one adaptive observation window.
@@ -822,6 +830,23 @@ impl ExecutorIteration {
             .iter()
             .map(|(request_id, arrived_at)| (*request_id, (*arrived_at, None, None)))
             .collect::<BTreeMap<_, _>>();
+        let admitted = self
+            .decision
+            .admissions
+            .iter()
+            .filter_map(|record| match &record.outcome {
+                crate::AdmissionOutcome::Decided {
+                    context,
+                    decision: crate::AdmissionDecision::Admit { .. },
+                    budget_selected: Some(true),
+                } => Some((
+                    record.request_id,
+                    (context.prompt_tokens, context.max_new_tokens),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut generated = BTreeMap::new();
 
         for event in &self.events {
             match event {
@@ -829,8 +854,10 @@ impl ExecutorIteration {
                     request_id,
                     at,
                     finished,
+                    generated_tokens,
                     ..
                 } => {
+                    generated.insert(*request_id, *generated_tokens);
                     if let Some((_, first_token_at, completed_at)) = timings.get_mut(request_id) {
                         *first_token_at = Some(first_token_at.unwrap_or(*at));
                         if *finished {
@@ -864,6 +891,9 @@ impl ExecutorIteration {
                         capability_fallback: observation_index < fallback_count,
                         first_token_at,
                         completed_at,
+                        prompt_tokens: admitted.get(&request_id).map(|(prompt, _)| *prompt),
+                        max_new_tokens: admitted.get(&request_id).map(|(_, limit)| *limit),
+                        generated_tokens: generated.get(&request_id).copied(),
                     }
                 },
             )
@@ -896,6 +926,10 @@ pub struct AdaptivePolicy {
     theta: Vec<(&'static str, String)>,
     update_count: u64,
     optimization_interval: u64,
+    /// Observations since the last optimizer call, which receives all of
+    /// them: with an interval above one, a single iteration's observations
+    /// would miss most admissions and completions.
+    window: Vec<AdaptiveRequestObservation>,
     seed: u64,
     random_state: u64,
 }
@@ -920,6 +954,7 @@ impl AdaptivePolicy {
             updater: None,
             theta,
             update_count: 0,
+            window: Vec::new(),
             optimization_interval: 1,
             seed: 0,
             random_state: 0,
@@ -1100,12 +1135,16 @@ impl ExecutionPolicy for AdaptivePolicy {
         }
         let should_optimize =
             (self.update_count.saturating_add(1)).is_multiple_of(self.optimization_interval);
+        if self.optimizer.is_some() {
+            self.window.extend(observations);
+        }
         let proposed_theta = if should_optimize {
+            let window = std::mem::take(&mut self.window);
             self.optimizer
                 .as_mut()
                 .and_then(|optimizer| {
                     optimizer
-                        .propose(&self.theta, &observations, self.constraints)
+                        .propose(&self.theta, &window, self.constraints)
                         .ok()
                 })
                 .map(|mut candidate| {
@@ -1451,6 +1490,52 @@ mod tests {
         policy.observe(&iteration);
         assert_eq!(policy.theta(), &[("budget", "2".into())]);
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn optimizer_receives_every_observation_since_its_last_call() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_by_optimizer = seen.clone();
+        let mut policy = AdaptivePolicy::new(AcceptingPolicy, vec![("budget", "1".into())])
+            .with_optimization_interval(3)
+            .with_optimizer(
+                move |current: &[(&'static str, String)],
+                      observations: &[AdaptiveRequestObservation],
+                      _: AdaptiveConstraints|
+                      -> Result<Vec<(&'static str, String)>, AdaptiveOptimizationError> {
+                    seen_by_optimizer.lock().unwrap().push(
+                        observations
+                            .iter()
+                            .map(|observation| observation.request_id.get())
+                            .collect::<Vec<_>>(),
+                    );
+                    Ok(current.to_vec())
+                },
+            );
+        let iteration = |request: u64| {
+            let mut decision = DecisionRecord::default();
+            decision
+                .arrival_times
+                .insert(RequestId::new(request), Timestamp::ZERO);
+            ExecutorIteration {
+                id: crate::IterationId::new(request),
+                at: Timestamp::ZERO,
+                events: Vec::new(),
+                execution_plan: ExecutionPlan::default(),
+                decision,
+                divergences: Vec::new(),
+                execution_batches: Vec::new(),
+                active_requests: 0,
+                queued_requests: 0,
+                kv_cache_bytes: 0,
+                reserved_kv_bytes: 0,
+            }
+        };
+        for request in 1..=6 {
+            policy.observe(&iteration(request));
+        }
+        // Each call sees its whole interval, not only its own iteration.
+        assert_eq!(*seen.lock().unwrap(), [vec![1, 2, 3], vec![4, 5, 6]]);
     }
 
     #[test]
@@ -1858,6 +1943,9 @@ mod tests {
             completion_latency_micros: Some(300),
             deadline_missed: false,
             capability_fallback: false,
+            prompt_tokens: None,
+            max_new_tokens: None,
+            generated_tokens: None,
         };
 
         let candidate = optimizer
@@ -1913,6 +2001,9 @@ mod tests {
                 completion_latency_micros: Some(15),
                 deadline_missed: false,
                 capability_fallback: false,
+                prompt_tokens: None,
+                max_new_tokens: None,
+                generated_tokens: Some(1),
             }]
         );
     }
@@ -1929,6 +2020,9 @@ mod tests {
                 completion_latency_micros: Some(1_000_000),
                 deadline_missed: false,
                 capability_fallback: false,
+                prompt_tokens: None,
+                max_new_tokens: None,
+                generated_tokens: None,
             },
             AdaptiveRequestObservation {
                 request_id: ola_core::RequestId::new(2),
@@ -1939,6 +2033,9 @@ mod tests {
                 completion_latency_micros: Some(2_000_000),
                 deadline_missed: true,
                 capability_fallback: true,
+                prompt_tokens: None,
+                max_new_tokens: None,
+                generated_tokens: None,
             },
         ];
         let metrics = AdaptiveObjectiveMetrics::from_observations(&observations);
