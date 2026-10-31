@@ -119,7 +119,10 @@ cost-aware knobs.
   a good one (74.5 ms). See `ADAPTIVE_OPTIMIZATION_PLAN.md`.
 - [ ] Find a regime where the best configuration moves with the workload,
   and show online adaptation beating the best fixed configuration there.
-- [ ] Install an adaptive policy in `ola serve` with a calibrated cost model.
+- [x] Install an adaptive policy in `ola serve` with a calibrated cost model.
+  (`ola serve --adaptive CALIBRATION.json`.)
+- [ ] Measure `ola serve --adaptive` on a real model and hardware against
+  the default policy.
 
 Done when an adaptive policy improves a chosen reward over the best fixed baseline on held-out seeded traces without validation failures. **Not met:** offline selection ties the best fixed baseline and online replay comes within 1–9% of it.
 

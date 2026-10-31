@@ -143,8 +143,13 @@ would miss most admissions and completions.
 
 Replays are as good as the simulator's `CostModel`. In the studies below the
 "live" executor is the same simulator, so the model is exact; on hardware it
-must come from `cost-calibration`. Nothing installs an adaptive policy in
-`ola serve` yet.
+must come from `cost-calibration`.
+
+`ola serve --adaptive REPORT` installs `ola_bench::serving_adaptive_policy`:
+the same grid and objective, starting from the largest budget (which behaves
+like the default unbounded batching), replaying with the cost model fitted
+in `REPORT`. A synthetic-executor test shows it re-plans mid-run without
+changing any output; it has not yet been measured on real hardware.
 
 ### Results (2026-10-31)
 

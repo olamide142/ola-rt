@@ -120,6 +120,28 @@ unknown fields. `seed` is accepted and has no effect. Errors use OpenAI's
 shape, `{"error": {"message", "type", "param", "code"}}`, with `type` set to
 the native kind. Chat completions need prompt templates and are not offered.
 
+## Adaptive token budgets
+
+`ola serve --adaptive REPORT.json` replaces the fixed policy with an
+adaptive one that re-tunes how many tokens each iteration may process. Every
+40 iterations it replays the last 64 completed requests in the virtual-time
+simulator under each candidate budget and switches when one would cut p95
+completion plus p95 time to first token by at least 5%. It starts from the
+largest budget, so until a replay finds something better it behaves like the
+default.
+
+`REPORT.json` is a `cost-calibration` report for the same model and
+backend, which supplies the simulator's per-iteration, per-call, and
+per-token costs:
+
+```text
+ola experiment run cost-calibration --model DIR --backend cpu --results-dir results
+ola serve --model DIR --backend cpu --adaptive results/<report>.json
+```
+
+The active budget is part of the policy descriptor in every request trace.
+Results and limits are in `../ola-runtime/ADAPTIVE_OPTIMIZATION_PLAN.md`.
+
 ## Cluster roles
 
 `ola serve` also runs the two roles of a distributed deployment

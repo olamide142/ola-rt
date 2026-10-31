@@ -1245,6 +1245,15 @@ Update this file whenever a meaningful capability is merged. Each update should:
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
 
+- **2026-10-31 — adaptive serving:** `ola serve --adaptive REPORT` installs
+  the online replay policy, replaying with the cost model from a saved
+  `cost-calibration` report (checked before the model loads). It starts from
+  the largest budget, so it behaves like the default until a replay predicts
+  a 5% improvement. The token-budget grid, factory, and objective now live in
+  `ola_bench::online` and are shared with the studies. A synthetic-executor
+  test shows the policy moves off a poor budget mid-run with outputs
+  identical to FIFO. Not yet measured on a real model.
+
 - **2026-10-31 — online adaptive optimization:** Added `ReplayOptimizer`
   (`ola-bench`), which rebuilds the recent completed workload from adaptive
   observations and replays it per candidate in virtual time, switching only
