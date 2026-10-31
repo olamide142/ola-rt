@@ -208,9 +208,23 @@ Endpoints: `GET /health`, `GET /ready`, `GET /v1/models`,
 `DELETE /v1/requests/{id}`, `GET /v1/requests/{id}/trace`.
 
 ```bash
-curl -s localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16}'
-curl -sN localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16,"stream":true}'
-curl -s localhost:8080/v1/completions -d '{"model":"llama","prompt":"Hello","max_tokens":16}'
+H='Content-Type: application/json'     # required: requests without it are refused
+curl -s  -H "$H" localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16}'
+curl -sN -H "$H" localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16,"stream":true}'
+curl -sN -H "$H" localhost:8080/v1/completions -d '{"model":"llama","prompt":"Hello","max_tokens":16,"stream":true}'
+```
+
+Streaming (`"stream": true`) sends server-sent events. `/v1/generate`
+emits `start`, one `token` event per token (`token_id`, `text`, `phase`,
+`generated_tokens`), and a final `done` with the full text, timings, and
+inter-token latencies. `/v1/completions` streams OpenAI-style chunks, a
+final chunk with `finish_reason` and `usage`, then `data: [DONE]`, so
+OpenAI client libraries can read it. To watch only the text arrive:
+
+```bash
+curl -sN -H "$H" localhost:8080/v1/generate \
+    -d '{"model":"llama","prompt":"Once upon a time","max_new_tokens":64,"stream":true}' |
+    sed -un 's/^data: //p' | jq --unbuffered -rj 'select(.token_id) | .text'; echo
 ```
 
 Requests name the model by its `--name` (default: the directory name; the
