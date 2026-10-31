@@ -6,7 +6,10 @@ use std::{
 };
 
 use burn::tensor::Device;
-use burn_store::{ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{
+    FloatCastAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
+    SafetensorsStore,
+};
 use ola_core::ArchitectureId;
 use ola_model::{
     ArchitectureFactory, ArchitectureLoadError, CausalLanguageModel, ModelDefinition, ModelSource,
@@ -260,7 +263,10 @@ fn load_safetensors_shards(
     let result = module.apply(
         snapshots.into_values().collect(),
         None,
-        Some(Box::new(PyTorchToBurnAdapter)),
+        // Checkpoints are usually bf16 or f16; the model runs in f32.
+        Some(Box::new(
+            PyTorchToBurnAdapter.chain(FloatCastAdapter::to(burn::tensor::DType::F32)),
+        )),
         false,
     );
     if !result.errors.is_empty() || !result.missing.is_empty() {

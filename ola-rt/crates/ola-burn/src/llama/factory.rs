@@ -6,7 +6,10 @@ use std::{
 };
 
 use burn::tensor::Device;
-use burn_store::{ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{
+    FloatCastAdapter, ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter,
+    SafetensorsStore,
+};
 use ola_core::ArchitectureId;
 use ola_model::{
     ArchitectureFactory, ArchitectureLoadError, CausalLanguageModel, ModelDefinition, ModelSource,
@@ -263,7 +266,10 @@ fn load_safetensors_shards(
     let result = module.apply(
         snapshots.into_values().collect(),
         None,
-        Some(Box::new(PyTorchToBurnAdapter)),
+        // Checkpoints are usually bf16 or f16; the model runs in f32.
+        Some(Box::new(
+            PyTorchToBurnAdapter.chain(FloatCastAdapter::to(burn::tensor::DType::F32)),
+        )),
         false,
     );
     let unexpected_missing = result
@@ -386,6 +392,72 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Hugging Face checkpoints usually store bf16 weights; the model runs in
+    /// f32, so loading must cast rather than fail.
+    #[test]
+    fn bf16_checkpoints_load_into_the_f32_model() {
+        use burn_store::BurnToPyTorchAdapter;
+
+        let directory = std::env::temp_dir().join(format!("ola-llama-bf16-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let json = r#"{
+            "model_type": "llama",
+            "vocab_size": 32,
+            "hidden_size": 16,
+            "intermediate_size": 24,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 64,
+            "rms_norm_eps": 0.00001,
+            "eos_token_id": 2
+        }"#;
+        std::fs::write(directory.join("config.json"), json).unwrap();
+        let config = LlamaConfig::from_json(json.as_bytes()).unwrap();
+        let device = Device::flex();
+        let original = LlamaForCausalLM::init(&config, &device);
+        let mut store = SafetensorsStore::from_file(directory.join("model.safetensors"))
+            .with_to_adapter(
+                BurnToPyTorchAdapter.chain(FloatCastAdapter::to(burn::tensor::DType::BF16)),
+            )
+            .with_key_remapping(r"layernorm\.gamma$", "layernorm.weight")
+            .with_key_remapping(r"^model\.norm\.gamma$", "model.norm.weight");
+        original.save_into(&mut store).unwrap();
+
+        let (_, loaded) = LlamaFactory::new(device)
+            .load_native(&directory)
+            .unwrap()
+            .into_parts();
+        std::fs::remove_dir_all(&directory).unwrap();
+        // Name to (dtype, little-endian values) for every parameter.
+        let tensors = |module: &LlamaForCausalLM| {
+            module
+                .collect(None, None, false)
+                .into_iter()
+                .map(|tensor| {
+                    let bytes = tensor.to_bytes().unwrap();
+                    let values = bytes
+                        .chunks_exact(4)
+                        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                        .collect::<Vec<_>>();
+                    (tensor.name, (tensor.dtype, values))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let (expected, actual) = (tensors(&original), tensors(&loaded));
+        assert_eq!(
+            expected.keys().collect::<Vec<_>>(),
+            actual.keys().collect::<Vec<_>>()
+        );
+        for (name, (dtype, values)) in &actual {
+            assert_eq!(*dtype, burn::tensor::DType::F32, "{name}");
+            // bf16 keeps 8 bits of mantissa: within 1% of the original.
+            for (want, got) in expected[name].1.iter().zip(values) {
+                assert!((want - got).abs() <= want.abs() * 0.01 + 1e-6, "{name}");
+            }
+        }
     }
 
     #[test]
