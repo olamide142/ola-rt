@@ -441,7 +441,7 @@ impl Experiment for AdaptivePrefillCost {
             ])
         };
         let summary = format!(
-            "{overhead} token-equivalent call cost · diverse {:?}: cost {} → {}, {} padding / {} calls · clustered {:?}: cost {} → {}, {} padding / {} calls",
+            "{overhead} token-equivalent call cost · diverse {:?}: unbucketed {} vs power-of-two {}, {} padding / {} calls · clustered {:?}: unbucketed {} vs power-of-two {}, {} padding / {} calls",
             diverse.decision.selected,
             diverse.decision.unbucketed.estimated_cost,
             diverse.decision.power_of_two.estimated_cost,

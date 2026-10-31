@@ -1,0 +1,1 @@
+2026-10-31T14:34:57+00:00	run 001	563d530	5 sweeps × 18 shapes · fixed 7792.0 µs [7030.6–8496.8] · per token 411.9 µs [400.3–426.2] · per call 85425.8 µs [85192.4–85674.1] · overhead ≈ 207 tokens · residual 7528.3 µs · study, host time

@@ -1,0 +1,191 @@
+{
+  "schema": "ola-experiment/1",
+  "experiment": {
+    "id": "llama-generation",
+    "payload_version": 2,
+    "kind": "probe",
+    "domain": "host"
+  },
+  "metadata": {
+    "recorded_at_unix_micros": 1793457280186545,
+    "model": "smollm2-135m-instruct",
+    "device": "ola-cli / Burn / wgpu",
+    "build": {
+      "crate_version": "0.1.0",
+      "revision": "563d5306cb7f",
+      "profile": "release",
+      "target": "x86_64-unknown-linux-gnu",
+      "features": [
+        "default",
+        "wgpu"
+      ]
+    }
+  },
+  "workload": {
+    "name": "single-prompt",
+    "seeds": [],
+    "parameters": {
+      "prompt": "The capital of France is",
+      "tokens": "64"
+    },
+    "digest": "85aba3b2db292e65"
+  },
+  "protocol": {
+    "warmups": 0,
+    "repetitions": 1,
+    "ordering": "single run"
+  },
+  "metrics": [
+    {
+      "name": "generated_tokens",
+      "unit": "tokens",
+      "domain": "untimed",
+      "better": "neither"
+    },
+    {
+      "name": "elapsed",
+      "unit": "micros",
+      "domain": "host",
+      "better": "lower"
+    },
+    {
+      "name": "ttft",
+      "unit": "micros",
+      "domain": "host",
+      "better": "lower"
+    },
+    {
+      "name": "itl_p50",
+      "unit": "micros",
+      "domain": "host",
+      "better": "lower"
+    },
+    {
+      "name": "itl_p90",
+      "unit": "micros",
+      "domain": "host",
+      "better": "lower"
+    },
+    {
+      "name": "itl_max",
+      "unit": "micros",
+      "domain": "host",
+      "better": "lower"
+    },
+    {
+      "name": "throughput",
+      "unit": "tokens_per_second",
+      "domain": "host",
+      "better": "higher"
+    },
+    {
+      "name": "kv_cache_bytes",
+      "unit": "bytes",
+      "domain": "untimed",
+      "better": "neither"
+    }
+  ],
+  "variants": [
+    {
+      "label": "greedy",
+      "policy": null,
+      "kernel": "cubecl-wgpu-paged-attention"
+    }
+  ],
+  "samples": [
+    {
+      "repetition": 0,
+      "variant": "greedy",
+      "values": {
+        "elapsed": 7128501.0,
+        "generated_tokens": 64.0,
+        "itl_max": 449555.0,
+        "itl_p50": 56405.0,
+        "itl_p90": 65757.0,
+        "kv_cache_bytes": 3686400.0,
+        "throughput": 8.978043483012067,
+        "ttft": 3161578.0
+      }
+    }
+  ],
+  "summaries": [
+    {
+      "variant": "greedy",
+      "estimates": {
+        "elapsed": {
+          "n": 1,
+          "mean": 7128501.0,
+          "p50": 7128501.0,
+          "p95": 7128501.0,
+          "min": 7128501.0,
+          "max": 7128501.0,
+          "ci95": null
+        },
+        "generated_tokens": {
+          "n": 1,
+          "mean": 64.0,
+          "p50": 64.0,
+          "p95": 64.0,
+          "min": 64.0,
+          "max": 64.0,
+          "ci95": null
+        },
+        "itl_max": {
+          "n": 1,
+          "mean": 449555.0,
+          "p50": 449555.0,
+          "p95": 449555.0,
+          "min": 449555.0,
+          "max": 449555.0,
+          "ci95": null
+        },
+        "itl_p50": {
+          "n": 1,
+          "mean": 56405.0,
+          "p50": 56405.0,
+          "p95": 56405.0,
+          "min": 56405.0,
+          "max": 56405.0,
+          "ci95": null
+        },
+        "itl_p90": {
+          "n": 1,
+          "mean": 65757.0,
+          "p50": 65757.0,
+          "p95": 65757.0,
+          "min": 65757.0,
+          "max": 65757.0,
+          "ci95": null
+        },
+        "kv_cache_bytes": {
+          "n": 1,
+          "mean": 3686400.0,
+          "p50": 3686400.0,
+          "p95": 3686400.0,
+          "min": 3686400.0,
+          "max": 3686400.0,
+          "ci95": null
+        },
+        "throughput": {
+          "n": 1,
+          "mean": 8.978043483012067,
+          "p50": 8.978043483012067,
+          "p95": 8.978043483012067,
+          "min": 8.978043483012067,
+          "max": 8.978043483012067,
+          "ci95": null
+        },
+        "ttft": {
+          "n": 1,
+          "mean": 3161578.0,
+          "p50": 3161578.0,
+          "p95": 3161578.0,
+          "min": 3161578.0,
+          "max": 3161578.0,
+          "ci95": null
+        }
+      }
+    }
+  ],
+  "details": null
+}

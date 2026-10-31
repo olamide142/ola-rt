@@ -1,0 +1,2 @@
+2026-10-31T14:34:25+00:00	run 001	563d530	64 tokens · TTFT 3.16 s · inter-token p50 56.4 ms max 449.6 ms · 8.98 tok/s · 3.5 MiB KV · probe, not for publication, host time
+2026-10-31T14:34:49+00:00	run 002	563d530	64 tokens · TTFT 801.2 ms · inter-token p50 57.3 ms max 125.7 ms · 14.38 tok/s · 3.5 MiB KV · probe, not for publication, host time

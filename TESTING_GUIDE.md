@@ -178,6 +178,14 @@ times in the summaries.
 
 ## 3. Run models directly
 
+Get a model first; [`lab/MODELS.md`](lab/MODELS.md) lists what loads and
+what fits in memory:
+
+```bash
+lab/lab fetch HuggingFaceTB/SmolLM2-135M-Instruct     # Llama architecture, 0.5 GiB as f32
+lab/lab fetch Locutusque/TinyMistral-248M             # Mistral architecture, 0.9 GiB
+```
+
 ```bash
 make llama MODEL=/path/to/llama PROMPT="Hello" TOKENS=16
 make llama-wgpu MODEL=/path/to/llama PROMPT="Hello" TOKENS=16

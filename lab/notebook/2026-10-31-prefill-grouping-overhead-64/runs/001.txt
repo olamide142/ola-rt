@@ -1,0 +1,2 @@
+64 token-equivalent call cost · diverse PowerOfTwo: cost 316 → 278, 2 padding / 3 calls · clustered Unbucketed: cost 96 → 96, 6 padding / 1 calls · probe, not for publication, untimed
+saved /home/olamide/dev/ola-rt/lab/notebook/2026-10-31-prefill-grouping-overhead-64/reports/adaptive-prefill-cost-1793457336032691-0.json

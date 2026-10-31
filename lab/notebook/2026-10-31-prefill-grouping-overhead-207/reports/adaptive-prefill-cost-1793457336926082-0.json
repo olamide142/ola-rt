@@ -1,0 +1,209 @@
+{
+  "schema": "ola-experiment/1",
+  "experiment": {
+    "id": "adaptive-prefill-cost",
+    "payload_version": 1,
+    "kind": "probe",
+    "domain": "untimed"
+  },
+  "metadata": {
+    "recorded_at_unix_micros": 1793457336926082,
+    "model": null,
+    "device": null,
+    "build": {
+      "crate_version": "0.1.0",
+      "revision": "563d5306cb7f",
+      "profile": "release",
+      "target": "x86_64-unknown-linux-gnu",
+      "features": [
+        "default"
+      ]
+    }
+  },
+  "workload": {
+    "name": "prompt-lengths",
+    "seeds": [],
+    "parameters": {
+      "clustered": "5,6,7,8",
+      "diverse": "5,7,9,63",
+      "invocation_overhead_tokens": "207"
+    },
+    "digest": "0fd372021b765219"
+  },
+  "protocol": {
+    "warmups": 0,
+    "repetitions": 1,
+    "ordering": "single run"
+  },
+  "metrics": [
+    {
+      "name": "unbucketed_cost",
+      "unit": "tokens",
+      "domain": "untimed",
+      "better": "lower"
+    },
+    {
+      "name": "power_of_two_cost",
+      "unit": "tokens",
+      "domain": "untimed",
+      "better": "lower"
+    },
+    {
+      "name": "selected_padding",
+      "unit": "tokens",
+      "domain": "untimed",
+      "better": "lower"
+    },
+    {
+      "name": "selected_invocations",
+      "unit": "count",
+      "domain": "untimed",
+      "better": "lower"
+    },
+    {
+      "name": "chose_power_of_two",
+      "unit": "ratio",
+      "domain": "untimed",
+      "better": "neither"
+    }
+  ],
+  "variants": [
+    {
+      "label": "diverse",
+      "policy": "[5, 7, 9, 63]",
+      "kernel": null
+    },
+    {
+      "label": "clustered",
+      "policy": "[5, 6, 7, 8]",
+      "kernel": null
+    }
+  ],
+  "samples": [
+    {
+      "repetition": 0,
+      "variant": "diverse",
+      "values": {
+        "chose_power_of_two": 0.0,
+        "power_of_two_cost": 707.0,
+        "selected_invocations": 1.0,
+        "selected_padding": 168.0,
+        "unbucketed_cost": 459.0
+      }
+    },
+    {
+      "repetition": 0,
+      "variant": "clustered",
+      "values": {
+        "chose_power_of_two": 0.0,
+        "power_of_two_cost": 239.0,
+        "selected_invocations": 1.0,
+        "selected_padding": 6.0,
+        "unbucketed_cost": 239.0
+      }
+    }
+  ],
+  "summaries": [
+    {
+      "variant": "diverse",
+      "estimates": {
+        "chose_power_of_two": {
+          "n": 1,
+          "mean": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "ci95": null
+        },
+        "power_of_two_cost": {
+          "n": 1,
+          "mean": 707.0,
+          "p50": 707.0,
+          "p95": 707.0,
+          "min": 707.0,
+          "max": 707.0,
+          "ci95": null
+        },
+        "selected_invocations": {
+          "n": 1,
+          "mean": 1.0,
+          "p50": 1.0,
+          "p95": 1.0,
+          "min": 1.0,
+          "max": 1.0,
+          "ci95": null
+        },
+        "selected_padding": {
+          "n": 1,
+          "mean": 168.0,
+          "p50": 168.0,
+          "p95": 168.0,
+          "min": 168.0,
+          "max": 168.0,
+          "ci95": null
+        },
+        "unbucketed_cost": {
+          "n": 1,
+          "mean": 459.0,
+          "p50": 459.0,
+          "p95": 459.0,
+          "min": 459.0,
+          "max": 459.0,
+          "ci95": null
+        }
+      }
+    },
+    {
+      "variant": "clustered",
+      "estimates": {
+        "chose_power_of_two": {
+          "n": 1,
+          "mean": 0.0,
+          "p50": 0.0,
+          "p95": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "ci95": null
+        },
+        "power_of_two_cost": {
+          "n": 1,
+          "mean": 239.0,
+          "p50": 239.0,
+          "p95": 239.0,
+          "min": 239.0,
+          "max": 239.0,
+          "ci95": null
+        },
+        "selected_invocations": {
+          "n": 1,
+          "mean": 1.0,
+          "p50": 1.0,
+          "p95": 1.0,
+          "min": 1.0,
+          "max": 1.0,
+          "ci95": null
+        },
+        "selected_padding": {
+          "n": 1,
+          "mean": 6.0,
+          "p50": 6.0,
+          "p95": 6.0,
+          "min": 6.0,
+          "max": 6.0,
+          "ci95": null
+        },
+        "unbucketed_cost": {
+          "n": 1,
+          "mean": 239.0,
+          "p50": 239.0,
+          "p95": 239.0,
+          "min": 239.0,
+          "max": 239.0,
+          "ci95": null
+        }
+      }
+    }
+  ],
+  "details": null
+}

@@ -7,6 +7,7 @@
 #   lab/lab compare <entry-dir>          # compare the entry's first and latest reports
 #   lab/lab compare <a.json> <b.json>    # compare any two reports
 #   lab/lab list                         # one line per entry; also rewrites lab/INDEX.md
+#   lab/lab fetch <org/repo> [dir]       # download a Hugging Face model (default ~/models/<repo>)
 #
 # An entry is lab/notebook/<date>-<slug>/ holding config.json (what ran),
 # args (model/backend flags), features (cargo features, if any), notes.md (your question, prediction, and
@@ -26,7 +27,7 @@ die() {
 }
 
 usage() {
-	sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 	exit 2
 }
 
@@ -194,6 +195,55 @@ print(f"\n{len(rows)} entries; index written to lab/INDEX.md")
 EOF
 }
 
+# Downloads the files OlaRT loads (config, tokenizer, SafeTensors weights
+# and their index) from a public Hugging Face repository, then reports
+# whether the config passes the loaders' checks and how much f32 memory
+# the weights need.
+cmd_fetch() {
+	[ $# -ge 1 ] || usage
+	local repo="$1" target="${2:-$HOME/models/$(basename "$1" | tr '[:upper:]' '[:lower:]')}"
+	mkdir -p "$target"
+	python3 - "$repo" "$target" <<'EOF'
+import json, os, sys, urllib.request
+repo, target = sys.argv[1:]
+base = f"https://huggingface.co/{repo}"
+with urllib.request.urlopen(f"https://huggingface.co/api/models/{repo}/tree/main") as response:
+    files = [f for f in json.load(response) if f["type"] == "file"]
+wanted = [f for f in files if f["path"] in ("config.json", "tokenizer.json")
+          or f["path"].endswith(".safetensors") or f["path"].endswith(".safetensors.index.json")]
+if not any(f["path"].endswith(".safetensors") for f in wanted):
+    sys.exit(f"lab: {repo} has no SafeTensors weights; OlaRT cannot load .bin checkpoints")
+for f in wanted:
+    path = os.path.join(target, f["path"])
+    if os.path.exists(path) and os.path.getsize(path) == f.get("size", -1):
+        print(f"have   {f['path']}")
+        continue
+    print(f"fetch  {f['path']} ({f.get('size', 0) / 1e6:.1f} MB)", flush=True)
+    urllib.request.urlretrieve(f"{base}/resolve/main/{f['path']}", path)
+config = json.load(open(os.path.join(target, "config.json")))
+problems = []
+kind = config.get("model_type")
+if kind not in ("llama", "mistral"):
+    problems.append(f"model_type `{kind}`: OlaRT runs llama and mistral only")
+if config.get("hidden_act", "silu") != "silu":
+    problems.append(f"hidden_act `{config['hidden_act']}`")
+scaling = config.get("rope_scaling")
+if scaling and (kind == "mistral" or scaling.get("type", scaling.get("rope_type")) != "linear"):
+    problems.append(f"rope_scaling {scaling}")
+if kind == "mistral" and config.get("tie_word_embeddings"):
+    problems.append("tied embeddings (Mistral)")
+for flag in ("attention_bias", "mlp_bias"):
+    if config.get(flag):
+        problems.append(flag)
+weights = sum(f.get("size", 0) for f in wanted if f["path"].endswith(".safetensors"))
+dtype = config.get("torch_dtype", "float32")
+f32 = weights * (2 if dtype in ("bfloat16", "float16") else 1)
+print(f"\n{repo} -> {target}")
+print(f"  {kind}, {config.get('num_hidden_layers')} layers, {dtype} on disk, ~{f32 / 2**30:.1f} GiB as f32")
+print("  config looks loadable" if not problems else "  likely unsupported: " + "; ".join(problems))
+EOF
+}
+
 [ $# -ge 1 ] || usage
 command="$1"
 shift
@@ -202,5 +252,6 @@ new) cmd_new "$@" ;;
 run) cmd_run "$@" ;;
 compare) cmd_compare "$@" ;;
 list) cmd_list "$@" ;;
+fetch) cmd_fetch "$@" ;;
 *) usage ;;
 esac

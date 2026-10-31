@@ -1,0 +1,7 @@
+{
+  "id": "llama-generation",
+  "parameters": {
+    "prompt": "The capital of France is",
+    "tokens": "64"
+  }
+}

@@ -10,6 +10,8 @@ each one is how you learn the system.
 - `TEMPLATE.md`: the notes every entry starts from.
 - `CURRICULUM.md`: graded experiments by track, each tied to code to read,
   mathematics to learn, a Rust exercise, and open research questions.
+- `MODELS.md`: which models load, what fits in memory, and how to fetch
+  them (`lab/lab fetch org/repo`).
 - `notebook/`: the entries. `INDEX.md` lists them (`make lab-list`).
 
 ## The loop

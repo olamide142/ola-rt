@@ -1,0 +1,2 @@
+64 tokens · TTFT 801.2 ms · inter-token p50 57.3 ms max 125.7 ms · 14.38 tok/s · 3.5 MiB KV · probe, not for publication, host time
+saved /home/olamide/dev/ola-rt/lab/notebook/2026-10-31-smollm2-generation-wgpu/reports/llama-generation-1793457295743992-0.json

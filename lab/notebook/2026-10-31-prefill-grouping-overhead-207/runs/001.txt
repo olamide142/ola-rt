@@ -1,0 +1,2 @@
+207 token-equivalent call cost · diverse Unbucketed: cost 459 → 707, 168 padding / 1 calls · clustered Unbucketed: cost 239 → 239, 6 padding / 1 calls · probe, not for publication, untimed
+saved /home/olamide/dev/ola-rt/lab/notebook/2026-10-31-prefill-grouping-overhead-207/reports/adaptive-prefill-cost-1793457336926082-0.json

@@ -1,0 +1,6 @@
+{
+  "id": "adaptive-prefill-cost",
+  "parameters": {
+    "invocation_overhead_tokens": "64"
+  }
+}

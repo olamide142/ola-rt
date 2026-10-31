@@ -1,0 +1,4 @@
+--model
+/home/olamide/models/smollm2-135m-instruct
+--backend
+wgpu
