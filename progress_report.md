@@ -38,7 +38,10 @@ reports the selected adaptive policy beside least-loaded and KV-headroom
 baselines on independent seeds. A regression test runs the study through the
 experiment registry and validates its reported variants; live-loop improvement
 evidence now includes a TCP weight-push/acknowledgement test, while broader
-live workload comparison remains.
+live workload comparison remains. Network cost is now a first-class adaptive
+weight: the coordinator can supply per-worker calibrated costs, the batch
+optimizer includes them in its objective, and route candidates preserve the
+cost used for the decision.
 
 `ola-cluster` now exposes a typed adapter from model-owned `SessionState` to
 the existing versioned `ola-net::BinaryFrame` data-plane envelope. It carries

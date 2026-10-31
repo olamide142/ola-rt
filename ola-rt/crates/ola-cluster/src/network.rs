@@ -279,9 +279,15 @@ impl TcpCoordinator {
         link.send_command(&WorkerCommand::PolicyUpdate {
             load_weight: weights.load,
             kv_headroom_weight: weights.kv_headroom,
+            network_weight: weights.network,
         })
         .await?;
         Ok(())
+    }
+
+    /// Supplies a calibrated network cost for a worker to routing policy.
+    pub fn set_worker_network_cost(&mut self, worker: WorkerId, cost_us: u64) {
+        self.coordinator.set_network_cost(worker, cost_us);
     }
 
     /// Receives one message from a worker and applies it to coordinator state.

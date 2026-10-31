@@ -110,6 +110,8 @@ pub struct WorkerView {
     pub in_flight: usize,
     /// Worst-case KV tokens of those in-flight requests.
     pub in_flight_tokens: usize,
+    /// Coordinator-calibrated cost of reaching this worker.
+    pub network_cost_us: u64,
 }
 
 impl WorkerView {

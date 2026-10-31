@@ -67,6 +67,8 @@ pub enum WorkerCommand {
         load_weight: u64,
         /// KV-headroom weight.
         kv_headroom_weight: u64,
+        /// Network-cost weight.
+        network_weight: u64,
     },
 }
 
@@ -137,6 +139,8 @@ pub enum WorkerMessage {
         load_weight: u64,
         /// KV-headroom weight.
         kv_headroom_weight: u64,
+        /// Network-cost weight.
+        network_weight: u64,
     },
 }
 
@@ -458,6 +462,7 @@ pub struct Coordinator {
     generation: u64,
     iterations: u64,
     migrations: BTreeMap<ClusterRequestId, (WorkerId, RequestId, WorkerId, String, u64)>,
+    network_costs_us: BTreeMap<WorkerId, u64>,
 }
 
 impl Coordinator {
@@ -473,6 +478,7 @@ impl Coordinator {
             generation: 0,
             iterations: 0,
             migrations: BTreeMap::new(),
+            network_costs_us: BTreeMap::new(),
         }
     }
 
@@ -700,6 +706,12 @@ impl Coordinator {
         self.requests.get(&id).map(|entry| &entry.status)
     }
 
+    /// Supplies a calibrated network cost for a worker to the next plan.
+    pub fn set_network_cost(&mut self, worker: WorkerId, cost_us: u64) {
+        self.network_costs_us.insert(worker, cost_us);
+        self.generation = self.generation.saturating_add(1);
+    }
+
     /// Commits the coordinator side of a migration after the source has
     /// exported the request. The source remains authoritative until this
     /// method is called; the returned command is the target admission step.
@@ -854,6 +866,7 @@ impl Coordinator {
                             summary: entry.summary.clone(),
                             in_flight,
                             in_flight_tokens,
+                            network_cost_us: self.network_costs_us.get(id).copied().unwrap_or(0),
                         },
                     )
                 })

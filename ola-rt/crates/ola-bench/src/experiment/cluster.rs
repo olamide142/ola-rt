@@ -75,18 +75,22 @@ impl Experiment for AdaptiveClusterRoutingStudy {
             ClusterWeights {
                 load: 1,
                 kv_headroom: 1,
+                network: 0,
             },
             ClusterWeights {
                 load: 2,
                 kv_headroom: 1,
+                network: 0,
             },
             ClusterWeights {
                 load: 1,
                 kv_headroom: 2,
+                network: 0,
             },
             ClusterWeights {
                 load: 1,
                 kv_headroom: 4,
+                network: 0,
             },
         ];
         let training = generate(0);

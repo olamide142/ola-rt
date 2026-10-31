@@ -207,10 +207,12 @@ impl WorkerHost {
             WorkerCommand::PolicyUpdate {
                 load_weight,
                 kv_headroom_weight,
+                network_weight,
             } => {
                 let weights = ClusterWeights {
                     load: load_weight,
                     kv_headroom: kv_headroom_weight,
+                    network: network_weight,
                 };
                 AdaptiveClusterPolicy::new(weights).map_err(|error| {
                     ExecutorError::InvalidPolicyConfiguration(error.to_string())
@@ -219,6 +221,7 @@ impl WorkerHost {
                 Ok(vec![WorkerMessage::PolicyUpdated {
                     load_weight,
                     kv_headroom_weight,
+                    network_weight,
                 }])
             }
         }

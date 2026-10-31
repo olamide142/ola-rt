@@ -119,6 +119,9 @@ pub struct RouteCandidate {
     /// Queued, live, and in-flight requests, including earlier assignments
     /// in the same plan.
     pub load: usize,
+    /// Calibrated coordinator-to-worker cost considered by adaptive routing.
+    #[serde(default)]
+    pub network_cost_us: u64,
     /// KV tokens the worker could still give out after queued, in-flight,
     /// and earlier same-plan demand; absent when its pool reports nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]

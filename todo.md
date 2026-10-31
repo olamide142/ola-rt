@@ -324,7 +324,8 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   adaptive, least-loaded, and KV-headroom results on independent held-out
   seeds. A loopback TCP test now pushes weights through `TcpCoordinator` and
   verifies the worker acknowledgement/state; broader live workload evaluation
-  remains.
+  remains. Adaptive routing now also accepts calibrated per-worker network
+  costs and records them in route candidates.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

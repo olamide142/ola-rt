@@ -17,6 +17,8 @@ pub struct ClusterWeights {
     pub load: u64,
     /// Weight assigned to available KV headroom.
     pub kv_headroom: u64,
+    /// Weight assigned to calibrated worker-link cost.
+    pub network: u64,
 }
 
 impl Default for ClusterWeights {
@@ -24,6 +26,7 @@ impl Default for ClusterWeights {
         Self {
             load: 1,
             kv_headroom: 1,
+            network: 0,
         }
     }
 }
@@ -87,6 +90,7 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
         PolicyDescriptor::new("adaptive-cluster-routing")
             .with_config("load_weight", self.weights.load)
             .with_config("kv_weight", self.weights.kv_headroom)
+            .with_config("network_weight", self.weights.network)
     }
 
     fn plan(&self, snapshot: &ClusterSnapshot) -> Result<ClusterDecision, ClusterPolicyError> {
@@ -110,7 +114,10 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
                     capacity: view.summary.max_active_requests,
                     current_load: view.load(),
                     kv_headroom_tokens: view.kv_headroom_tokens(&model).unwrap_or(usize::MAX),
-                    load_cost: (view.load() as u64).saturating_mul(self.weights.load.max(1)),
+                    load_cost: (view.load() as u64)
+                        .saturating_mul(self.weights.load.max(1))
+                        .saturating_add(view.network_cost_us.saturating_mul(self.weights.network)),
+                    network_cost_us: view.network_cost_us,
                 })
                 .collect::<Vec<_>>();
             if workers.is_empty() {
@@ -176,6 +183,7 @@ mod tests {
                 },
                 in_flight: 0,
                 in_flight_tokens: 0,
+                network_cost_us: 0,
             },
         )
     }
@@ -218,5 +226,40 @@ mod tests {
                 .all(|route| route.reason == RouteReason::BatchOptimizer)
         );
         assert_eq!(decision.plan.actions.len(), 2);
+    }
+
+    #[test]
+    fn adaptive_policy_accounts_for_calibrated_network_cost() {
+        let model = ModelId::from("tiny");
+        let mut near = worker("near", 0).1;
+        near.network_cost_us = 1;
+        let mut far = worker("far", 0).1;
+        far.network_cost_us = 100;
+        let snapshot = ClusterSnapshot {
+            at: Timestamp::ZERO,
+            generation: 0,
+            workers: BTreeMap::from([(WorkerId::new("far"), far), (WorkerId::new("near"), near)]),
+            pending: vec![PendingRequest {
+                id: ola_core::ClusterRequestId::new(1),
+                model,
+                priority: Priority::NORMAL,
+                arrival_at: Timestamp::ZERO,
+                prompt_tokens: Some(1),
+                prompt: vec![1],
+                max_new_tokens: 1,
+            }],
+            routed_requests: 0,
+        };
+        let policy = AdaptiveClusterPolicy::new(ClusterWeights {
+            load: 1,
+            kv_headroom: 1,
+            network: 1,
+        })
+        .unwrap();
+        let decision = policy.plan(&snapshot).unwrap();
+        assert!(matches!(
+            decision.plan.actions.as_slice(),
+            [crate::ClusterAction::Assign { worker, .. }] if worker == &WorkerId::new("near")
+        ));
     }
 }

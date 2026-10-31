@@ -149,6 +149,7 @@ fn worker_accepts_and_acknowledges_adaptive_policy_updates() {
             WorkerCommand::PolicyUpdate {
                 load_weight: 3,
                 kv_headroom_weight: 7,
+                network_weight: 0,
             },
             at(0),
         )
@@ -159,7 +160,8 @@ fn worker_accepts_and_acknowledges_adaptive_policy_updates() {
         messages.as_slice(),
         [WorkerMessage::PolicyUpdated {
             load_weight: 3,
-            kv_headroom_weight: 7
+            kv_headroom_weight: 7,
+            network_weight: 0,
         }]
     ));
 }

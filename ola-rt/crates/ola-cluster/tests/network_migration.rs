@@ -46,6 +46,7 @@ async fn adaptive_weights_are_pushed_and_acknowledged_over_tcp() {
             ClusterWeights {
                 load: 3,
                 kv_headroom: 9,
+                network: 2,
             },
         )
         .await
@@ -58,6 +59,7 @@ async fn adaptive_weights_are_pushed_and_acknowledged_over_tcp() {
     let worker = task.await.unwrap();
     assert_eq!(worker.policy_weights().load, 3);
     assert_eq!(worker.policy_weights().kv_headroom, 9);
+    assert_eq!(worker.policy_weights().network, 2);
 }
 
 fn request() -> RequestSpec {

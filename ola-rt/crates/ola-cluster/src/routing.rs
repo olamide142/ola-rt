@@ -243,6 +243,7 @@ fn route_each(
                 RouteCandidate {
                     worker: worker.clone(),
                     load: view.load() + requests,
+                    network_cost_us: view.network_cost_us,
                     kv_headroom_tokens: view
                         .kv_headroom_tokens(&pending.model)
                         .map(|free| free.saturating_sub(tokens)),

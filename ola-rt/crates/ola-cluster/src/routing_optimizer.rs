@@ -18,6 +18,8 @@ pub struct RoutingWorker {
     pub kv_headroom_tokens: usize,
     /// Cost of adding one request to this worker.
     pub load_cost: u64,
+    /// Calibrated network cost retained for routing decisions.
+    pub network_cost_us: u64,
 }
 
 /// One request competing for a worker in the same planning tick.
@@ -143,6 +145,7 @@ mod tests {
             current_load: 0,
             kv_headroom_tokens: kv,
             load_cost: cost,
+            network_cost_us: 0,
         }
     }
 
