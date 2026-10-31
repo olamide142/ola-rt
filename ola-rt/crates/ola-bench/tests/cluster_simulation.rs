@@ -2,7 +2,8 @@
 
 use ola_bench::{
     ClusterSimulationConfig, KvGeometry, NetworkModel, SchedulingTrace, SimulationConfig,
-    TraceParameters, TrialOutcome, run_cluster_trial, run_scheduling_trial, summarize_cluster_run,
+    TraceParameters, TrialOutcome, WorkerFailure, run_cluster_trial, run_scheduling_trial,
+    summarize_cluster_run,
 };
 use ola_cluster::{
     ClusterPolicy, ClusterTraceEvent, KvHeadroomRouting, LeastLoadedRouting, PowerOfTwoRouting,
@@ -70,6 +71,41 @@ fn cluster_trials_are_reproducible() {
             run_cluster_trial(&trace, second, &config).unwrap()
         );
     }
+}
+
+#[test]
+fn injected_worker_failure_requeues_requests_on_a_survivor() {
+    let trace = SchedulingTrace::early_stopping(TraceParameters {
+        seed: 17,
+        requests: 24,
+        mean_interarrival_micros: 100,
+    });
+    let config = ClusterSimulationConfig {
+        failures: vec![WorkerFailure {
+            worker: 0,
+            at_micros: 5_000,
+        }],
+        ..ClusterSimulationConfig::uniform(2, worker(), NetworkModel::INSTANT)
+    };
+    let run = run_cluster_trial(&trace, RoundRobinRouting, &config).unwrap();
+    assert!(run.workers[0].routed > 0);
+    assert!(run.cluster_trace.iter().any(|record| {
+        matches!(
+            &record.event,
+            ClusterTraceEvent::Routed { worker, .. } if worker == &ola_core::WorkerId::new("w1")
+        )
+    }));
+    assert!(
+        run.requests
+            .iter()
+            .any(|request| request.outcome == TrialOutcome::Completed)
+    );
+    assert!(!run.cluster_trace.iter().any(|record| {
+        matches!(
+            &record.event,
+            ClusterTraceEvent::Accepted { worker, .. } if worker == &ola_core::WorkerId::new("w0")
+        ) && record.at_us > 5_000
+    }));
 }
 
 #[test]

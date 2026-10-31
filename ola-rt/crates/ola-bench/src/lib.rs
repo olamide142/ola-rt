@@ -34,8 +34,8 @@ pub use calibration::{
 };
 pub use cluster_simulation::{
     ClusterRun, ClusterSimulationConfig, ClusterSimulationError, ClusterSummary,
-    MESSAGE_HEADER_BYTES, NetworkModel, SUMMARY_BYTES, TOKEN_BYTES, WorkerRun, run_cluster_trial,
-    summarize_cluster_run,
+    MESSAGE_HEADER_BYTES, NetworkModel, SUMMARY_BYTES, TOKEN_BYTES, WorkerFailure, WorkerRun,
+    run_cluster_trial, summarize_cluster_run,
 };
 pub use experiment::{
     AdaptivePrefillCost, BOOTSTRAP_RESAMPLES, BuildInfo, Change, ChunkedPrefill, ClusterRouting,

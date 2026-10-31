@@ -591,6 +591,32 @@ impl Coordinator {
         recovered
     }
 
+    /// Marks one worker lost and requeues its owned requests immediately.
+    ///
+    /// Virtual-time simulations use this deterministic hook to model a
+    /// worker disappearing without waiting for wall-clock lease expiry.
+    pub fn recover_worker(
+        &mut self,
+        worker: &WorkerId,
+        _now: Timestamp,
+    ) -> Result<Vec<ClusterRequestId>, CoordinatorError> {
+        let entry = self
+            .workers
+            .get_mut(worker)
+            .ok_or_else(|| CoordinatorError::UnknownWorker(worker.clone()))?;
+        entry.summary.health = WorkerHealth::Lost;
+        let mut recovered = Vec::new();
+        for (request, request_entry) in &mut self.requests {
+            if request_entry.status.owner() == Some(worker) {
+                request_entry.status = ClusterRequestStatus::Pending;
+                self.pending.push(*request);
+                recovered.push(*request);
+            }
+        }
+        self.generation = self.generation.saturating_add(1 + recovered.len() as u64);
+        Ok(recovered)
+    }
+
     /// Latest summary of each joined worker, in ID order.
     pub fn workers(&self) -> impl ExactSizeIterator<Item = &WorkerSummary> {
         self.workers.values().map(|entry| &entry.summary)

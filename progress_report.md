@@ -19,6 +19,12 @@ real two-worker TCP integration test now verifies handoff, trace emission, and
 completion after migration; coordinator accounting removes the staged target
 reservation on rollback and the source reservation on commit.
 
+The virtual cluster simulator now accepts deterministic worker-failure events.
+The failed worker stops processing and stale messages are discarded; the
+coordinator marks only that worker lost, requeues its owned requests, and the
+surviving workers plan them again. A seeded integration test verifies recovery
+and excludes post-failure admissions on the lost worker.
+
 The cluster crate now also exposes calibrated transfer-vs-recompute selection
 and an exact small-batch MILP router with request/KV capacity constraints;
 both have deterministic feasibility and objective tests. The adaptive policy

@@ -96,6 +96,17 @@ pub struct ClusterSimulationConfig {
     /// Simulation events after which the trial stops; remaining work is
     /// unfinished.
     pub max_events: usize,
+    /// Deterministic worker failures injected at virtual times.
+    pub failures: Vec<WorkerFailure>,
+}
+
+/// A worker disappearance in a virtual-time cluster trial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerFailure {
+    /// Zero-based worker index in the simulation configuration.
+    pub worker: usize,
+    /// Virtual time at which the worker stops processing.
+    pub at_micros: u64,
 }
 
 impl ClusterSimulationConfig {
@@ -105,6 +116,7 @@ impl ClusterSimulationConfig {
             workers: vec![worker; count],
             network,
             max_events: 2_000_000,
+            failures: Vec::new(),
         }
     }
 
@@ -193,6 +205,7 @@ impl From<CoordinatorError> for ClusterSimulationError {
 
 enum Event {
     Arrival(usize),
+    WorkerFailure(usize),
     ToWorker(usize, WorkerCommand),
     ToCoordinator(usize, WorkerMessage),
     /// A worker finished its iteration and may step again.
@@ -212,6 +225,7 @@ struct SimWorker {
     downlink_free: u64,
     /// Worker → coordinator link is free from this time.
     uplink_free: u64,
+    failed: bool,
 }
 
 /// Discrete-event queue ordered by time, then by insertion.
@@ -464,12 +478,20 @@ where
             },
             downlink_free: 0,
             uplink_free: 0,
+            failed: false,
         });
     }
     for (index, request) in trace.requests.iter().enumerate() {
         simulation
             .events
             .push(request.arrival_micros, Event::Arrival(index));
+    }
+    for failure in &config.failures {
+        if failure.worker < simulation.workers.len() {
+            simulation
+                .events
+                .push(failure.at_micros, Event::WorkerFailure(failure.worker));
+        }
     }
 
     let mut ids = BTreeMap::<ClusterRequestId, usize>::new();
@@ -492,7 +514,25 @@ where
                     ids.insert(id, index);
                     simulation.send_commands(output, now);
                 }
+                Event::WorkerFailure(index) => {
+                    if simulation.workers[index].failed {
+                        continue;
+                    }
+                    simulation.workers[index].failed = true;
+                    let worker = simulation.workers[index].run.worker.clone();
+                    simulation
+                        .coordinator
+                        .recover_worker(&worker, Timestamp::from_micros(now))?;
+                    if let Some((_, output)) =
+                        simulation.coordinator.plan(Timestamp::from_micros(now))?
+                    {
+                        simulation.send_commands(output, now);
+                    }
+                }
                 Event::ToWorker(index, command) => {
+                    if simulation.workers[index].failed {
+                        continue;
+                    }
                     let worker = &mut simulation.workers[index];
                     worker.blocked = false;
                     let admit = matches!(command, WorkerCommand::Admit { .. });
@@ -505,6 +545,9 @@ where
                     }
                 }
                 Event::ToCoordinator(index, message) => {
+                    if simulation.workers[index].failed {
+                        continue;
+                    }
                     let from = simulation.workers[index].run.worker.clone();
                     let output = simulation.coordinator.handle(
                         &from,
@@ -521,7 +564,11 @@ where
         }
         for index in 0..simulation.workers.len() {
             let worker = &simulation.workers[index];
-            if worker.busy_until <= now && !worker.blocked && worker.host.has_work() {
+            if !worker.failed
+                && worker.busy_until <= now
+                && !worker.blocked
+                && worker.host.has_work()
+            {
                 simulation.step_worker(index, now)?;
             }
         }
