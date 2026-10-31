@@ -52,7 +52,11 @@ pub use experiment::{
     TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity, compare_reports, content_digest,
     nsight_metrics,
 };
-pub use online::{ReplayOptimizer, ReplaySettings};
+pub use online::{
+    LATENCY_OBJECTIVE, OnlineTuning, ReplayOptimizer, ReplaySettings, TOKEN_BUDGET_DOMAINS,
+    largest_token_budget, serving_adaptive_policy, smallest_token_budget, token_budget,
+    token_budget_policy,
+};
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,
     PlanReportBatchHook, PlanReportCandidate, PlanReportCapabilityFallback, PlanReportDecision,

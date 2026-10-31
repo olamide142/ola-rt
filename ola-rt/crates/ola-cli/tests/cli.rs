@@ -225,6 +225,37 @@ fn errors_exit_with_code_two() {
     let (code, output) = ola(&["serve", "--model", "x", "--max-active", "0"]);
     assert_eq!(code, EXIT_ERROR);
     assert!(output.contains("--max-active expects a positive integer"));
+
+    // `--adaptive` needs a saved cost-calibration report, checked before
+    // the model loads.
+    let directory = scratch("adaptive");
+    let (code, output) = ola(&[
+        "experiment",
+        "run",
+        "fifo-workload",
+        "--results-dir",
+        directory.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{output}");
+    let report = std::fs::read_dir(&directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let (code, output) = ola(&[
+        "serve",
+        "--model",
+        "no-such-model",
+        "--adaptive",
+        report.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(
+        output.contains("is not a cost-calibration report"),
+        "{output}"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

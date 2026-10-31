@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use ola_bench::{CostFit, CostModel, ExperimentReport, OnlineTuning, serving_adaptive_policy};
 use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
@@ -28,6 +29,7 @@ struct Options {
     drain: Duration,
     trace: Option<PathBuf>,
     workers: Vec<String>,
+    adaptive: Option<PathBuf>,
 }
 
 fn parse(rest: &[&str]) -> Result<Options, String> {
@@ -43,6 +45,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
         drain: Duration::from_secs(30),
         trace: None,
         workers: Vec::new(),
+        adaptive: None,
     };
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
@@ -67,6 +70,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             "--max-in-flight" => options.max_in_flight = number(value()?)?,
             "--trace" => options.trace = Some(PathBuf::from(value()?)),
             "--worker" => options.workers.push(value()?),
+            "--adaptive" => options.adaptive = Some(PathBuf::from(value()?)),
             "--drain-secs" => {
                 let text = value()?;
                 let seconds = text
@@ -85,6 +89,22 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
         ));
     }
     Ok(options)
+}
+
+/// The cost model fitted by a saved `cost-calibration` report, which
+/// `--adaptive` replays recent work with.
+fn calibrated_cost(path: &std::path::Path) -> Result<CostModel, String> {
+    let report = ExperimentReport::read_compatible(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    CostFit::from_report(&report)
+        .map(|fit| fit.cost_model())
+        .ok_or_else(|| {
+            format!(
+                "{} is not a cost-calibration report; run `ola experiment run cost-calibration \
+                 --model DIR --results-dir DIR` first",
+                path.display()
+            )
+        })
 }
 
 /// Device memory and utilization for `/health` on accelerator backends;
@@ -112,6 +132,12 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
             return Err(format!("unsupported serve role `{}`", options.role));
         }
     }
+    // Checked before the model loads, which can take a while.
+    let adaptive_cost = options
+        .adaptive
+        .as_deref()
+        .map(calibrated_cost)
+        .transpose()?;
     let model = load_model(&options.model, &options.backend)?;
     let name = options.name.clone().unwrap_or_else(|| {
         options
@@ -121,9 +147,27 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
             .unwrap_or("model")
             .to_owned()
     });
-    let mut executor = Executor::with_max_active_requests(Runtime::default(), options.max_active)
-        .map_err(|error| error.to_string())?
-        .with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission));
+    let executor = Executor::with_max_active_requests(Runtime::default(), options.max_active)
+        .map_err(|error| error.to_string())?;
+    let mut executor = match adaptive_cost {
+        None => {
+            executor.with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission))
+        }
+        Some(cost) => {
+            write_line(
+                out,
+                format!(
+                    "adaptive token budgets: replaying with fixed={} µs, per call={} µs, \
+                     per token={} µs",
+                    cost.fixed_micros, cost.per_invocation_micros, cost.per_dense_token_micros
+                ),
+            )?;
+            executor.with_policy(
+                serving_adaptive_policy(cost, options.max_active, OnlineTuning::default())
+                    .map_err(|error| error.to_string())?,
+            )
+        }
+    };
     executor
         .register_model(ModelDescriptor::language(name.as_str(), "llama"), model)
         .map_err(|error| error.to_string())?;

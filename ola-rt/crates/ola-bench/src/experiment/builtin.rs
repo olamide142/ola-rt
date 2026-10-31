@@ -13,8 +13,8 @@ use ola_core::{ModelDescriptor, Timestamp};
 use ola_runtime::{
     AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveObjectiveWeights, AdaptivePolicy,
     ComposedPolicy, EarliestDeadlineFirst, ExecutionPolicy, HeadOfLine, JobCost, KvBlockManager,
-    MemoryAwareAdmission, MixedTokenBudgetPolicy, NewestFirst, PolicyError, PriorityScheduler,
-    Runtime, ShortestJobFirst, WatermarkAdmission,
+    MemoryAwareAdmission, NewestFirst, PolicyError, PriorityScheduler, Runtime, ShortestJobFirst,
+    WatermarkAdmission,
 };
 
 use super::cluster::AdaptiveClusterRoutingStudy;
@@ -754,55 +754,14 @@ impl Experiment for SchedulerComparison {
 pub struct AdaptivePolicyStudy;
 
 impl AdaptivePolicyStudy {
-    /// Candidate token budgets: 2^4 to 2^10 tokens per iteration, of which
-    /// 25% to 100% may be prompt work. The top of the range admits a whole
-    /// iteration's work at these trace sizes, so the unbounded baseline's
-    /// behaviour is always a candidate.
-    const DOMAINS: [AdaptiveIntegerDomain; 2] = [
-        AdaptiveIntegerDomain {
-            name: "log2_max_tokens",
-            min: 4,
-            max: 10,
-            step: 1,
-        },
-        AdaptiveIntegerDomain {
-            name: "prefill_share_percent",
-            min: 25,
-            max: 100,
-            step: 25,
-        },
-    ];
+    const DOMAINS: [AdaptiveIntegerDomain; 2] = crate::online::TOKEN_BUDGET_DOMAINS;
 
     fn initial_theta() -> Vec<(&'static str, String)> {
-        vec![
-            ("log2_max_tokens", "4".into()),
-            ("prefill_share_percent", "50".into()),
-        ]
-    }
-
-    /// The `(max_tokens, max_prefill_tokens)` budget a parameter vector names.
-    fn budget(theta: &[(&'static str, String)]) -> Result<(usize, usize), PolicyError> {
-        let value = |name: &str| {
-            theta
-                .iter()
-                .find(|(key, _)| *key == name)
-                .and_then(|(_, value)| value.parse::<u32>().ok())
-                .ok_or_else(|| PolicyError::InvalidCandidate(format!("missing {name}")))
-        };
-        let log2 = value("log2_max_tokens")?;
-        let share = value("prefill_share_percent")?;
-        if log2 > 20 || !(1..=100).contains(&share) {
-            return Err(PolicyError::InvalidCandidate(
-                "budget parameters out of range".into(),
-            ));
-        }
-        let max_tokens = 1_usize << log2;
-        let max_prefill_tokens = (max_tokens * share as usize / 100).max(1);
-        Ok((max_tokens, max_prefill_tokens))
+        crate::online::smallest_token_budget()
     }
 
     fn describe(theta: &[(&'static str, String)]) -> String {
-        Self::budget(theta).map_or_else(
+        crate::online::token_budget(theta).map_or_else(
             |_| "?".into(),
             |(max_tokens, max_prefill_tokens)| {
                 format!("max_tokens={max_tokens}, max_prefill_tokens={max_prefill_tokens}")
@@ -813,18 +772,7 @@ impl AdaptivePolicyStudy {
     fn adaptive_policy(
         theta: &[(&'static str, String)],
     ) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
-        let (max_tokens, max_prefill_tokens) = Self::budget(theta)?;
-        let batch =
-            MixedTokenBudgetPolicy::new(max_tokens, max_prefill_tokens).ok_or_else(|| {
-                PolicyError::InvalidCandidate(
-                    "max_prefill_tokens must be positive and no greater than max_tokens".into(),
-                )
-            })?;
-        Ok(Box::new(
-            ComposedPolicy::default()
-                .with_admission(MemoryAwareAdmission)
-                .with_batch(batch),
-        ))
+        crate::online::token_budget_policy(theta)
     }
 
     fn baseline_policy(
