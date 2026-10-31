@@ -97,14 +97,13 @@ fn level_one_migration_exports_and_resumes_on_another_worker() {
         [WorkerMessage::Accepted { .. }]
     ));
     for tick in 3..20 {
-        if let Some((_, messages)) = target.step(at(tick)).unwrap() {
-            if messages
+        if let Some((_, messages)) = target.step(at(tick)).unwrap()
+            && messages
                 .iter()
                 .any(|message| matches!(message, WorkerMessage::Finished { request: id, .. } if *id == request))
             {
                 return;
             }
-        }
     }
     panic!("migrated request did not finish");
 }

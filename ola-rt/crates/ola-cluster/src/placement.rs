@@ -85,7 +85,7 @@ pub fn optimize_placement(
         })
         .collect::<Vec<_>>();
     let mut objective = Expression::from(0.0);
-    for (_model_index, row) in decision.iter().enumerate() {
+    for row in decision.iter() {
         for (worker_index, variable) in row.iter().enumerate() {
             objective += workers[worker_index].load_cost as f64 * *variable;
         }

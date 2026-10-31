@@ -154,6 +154,10 @@ where
 
 /// Selects θ on one trace and evaluates that fixed θ against a baseline on
 /// independent held-out traces. No held-out result influences selection.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a study's protocol: traces, simulator, search space, policies, and objective"
+)]
 pub fn evaluate_virtual_time_held_out<F, G>(
     training_trace: &SchedulingTrace,
     held_out_traces: &[SchedulingTrace],

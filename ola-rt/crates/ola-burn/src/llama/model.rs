@@ -853,11 +853,11 @@ impl LlamaAttention {
             .into_iter()
             .map(|(key, value)| PagedKvPage::new(key, value))
             .collect();
-        let input = PagedAttentionInput::new(query, pages, config)
+
+        PagedAttentionInput::new(query, pages, config)
             .expect("Llama cache pages must satisfy the paged-attention contract")
             .with_blocks(blocks)
-            .expect("Llama physical cache must satisfy the paged-attention contract");
-        input
+            .expect("Llama physical cache must satisfy the paged-attention contract")
     }
 
     fn project_attention_output(&self, context: Tensor<4>) -> Tensor<3> {

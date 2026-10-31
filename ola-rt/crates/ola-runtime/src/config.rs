@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Serializable batch-policy choices supported by the runtime builder.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BatchPolicyConfig {
     /// Preserve the default unbounded batch selection.
+    #[default]
     Unbounded,
     /// Select a FIFO prefix under one input-token budget.
     FifoTokenBudget {
@@ -18,12 +20,6 @@ pub enum BatchPolicyConfig {
         /// Maximum prompt-token positions per iteration.
         max_prefill_tokens: usize,
     },
-}
-
-impl Default for BatchPolicyConfig {
-    fn default() -> Self {
-        Self::Unbounded
-    }
 }
 
 /// Serializable limits and device-memory settings for an executor.

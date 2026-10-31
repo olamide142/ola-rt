@@ -833,13 +833,13 @@ impl Executor {
             }
             (record.request.spec.clone(), record.preemptions)
         };
-        if self.resumed.get(&request_id).is_none() {
+        if !self.resumed.contains_key(&request_id) {
             return Err(ExecutorError::Runtime(RuntimeError::InvalidTransition {
                 request: request_id,
                 operation: "migrate",
             }));
         }
-        let mut resumed = self.resumed.remove(&request_id).ok_or_else(|| {
+        let mut resumed = self.resumed.remove(&request_id).ok_or({
             ExecutorError::Runtime(RuntimeError::InvalidTransition {
                 request: request_id,
                 operation: "migrate",
@@ -1603,13 +1603,13 @@ impl Executor {
             reserved_kv_bytes,
             ..
         } = pending;
-        let resumed = self.resumed.remove(&request_id).ok_or_else(|| {
+        let resumed = self.resumed.remove(&request_id).ok_or({
             ExecutorError::Runtime(RuntimeError::InvalidTransition {
                 request: request_id,
                 operation: "restore migrated session",
             })
         })?;
-        let last_token = resumed.generated.last().copied().ok_or_else(|| {
+        let last_token = resumed.generated.last().copied().ok_or({
             ExecutorError::Runtime(RuntimeError::InvalidTransition {
                 request: request_id,
                 operation: "restore migrated session without generated token",
@@ -2214,7 +2214,6 @@ mod tests {
                     prompt_tokens: state.cursor,
                     generated_tokens: 1,
                     kv_cache_bytes: state.cursor as u64 * 8,
-                    ..SessionMetrics::default()
                 },
                 ready: true,
             })))

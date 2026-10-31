@@ -127,10 +127,8 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
     if options.role == "gateway" {
         return gateway(options, out);
     }
-    if options.role != "standalone" {
-        if options.role != "worker" {
-            return Err(format!("unsupported serve role `{}`", options.role));
-        }
+    if options.role != "standalone" && options.role != "worker" {
+        return Err(format!("unsupported serve role `{}`", options.role));
     }
     // Checked before the model loads, which can take a while.
     let adaptive_cost = options

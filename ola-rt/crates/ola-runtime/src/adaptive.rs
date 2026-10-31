@@ -297,20 +297,27 @@ pub struct AdaptiveMemoryConstraint {
     pub terms: Vec<(&'static str, u64)>,
 }
 
+/// Rebuilds a MILP objective from the latest observations.
+type ObjectiveBuilder = Box<
+    dyn FnMut(&[AdaptiveRequestObservation], AdaptiveConstraints) -> Vec<(&'static str, i64)>
+        + Send,
+>;
+
+/// Accepts or rejects a candidate decision before it reaches the executor.
+type DecisionValidator = Box<dyn Fn(&PlanningSnapshot, &PolicyDecision) -> bool + Send + Sync>;
+
+/// Adjusts θ directly after each committed iteration.
+type ThetaUpdater = Box<
+    dyn FnMut(&ExecutorIteration, &[AdaptiveRequestObservation], &mut Vec<(&'static str, String)>)
+        + Send,
+>;
+
 /// A linear integer optimizer backed by `good_lp` and its pure-Rust `microlp`
 /// solver. The finite optimizer remains the exact small-domain oracle.
 pub struct MilpCandidateOptimizer {
     domains: Vec<AdaptiveIntegerDomain>,
     objective: Vec<(&'static str, i64)>,
-    objective_builder: Option<
-        Box<
-            dyn FnMut(
-                    &[AdaptiveRequestObservation],
-                    AdaptiveConstraints,
-                ) -> Vec<(&'static str, i64)>
-                + Send,
-        >,
-    >,
+    objective_builder: Option<ObjectiveBuilder>,
     constraints: Vec<AdaptiveLinearConstraint>,
     memory_constraints: Vec<AdaptiveMemoryConstraint>,
     constant: i64,
@@ -913,16 +920,8 @@ pub struct AdaptivePolicy {
     factory: Option<Box<dyn AdaptivePolicyFactory>>,
     optimizer: Option<Box<dyn AdaptiveOptimizer>>,
     constraints: AdaptiveConstraints,
-    validator: Option<Box<dyn Fn(&PlanningSnapshot, &PolicyDecision) -> bool + Send + Sync>>,
-    updater: Option<
-        Box<
-            dyn FnMut(
-                    &ExecutorIteration,
-                    &[AdaptiveRequestObservation],
-                    &mut Vec<(&'static str, String)>,
-                ) + Send,
-        >,
-    >,
+    validator: Option<DecisionValidator>,
+    updater: Option<ThetaUpdater>,
     theta: Vec<(&'static str, String)>,
     update_count: u64,
     optimization_interval: u64,

@@ -44,6 +44,10 @@ pub enum CoordinatorLinkError {
 /// An event received from a worker link after transport-level heartbeat
 /// acknowledgements have been handled.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "each event is moved once, straight from the reader to the coordinator"
+)]
 pub enum CoordinatorLinkEvent {
     /// A domain message from the worker.
     Message(WorkerMessage),

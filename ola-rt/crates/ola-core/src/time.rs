@@ -11,7 +11,15 @@ use std::{
 ///
 /// Keeping wall-clock time out of the core API makes experiments deterministic.
 #[derive(
-    Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    serde::Deserialize,
     serde::Serialize,
 )]
 #[serde(transparent)]

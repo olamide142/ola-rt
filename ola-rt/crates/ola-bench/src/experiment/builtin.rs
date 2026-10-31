@@ -1702,9 +1702,9 @@ impl Experiment for PagedAttentionKernelStudy {
         #[cfg(not(any(feature = "cubecl-cpu", feature = "wgpu")))]
         {
             let _ = (context, parameters);
-            return Err(ExperimentError::Run(
+            Err(ExperimentError::Run(
                 "paged-attention-kernel requires the ola-bench cubecl-cpu feature".into(),
-            ));
+            ))
         }
 
         #[cfg(any(feature = "cubecl-cpu", feature = "wgpu"))]
