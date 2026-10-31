@@ -6,7 +6,7 @@ use ola_core::{ClusterRequestId, RequestSpec, Timestamp, WorkerId};
 
 use crate::{
     ClusterPolicy, Coordinator, CoordinatorError, CoordinatorLinkError, CoordinatorLinkEvent,
-    CoordinatorOutput, CoordinatorWorkerLink, WorkerCommand,
+    CoordinatorOutput, CoordinatorWorkerLink, WorkerCommand, WorkerMessage,
 };
 
 /// Errors raised while coordinating connected TCP workers.
@@ -150,6 +150,49 @@ impl TcpCoordinator {
         Ok(output)
     }
 
+    /// Performs the coordinator-managed half of a migration handoff. The
+    /// source exports first; only after the payload arrives does ownership
+    /// move to the target and an `AdmitMigrated` command get dispatched.
+    pub async fn migrate(
+        &mut self,
+        request: ClusterRequestId,
+        source: &WorkerId,
+        target: WorkerId,
+        at: Timestamp,
+    ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
+        self.links
+            .get_mut(source)
+            .ok_or_else(|| TcpCoordinatorError::MissingLink(source.clone()))?
+            .send_command(&WorkerCommand::MigrateOut { request })
+            .await?;
+        let state = loop {
+            let event = self
+                .links
+                .get_mut(source)
+                .ok_or_else(|| TcpCoordinatorError::MissingLink(source.clone()))?
+                .receive_event()
+                .await?;
+            match event {
+                CoordinatorLinkEvent::Message(WorkerMessage::Migrated {
+                    request: migrated_request,
+                    state,
+                }) if migrated_request == request => break state,
+                CoordinatorLinkEvent::Message(message) => {
+                    let _ = self.coordinator.handle(source, message, at)?;
+                }
+                CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
+                    self.coordinator.heartbeat(source, epoch, at)?;
+                    self.record_calibration(source, at, sent_at_us);
+                }
+            }
+        };
+        let output = self
+            .coordinator
+            .stage_migration(request, source, target, state, at)?;
+        self.dispatch(&output.commands).await?;
+        Ok(output)
+    }
+
     /// Places a worker into draining mode. Existing requests continue, while
     /// subsequent plans exclude it from admission.
     pub async fn drain_worker(&mut self, worker: &WorkerId) -> Result<(), TcpCoordinatorError> {
@@ -185,28 +228,20 @@ impl TcpCoordinator {
         worker: &WorkerId,
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        let link = self
-            .links
-            .get_mut(worker)
-            .ok_or_else(|| TcpCoordinatorError::MissingLink(worker.clone()))?;
         loop {
-            match link.receive_event().await? {
+            let event = self
+                .links
+                .get_mut(worker)
+                .ok_or_else(|| TcpCoordinatorError::MissingLink(worker.clone()))?
+                .receive_event()
+                .await?;
+            match event {
                 CoordinatorLinkEvent::Message(message) => {
                     return Ok(self.coordinator.handle(worker, message, at)?);
                 }
                 CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
                     self.coordinator.heartbeat(worker, epoch, at)?;
-                    let offset = i128::from(at.as_micros()) - i128::from(sent_at_us);
-                    let offset = offset.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-                    if let Some(calibration) = self.calibration.get_mut(worker) {
-                        calibration.samples = calibration.samples.saturating_add(1);
-                        let samples = i128::from(calibration.samples);
-                        let previous =
-                            i128::from(calibration.offset_us) * samples.saturating_sub(1);
-                        calibration.offset_us = ((previous + i128::from(offset)) / samples)
-                            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
-                            as i64;
-                    }
+                    self.record_calibration(worker, at, sent_at_us);
                 }
             }
         }
@@ -234,5 +269,18 @@ impl TcpCoordinator {
             link.send_command(command).await?;
         }
         Ok(())
+    }
+
+    fn record_calibration(&mut self, worker: &WorkerId, at: Timestamp, sent_at_us: u64) {
+        let offset = i128::from(at.as_micros()) - i128::from(sent_at_us);
+        let offset = offset.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        if let Some(calibration) = self.calibration.get_mut(worker) {
+            calibration.samples = calibration.samples.saturating_add(1);
+            let samples = i128::from(calibration.samples);
+            let previous = i128::from(calibration.offset_us) * samples.saturating_sub(1);
+            calibration.offset_us = ((previous + i128::from(offset)) / samples)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+                as i64;
+        }
     }
 }

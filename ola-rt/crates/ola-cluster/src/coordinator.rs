@@ -651,6 +651,63 @@ impl Coordinator {
         self.requests.get(&id).map(|entry| &entry.status)
     }
 
+    /// Commits the coordinator side of a migration after the source has
+    /// exported the request. The source remains authoritative until this
+    /// method is called; the returned command is the target admission step.
+    pub fn stage_migration(
+        &mut self,
+        request: ClusterRequestId,
+        source: &WorkerId,
+        target: WorkerId,
+        state: MigratedRequest,
+        at: Timestamp,
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
+        let entry = self
+            .requests
+            .get_mut(&request)
+            .ok_or(CoordinatorError::UnknownRequest(request))?;
+        if !matches!(
+            &entry.status,
+            ClusterRequestStatus::Running { worker, .. } if worker == source
+        ) {
+            return Err(CoordinatorError::UnexpectedMessage {
+                from: source.clone(),
+                request,
+            });
+        }
+        let worker = self
+            .workers
+            .get_mut(&target)
+            .ok_or_else(|| CoordinatorError::UnknownWorker(target.clone()))?;
+        if !worker.summary.accepts(&entry.spec.model) {
+            return Err(CoordinatorError::UnexpectedMessage {
+                from: target,
+                request,
+            });
+        }
+        let arrival_at = entry.arrival_at;
+        let spec = entry.spec.clone();
+        entry.status = ClusterRequestStatus::Assigned {
+            worker: target.clone(),
+        };
+        worker.assigned = worker.assigned.saturating_add(1);
+        worker
+            .in_flight_tokens
+            .push_back(crate::token_demand(&spec));
+        self.generation = self.generation.saturating_add(1);
+        let mut output = CoordinatorOutput::default();
+        output.commands.push((
+            target,
+            WorkerCommand::AdmitMigrated {
+                request,
+                state,
+                arrival_at,
+            },
+        ));
+        let _ = at;
+        Ok(output)
+    }
+
     /// Unowned requests waiting for a plan.
     pub fn pending_len(&self) -> usize {
         self.pending.len()

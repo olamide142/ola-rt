@@ -8,8 +8,12 @@ carried in the migration envelope. The runtime promotes an imported session
 directly to decode-ready state and keeps token recompute as the fallback when a
 model returns `None`; a regression test proves there is no duplicate prefill
 token. Burn Llama and Mistral both have versioned session export/import tests.
-The remaining D3/D4 gaps are coordinator-managed two-phase ownership handoff,
+The remaining D3/D4 gaps are full target-acknowledged two-phase rollback,
 raw KV-byte transfer/disaggregation, and simulator failure injection.
+
+`TcpCoordinator::migrate` now waits for source export before moving coordinator
+ownership to the target and dispatching `AdmitMigrated`; ordinary worker
+messages and heartbeat calibration continue to be processed while waiting.
 
 The cluster crate now also exposes calibrated transfer-vs-recompute selection
 and an exact small-batch MILP router with request/KV capacity constraints;
