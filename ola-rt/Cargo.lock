@@ -4895,6 +4895,7 @@ dependencies = [
 name = "ola-cluster"
 version = "0.1.0"
 dependencies = [
+ "good_lp",
  "ola-bench",
  "ola-core",
  "ola-model",
@@ -4902,6 +4903,7 @@ dependencies = [
  "ola-runtime",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -4971,13 +4973,17 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
+ "ola-bench",
+ "ola-cluster",
  "ola-core",
  "ola-model",
+ "ola-net",
  "ola-observe",
  "ola-runtime",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

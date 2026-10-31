@@ -8,7 +8,7 @@ use ola_core::GenerationConfig;
 use ola_kernel::{PagedAttentionKernel, PortablePagedAttention};
 use ola_model::{
     BatchCapabilities, CausalModel, ExecutionStage, GeneratedToken, GenerationSession,
-    ModelExecutionContext, ModelExecutionError, PrefillOutcome, SessionMetrics,
+    ModelExecutionContext, ModelExecutionError, PrefillOutcome, SessionMetrics, SessionState,
 };
 use ola_runtime::KvBlockError;
 
@@ -25,6 +25,15 @@ pub(crate) struct BurnMistralModel {
     cache_pool: Arc<Mutex<MistralKvPool>>,
 }
 
+#[derive(serde::Deserialize)]
+struct MistralSessionState {
+    tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    rng_state: u64,
+    prompt_tokens: usize,
+    cursor: usize,
+}
+
 impl BurnMistralModel {
     pub(crate) fn with_kv_cache(
         module: MistralForCausalLM,
@@ -38,6 +47,46 @@ impl BurnMistralModel {
             config: Arc::new(config),
             device,
             cache_pool: Arc::new(Mutex::new(cache_pool)),
+        })
+    }
+
+    fn new_session(
+        &self,
+        generation: GenerationConfig,
+    ) -> Result<MistralSession, ModelExecutionError> {
+        if generation.max_new_tokens == 0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "max_new_tokens must be greater than zero",
+            ));
+        }
+        if !generation.top_p.is_finite() || generation.top_p <= 0.0 || generation.top_p > 1.0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "top_p must be finite and in the interval (0, 1]",
+            ));
+        }
+        if !generation.temperature.is_finite() || generation.temperature < 0.0 {
+            return Err(ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                "temperature must be finite and non-negative",
+            ));
+        }
+        let cache = MistralKvCache::allocate(self.cache_pool.clone())
+            .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
+        let rng_state = generation.seed.unwrap_or_else(entropy_seed);
+        Ok(MistralSession {
+            module: self.module.clone(),
+            config: self.config.clone(),
+            device: self.device.clone(),
+            generation,
+            tokens: Vec::new(),
+            generated_tokens: Vec::new(),
+            cache: Some(cache),
+            rng_state,
+            last_generated: None,
+            metrics: SessionMetrics::default(),
+            terminal: false,
         })
     }
 }
@@ -151,39 +200,44 @@ impl CausalModel for BurnMistralModel {
         &self,
         generation: GenerationConfig,
     ) -> Result<Box<dyn GenerationSession>, ModelExecutionError> {
-        if generation.max_new_tokens == 0 {
-            return Err(ModelExecutionError::new(
-                ExecutionStage::SessionCreation,
-                "max_new_tokens must be greater than zero",
-            ));
+        Ok(Box::new(self.new_session(generation)?))
+    }
+
+    fn import_session(
+        &self,
+        generation: GenerationConfig,
+        state: SessionState,
+    ) -> Result<Option<Box<dyn GenerationSession>>, ModelExecutionError> {
+        if state.format != "ola-burn/mistral-recompute-v1" {
+            return Ok(None);
         }
-        if !generation.top_p.is_finite() || generation.top_p <= 0.0 || generation.top_p > 1.0 {
-            return Err(ModelExecutionError::new(
-                ExecutionStage::SessionCreation,
-                "top_p must be finite and in the interval (0, 1]",
-            ));
+        let state: MistralSessionState =
+            serde_json::from_slice(&state.payload).map_err(|error| {
+                ModelExecutionError::new(
+                    ExecutionStage::SessionCreation,
+                    format!("invalid Mistral session state: {error}"),
+                )
+            })?;
+        if state.tokens.is_empty()
+            || state.generated_tokens.is_empty()
+            || state.cursor != state.tokens.len()
+            || state.prompt_tokens > state.tokens.len()
+        {
+            return Ok(None);
         }
-        if !generation.temperature.is_finite() || generation.temperature < 0.0 {
-            return Err(ModelExecutionError::new(
-                ExecutionStage::SessionCreation,
-                "temperature must be finite and non-negative",
-            ));
-        }
-        let cache = MistralKvCache::allocate(self.cache_pool.clone())
-            .map_err(|error| cache_error(ExecutionStage::SessionCreation, error))?;
-        let rng_state = generation.seed.unwrap_or_else(entropy_seed);
-        Ok(Box::new(MistralSession {
-            module: self.module.clone(),
-            config: self.config.clone(),
-            device: self.device.clone(),
-            generation,
-            tokens: Vec::new(),
-            cache: Some(cache),
-            rng_state,
-            last_generated: None,
-            metrics: SessionMetrics::default(),
-            terminal: false,
-        }))
+        let mut session = self.new_session(generation)?;
+        let _ = session.prefill(&state.tokens)?;
+        session.tokens = state.tokens;
+        session.generated_tokens = state.generated_tokens.clone();
+        session.rng_state = state.rng_state;
+        session.last_generated = state.generated_tokens.last().copied();
+        session.metrics.prompt_tokens = state.prompt_tokens;
+        session.metrics.generated_tokens = state.generated_tokens.len();
+        session.terminal = session
+            .last_generated
+            .is_some_and(|token| session.config.eos_token_id.contains(&token))
+            || session.metrics.generated_tokens >= session.generation.max_new_tokens;
+        Ok(Some(Box::new(session)))
     }
 
     fn prefill_batch(
@@ -560,6 +614,7 @@ struct MistralSession {
     device: burn::tensor::Device,
     generation: GenerationConfig,
     tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
     cache: Option<MistralKvCache>,
     rng_state: u64,
     last_generated: Option<u32>,
@@ -603,6 +658,7 @@ impl MistralSession {
     }
 
     fn record_selected_token(&mut self, id: u32) -> GeneratedToken {
+        self.generated_tokens.push(id);
         let is_end_of_sequence = self.config.eos_token_id.contains(&id);
         self.last_generated = Some(id);
         self.metrics.generated_tokens += 1;
@@ -826,6 +882,35 @@ impl GenerationSession for MistralSession {
         self.metrics
     }
 
+    fn export_state(&self) -> Result<Option<SessionState>, ModelExecutionError> {
+        #[derive(serde::Serialize)]
+        struct State<'a> {
+            tokens: &'a [u32],
+            generated_tokens: &'a [u32],
+            rng_state: u64,
+            prompt_tokens: usize,
+            cursor: usize,
+        }
+        let payload = serde_json::to_vec(&State {
+            tokens: &self.tokens,
+            generated_tokens: &self.generated_tokens,
+            rng_state: self.rng_state,
+            prompt_tokens: self.metrics.prompt_tokens,
+            cursor: self.tokens.len(),
+        })
+        .map_err(|error| {
+            ModelExecutionError::new(
+                ExecutionStage::SessionCreation,
+                format!("could not serialize Mistral session state: {error}"),
+            )
+        })?;
+        Ok(Some(SessionState {
+            format: "ola-burn/mistral-recompute-v1".into(),
+            cursor: self.tokens.len(),
+            payload,
+        }))
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -1001,6 +1086,25 @@ mod tests {
         let device = burn::tensor::Device::default();
         let module = MistralForCausalLM::init(config, &device);
         BurnMistralModel::with_kv_cache(module, config.clone(), device, cache_config).unwrap()
+    }
+
+    #[test]
+    fn imports_recompute_safe_session_state() {
+        let config = tiny_config(None);
+        let model = make_model(&config, MistralKvCacheConfig::for_model(&config));
+        let mut original = model.create_session(greedy(4)).unwrap();
+        let first = original.prefill(&[1, 5]).unwrap();
+        let second = original.decode(first.id).unwrap();
+        let state = original.export_state().unwrap().unwrap();
+
+        let mut resumed = model
+            .import_session(greedy(4), state)
+            .unwrap()
+            .expect("matching Mistral state format is importable");
+        assert_eq!(
+            original.decode(second.id).unwrap().id,
+            resumed.decode(second.id).unwrap().id
+        );
     }
 
     #[test]
