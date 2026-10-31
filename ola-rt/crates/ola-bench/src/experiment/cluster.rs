@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use ola_cluster::{
-    ClusterPolicy, KvHeadroomRouting, LeastLoadedRouting, PowerOfTwoRouting, PrefixAffinityRouting,
-    RoundRobinRouting,
+    AdaptiveClusterPolicy, ClusterPolicy, KvHeadroomRouting, LeastLoadedRouting, PowerOfTwoRouting,
+    PrefixAffinityRouting, RoundRobinRouting,
 };
 
 use super::builtin::{as_f64, finish, run_error};
@@ -37,6 +37,7 @@ impl ClusterRouting {
                 "prefix-affinity",
                 Box::new(PrefixAffinityRouting::new(prefix_tokens, load_slack)),
             ),
+            ("adaptive", Box::new(AdaptiveClusterPolicy::default())),
         ]
     }
 }

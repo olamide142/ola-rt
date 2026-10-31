@@ -313,9 +313,9 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   load/KV routing policy, a microlp-backed model placement optimizer, and
   heartbeat link calibration are present; validated routing-weight pushes are
   now carried over worker control links. A microlp-backed batch assignment
-  optimizer now enforces worker request and KV capacities; integrating its
-  result into the live coordinator policy and held-out adaptive evaluation
-  remain.
+  optimizer now enforces worker request and KV capacities in the adaptive
+  policy, and the registered cluster study compares the adaptive variant;
+  held-out improvement claims and live-loop evaluation remain.
 - [ ] D6 (research): pipeline parallelism across workers.
 
 Done when a seeded workload served by a gateway and two worker processes

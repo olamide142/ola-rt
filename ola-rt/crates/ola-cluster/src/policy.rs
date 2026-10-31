@@ -67,6 +67,13 @@ impl ClusterDecisionRecord {
     pub fn route(&self, request: ClusterRequestId) -> Option<&RouteRecord> {
         self.routes.iter().find(|route| route.request == request)
     }
+
+    /// Returns the route record for mutation while a decision is assembled.
+    pub(crate) fn route_mut(&mut self, request: ClusterRequestId) -> Option<&mut RouteRecord> {
+        self.routes
+            .iter_mut()
+            .find(|route| route.request == request)
+    }
 }
 
 /// The workers a policy weighed for one request.
@@ -100,6 +107,8 @@ pub enum RouteReason {
     },
     /// No prefix to route by, so least load.
     NoPrefix,
+    /// A capacity-constrained batch assignment optimized the whole tick.
+    BatchOptimizer,
 }
 
 /// One eligible worker and its load when a request was routed.

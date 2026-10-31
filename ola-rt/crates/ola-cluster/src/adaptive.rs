@@ -1,10 +1,13 @@
 //! Slowly adapting cluster routing policy.
 
+use std::collections::BTreeMap;
+
 use ola_runtime::PolicyDescriptor;
 
 use crate::{
     ClusterDecision, ClusterIteration, ClusterPolicy, ClusterPolicyError, ClusterSnapshot,
-    KvHeadroomRouting, LeastLoadedRouting,
+    KvHeadroomRouting, LeastLoadedRouting, RouteReason, RoutingRequest, RoutingWorker,
+    optimize_batch_routing,
 };
 
 /// Weights for the cluster-level routing objective.
@@ -87,14 +90,133 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
     }
 
     fn plan(&self, snapshot: &ClusterSnapshot) -> Result<ClusterDecision, ClusterPolicyError> {
-        if self.weights.kv_headroom > self.weights.load {
-            KvHeadroomRouting.plan(snapshot)
+        let mut decision = if self.weights.kv_headroom > self.weights.load {
+            KvHeadroomRouting.plan(snapshot)?
         } else {
-            LeastLoadedRouting.plan(snapshot)
+            LeastLoadedRouting.plan(snapshot)?
+        };
+        let mut grouped = BTreeMap::new();
+        for request in &snapshot.pending {
+            grouped
+                .entry(request.model.clone())
+                .or_insert_with(Vec::new)
+                .push(request);
         }
+        for (model, requests) in grouped {
+            let workers = snapshot
+                .eligible_workers(&model)
+                .map(|(worker, view)| RoutingWorker {
+                    worker: worker.clone(),
+                    capacity: view.summary.max_active_requests,
+                    current_load: view.load(),
+                    kv_headroom_tokens: view.kv_headroom_tokens(&model).unwrap_or(usize::MAX),
+                    load_cost: (view.load() as u64).saturating_mul(self.weights.load.max(1)),
+                })
+                .collect::<Vec<_>>();
+            if workers.is_empty() {
+                continue;
+            }
+            let batch = requests
+                .iter()
+                .map(|request| RoutingRequest {
+                    request: request.id,
+                    kv_tokens: request.demand_tokens(),
+                })
+                .collect::<Vec<_>>();
+            let Ok(solution) = optimize_batch_routing(&workers, &batch) else {
+                continue;
+            };
+            for action in &mut decision.plan.actions {
+                let crate::ClusterAction::Assign { request, worker } = action else {
+                    continue;
+                };
+                let Some(target) = solution.assignments.get(request) else {
+                    continue;
+                };
+                *worker = target.clone();
+                if let Some(route) = decision.record.route_mut(*request) {
+                    route.reason = RouteReason::BatchOptimizer;
+                }
+            }
+        }
+        Ok(decision)
     }
 
     fn observe(&mut self, _iteration: &ClusterIteration) {
         self.observations = self.observations.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ola_core::{ModelId, Priority, Timestamp, WorkerId};
+
+    use super::*;
+    use crate::{PendingRequest, WorkerHealth, WorkerSummary, WorkerView};
+
+    fn worker(id: &str, queued: usize) -> (WorkerId, WorkerView) {
+        let model = ModelId::from("tiny");
+        (
+            WorkerId::new(id),
+            WorkerView {
+                summary: WorkerSummary {
+                    worker: WorkerId::new(id),
+                    generation: 0,
+                    reported_at: Timestamp::ZERO,
+                    health: WorkerHealth::Ready,
+                    models: BTreeSet::from([model]),
+                    max_active_requests: 2,
+                    queued_requests: queued,
+                    live_requests: 0,
+                    queued_tokens: queued,
+                    admitted_requests: 0,
+                    kv: BTreeMap::new(),
+                },
+                in_flight: 0,
+                in_flight_tokens: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn adaptive_policy_marks_a_capacity_constrained_batch_assignment() {
+        let model = ModelId::from("tiny");
+        let snapshot = ClusterSnapshot {
+            at: Timestamp::ZERO,
+            generation: 0,
+            workers: BTreeMap::from([worker("busy", 1), worker("idle", 0)]),
+            pending: vec![
+                PendingRequest {
+                    id: ola_core::ClusterRequestId::new(1),
+                    model: model.clone(),
+                    priority: Priority::NORMAL,
+                    arrival_at: Timestamp::ZERO,
+                    prompt_tokens: Some(1),
+                    prompt: vec![1],
+                    max_new_tokens: 1,
+                },
+                PendingRequest {
+                    id: ola_core::ClusterRequestId::new(2),
+                    model,
+                    priority: Priority::NORMAL,
+                    arrival_at: Timestamp::ZERO,
+                    prompt_tokens: Some(1),
+                    prompt: vec![2],
+                    max_new_tokens: 1,
+                },
+            ],
+            routed_requests: 0,
+        };
+        let decision = AdaptiveClusterPolicy::default().plan(&snapshot).unwrap();
+        assert!(
+            decision
+                .record
+                .routes
+                .iter()
+                .all(|route| route.reason == RouteReason::BatchOptimizer)
+        );
+        assert_eq!(decision.plan.actions.len(), 2);
     }
 }

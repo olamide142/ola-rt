@@ -13,9 +13,10 @@ raw KV-byte transfer/disaggregation, and simulator failure injection.
 
 The cluster crate now also exposes calibrated transfer-vs-recompute selection
 and an exact small-batch MILP router with request/KV capacity constraints;
-both have deterministic feasibility and objective tests. The live coordinator
-still uses the established routing policies until batch-level adaptive
-evaluation is integrated.
+both have deterministic feasibility and objective tests. The adaptive policy
+now applies the batch assignment refinement transactionally with baseline
+fallback, and the registered cluster study includes it as a comparison
+variant; held-out improvement measurement remains.
 
 **2026-10-30 distributed continuation:** The TCP worker session now uses a
 dedicated frame reader so cancellation-safe heartbeats and payloads cannot
