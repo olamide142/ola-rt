@@ -43,6 +43,12 @@ impl From<ExecutorError> for WorkerSessionError {
 }
 
 /// Runs one worker's executor behind a TCP control-plane connection.
+///
+/// A dedicated task reads frames, so a frame is never abandoned half-read.
+/// The session loop applies coordinator commands as they arrive, sends a
+/// heartbeat and a load summary every `heartbeat_interval`, and runs executor
+/// iterations back to back whenever the executor has work. Iterations run on
+/// the session's task; give a heavy model its own runtime thread.
 pub struct WorkerSession {
     peer: TcpPeer,
     worker: WorkerHost,
@@ -90,7 +96,11 @@ impl WorkerSession {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // Commands first, then liveness, then one executor iteration.
+            // Execution is not tied to the heartbeat: while there is work the
+            // loop steps back to back, checking for commands in between.
             tokio::select! {
+                biased;
                 received = received_rx.recv() => {
                     let Some(received) = received else { break };
                     let message = received?;
@@ -106,7 +116,7 @@ impl WorkerSession {
                                 &mut writer,
                                 self.epoch,
                                 &mut self.next_correlation,
-                                WireBody::HeartbeatAck { received_at_us: sent_at_us },
+                                WireBody::HeartbeatAck { echo_sent_at_us: sent_at_us },
                             ).await?;
                         }
                         WireBody::Goodbye { .. } => break,
@@ -128,9 +138,14 @@ impl WorkerSession {
                         &mut self.next_correlation,
                         summary,
                     ).await?;
-                    if let Some((_, messages)) = self.worker.step(now)? {
+                }
+                () = std::future::ready(()), if self.worker.has_work() => {
+                    if let Some((_, messages)) = self.worker.step(self.clock.now())? {
                         send_messages(&mut writer, self.epoch, &mut self.next_correlation, messages).await?;
                     }
+                    // An iteration is synchronous; let the reader task and
+                    // timers run before the next one.
+                    tokio::task::yield_now().await;
                 }
             }
         }

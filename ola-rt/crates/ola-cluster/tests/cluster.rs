@@ -1010,3 +1010,199 @@ fn an_invalid_plan_changes_nothing() {
     assert_eq!(coordinator.snapshot(at(0)), before);
     assert_eq!(coordinator.status(id), Some(&ClusterRequestStatus::Pending));
 }
+
+fn token(request: ClusterRequestId, generated_tokens: usize) -> WorkerMessage {
+    WorkerMessage::Token {
+        request,
+        token_id: 7,
+        generated_tokens,
+        phase: ola_runtime::ExecutionPhase::Decode,
+        at: at(1),
+    }
+}
+
+fn accepted(request: ClusterRequestId, local: u64) -> WorkerMessage {
+    WorkerMessage::Accepted {
+        request,
+        local: RequestId::new(local),
+    }
+}
+
+/// Submits one request, plans it, and has its owner accept it.
+fn running(coordinator: &mut Coordinator) -> (ClusterRequestId, WorkerId) {
+    let (id, _) = coordinator.submit(spec(4, 8, None), at(0)).unwrap();
+    let (_, output) = coordinator.plan(at(0)).unwrap().unwrap();
+    let [(owner, WorkerCommand::Admit { .. })] = output.commands.as_slice() else {
+        panic!("expected one admission");
+    };
+    let owner = owner.clone();
+    coordinator.handle(&owner, accepted(id, 1), at(0)).unwrap();
+    (id, owner)
+}
+
+fn migrated(request_spec: RequestSpec) -> MigratedRequest {
+    MigratedRequest {
+        spec: request_spec,
+        prompt_tokens: vec![1, 2, 3, 4],
+        generated_tokens: vec![7],
+        token_times: vec![at(1)],
+        preemptions: 0,
+        session_state: None,
+    }
+}
+
+#[test]
+fn recovered_requests_do_not_replay_tokens_and_stale_copies_are_cancelled() {
+    let mut coordinator = Coordinator::new(RoundRobinRouting);
+    for worker in ["a", "b", "c"] {
+        coordinator.join(summary(worker, &[MODEL], 0, 0)).unwrap();
+    }
+    let (id, first) = running(&mut coordinator);
+    for generated in 1..=2 {
+        let output = coordinator
+            .handle(&first, token(id, generated), at(1))
+            .unwrap();
+        assert_eq!(output.client.len(), 1);
+    }
+
+    assert_eq!(coordinator.recover_worker(&first, at(2)).unwrap(), [id]);
+    let (_, output) = coordinator.plan(at(2)).unwrap().unwrap();
+    let [(second, WorkerCommand::Admit { .. })] = output.commands.as_slice() else {
+        panic!("recovery did not reassign the request");
+    };
+    let second = second.clone();
+    assert_ne!(second, first);
+    coordinator.handle(&second, accepted(id, 1), at(3)).unwrap();
+    // The new owner regenerates from the prompt; replays stay hidden.
+    for generated in 1..=2 {
+        let output = coordinator
+            .handle(&second, token(id, generated), at(3))
+            .unwrap();
+        assert!(output.client.is_empty());
+    }
+    let output = coordinator.handle(&second, token(id, 3), at(3)).unwrap();
+    assert!(matches!(
+        output.client.as_slice(),
+        [(
+            _,
+            ClientEvent::Token {
+                generated_tokens: 3,
+                ..
+            }
+        )]
+    ));
+
+    // The lost worker comes back still running its copy.
+    let stale = coordinator.handle(&first, token(id, 3), at(4)).unwrap();
+    assert!(stale.client.is_empty());
+    assert_eq!(
+        stale.commands,
+        [(first.clone(), WorkerCommand::Cancel { request: id })]
+    );
+    let stale = coordinator
+        .handle(
+            &first,
+            WorkerMessage::Finished {
+                request: id,
+                token_ids: vec![7; 3],
+                text: String::new(),
+            },
+            at(4),
+        )
+        .unwrap();
+    assert!(stale.client.is_empty() && stale.commands.is_empty());
+    assert!(matches!(
+        coordinator.status(id),
+        Some(ClusterRequestStatus::Running { worker, .. }) if worker == &second
+    ));
+
+    // A worker that never owned the request is still a protocol error.
+    let never = ["a", "b", "c"]
+        .into_iter()
+        .map(WorkerId::new)
+        .find(|worker| worker != &first && worker != &second)
+        .unwrap();
+    assert!(matches!(
+        coordinator.handle(&never, token(id, 4), at(5)),
+        Err(CoordinatorError::UnexpectedMessage { .. })
+    ));
+}
+
+#[test]
+fn a_committed_migration_leaves_the_source_load_accounting_intact() {
+    let mut coordinator = Coordinator::new(RoundRobinRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    coordinator.join(summary("b", &[MODEL], 0, 0)).unwrap();
+    let (id, source) = running(&mut coordinator);
+    let target = WorkerId::new(if source.as_str() == "a" { "b" } else { "a" });
+    let mut reported = summary(source.as_str(), &[MODEL], 0, 1);
+    reported.admitted_requests = 1;
+    coordinator
+        .handle(&source, WorkerMessage::Summary(reported.clone()), at(1))
+        .unwrap();
+
+    coordinator
+        .stage_migration(
+            id,
+            &source,
+            target.clone(),
+            migrated(spec(4, 8, None)),
+            at(2),
+        )
+        .unwrap();
+    coordinator.handle(&target, accepted(id, 1), at(2)).unwrap();
+    coordinator.finish_migration(id, at(2));
+    // Only the source can take new work now.
+    let mut draining = summary(target.as_str(), &[MODEL], 0, 1);
+    draining.health = WorkerHealth::Draining;
+    coordinator
+        .handle(&target, WorkerMessage::Summary(draining), at(3))
+        .unwrap();
+    reported.live_requests = 0;
+    coordinator
+        .handle(&source, WorkerMessage::Summary(reported), at(3))
+        .unwrap();
+
+    coordinator.submit(spec(4, 8, None), at(4)).unwrap();
+    let (_, output) = coordinator.plan(at(4)).unwrap().unwrap();
+    assert!(matches!(
+        output.commands.as_slice(),
+        [(worker, WorkerCommand::Admit { .. })] if worker == &source
+    ));
+    // The new admission is in flight until the source's summary counts it.
+    assert_eq!(coordinator.snapshot(at(4)).workers[&source].in_flight, 1);
+}
+
+#[test]
+fn losing_a_migration_target_rolls_the_request_back_to_its_source() {
+    let mut coordinator = Coordinator::new(RoundRobinRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    coordinator.join(summary("b", &[MODEL], 0, 0)).unwrap();
+    let (id, source) = running(&mut coordinator);
+    let target = WorkerId::new(if source.as_str() == "a" { "b" } else { "a" });
+    coordinator
+        .stage_migration(
+            id,
+            &source,
+            target.clone(),
+            migrated(spec(4, 8, None)),
+            at(1),
+        )
+        .unwrap();
+
+    assert!(
+        coordinator
+            .recover_worker(&target, at(2))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        coordinator.status(id),
+        Some(ClusterRequestStatus::Running { worker, .. }) if worker == &source
+    ));
+    assert_eq!(
+        coordinator.take_commands(),
+        [(source, WorkerCommand::AbortMigration { request: id })]
+    );
+    assert!(coordinator.staged_migration(id).is_none());
+}

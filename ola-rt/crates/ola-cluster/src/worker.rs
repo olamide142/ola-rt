@@ -114,12 +114,15 @@ impl WorkerHost {
 
     /// Applies one coordinator command.
     ///
-    /// Admission failures become [`WorkerMessage::Refused`] rather than
-    /// errors, since the coordinator must learn about them.
+    /// Admission and import failures become [`WorkerMessage::Refused`] (or
+    /// [`WorkerMessage::Failed`] for an aborted migration that cannot be
+    /// restored) rather than errors, since the coordinator must learn about
+    /// them and the session must survive them.
     ///
     /// # Errors
     ///
-    /// Fails if the executor cannot cancel an owned, live request.
+    /// Fails if the executor cannot cancel or export an owned, live request,
+    /// or a policy update is invalid.
     pub fn handle(
         &mut self,
         command: WorkerCommand,
@@ -142,6 +145,9 @@ impl WorkerHost {
                         },
                     }]);
                 }
+                // Recovery can hand a request back to a worker that still runs
+                // an older copy; only the new admission may stream.
+                self.drop_stale_copy(request, at)?;
                 Ok(vec![match self.executor.submit(spec, arrival_at) {
                     Ok(local) => {
                         self.by_local.insert(local, request);
@@ -207,11 +213,23 @@ impl WorkerHost {
                         },
                     }]);
                 }
-                let local = self.executor.import_request(state, arrival_at)?;
-                self.admitted += 1;
-                self.by_local.insert(local, request);
-                self.by_cluster.insert(request, local);
-                Ok(vec![WorkerMessage::Accepted { request, local }])
+                self.drop_stale_copy(request, at)?;
+                // An import the executor cannot take is a refusal the
+                // coordinator rolls back, not a reason to end the session.
+                Ok(vec![
+                    match self.executor.import_request(state, arrival_at) {
+                        Ok(local) => {
+                            self.admitted += 1;
+                            self.by_local.insert(local, request);
+                            self.by_cluster.insert(request, local);
+                            WorkerMessage::Accepted { request, local }
+                        }
+                        Err(error) => WorkerMessage::Refused {
+                            request,
+                            message: error.to_string(),
+                        },
+                    },
+                ])
             }
             WorkerCommand::CommitMigration { request } => {
                 self.pending_migrations.remove(&request);
@@ -221,10 +239,17 @@ impl WorkerHost {
                 let Some(state) = self.pending_migrations.remove(&request) else {
                     return Ok(Vec::new());
                 };
-                let local = self.executor.import_request(state, at)?;
-                self.by_local.insert(local, request);
-                self.by_cluster.insert(request, local);
-                Ok(vec![WorkerMessage::Accepted { request, local }])
+                Ok(vec![match self.executor.import_request(state, at) {
+                    Ok(local) => {
+                        self.by_local.insert(local, request);
+                        self.by_cluster.insert(request, local);
+                        WorkerMessage::Accepted { request, local }
+                    }
+                    Err(error) => WorkerMessage::Failed {
+                        request,
+                        message: format!("could not restore aborted migration: {error}"),
+                    },
+                }])
             }
             WorkerCommand::PolicyUpdate {
                 load_weight,
@@ -327,6 +352,29 @@ impl WorkerHost {
             }
         }
         Ok(Some((iteration, messages)))
+    }
+
+    /// Cancels a live local copy of `request` left from an earlier
+    /// assignment, without reporting it; the coordinator already moved on.
+    fn drop_stale_copy(
+        &mut self,
+        request: ClusterRequestId,
+        at: Timestamp,
+    ) -> Result<(), ExecutorError> {
+        let Some(&local) = self.by_cluster.get(&request) else {
+            return Ok(());
+        };
+        let live = self.executor.state().request(local).is_some_and(|record| {
+            matches!(
+                record.status,
+                RequestStatus::Queued | RequestStatus::Running
+            )
+        });
+        if live {
+            self.executor.cancel(local, at)?;
+        }
+        self.unmap(local);
+        Ok(())
     }
 
     fn unmap(&mut self, local: RequestId) -> Option<ClusterRequestId> {

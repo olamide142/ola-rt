@@ -1,11 +1,22 @@
 //! Coordinator-side link to one TCP worker.
+//!
+//! A link owns the write half of the connection. A dedicated task owns the
+//! read half and forwards every frame, tagged with the worker's ID, into a
+//! channel shared by all links. Reading therefore never happens inside a
+//! caller's future, so dropping that future (a client disconnecting, a
+//! `select!` choosing another branch) can never abandon a half-read frame and
+//! desynchronize the length-prefixed stream.
 
 use std::{error::Error, fmt};
 
 use ola_core::WorkerId;
-use ola_net::{TcpPeer, WireBody, WireError, WireMessage};
+use ola_net::{TcpPeer, WireBody, WireError, WireMessage, read_message, write_message};
+use tokio::{net::tcp::OwnedWriteHalf, sync::mpsc, task::JoinHandle};
 
 use crate::{WorkerCommand, WorkerMessage, WorkerSummary};
+
+/// A frame read from one worker, or the error that ended its reader.
+pub type LinkFrame = (WorkerId, Result<WireMessage, WireError>);
 
 /// Errors raised while connecting to or communicating with one worker.
 #[derive(Debug)]
@@ -63,34 +74,40 @@ impl From<WireError> for CoordinatorLinkError {
 
 /// One coordinator connection to one worker.
 pub struct CoordinatorWorkerLink {
-    peer: TcpPeer,
+    writer: OwnedWriteHalf,
     worker: WorkerId,
     next_correlation: u64,
+    reader: JoinHandle<()>,
 }
 
 impl CoordinatorWorkerLink {
-    /// Connects and completes the worker hello/summary handshake.
+    /// Connects, completes the worker hello/summary handshake, and starts
+    /// forwarding the worker's frames into `frames`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the connection or handshake fails, or the worker is not
+    /// `expected_worker`.
     pub async fn connect(
         address: impl tokio::net::ToSocketAddrs,
         expected_worker: Option<WorkerId>,
+        frames: mpsc::UnboundedSender<LinkFrame>,
     ) -> Result<(Self, WorkerSummary), CoordinatorLinkError> {
         let mut peer = TcpPeer::connect(address).await?;
+        // The handshake reads inline: nothing else can be waiting on this
+        // connection yet, and a failed handshake drops it.
         let hello = peer.receive().await?;
         let worker = match hello.body {
             WireBody::Hello { worker } => worker,
-            other => {
-                return Err(CoordinatorLinkError::UnexpectedMessage(
-                    other.kind_name_for_error(),
-                ));
-            }
+            other => return Err(CoordinatorLinkError::UnexpectedMessage(other.kind_name())),
         };
-        if let Some(expected) = expected_worker {
-            if expected != worker {
-                return Err(CoordinatorLinkError::UnexpectedWorker {
-                    expected,
-                    received: worker,
-                });
-            }
+        if let Some(expected) = expected_worker
+            && expected != worker
+        {
+            return Err(CoordinatorLinkError::UnexpectedWorker {
+                expected,
+                received: worker,
+            });
         }
         let summary = peer.receive().await?;
         let summary: WorkerMessage = summary.body.decode_json()?;
@@ -103,11 +120,23 @@ impl CoordinatorWorkerLink {
                 received: summary.worker,
             });
         }
+        let (mut reader, writer) = peer.into_split();
+        let reader_worker = worker.clone();
+        let reader = tokio::spawn(async move {
+            loop {
+                let frame = read_message(&mut reader).await;
+                let done = frame.is_err();
+                if frames.send((reader_worker.clone(), frame)).is_err() || done {
+                    return;
+                }
+            }
+        });
         Ok((
             Self {
-                peer,
+                writer,
                 worker,
                 next_correlation: 1,
+                reader,
             },
             summary,
         ))
@@ -119,89 +148,70 @@ impl CoordinatorWorkerLink {
     }
 
     /// Sends a coordinator command to the worker.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the command cannot be encoded or written.
     pub async fn send_command(
         &mut self,
         command: &WorkerCommand,
     ) -> Result<(), CoordinatorLinkError> {
-        let correlation = self.next_correlation;
-        self.next_correlation = self.next_correlation.saturating_add(1);
-        self.peer
-            .send(&WireMessage::new(
-                0,
-                correlation,
-                WireBody::json_payload(command)?,
-            ))
-            .await?;
-        Ok(())
+        let body = WireBody::json_payload(command)?;
+        self.send(body).await
     }
 
-    /// Receives the next worker message, acknowledging worker heartbeats.
-    pub async fn receive(&mut self) -> Result<WorkerMessage, CoordinatorLinkError> {
-        loop {
-            match self.receive_event().await? {
-                CoordinatorLinkEvent::Message(message) => return Ok(message),
-                CoordinatorLinkEvent::Heartbeat { .. } => {}
-            }
-        }
-    }
-
-    /// Receives the next worker event and acknowledges heartbeats.
-    pub async fn receive_event(&mut self) -> Result<CoordinatorLinkEvent, CoordinatorLinkError> {
-        let message = self.peer.receive().await?;
+    /// Interprets one frame from this worker, acknowledging heartbeats.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the frame is an error, a goodbye, or not valid on a
+    /// coordinator link.
+    pub async fn accept_frame(
+        &mut self,
+        frame: Result<WireMessage, WireError>,
+    ) -> Result<CoordinatorLinkEvent, CoordinatorLinkError> {
+        let message = frame?;
         match message.body {
             WireBody::Payload { .. } => {
                 Ok(CoordinatorLinkEvent::Message(message.body.decode_json()?))
             }
             WireBody::Heartbeat { sent_at_us } => {
-                self.peer
-                    .send(&WireMessage::new(
-                        0,
-                        message.correlation,
-                        WireBody::HeartbeatAck {
-                            received_at_us: sent_at_us,
-                        },
-                    ))
-                    .await?;
+                self.send(WireBody::HeartbeatAck {
+                    echo_sent_at_us: sent_at_us,
+                })
+                .await?;
                 Ok(CoordinatorLinkEvent::Heartbeat {
                     epoch: message.sender_epoch,
                     sent_at_us,
                 })
             }
             WireBody::Goodbye { .. } => Err(CoordinatorLinkError::Wire(WireError::Truncated)),
-            other => Err(CoordinatorLinkError::UnexpectedMessage(
-                other.kind_name_for_error(),
-            )),
+            other => Err(CoordinatorLinkError::UnexpectedMessage(other.kind_name())),
         }
     }
 
     /// Asks the worker to close the connection gracefully.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the goodbye cannot be written.
     pub async fn close(&mut self) -> Result<(), CoordinatorLinkError> {
-        self.peer
-            .send(&WireMessage::new(
-                0,
-                self.next_correlation,
-                WireBody::Goodbye {
-                    reason: Some("coordinator shutdown".into()),
-                },
-            ))
-            .await?;
+        self.send(WireBody::Goodbye {
+            reason: Some("coordinator shutdown".into()),
+        })
+        .await
+    }
+
+    async fn send(&mut self, body: WireBody) -> Result<(), CoordinatorLinkError> {
+        let correlation = self.next_correlation;
         self.next_correlation = self.next_correlation.saturating_add(1);
+        write_message(&mut self.writer, &WireMessage::new(0, correlation, body)).await?;
         Ok(())
     }
 }
 
-trait WireBodyKind {
-    fn kind_name_for_error(&self) -> &'static str;
-}
-
-impl WireBodyKind for WireBody {
-    fn kind_name_for_error(&self) -> &'static str {
-        match self {
-            Self::Hello { .. } => "hello",
-            Self::Heartbeat { .. } => "heartbeat",
-            Self::HeartbeatAck { .. } => "heartbeat_ack",
-            Self::Payload { .. } => "payload",
-            Self::Goodbye { .. } => "goodbye",
-        }
+impl Drop for CoordinatorWorkerLink {
+    fn drop(&mut self) {
+        self.reader.abort();
     }
 }

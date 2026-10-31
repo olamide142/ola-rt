@@ -88,10 +88,12 @@ pub enum WireBody {
         /// Sender-clock timestamp when the heartbeat was emitted.
         sent_at_us: u64,
     },
-    /// Reply to a heartbeat, carrying the receiver's clock reading.
+    /// Reply to a heartbeat. It echoes the heartbeat's own timestamp, so
+    /// the original sender can measure the round trip on its own clock.
     HeartbeatAck {
-        /// Receiver-clock timestamp when the heartbeat was received.
-        received_at_us: u64,
+        /// The acknowledged heartbeat's `sent_at_us`, in the original
+        /// sender's clock domain.
+        echo_sent_at_us: u64,
     },
     /// Opaque domain payload. Cluster commands/messages are kept out of the
     /// wire crate until their serde representation is part of the stable
@@ -131,7 +133,8 @@ impl WireBody {
         }
     }
 
-    const fn kind_name(&self) -> &'static str {
+    /// The body's stable `kind` tag, for diagnostics.
+    pub const fn kind_name(&self) -> &'static str {
         match self {
             Self::Hello { .. } => "hello",
             Self::Heartbeat { .. } => "heartbeat",
@@ -147,6 +150,9 @@ pub async fn write_binary_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &BinaryFrame,
 ) -> Result<(), WireError> {
+    if frame.version != PROTOCOL_VERSION {
+        return Err(WireError::UnsupportedVersion(frame.version));
+    }
     let header = serde_json::to_vec(&BinaryHeader {
         version: frame.version,
         sender_epoch: frame.sender_epoch,
@@ -175,26 +181,32 @@ pub async fn write_binary_frame<W: AsyncWrite + Unpin>(
 pub async fn read_binary_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<BinaryFrame, WireError> {
-    let payload_len = reader.read_u32().await? as usize;
+    let payload_len = reader.read_u32().await.map_err(truncated)? as usize;
     if payload_len > MAX_BINARY_FRAME_BYTES || payload_len < 4 {
         return Err(WireError::InvalidLength(payload_len as u32));
     }
-    let header_len = reader.read_u32().await? as usize;
+    let header_len = reader.read_u32().await.map_err(truncated)? as usize;
     if header_len > payload_len.saturating_sub(4) {
         return Err(WireError::InvalidLength(header_len as u32));
     }
     let mut header_bytes = vec![0; header_len];
-    reader.read_exact(&mut header_bytes).await?;
+    reader
+        .read_exact(&mut header_bytes)
+        .await
+        .map_err(truncated)?;
     let header: BinaryHeader = serde_json::from_slice(&header_bytes)?;
+    if header.version != PROTOCOL_VERSION {
+        return Err(WireError::UnsupportedVersion(header.version));
+    }
     let metadata_len = header.metadata_len as usize;
     let remaining = payload_len.saturating_sub(4).saturating_sub(header_len);
     if metadata_len > remaining {
         return Err(WireError::InvalidLength(header.metadata_len));
     }
     let mut metadata = vec![0; metadata_len];
-    reader.read_exact(&mut metadata).await?;
+    reader.read_exact(&mut metadata).await.map_err(truncated)?;
     let mut data = vec![0; remaining - metadata_len];
-    reader.read_exact(&mut data).await?;
+    reader.read_exact(&mut data).await.map_err(truncated)?;
     Ok(BinaryFrame {
         version: header.version,
         sender_epoch: header.sender_epoch,
@@ -332,29 +344,26 @@ pub async fn read_message<R>(reader: &mut R) -> Result<WireMessage, WireError>
 where
     R: AsyncRead + Unpin,
 {
-    let length = match reader.read_u32().await {
-        Ok(length) => length,
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(WireError::Truncated);
-        }
-        Err(error) => return Err(WireError::Io(error)),
-    };
+    let length = reader.read_u32().await.map_err(truncated)?;
     if usize::try_from(length).unwrap_or(usize::MAX) > MAX_MESSAGE_BYTES {
         return Err(WireError::InvalidLength(length));
     }
     let mut payload = vec![0; length as usize];
-    reader.read_exact(&mut payload).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            WireError::Truncated
-        } else {
-            WireError::Io(error)
-        }
-    })?;
+    reader.read_exact(&mut payload).await.map_err(truncated)?;
     let message: WireMessage = serde_json::from_slice(&payload)?;
     if message.version != PROTOCOL_VERSION {
         return Err(WireError::UnsupportedVersion(message.version));
     }
     Ok(message)
+}
+
+/// Maps an early end of stream to [`WireError::Truncated`].
+fn truncated(error: std::io::Error) -> WireError {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        WireError::Truncated
+    } else {
+        WireError::Io(error)
+    }
 }
 
 #[cfg(test)]
@@ -428,7 +437,7 @@ mod tests {
                 9,
                 message.correlation,
                 WireBody::HeartbeatAck {
-                    received_at_us: 123,
+                    echo_sent_at_us: 123,
                 },
             ))
             .await
@@ -448,7 +457,7 @@ mod tests {
         assert_eq!(
             reply.body,
             WireBody::HeartbeatAck {
-                received_at_us: 123
+                echo_sent_at_us: 123
             }
         );
         server.await.unwrap();
@@ -470,6 +479,39 @@ mod tests {
         let received = read_binary_frame(&mut right).await.unwrap();
         write.await.unwrap().unwrap();
         assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn binary_frames_reject_other_versions_and_report_truncation() {
+        let mut frame = BinaryFrame {
+            version: PROTOCOL_VERSION + 1,
+            sender_epoch: 0,
+            correlation: 0,
+            content_type: "application/x-ola-kv".into(),
+            metadata: Vec::new(),
+            data: vec![1, 2, 3],
+        };
+        let (mut left, _right) = duplex(1024);
+        assert!(matches!(
+            write_binary_frame(&mut left, &frame).await,
+            Err(WireError::UnsupportedVersion(_))
+        ));
+
+        frame.version = PROTOCOL_VERSION;
+        let (mut left, mut right) = duplex(1024);
+        write_binary_frame(&mut left, &frame).await.unwrap();
+        let mut bytes = vec![0; 64];
+        let read = tokio::io::AsyncReadExt::read(&mut right, &mut bytes)
+            .await
+            .unwrap();
+        // Replay the frame without its last byte, then close the stream.
+        let (mut short_writer, mut short_reader) = duplex(1024);
+        short_writer.write_all(&bytes[..read - 1]).await.unwrap();
+        drop(short_writer);
+        assert!(matches!(
+            read_binary_frame(&mut short_reader).await,
+            Err(WireError::Truncated)
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The sans-IO cluster coordinator.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     fmt,
     time::Duration,
@@ -154,6 +154,22 @@ pub enum WorkerMessage {
     },
 }
 
+impl WorkerMessage {
+    /// The cluster request the message reports on, if any.
+    pub const fn request(&self) -> Option<ClusterRequestId> {
+        match self {
+            Self::Accepted { request, .. }
+            | Self::Refused { request, .. }
+            | Self::Token { request, .. }
+            | Self::Finished { request, .. }
+            | Self::Failed { request, .. }
+            | Self::Cancelled { request }
+            | Self::Migrated { request, .. } => Some(*request),
+            Self::Summary(_) | Self::PolicyUpdated { .. } | Self::RoleUpdated { .. } => None,
+        }
+    }
+}
+
 /// What a client sees about its request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientEvent {
@@ -301,6 +317,12 @@ pub enum ClusterTraceEvent {
         /// Owner at cancellation, if one had been assigned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker: Option<WorkerId>,
+    },
+    /// A former owner reported on a request that recovery had moved away;
+    /// the coordinator asked it to cancel its stale copy.
+    Superseded {
+        /// Former owner still running the request.
+        worker: WorkerId,
     },
     /// A migration was accepted by its target worker.
     Migrated {
@@ -454,6 +476,13 @@ struct RequestEntry {
     spec: RequestSpec,
     arrival_at: Timestamp,
     status: ClusterRequestStatus,
+    /// Highest `generated_tokens` already delivered to the client. A
+    /// recovered request restarts on a new worker; its tokens up to here are
+    /// replays and are not delivered again.
+    delivered_tokens: usize,
+    /// Workers that owned the request before recovery moved it. Their late
+    /// reports are stale rather than protocol errors.
+    former_owners: Vec<WorkerId>,
 }
 
 /// Owns cluster-level request state and routes work to workers.
@@ -471,8 +500,21 @@ pub struct Coordinator {
     routed: u64,
     generation: u64,
     iterations: u64,
-    migrations: BTreeMap<ClusterRequestId, (WorkerId, RequestId, WorkerId, String, u64)>,
+    migrations: BTreeMap<ClusterRequestId, StagedMigration>,
     network_costs_us: BTreeMap<WorkerId, u64>,
+    /// Commands produced outside a call that returns output, such as
+    /// migration aborts during recovery; see [`Coordinator::take_commands`].
+    outbox: Vec<(WorkerId, WorkerCommand)>,
+}
+
+/// A migration whose target has been asked to admit the request.
+#[derive(Clone)]
+struct StagedMigration {
+    source: WorkerId,
+    source_local: RequestId,
+    target: WorkerId,
+    mode: String,
+    bytes: u64,
 }
 
 impl Coordinator {
@@ -489,6 +531,7 @@ impl Coordinator {
             iterations: 0,
             migrations: BTreeMap::new(),
             network_costs_us: BTreeMap::new(),
+            outbox: Vec::new(),
         }
     }
 
@@ -581,9 +624,14 @@ impl Coordinator {
     /// Requeues requests owned by workers whose leases have expired.
     ///
     /// The request specification remains in coordinator state, so a new plan
-    /// can admit it on another worker. This is the recompute recovery path;
-    /// callers that have a [`MigratedRequest`] may instead use the explicit
-    /// worker migration commands to preserve generated tokens.
+    /// can admit it on another worker. This is the recompute recovery path:
+    /// the new owner regenerates from the prompt, and tokens the client
+    /// already received are not delivered again. That replay matches only
+    /// when generation is deterministic (greedy or seeded sampling). A staged
+    /// migration whose target is lost is rolled back to its source instead;
+    /// the resulting `AbortMigration` command is in [`take_commands`].
+    ///
+    /// [`take_commands`]: Self::take_commands
     pub fn recover_lost_requests(
         &mut self,
         now: Timestamp,
@@ -593,44 +641,67 @@ impl Coordinator {
         if expired.is_empty() {
             return Vec::new();
         }
-        let lost = expired.iter().collect::<std::collections::BTreeSet<_>>();
-        let mut recovered = Vec::new();
-        for (request, entry) in &mut self.requests {
-            let owner = entry.status.owner();
-            if owner.is_some_and(|worker| lost.contains(worker)) {
-                entry.status = ClusterRequestStatus::Pending;
-                self.pending.push(*request);
-                recovered.push(*request);
-            }
-        }
-        self.generation += recovered.len() as u64;
-        recovered
+        self.requeue_owned_by(&expired.into_iter().collect(), now)
     }
 
     /// Marks one worker lost and requeues its owned requests immediately.
     ///
-    /// Virtual-time simulations use this deterministic hook to model a
-    /// worker disappearing without waiting for wall-clock lease expiry.
+    /// Virtual-time simulations and connection loss use this to model a
+    /// worker disappearing without waiting for lease expiry. Recovery
+    /// follows [`recover_lost_requests`](Self::recover_lost_requests).
     pub fn recover_worker(
         &mut self,
         worker: &WorkerId,
-        _now: Timestamp,
+        now: Timestamp,
     ) -> Result<Vec<ClusterRequestId>, CoordinatorError> {
         let entry = self
             .workers
             .get_mut(worker)
             .ok_or_else(|| CoordinatorError::UnknownWorker(worker.clone()))?;
         entry.summary.health = WorkerHealth::Lost;
-        let mut recovered = Vec::new();
-        for (request, request_entry) in &mut self.requests {
-            if request_entry.status.owner() == Some(worker) {
-                request_entry.status = ClusterRequestStatus::Pending;
-                self.pending.push(*request);
-                recovered.push(*request);
+        self.generation = self.generation.saturating_add(1);
+        Ok(self.requeue_owned_by(&BTreeSet::from([worker.clone()]), now))
+    }
+
+    fn requeue_owned_by(
+        &mut self,
+        lost: &BTreeSet<WorkerId>,
+        now: Timestamp,
+    ) -> Vec<ClusterRequestId> {
+        // A staged migration to a lost target goes back to a live source,
+        // which still holds the exported state.
+        let rolled_back = self
+            .migrations
+            .iter()
+            .filter(|(_, staged)| lost.contains(&staged.target) && !lost.contains(&staged.source))
+            .map(|(request, staged)| (*request, staged.source.clone()))
+            .collect::<Vec<_>>();
+        for (request, source) in rolled_back {
+            if self.rollback_migration(request, &source).is_ok() {
+                self.outbox
+                    .push((source, WorkerCommand::AbortMigration { request }));
             }
         }
-        self.generation = self.generation.saturating_add(1 + recovered.len() as u64);
-        Ok(recovered)
+        let mut recovered = Vec::new();
+        for (request, entry) in &mut self.requests {
+            let Some(owner) = entry.status.owner().filter(|owner| lost.contains(*owner)) else {
+                continue;
+            };
+            entry.former_owners.push(owner.clone());
+            entry.status = ClusterRequestStatus::Pending;
+            self.pending.push(*request);
+            self.migrations.remove(request);
+            recovered.push(*request);
+        }
+        let _ = now;
+        self.generation = self.generation.saturating_add(recovered.len() as u64);
+        recovered
+    }
+
+    /// Drains commands produced by recovery, which has no output of its own.
+    /// Deliver them before the next plan's commands.
+    pub fn take_commands(&mut self) -> Vec<(WorkerId, WorkerCommand)> {
+        std::mem::take(&mut self.outbox)
     }
 
     /// Latest summary of each joined worker, in ID order.
@@ -666,6 +737,8 @@ impl Coordinator {
                 spec,
                 arrival_at: at,
                 status: ClusterRequestStatus::Pending,
+                delivered_tokens: 0,
+                former_owners: Vec::new(),
             },
         );
         self.pending.push(id);
@@ -772,7 +845,13 @@ impl Coordinator {
             .unwrap_or_else(|| ("recompute".to_owned(), 0));
         self.migrations.insert(
             request,
-            (source.clone(), source_local, target.clone(), mode, bytes),
+            StagedMigration {
+                source: source.clone(),
+                source_local,
+                target: target.clone(),
+                mode,
+                bytes,
+            },
         );
         worker.assigned = worker.assigned.saturating_add(1);
         worker
@@ -793,23 +872,26 @@ impl Coordinator {
     }
 
     /// Rolls a staged migration back to the source owner.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no migration of `request` from `source` is staged.
     pub fn rollback_migration(
         &mut self,
         request: ClusterRequestId,
         source: &WorkerId,
     ) -> Result<(), CoordinatorError> {
-        let Some((original_source, local, target, _, _)) = self.migrations.get(&request).cloned()
-        else {
+        let Some(staged) = self.migrations.get(&request).cloned() else {
             return Err(CoordinatorError::UnknownRequest(request));
         };
-        if &original_source != source {
+        if &staged.source != source {
             return Err(CoordinatorError::UnexpectedMessage {
                 from: source.clone(),
                 request,
             });
         }
         self.migrations.remove(&request);
-        if let Some(worker) = self.workers.get_mut(&target) {
+        if let Some(worker) = self.workers.get_mut(&staged.target) {
             worker.assigned = worker.assigned.saturating_sub(1);
             worker.in_flight_tokens.pop_back();
         }
@@ -818,34 +900,34 @@ impl Coordinator {
             .get_mut(&request)
             .ok_or(CoordinatorError::UnknownRequest(request))?;
         entry.status = ClusterRequestStatus::Running {
-            worker: original_source,
-            local,
+            worker: staged.source,
+            local: staged.source_local,
         };
         self.generation = self.generation.saturating_add(1);
         Ok(())
     }
 
-    /// Clears the source-side bookkeeping after target admission succeeds.
+    /// Records a staged migration as committed once its target accepted it.
+    ///
+    /// The source's load accounting is left alone: it counted the request
+    /// when it was admitted there, and the source's summary stops counting
+    /// it once the export is committed.
     pub fn finish_migration(
         &mut self,
         request: ClusterRequestId,
         at: Timestamp,
     ) -> CoordinatorOutput {
         let mut output = CoordinatorOutput::default();
-        if let Some((source, _, target, mode, bytes)) = self.migrations.remove(&request) {
-            if let Some(worker) = self.workers.get_mut(&source) {
-                worker.assigned = worker.assigned.saturating_sub(1);
-                worker.in_flight_tokens.pop_back();
-            }
+        if let Some(staged) = self.migrations.remove(&request) {
             output.record(
                 request,
                 None,
                 at,
                 ClusterTraceEvent::Migrated {
-                    from: source,
-                    to: target,
-                    mode,
-                    bytes,
+                    from: staged.source,
+                    to: staged.target,
+                    mode: staged.mode,
+                    bytes: staged.bytes,
                 },
             );
         }
@@ -1023,6 +1105,31 @@ impl Coordinator {
             return Err(CoordinatorError::UnknownWorker(from.clone()));
         }
         let mut output = CoordinatorOutput::default();
+        if let Some(request) = message.request()
+            && self.is_stale(from, request)
+        {
+            // A worker that recovery gave up on came back still running the
+            // request. Its reports are dropped, and a live copy is cancelled.
+            if matches!(message, WorkerMessage::Accepted { .. }) {
+                output.record(
+                    request,
+                    None,
+                    at,
+                    ClusterTraceEvent::Superseded {
+                        worker: from.clone(),
+                    },
+                );
+            }
+            if matches!(
+                message,
+                WorkerMessage::Accepted { .. } | WorkerMessage::Token { .. }
+            ) {
+                output
+                    .commands
+                    .push((from.clone(), WorkerCommand::Cancel { request }));
+            }
+            return Ok(output);
+        }
         let request = match message {
             WorkerMessage::Summary(summary) => {
                 if &summary.worker != from {
@@ -1084,7 +1191,12 @@ impl Coordinator {
                 phase,
                 at: token_at,
             } => {
-                self.owned(from, request, true)?;
+                let entry = self.owned(from, request, true)?;
+                if generated_tokens <= entry.delivered_tokens {
+                    // A recovered request replaying output the client has.
+                    return Ok(output);
+                }
+                entry.delivered_tokens = generated_tokens;
                 output.client.push((
                     request,
                     ClientEvent::Token {
@@ -1172,6 +1284,20 @@ impl Coordinator {
         debug_assert!(self.requests.contains_key(&request));
         self.generation += 1;
         Ok(output)
+    }
+
+    /// Whether `from` reports on a request it owned before recovery moved it.
+    fn is_stale(&self, from: &WorkerId, request: ClusterRequestId) -> bool {
+        self.requests.get(&request).is_some_and(|entry| {
+            entry.status.owner() != Some(from) && entry.former_owners.contains(from)
+        })
+    }
+
+    /// The source and target of a staged migration of `request`.
+    pub fn staged_migration(&self, request: ClusterRequestId) -> Option<(&WorkerId, &WorkerId)> {
+        self.migrations
+            .get(&request)
+            .map(|staged| (&staged.source, &staged.target))
     }
 
     /// The entry for a request `from` owns. With `accepted`, the worker must

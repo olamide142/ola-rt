@@ -17,7 +17,7 @@ mod transfer;
 mod worker;
 
 pub use adaptive::{AdaptiveClusterPolicy, ClusterWeights};
-pub use client::{CoordinatorLinkError, CoordinatorLinkEvent, CoordinatorWorkerLink};
+pub use client::{CoordinatorLinkError, CoordinatorLinkEvent, CoordinatorWorkerLink, LinkFrame};
 pub use coordinator::{
     ClientEvent, ClusterIteration, ClusterRequestStatus, ClusterTraceEvent, ClusterTraceRecord,
     Coordinator, CoordinatorError, CoordinatorOutput, WorkerCommand, WorkerMessage,
