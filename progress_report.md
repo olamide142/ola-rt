@@ -2,6 +2,15 @@
 
 **Last updated:** 2026-10-24 14:18 BST (Europe/London)
 
+**2026-10-31 distributed continuation:** Supported architecture-specific
+`SessionState` is now consumed during destination admission rather than merely
+carried in the migration envelope. The runtime promotes an imported session
+directly to decode-ready state and keeps token recompute as the fallback when a
+model returns `None`; a regression test proves there is no duplicate prefill
+token. Burn Llama and Mistral both have versioned session export/import tests.
+The remaining D3/D4 gaps are coordinator-managed two-phase ownership handoff,
+raw KV-byte transfer/disaggregation, and simulator failure injection.
+
 **2026-10-30 distributed continuation:** The TCP worker session now uses a
 dedicated frame reader so cancellation-safe heartbeats and payloads cannot
 corrupt length-prefixed reads; loopback handshake, lease refresh, command

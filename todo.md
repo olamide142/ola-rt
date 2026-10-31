@@ -298,12 +298,13 @@ coordinator and cluster policy) and `ola-net` (wire protocol and transports).
   routes are covered, while deeper request-level backend unification remains.
 - [~] D3: `export_request`/`import_request`, recompute migration, drain, and
   lease-expiry recovery with failure injection. Runtime and worker protocol
-  hooks plus coordinator requeue recovery are implemented; end-to-end
-  ownership handoff and simulator failure injection remain.
+  hooks plus coordinator requeue recovery are implemented; supported session
+  snapshots now enter the destination decode-ready path, while end-to-end
+  coordinator ownership handoff and simulator failure injection remain.
 - [~] D4: KV session export/import in Burn models, binary KV frames,
   prefill/decode disaggregation, transfer-vs-recompute policy choice.
-  The optional `SessionState` model hook is now carried through migration
-  envelopes alongside the recompute fallback; architecture-specific KV
+  Llama and Mistral now export and import versioned recompute-safe session
+  snapshots through the runtime migration path; raw architecture-specific KV
   producers/consumers and disaggregation remain.
 - [~] D5: `AdaptiveClusterPolicy`, θ push to worker adaptive policies, MILP
   placement and batch routing, link calibration. A transactional adaptive

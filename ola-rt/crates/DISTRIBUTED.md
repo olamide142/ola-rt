@@ -1,6 +1,7 @@
 # Distributed execution design
 
-Status: **proposed** (2026-10-29). Covers `todo.md` P9, which replaces the
+Status: **implemented through the D5 foundation; final D3–D5 integration gaps
+remain** (2026-10-31). Covers `todo.md` P9, which replaces the
 "multi-GPU placement", "distributed request routing", "distributed KV-cache
 management", and "tensor and pipeline parallelism" bullets under later work.
 

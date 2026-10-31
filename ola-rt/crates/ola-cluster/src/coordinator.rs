@@ -517,7 +517,7 @@ impl Coordinator {
     /// Expires workers whose lease has been silent for `timeout`.
     ///
     /// This only changes routing eligibility. Requests remain owned by the
-    /// worker until D3 recovery/migration is implemented.
+    /// worker until recovery or an explicit migration handoff completes.
     pub fn expire_workers(&mut self, now: Timestamp, timeout: Duration) -> Vec<WorkerId> {
         let expired = self
             .workers
