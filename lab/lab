@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# OlaRT lab notebook: create, run, compare, and list experiment entries.
+#
+#   lab/lab new <slug> <experiment-id> [key=value ...] [--model DIR] [--backend cpu|wgpu|cuda]
+#               [--features cubecl-cpu|wgpu|cuda]
+#   lab/lab run <entry-dir>              # run again (replication); adds a report
+#   lab/lab compare <entry-dir>          # compare the entry's first and latest reports
+#   lab/lab compare <a.json> <b.json>    # compare any two reports
+#   lab/lab list                         # one line per entry; also rewrites lab/INDEX.md
+#
+# An entry is lab/notebook/<date>-<slug>/ holding config.json (what ran),
+# args (model/backend flags), features (cargo features, if any), notes.md (your question, prediction, and
+# findings), reports/ (versioned experiment reports, never overwritten),
+# runs/ (each run's printed summary), runs.log (revision and time of each
+# run), and traces/ (JSON Lines traces; not committed). See lab/README.md.
+set -euo pipefail
+
+LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$LAB")"
+MANIFEST="$ROOT/ola-rt/Cargo.toml"
+NOTEBOOK="$LAB/notebook"
+
+die() {
+	echo "lab: $*" >&2
+	exit 2
+}
+
+usage() {
+	sed -n '2,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+	exit 2
+}
+
+# Builds `ola` in release mode with the features a backend needs plus any
+# extra features, and prints the binary's path. Release keeps host-time
+# studies meaningful. Each feature set gets its own target directory, so
+# switching between them does not rebuild everything.
+build_ola() {
+	local backend="$1" extra="${2:-}" list=()
+	case "$backend" in
+	cpu | "") ;;
+	wgpu | cuda) list+=("$backend") ;;
+	*) die "unknown backend '$backend'" ;;
+	esac
+	[ -z "$extra" ] || list+=("$extra")
+	local features=() target="$ROOT/ola-rt/target"
+	if [ ${#list[@]} -gt 0 ]; then
+		local joined
+		joined="$(printf '%s\n' "${list[@]}" | sort -u | paste -sd, -)"
+		features=(--features "$joined")
+		target="$ROOT/ola-rt/target/lab-${joined//,/-}"
+	fi
+	CARGO_TARGET_DIR="$target" cargo build --quiet --release --manifest-path "$MANIFEST" \
+		-p ola-cli "${features[@]+"${features[@]}"}" >&2
+	echo "$target/release/ola"
+}
+
+revision() {
+	local rev dirty=""
+	rev="$(git -C "$ROOT" rev-parse --short HEAD)"
+	git -C "$ROOT" diff --quiet HEAD -- ola-rt || dirty="+dirty"
+	echo "$rev$dirty"
+}
+
+cmd_new() {
+	[ $# -ge 2 ] || usage
+	local slug="$1" id="$2" model="" backend="cpu" features=""
+	shift 2
+	[[ "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "slug must be lowercase letters, digits, and dashes"
+	local pairs=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--model) model="$2"; shift 2 ;;
+		--backend) backend="$2"; shift 2 ;;
+		--features) features="$2"; shift 2 ;;
+		*=*) pairs+=("$1"); shift ;;
+		*) die "expected key=value, --model, or --backend, got '$1'" ;;
+		esac
+	done
+	local entry="$NOTEBOOK/$(date +%F)-$slug"
+	[ ! -e "$entry" ] || die "$entry already exists; pick another slug or use 'lab run'"
+	local ola
+	ola="$(build_ola "$backend" "$features")"
+	local experiments
+	experiments="$("$ola" experiment list)"
+	grep -q "^$id " <<<"$experiments" ||
+		die "unknown experiment '$id' in this build; see 'make experiments' (kernel studies need --features)"
+
+	mkdir -p "$entry/reports" "$entry/runs" "$entry/traces"
+	python3 - "$entry/config.json" "$id" "${pairs[@]+"${pairs[@]}"}" <<'EOF'
+import json, sys
+path, experiment, *pairs = sys.argv[1:]
+parameters = dict(pair.split("=", 1) for pair in pairs)
+with open(path, "w") as out:
+    json.dump({"id": experiment, "parameters": parameters}, out, indent=2, sort_keys=True)
+    out.write("\n")
+EOF
+	{
+		[ -z "$model" ] || printf -- '--model\n%s\n' "$model"
+		printf -- '--backend\n%s\n' "$backend"
+	} >"$entry/args"
+	printf '%s\n' "$features" >"$entry/features"
+	local title="${slug//-/ }"
+	sed -e "s|{{TITLE}}|${title^}|" \
+		-e "s|{{DATE}}|$(date +%F)|" \
+		-e "s|{{EXPERIMENT}}|$id|" \
+		-e "s|{{REVISION}}|$(revision)|" \
+		-e "s|{{ENTRY}}|${entry#"$ROOT"/}|" \
+		"$LAB/TEMPLATE.md" >"$entry/notes.md"
+	echo "created ${entry#"$ROOT"/}"
+	echo "write your question, hypothesis, and prediction in notes.md before reading results."
+	cmd_run "$entry"
+}
+
+cmd_run() {
+	[ $# -eq 1 ] || usage
+	local entry
+	entry="$(cd "$1" && pwd)" || die "no entry '$1'"
+	[ -f "$entry/config.json" ] || die "$entry has no config.json"
+	local id args=() backend="cpu"
+	id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$entry/config.json")"
+	mapfile -t args <"$entry/args"
+	for ((i = 0; i < ${#args[@]}; i++)); do
+		[ "${args[i]}" != "--backend" ] || backend="${args[i + 1]}"
+	done
+	local ola run trace=() features=""
+	[ ! -f "$entry/features" ] || features="$(cat "$entry/features")"
+	ola="$(build_ola "$backend" "$features")"
+	run="$(printf '%03d' $(($(find "$entry/runs" -name '*.txt' | wc -l) + 1)))"
+	local experiments
+	experiments="$("$ola" experiment list)"
+	if grep -q "^$id .*traceable" <<<"$experiments"; then
+		trace=(--trace "$entry/traces/run-$run.jsonl")
+	fi
+	local rev started
+	rev="$(revision)"
+	started="$(date -Is)"
+	echo "run $run of $id at $rev"
+	"$ola" experiment run "$id" --config "$entry/config.json" "${args[@]}" \
+		--results-dir "$entry/reports" "${trace[@]+"${trace[@]}"}" | tee "$entry/runs/$run.txt"
+	printf '%s\trun %s\t%s\t%s\n' "$started" "$run" "$rev" "$(head -n 1 "$entry/runs/$run.txt")" \
+		>>"$entry/runs.log"
+}
+
+cmd_compare() {
+	local ola baseline candidate
+	ola="$(build_ola cpu)"
+	if [ $# -eq 1 ] && [ -d "$1" ]; then
+		mapfile -t reports < <(find "$1/reports" -name '*.json' | sort)
+		[ ${#reports[@]} -ge 2 ] || die "$1 needs at least two runs to compare; use 'lab run $1'"
+		baseline="${reports[0]}"
+		candidate="${reports[${#reports[@]} - 1]}"
+	elif [ $# -eq 2 ]; then
+		baseline="$1"
+		candidate="$2"
+	else
+		usage
+	fi
+	"$ola" experiment compare "$baseline" "$candidate"
+}
+
+cmd_list() {
+	mkdir -p "$NOTEBOOK"
+	python3 - "$NOTEBOOK" "$LAB/INDEX.md" <<'EOF'
+import json, os, re, sys
+notebook, index = sys.argv[1:]
+rows = []
+for name in sorted(os.listdir(notebook)):
+    entry = os.path.join(notebook, name)
+    notes = os.path.join(entry, "notes.md")
+    if not os.path.isfile(notes):
+        continue
+    text = open(notes).read()
+    def field(label):
+        match = re.search(rf"^- \*\*{label}:\*\* *(.*)$", text, re.M)
+        return match.group(1).strip() if match else ""
+    question = re.search(r"^## Question\s*\n+((?:.+\n?)+)", text, re.M)
+    question = " ".join(question.group(1).split()) if question else ""
+    if question.startswith("<!--"):
+        question = ""
+    runs = len([f for f in os.listdir(os.path.join(entry, "runs")) if f.endswith(".txt")]) \
+        if os.path.isdir(os.path.join(entry, "runs")) else 0
+    experiment = json.load(open(os.path.join(entry, "config.json")))["id"] \
+        if os.path.isfile(os.path.join(entry, "config.json")) else ""
+    rows.append((name, field("Status"), field("Track"), experiment, runs, question))
+lines = ["# Lab index", "", "Generated by `lab/lab list`; edit the entries, not this file.", "",
+         "| Entry | Status | Track | Experiment | Runs | Question |",
+         "| --- | --- | --- | --- | ---: | --- |"]
+for name, status, track, experiment, runs, question in rows:
+    lines.append(f"| [{name}](notebook/{name}/notes.md) | {status} | {track} | `{experiment}` | {runs} | {question} |")
+open(index, "w").write("\n".join(lines) + "\n")
+for name, status, track, experiment, runs, question in rows:
+    print(f"{name:40} {status:10} {experiment:30} runs={runs}  {question[:60]}")
+print(f"\n{len(rows)} entries; index written to lab/INDEX.md")
+EOF
+}
+
+[ $# -ge 1 ] || usage
+command="$1"
+shift
+case "$command" in
+new) cmd_new "$@" ;;
+run) cmd_run "$@" ;;
+compare) cmd_compare "$@" ;;
+list) cmd_list "$@" ;;
+*) usage ;;
+esac

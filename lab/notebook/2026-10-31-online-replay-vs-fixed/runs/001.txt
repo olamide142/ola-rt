@@ -1,0 +1,2 @@
+10 held-out phased traces; fixed max_tokens=512, max_prefill_tokens=384 · online: objective 80.0 ms · online-warm: objective 74.5 ms · fixed: objective 73.7 ms · fifo: objective 73.7 ms · study, virtual time
+saved /home/olamide/dev/ola-rt/lab/notebook/2026-10-31-online-replay-vs-fixed/reports/online-adaptive-policy-study-1793450100197754-0.json

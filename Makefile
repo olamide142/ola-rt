@@ -14,10 +14,11 @@ ADDR ?= 127.0.0.1:8080
 
 .PHONY: help fmt fmt-check check test clippy doc verify \
 	check-wgpu check-cuda gpu-info ui ui-wgpu llama llama-wgpu \
-	test-fixture test-gpu-fixture require-model experiments experiment require-id serve
+	test-fixture test-gpu-fixture require-model experiments experiment require-id serve \
+	lab-new lab-run lab-compare lab-list
 
 help: ## Show available commands and configurable variables.
-	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results ID=experiment-id SET=\"key=value ...\" ADDR=127.0.0.1:8080"}' Makefile
+	@awk 'BEGIN {FS = ":.*## "; print "OlaRT developer commands:\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2} END {print "\nVariables: MODEL=/path/to/artifact PROMPT=Hello TOKENS=8 RESULTS_DIR=/path/to/results ID=experiment-id SET=\"key=value ...\" ADDR=127.0.0.1:8080 NAME=slug ENTRY=lab/notebook/<entry> BACKEND=cpu FEATURES=cubecl-cpu"}' Makefile
 
 fmt: ## Format every Rust crate.
 	$(CARGO) fmt --manifest-path $(MANIFEST) --all
@@ -81,3 +82,18 @@ require-id:
 
 require-model:
 	@test -n "$(MODEL)" || { echo "MODEL=/path/to/llama-artifact is required" >&2; exit 2; }
+
+lab-new: require-id ## New lab entry NAME (slug) for ID; SET, MODEL, BACKEND, FEATURES optional.
+	@test -n "$(NAME)" || { echo "NAME=<slug> is required" >&2; exit 2; }
+	lab/lab new "$(NAME)" "$(ID)" $(SET) $(if $(MODEL),--model "$(MODEL)",) $(if $(BACKEND),--backend "$(BACKEND)",) $(if $(FEATURES),--features "$(FEATURES)",)
+
+lab-run: ## Run a lab entry again: ENTRY=lab/notebook/<entry>.
+	@test -n "$(ENTRY)" || { echo "ENTRY=lab/notebook/<entry> is required" >&2; exit 2; }
+	lab/lab run "$(ENTRY)"
+
+lab-compare: ## Compare an entry's first and latest reports: ENTRY=lab/notebook/<entry>.
+	@test -n "$(ENTRY)" || { echo "ENTRY=lab/notebook/<entry> is required" >&2; exit 2; }
+	lab/lab compare "$(ENTRY)"
+
+lab-list: ## List lab entries and rewrite lab/INDEX.md.
+	lab/lab list

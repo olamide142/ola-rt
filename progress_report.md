@@ -1245,6 +1245,21 @@ Update this file whenever a meaningful capability is merged. Each update should:
   migration, lease-based recovery, and a hierarchical optimization loop that
   reuses `AdaptiveOptimizer` and MILP. Added P9 (D0–D6) to `todo.md`.
 
+- **2026-10-31 — research lab:** Added `lab/`: a notebook tool (`lab/lab`,
+  `make lab-new|lab-run|lab-compare|lab-list`) that creates dated entries
+  recording the configuration, git revision, versioned reports, traces, and
+  notes from a findings template; a graded curriculum (`lab/CURRICULUM.md`)
+  across the runtime loop, batching, scheduling, memory, adaptive
+  optimization, clusters, kernels, and Rust; and rules for honest results
+  learned from this project's mistakes. The first entry replicates
+  `online-adaptive-policy-study` exactly across revisions. Rewrote
+  `TESTING_GUIDE.md` against the real CLI (the trace `jq` filter and the
+  gateway's claimed migration support were wrong). `make verify` passes
+  again: it had been failing on formatting and 16 Clippy warnings. The two
+  adaptive studies now actually write the traces they advertise, and
+  `ola-cli` exposes the kernel studies (`wgpu` now enables them;
+  new `cubecl-cpu` feature).
+
 - **2026-10-31 — adaptive serving:** `ola serve --adaptive REPORT` installs
   the online replay policy, replaying with the cost model from a saved
   `cost-calibration` report (checked before the model loads). It starts from

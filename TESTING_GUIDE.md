@@ -1,221 +1,303 @@
-# OlaRT Testing Guide
+# OlaRT testing and experiment guide
 
-This guide lists the runnable functionality, experiments, serving modes, and validation commands in the current repository.
+How to validate the runtime, run every experiment, serve models alone or as
+a cluster, and record what you find. For the research workflow (notebook
+entries, predictions, findings) see [`lab/README.md`](lab/README.md); for a
+graded list of experiments to learn from, see
+[`lab/CURRICULUM.md`](lab/CURRICULUM.md).
 
-Run from the repository root:
+Run everything from the repository root. `make help` lists every target and
+variable.
 
-~~~bash
-cd /home/olamide/dev/ola-rt
-~~~
+## 1. Validate the code
 
-## Baseline validation
+```bash
+make verify        # fmt-check, check, test, clippy (warnings denied), doc
+```
 
-~~~bash
-make check
-make test
-make clippy
-make doc
-make verify
-~~~
+`make verify` is the gate to pass before committing code or running
+experiments you intend to cite. Its parts:
 
-Targeted commands:
+| Target | What it does |
+| --- | --- |
+| `make fmt` / `make fmt-check` | Format, or check formatting of, every crate. |
+| `make check` | Type-check all targets, including tests and examples. |
+| `make test` | Run the default (CPU) test suite. |
+| `make clippy` | Lint with warnings as errors. |
+| `make doc` | Build API docs; fails on broken doc links. |
 
-~~~bash
-cargo check --manifest-path ola-rt/Cargo.toml --workspace
-cargo test --manifest-path ola-rt/Cargo.toml --workspace
+One crate at a time is faster while you work:
+
+```bash
 cargo test --manifest-path ola-rt/Cargo.toml -p ola-runtime
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-burn
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-cluster
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-net
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-serve
-~~~
+cargo test --manifest-path ola-rt/Cargo.toml -p ola-bench --lib online   # tests matching "online"
+```
 
-## Experiment CLI
+Crate map: `ola-core` (identities, time), `ola-model` (model traits),
+`ola-kernel` (attention kernels), `ola-burn` (Llama and Mistral on Burn),
+`ola-runtime` (executor, policies, KV cache), `ola-observe` (traces),
+`ola-bench` (experiments, simulator), `ola-serve` (HTTP serving),
+`ola-net` (wire format), `ola-cluster` (coordinator, workers), `ola-cli`
+(the `ola` command), `ola-ui` (terminal workbench).
 
-List every registered experiment and its parameters:
+### Tests that need more than a CPU
 
-~~~bash
-make experiments
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment list
-~~~
+| Command | Needs |
+| --- | --- |
+| `make test-fixture MODEL=/path/to/tiny-llama` | A Hugging Face-style Llama directory; runs the ignored end-to-end serving and conformance tests. |
+| `make test-gpu-fixture MODEL=…` | The same, on WGPU. |
+| `make check-wgpu`, `make check-cuda` | Compile-only checks of the accelerator builds. |
+| `cargo test --manifest-path ola-rt/Cargo.toml -p ola-bench --features cubecl-cpu` | Nothing extra: CubeCL kernels on the CPU. |
+| `make gpu-info` | A working NVIDIA driver. |
 
-Run or compare experiments:
+## 2. Run experiments
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run <id> [--model DIR] [--backend cpu|wgpu|cuda] [--set KEY=VALUE]... [--results-dir DIR] [--json] [--trace FILE]
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment compare baseline.json candidate.json
-~~~
+```bash
+make experiments                       # every experiment, its kind, clock, and parameters
+make experiment ID=scheduler-comparison SET="trace=overload seeds=10"
+make lab-new NAME=my-question ID=scheduler-comparison SET="trace=overload seeds=10"
+```
 
-### Available experiments
+`make experiment` prints a summary. `make lab-new` does the same inside a
+notebook entry that keeps the configuration, versioned reports, traces, and
+your notes, which is what you want for anything you may cite (see
+`lab/README.md`). Directly:
 
-Model-backed host-time experiments requiring a local Llama artifact:
+```bash
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+    experiment run <id> [--config FILE] [--set KEY=VALUE]... [--model DIR] \
+    [--backend cpu|wgpu|cuda] [--results-dir DIR] [--json] [--trace FILE]
+```
 
-- `llama-generation` — greedy generation, TTFT, inter-token latency, and throughput.
-- `llama-prefill-strategies` — unbucketed, power-of-two, and adaptive prefill grouping.
-- `llama-chunked-prefill` — complete prompt versus resumable prompt segments.
-- `cost-calibration` — fixed, per-token, and per-call execution cost fitting.
+`--config FILE` reads `{"id": "<id>", "parameters": {"key": "value"}}`;
+`--set` overrides it. Use `--release` for host-time experiments: debug
+builds measure the compiler, not the runtime.
 
-Runtime and KV experiments that do not require a model:
+### Kinds and clocks
 
-- `kv-block-pressure` — KV block allocation, growth, reuse, and freeing.
-- `fifo-workload` — deterministic FIFO runtime replay.
-- `prefill-bucketing` — padding and invocation tradeoffs.
-- `adaptive-prefill-cost` — cost-aware grouping under different invocation costs.
+Every experiment is a **probe** (an operational check, not for publication)
+or a **study** (a protocol with repetitions and 95% intervals that you can
+cite). Its metrics come from one clock:
 
-Virtual-time scheduling experiments:
+- **virtual time**: the deterministic simulator and its `CostModel`;
+  results reproduce exactly anywhere, and say what the cost model implies;
+- **host time**: wall-clock on this machine; real but noisy;
+- **device time**: a hardware profiler's kernel timings;
+- **untimed**: counts and ratios.
 
-- `scheduler-comparison` — scheduling baselines on seeded traces.
-- `adaptive-policy-study` — training-trace selection and held-out evaluation.
-- `kv-pressure` — KV reservation versus watermark admission and preemption.
-- `prefix-cache` — shared-prefix reuse and cache affinity.
-- `kv-page-size` — fragmentation and prefix reuse across page sizes.
+`compare` never mixes clocks, and the registry rejects studies with fewer
+than 3 repetitions (5 plus a warm-up in host time).
 
-Distributed simulation experiments:
+### The experiments
 
-- `cluster-routing` — routing baselines across simulated workers and links, including latency, bandwidth, capacity, KV headroom, and prefix affinity.
-- `adaptive-cluster-routing-study` — training-selected routing weights on held-out traces.
+Model-backed, host time (`--model DIR`):
 
-Kernel and accelerator experiments:
+| ID | Kind | What it measures |
+| --- | --- | --- |
+| `llama-generation` | probe | Greedy generation: TTFT, inter-token latency, throughput. |
+| `llama-prefill-strategies` | study | Unbucketed, power-of-two, and cost-aware prefill grouping, calibrated first. |
+| `llama-chunked-prefill` | probe | Whole prompts against resumable prompt chunks, and fairness across chunk sizes. |
+| `cost-calibration` | study | Fits per-iteration, per-call, and per-token cost; feeds `ola serve --adaptive`. |
 
-- `paged-attention-kernel` — portable versus CubeCL paged attention, correctness, latency, page sizes, and batch sizes.
-- `paged-attention-occupancy` — paged-attention latency and Nsight Compute occupancy metrics.
+No model needed:
 
-Common scheduler trace values include `mixed_short_long`, `prefill_decode_competition`, `priority_classes`, `deadlines`, `overload`, `impossible`, and `early_stopping`.
+| ID | Kind, clock | What it measures |
+| --- | --- | --- |
+| `kv-block-pressure` | probe, host | KV block allocation, growth, freeing. |
+| `fifo-workload` | probe, host | A deterministic FIFO runtime replay. |
+| `prefill-bucketing` | probe, untimed | Padding against invocations. |
+| `adaptive-prefill-cost` | probe, untimed | Cost-aware grouping at different invocation costs. |
+| `scheduler-comparison` | study, virtual | FIFO, priority, EDF, SJF, and backfill on one trace (`trace=` `mixed_short_long`, `prefill_decode_competition`, `priority_classes`, `deadlines`, `overload`, `impossible`). |
+| `adaptive-policy-study` | study, virtual | A token budget chosen offline on seed 0, against FIFO on held-out seeds. |
+| `online-adaptive-policy-study` | study, virtual | Token budgets re-optimized online by replaying recent work, against the best offline budget and FIFO. |
+| `kv-pressure` | study, virtual | Worst-case KV reservation against watermark admission with preemption (`trace=` `early_stopping`, `mixed_short_long`, `overload`). |
+| `prefix-cache` | study, virtual | Prefill reuse for prompts sharing a system prompt. |
+| `kv-page-size` | study, virtual | Internal fragmentation and prefix reuse across page sizes. |
+| `cluster-routing` | study, virtual | Routing baselines across simulated workers and links (`trace=` `prefix_groups`, `mixed_short_long`, `overload`, `prefill_decode_competition`, `priority_classes`). |
+| `adaptive-cluster-routing-study` | study, virtual | Cluster routing weights chosen on seed 0, on held-out seeds. |
+
+Kernel studies, only in builds with a CubeCL feature
+(`--features cubecl-cpu`, `wgpu`, or `cuda` on `ola-cli`; `FEATURES=` for
+`make lab-new`):
+
+| ID | Kind, clock | What it measures |
+| --- | --- | --- |
+| `paged-attention-kernel` | study, host | Portable against CubeCL paged attention: latency, correctness, page and batch sizes. |
+| `paged-attention-occupancy` | study, host and device | The same shapes with Nsight Compute occupancy and utilization; see `ola-rt/crates/ola-bench/README.md`. |
 
 Examples:
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run kv-block-pressure
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run scheduler-comparison --set trace=overload --set seeds=10 --set requests=200
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run cluster-routing --set workers="4,4,4,4" --set latency_micros=50 --set bytes_per_micro=1250 --set prefix_cache=1 --set seeds=10
-~~~
+```bash
+make experiment ID=scheduler-comparison SET="trace=mixed_short_long seeds=10 requests=200"
+make experiment ID=cluster-routing SET="workers=4,4,4,4 latency_micros=50 bytes_per_micro=1250 seeds=10"
+make experiment ID=online-adaptive-policy-study SET="seeds=10 window=64"
+make lab-new NAME=attention-cpu ID=paged-attention-kernel FEATURES=cubecl-cpu
+```
 
-## Reports and traces
+### Reports
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run scheduler-comparison --results-dir ./results
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run scheduler-comparison --json
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment run scheduler-comparison --trace scheduler.jsonl
-jq . scheduler.jsonl
-~~~
+`--results-dir DIR` writes an `ola-experiment/1` JSON report and never
+overwrites one. It holds the experiment and payload version, build
+(revision, profile, features), workload digest, protocol, every raw sample,
+and per-variant summaries with means and 95% bootstrap intervals.
 
-Reports retain raw samples, metrics, confidence intervals, policy variants, build information, workload identity, and decision data. Report files are never overwritten.
+```bash
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment compare a.json b.json
+```
 
-Filter planning events:
+`compare` lists identity differences and classifies each metric as improved
+or regressed only when the intervals separate and the change exceeds 5%
+(`--threshold`); it exits 1 on a regression. Summaries with `jq`:
 
-~~~bash
-jq 'select(.event.kind == "ranked" or .event.kind == "admission" or .event.kind == "selection")' scheduler.jsonl
-~~~
+```bash
+jq '.summaries[] | {variant, p95: .estimates.completion_p95.mean, ci: .estimates.completion_p95.ci95}' report.json
+```
 
-## Direct model execution
+### Reading traces
 
-Llama on CPU:
+Experiments marked `traceable` in `make experiments` accept
+`--trace FILE`, written as JSON Lines, one record per request event, each
+labelled with its executor run (`"run": "fifo/seed=3"`):
 
-~~~bash
-make llama MODEL=/path/to/llama-artifact PROMPT="Hello" TOKENS=16
-~~~
+```json
+{"run":"fifo/seed=1","request":1,"iteration":1,"at_us":0,"event":"admission","outcome":"admitted","reserved_kv_bytes":1024,"budget_selected":true}
+```
 
-Llama through WGPU:
+Event kinds: `arrived`, `ranked`, `admission`, `backfill_skipped`,
+`selection`, `invocation`, `prefill_progress`, `token`, `completed`,
+`failed`, `rejected`, `cancelled`, `preempted`.
 
-~~~bash
-make llama-wgpu MODEL=/path/to/llama-artifact PROMPT="Hello" TOKENS=16
-~~~
+```bash
+jq -c 'select(.event == "admission" and .outcome != "admitted")' trace.jsonl   # deferrals
+jq -c 'select(.run == "sjf/seed=1" and .request == 7)' trace.jsonl            # one request's life
+jq -s 'group_by(.run) | map({run: .[0].run, tokens: map(select(.event == "token")) | length})' trace.jsonl
+```
 
-Mistral through the Burn example:
+Simulator traces carry iteration start times, not the cost-model-corrected
+times in the summaries.
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-burn --example run_mistral -- /path/to/mistral-artifact "Hello" 16
-~~~
+## 3. Run models directly
 
-The CLI serving path currently loads Llama artifacts. Mistral is directly runnable through its Burn example and library APIs.
+```bash
+make llama MODEL=/path/to/llama PROMPT="Hello" TOKENS=16
+make llama-wgpu MODEL=/path/to/llama PROMPT="Hello" TOKENS=16
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-burn --example run_mistral -- /path/to/mistral "Hello" 16
+```
 
-## Standalone HTTP serving
+`ola serve` and the model-backed experiments load Llama artifacts; Mistral
+runs through its example and the library API.
 
-~~~bash
-make serve MODEL=/path/to/llama-artifact ADDR=127.0.0.1:8080
-~~~
+## 4. Serve one model
 
-With tracing:
+```bash
+make serve MODEL=/path/to/llama ADDR=127.0.0.1:8080
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+    serve --model /path/to/llama --name llama --addr 127.0.0.1:8080 --trace server.jsonl
+```
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --model /path/to/llama-artifact --addr 127.0.0.1:8080 --trace server.jsonl
-~~~
+Endpoints: `GET /health`, `GET /ready`, `GET /v1/models`,
+`POST /v1/generate`, `POST /v1/completions`, `GET /v1/requests/{id}`,
+`DELETE /v1/requests/{id}`, `GET /v1/requests/{id}/trace`.
 
-Endpoints:
+```bash
+curl -s localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16}'
+curl -sN localhost:8080/v1/generate -d '{"model":"llama","prompt":"Hello","max_new_tokens":16,"stream":true}'
+curl -s localhost:8080/v1/completions -d '{"model":"llama","prompt":"Hello","max_tokens":16}'
+```
 
-- `GET /health`
-- `GET /ready`
-- `GET /v1/models`
-- `POST /v1/generate`
-- `POST /v1/completions`
-- `GET /v1/requests/{id}`
-- `DELETE /v1/requests/{id}`
-- `GET /v1/requests/{id}/trace`
+Requests name the model by its `--name` (default: the directory name; the
+examples use `--name llama`). Ctrl-C
+drains: new work is refused and accepted requests get `--drain-secs`
+(default 30) to finish. Full contract: `ola-rt/crates/ola-serve/README.md`.
 
-This exercises JSON generation, SSE streaming, OpenAI-compatible completions, request status, cancellation, tracing, bounded in-flight work, memory-aware admission, and graceful draining.
+### Adaptive token budgets
 
-## Distributed worker and gateway serving
+```bash
+make lab-new NAME=calibrate ID=cost-calibration MODEL=/path/to/llama
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+    serve --model /path/to/llama --adaptive lab/notebook/<date>-calibrate/reports/<report>.json
+```
 
-Start two workers:
+`--adaptive` replays recent work in the simulator, with the calibrated cost
+model, to re-tune how many tokens each iteration may process; it starts
+from the default behaviour. Calibrate on the same model and backend you
+serve. How it works and what it has (not yet) shown:
+`ola-rt/crates/ola-runtime/ADAPTIVE_OPTIMIZATION_PLAN.md`.
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role worker --model /path/to/llama-artifact --name worker-a --addr 127.0.0.1:7001
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role worker --model /path/to/llama-artifact --name worker-b --addr 127.0.0.1:7002
-~~~
+## 5. Serve a cluster
 
-Start the gateway:
+Start the workers first, then the gateway, which connects to each:
 
-~~~bash
-cargo run --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role gateway --addr 127.0.0.1:8080 --worker 127.0.0.1:7001 --worker 127.0.0.1:7002
-~~~
+```bash
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role worker --model /path/to/llama --name worker-a --addr 127.0.0.1:7001
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role worker --model /path/to/llama --name worker-b --addr 127.0.0.1:7002
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- serve --role gateway --addr 127.0.0.1:8080 --worker 127.0.0.1:7001 --worker 127.0.0.1:7002
+```
 
-This exercises adaptive routing, heartbeats, leases, readiness, disconnect recovery, migration, recompute fallback, binary KV/session snapshot transfer, prefill/decode roles, streamed text and usage, stale-token suppression, cancellation, and graceful shutdown.
+The gateway serves `/health`, `/ready`, `/v1/generate`, `/v1/completions`,
+and `DELETE /v1/requests/{id}`, routing with the adaptive cluster policy.
+Things to try:
 
-Targeted integration tests:
+- `curl -s localhost:8080/health` shows connected and ready workers.
+- Kill a worker mid-request: the gateway sees the connection close (or,
+  for a worker that hangs, its 2 s lease lapse), marks it lost, and restarts
+  its requests on the other worker; a streaming client sees no repeated
+  tokens.
+- Disconnect a client mid-stream: its request is cancelled on the worker.
 
-~~~bash
+Migration, draining, role changes, and policy pushes are library
+operations (`TcpCoordinator::migrate`, `drain_worker`, `set_worker_role`,
+`update_worker_policy`) that the gateway does not trigger itself; the
+integration tests exercise them:
+
+```bash
 cargo test --manifest-path ola-rt/Cargo.toml -p ola-net
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-cluster --test network
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-cluster --test network_migration
-cargo test --manifest-path ola-rt/Cargo.toml -p ola-serve --test cluster_gateway
-~~~
+cargo test --manifest-path ola-rt/Cargo.toml -p ola-cluster --test network            # loss, recovery, large snapshots
+cargo test --manifest-path ola-rt/Cargo.toml -p ola-cluster --test network_migration  # two-phase migration
+cargo test --manifest-path ola-rt/Cargo.toml -p ola-serve --test cluster_gateway      # gateway behaviour
+```
 
-## Terminal UI
+Design, status, and limits: `ola-rt/crates/DISTRIBUTED.md`.
 
-~~~bash
+## 6. Terminal workbench
+
+```bash
 make ui
-make ui MODEL=/path/to/llama-artifact
-make ui-wgpu MODEL=/path/to/llama-artifact
-~~~
+make ui MODEL=/path/to/llama RESULTS_DIR=results
+make ui-wgpu MODEL=/path/to/llama
+```
 
-The UI includes runtime overview, local chat, generation benchmarks, prefill benchmarks, chunked prefill, KV pressure, scheduler experiments, report persistence, and experiment progress.
+The workbench runs the same registered experiments as the CLI, with chat,
+benchmarks, and saved reports.
 
-## Hardware and model constraints
+## 7. Hardware
 
-- CPU is the default and safest backend.
-- WGPU requires `--features wgpu`.
-- CUDA requires `--features cuda`, a working NVIDIA driver, and CUDA/NVRTC.
-- A trained Hugging Face-style artifact is needed for meaningful generated text.
-- Check the local NVIDIA setup with `make gpu-info`.
+- CPU is the default backend and needs nothing extra.
+- WGPU needs `--features wgpu` (`make check-wgpu` to compile-check).
+- CUDA needs `--features cuda`, a working driver, and the CUDA toolkit with
+  NVRTC; check with `make gpu-info`.
+- Meaningful generated text needs a trained Hugging Face-style Llama
+  artifact. The tiny conformance fixture checks correctness, not quality.
 
-## Recommended order
+## 8. A first session
 
-1. Run `make check` and `make test`.
-2. Run `kv-block-pressure`, `prefill-bucketing`, and `scheduler-comparison`.
-3. Run `cluster-routing` and `adaptive-cluster-routing-study`.
-4. Run direct Llama CPU generation and host-time experiments.
-5. Start and test standalone HTTP serving.
-6. Start two workers and a gateway.
-7. Run the distributed integration tests.
-8. Try WGPU after `make check-wgpu`.
-9. Attempt CUDA only after `make gpu-info` succeeds.
+1. `make verify`.
+2. Read `lab/README.md`, then do curriculum items A1, C1, and D1 as lab
+   entries, writing each prediction first.
+3. With a model: B2 (calibrate), then serve it (section 4) and try the
+   `--adaptive` flag.
+4. Two workers and a gateway (section 5); kill one.
+5. Pick an L4 question from `lab/CURRICULUM.md` and start a series of
+   entries.
 
-## Further references
+## References
 
-- [`ola-bench/README.md`](ola-rt/crates/ola-bench/README.md)
-- [`ola-bench/EXPERIMENTS.md`](ola-rt/crates/ola-bench/EXPERIMENTS.md)
+- [`lab/README.md`](lab/README.md), [`lab/CURRICULUM.md`](lab/CURRICULUM.md)
+- [`ola-bench/README.md`](ola-rt/crates/ola-bench/README.md) and
+  [`EXPERIMENTS.md`](ola-rt/crates/ola-bench/EXPERIMENTS.md)
 - [`ola-cli/README.md`](ola-rt/crates/ola-cli/README.md)
 - [`ola-serve/README.md`](ola-rt/crates/ola-serve/README.md)
-- [`ola-cluster/README.md`](ola-rt/crates/ola-cluster/README.md)
-- [`DISTRIBUTED.md`](ola-rt/crates/DISTRIBUTED.md)
+- [`ola-cluster/README.md`](ola-rt/crates/ola-cluster/README.md),
+  [`DISTRIBUTED.md`](ola-rt/crates/DISTRIBUTED.md)
 - [`OBSERVABILITY.md`](ola-rt/crates/ola-observe/OBSERVABILITY.md)
+- [`ADAPTIVE_OPTIMIZATION_PLAN.md`](ola-rt/crates/ola-runtime/ADAPTIVE_OPTIMIZATION_PLAN.md)

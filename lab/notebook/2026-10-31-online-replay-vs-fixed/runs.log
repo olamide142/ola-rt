@@ -1,0 +1,2 @@
+2026-10-31T12:34:51+00:00	run 001	09b75b4+dirty	10 held-out phased traces; fixed max_tokens=512, max_prefill_tokens=384 · online: objective 80.0 ms · online-warm: objective 74.5 ms · fixed: objective 73.7 ms · fifo: objective 73.7 ms · study, virtual time
+2026-10-31T12:39:05+00:00	run 002	923d7dd	10 held-out phased traces; fixed max_tokens=512, max_prefill_tokens=384 · online: objective 80.0 ms · online-warm: objective 74.5 ms · fixed: objective 73.7 ms · fifo: objective 73.7 ms · study, virtual time

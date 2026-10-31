@@ -23,6 +23,8 @@ It begins as a practical runtime built on top of existing Rust ML infrastructure
 
 OlaRT is intended to remain useful throughout a multi-year PhD program: first as a learning platform, then as an inference engine, then as an experimental systems runtime, and finally as a vehicle for original research.
 
+**Start here:** [`TESTING_GUIDE.md`](TESTING_GUIDE.md) shows how to validate, run every experiment, and serve models; [`lab/README.md`](lab/README.md) is the research notebook workflow, and [`lab/CURRICULUM.md`](lab/CURRICULUM.md) the graded experiments to learn from. `make help` lists every command.
+
 ---
 
 ## Why OlaRT?

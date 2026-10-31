@@ -1,0 +1,812 @@
+{
+  "schema": "ola-experiment/1",
+  "experiment": {
+    "id": "online-adaptive-policy-study",
+    "payload_version": 1,
+    "kind": "study",
+    "domain": "virtual"
+  },
+  "metadata": {
+    "recorded_at_unix_micros": 1793450100197754,
+    "model": null,
+    "device": null,
+    "build": {
+      "crate_version": "0.1.0",
+      "revision": "09b75b4901cd",
+      "profile": "release",
+      "target": "x86_64-unknown-linux-gnu",
+      "features": [
+        "default"
+      ]
+    }
+  },
+  "workload": {
+    "name": "online-adaptive-policy-study",
+    "seeds": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "parameters": {
+      "max_active_requests": "8",
+      "mean_interarrival_micros": "2000",
+      "min_improvement_percent": "5",
+      "optimization_interval": "40",
+      "requests": "80",
+      "seeds": "10",
+      "window": "64"
+    },
+    "digest": "ff015bbb7d510961"
+  },
+  "protocol": {
+    "warmups": 0,
+    "repetitions": 10,
+    "ordering": "one seed per repetition"
+  },
+  "metrics": [
+    {
+      "name": "completion_p95",
+      "unit": "micros",
+      "domain": "virtual",
+      "better": "lower"
+    },
+    {
+      "name": "ttft_p95",
+      "unit": "micros",
+      "domain": "virtual",
+      "better": "lower"
+    },
+    {
+      "name": "objective",
+      "unit": "micros",
+      "domain": "virtual",
+      "better": "lower"
+    },
+    {
+      "name": "throughput",
+      "unit": "tokens_per_second",
+      "domain": "virtual",
+      "better": "higher"
+    },
+    {
+      "name": "starved",
+      "unit": "count",
+      "domain": "virtual",
+      "better": "lower"
+    }
+  ],
+  "variants": [
+    {
+      "label": "online",
+      "policy": "adaptive{update_count=0,seed=0,random_state=0,log2_max_tokens=4,prefill_share_percent=50}[composed{head_of_line=block}[fifo,memory-aware-admission,mixed-token-budget{max_tokens=16,max_prefill_tokens=8},unbucketed-prefill],composed{head_of_line=block}[fifo,memory-aware-admission,unbounded-batch,unbucketed-prefill]]",
+      "kernel": null
+    },
+    {
+      "label": "online-warm",
+      "policy": "adaptive{update_count=0,seed=0,random_state=0,log2_max_tokens=9,prefill_share_percent=75}[composed{head_of_line=block}[fifo,memory-aware-admission,mixed-token-budget{max_tokens=512,max_prefill_tokens=384},unbucketed-prefill],composed{head_of_line=block}[fifo,memory-aware-admission,unbounded-batch,unbucketed-prefill]]",
+      "kernel": null
+    },
+    {
+      "label": "fixed",
+      "policy": "composed{head_of_line=block}[fifo,memory-aware-admission,mixed-token-budget{max_tokens=512,max_prefill_tokens=384},unbucketed-prefill]",
+      "kernel": null
+    },
+    {
+      "label": "fifo",
+      "policy": "composed{head_of_line=block}[fifo,memory-aware-admission,unbounded-batch,unbucketed-prefill]",
+      "kernel": null
+    }
+  ],
+  "samples": [
+    {
+      "repetition": 0,
+      "variant": "online",
+      "values": {
+        "completion_p95": 46217.0,
+        "objective": 83910.0,
+        "starved": 6.0,
+        "throughput": 2511.9916669783875,
+        "ttft_p95": 37693.0
+      }
+    },
+    {
+      "repetition": 1,
+      "variant": "online",
+      "values": {
+        "completion_p95": 51984.0,
+        "objective": 96988.0,
+        "starved": 8.0,
+        "throughput": 2537.092136767549,
+        "ttft_p95": 45004.0
+      }
+    },
+    {
+      "repetition": 2,
+      "variant": "online",
+      "values": {
+        "completion_p95": 38909.0,
+        "objective": 70400.0,
+        "starved": 6.0,
+        "throughput": 2111.7538187950922,
+        "ttft_p95": 31491.0
+      }
+    },
+    {
+      "repetition": 3,
+      "variant": "online",
+      "values": {
+        "completion_p95": 39781.0,
+        "objective": 71884.0,
+        "starved": 3.0,
+        "throughput": 2172.521333131079,
+        "ttft_p95": 32103.0
+      }
+    },
+    {
+      "repetition": 4,
+      "variant": "online",
+      "values": {
+        "completion_p95": 41853.0,
+        "objective": 73753.0,
+        "starved": 4.0,
+        "throughput": 2118.9737631106636,
+        "ttft_p95": 31900.0
+      }
+    },
+    {
+      "repetition": 5,
+      "variant": "online",
+      "values": {
+        "completion_p95": 40750.0,
+        "objective": 72052.0,
+        "starved": 5.0,
+        "throughput": 2293.9738051556,
+        "ttft_p95": 31302.0
+      }
+    },
+    {
+      "repetition": 6,
+      "variant": "online",
+      "values": {
+        "completion_p95": 36651.0,
+        "objective": 65787.0,
+        "starved": 3.0,
+        "throughput": 2302.682021231935,
+        "ttft_p95": 29136.0
+      }
+    },
+    {
+      "repetition": 7,
+      "variant": "online",
+      "values": {
+        "completion_p95": 49882.0,
+        "objective": 90046.0,
+        "starved": 8.0,
+        "throughput": 2313.4277414118737,
+        "ttft_p95": 40164.0
+      }
+    },
+    {
+      "repetition": 8,
+      "variant": "online",
+      "values": {
+        "completion_p95": 56789.0,
+        "objective": 104274.0,
+        "starved": 7.0,
+        "throughput": 2346.7454610324676,
+        "ttft_p95": 47485.0
+      }
+    },
+    {
+      "repetition": 9,
+      "variant": "online",
+      "values": {
+        "completion_p95": 39394.0,
+        "objective": 70951.0,
+        "starved": 5.0,
+        "throughput": 2308.106583232888,
+        "ttft_p95": 31557.0
+      }
+    },
+    {
+      "repetition": 0,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 43785.0,
+        "objective": 79106.0,
+        "starved": 6.0,
+        "throughput": 2529.664884600339,
+        "ttft_p95": 35321.0
+      }
+    },
+    {
+      "repetition": 1,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 49430.0,
+        "objective": 91418.0,
+        "starved": 8.0,
+        "throughput": 2550.9947116595317,
+        "ttft_p95": 41988.0
+      }
+    },
+    {
+      "repetition": 2,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 37426.0,
+        "objective": 67037.0,
+        "starved": 6.0,
+        "throughput": 2129.2249523725995,
+        "ttft_p95": 29611.0
+      }
+    },
+    {
+      "repetition": 3,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 37889.0,
+        "objective": 68795.0,
+        "starved": 2.0,
+        "throughput": 2185.987432512489,
+        "ttft_p95": 30906.0
+      }
+    },
+    {
+      "repetition": 4,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 37663.0,
+        "objective": 65363.0,
+        "starved": 2.0,
+        "throughput": 2139.9983236243243,
+        "ttft_p95": 27700.0
+      }
+    },
+    {
+      "repetition": 5,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 39246.0,
+        "objective": 69904.0,
+        "starved": 5.0,
+        "throughput": 2296.9010445051163,
+        "ttft_p95": 30658.0
+      }
+    },
+    {
+      "repetition": 6,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 33163.0,
+        "objective": 58285.0,
+        "starved": 3.0,
+        "throughput": 2326.024301367428,
+        "ttft_p95": 25122.0
+      }
+    },
+    {
+      "repetition": 7,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 42734.0,
+        "objective": 75692.0,
+        "starved": 6.0,
+        "throughput": 2352.8806716638596,
+        "ttft_p95": 32958.0
+      }
+    },
+    {
+      "repetition": 8,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 56789.0,
+        "objective": 104274.0,
+        "starved": 7.0,
+        "throughput": 2346.7454610324676,
+        "ttft_p95": 47485.0
+      }
+    },
+    {
+      "repetition": 9,
+      "variant": "online-warm",
+      "values": {
+        "completion_p95": 36657.0,
+        "objective": 65019.0,
+        "starved": 3.0,
+        "throughput": 2325.734975321368,
+        "ttft_p95": 28362.0
+      }
+    },
+    {
+      "repetition": 0,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 43785.0,
+        "objective": 79106.0,
+        "starved": 6.0,
+        "throughput": 2529.664884600339,
+        "ttft_p95": 35321.0
+      }
+    },
+    {
+      "repetition": 1,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 49430.0,
+        "objective": 91418.0,
+        "starved": 8.0,
+        "throughput": 2550.9947116595317,
+        "ttft_p95": 41988.0
+      }
+    },
+    {
+      "repetition": 2,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 37426.0,
+        "objective": 67037.0,
+        "starved": 6.0,
+        "throughput": 2129.2249523725995,
+        "ttft_p95": 29611.0
+      }
+    },
+    {
+      "repetition": 3,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 37889.0,
+        "objective": 68795.0,
+        "starved": 2.0,
+        "throughput": 2185.987432512489,
+        "ttft_p95": 30906.0
+      }
+    },
+    {
+      "repetition": 4,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 37663.0,
+        "objective": 65363.0,
+        "starved": 2.0,
+        "throughput": 2139.9983236243243,
+        "ttft_p95": 27700.0
+      }
+    },
+    {
+      "repetition": 5,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 39246.0,
+        "objective": 69904.0,
+        "starved": 5.0,
+        "throughput": 2296.9010445051163,
+        "ttft_p95": 30658.0
+      }
+    },
+    {
+      "repetition": 6,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 33163.0,
+        "objective": 58285.0,
+        "starved": 3.0,
+        "throughput": 2326.024301367428,
+        "ttft_p95": 25122.0
+      }
+    },
+    {
+      "repetition": 7,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 42734.0,
+        "objective": 75692.0,
+        "starved": 6.0,
+        "throughput": 2352.8806716638596,
+        "ttft_p95": 32958.0
+      }
+    },
+    {
+      "repetition": 8,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 52445.0,
+        "objective": 95930.0,
+        "starved": 5.0,
+        "throughput": 2375.7077523362823,
+        "ttft_p95": 43485.0
+      }
+    },
+    {
+      "repetition": 9,
+      "variant": "fixed",
+      "values": {
+        "completion_p95": 36657.0,
+        "objective": 65019.0,
+        "starved": 3.0,
+        "throughput": 2325.734975321368,
+        "ttft_p95": 28362.0
+      }
+    },
+    {
+      "repetition": 0,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 43785.0,
+        "objective": 79106.0,
+        "starved": 6.0,
+        "throughput": 2529.664884600339,
+        "ttft_p95": 35321.0
+      }
+    },
+    {
+      "repetition": 1,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 49430.0,
+        "objective": 91418.0,
+        "starved": 8.0,
+        "throughput": 2550.9947116595317,
+        "ttft_p95": 41988.0
+      }
+    },
+    {
+      "repetition": 2,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 37426.0,
+        "objective": 67037.0,
+        "starved": 6.0,
+        "throughput": 2129.2249523725995,
+        "ttft_p95": 29611.0
+      }
+    },
+    {
+      "repetition": 3,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 37889.0,
+        "objective": 68795.0,
+        "starved": 2.0,
+        "throughput": 2185.987432512489,
+        "ttft_p95": 30906.0
+      }
+    },
+    {
+      "repetition": 4,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 37663.0,
+        "objective": 65363.0,
+        "starved": 2.0,
+        "throughput": 2139.9983236243243,
+        "ttft_p95": 27700.0
+      }
+    },
+    {
+      "repetition": 5,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 39246.0,
+        "objective": 69904.0,
+        "starved": 5.0,
+        "throughput": 2296.9010445051163,
+        "ttft_p95": 30658.0
+      }
+    },
+    {
+      "repetition": 6,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 33163.0,
+        "objective": 58285.0,
+        "starved": 3.0,
+        "throughput": 2326.024301367428,
+        "ttft_p95": 25122.0
+      }
+    },
+    {
+      "repetition": 7,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 42734.0,
+        "objective": 75692.0,
+        "starved": 6.0,
+        "throughput": 2352.8806716638596,
+        "ttft_p95": 32958.0
+      }
+    },
+    {
+      "repetition": 8,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 52445.0,
+        "objective": 95930.0,
+        "starved": 5.0,
+        "throughput": 2375.7077523362823,
+        "ttft_p95": 43485.0
+      }
+    },
+    {
+      "repetition": 9,
+      "variant": "fifo",
+      "values": {
+        "completion_p95": 36657.0,
+        "objective": 65019.0,
+        "starved": 3.0,
+        "throughput": 2325.734975321368,
+        "ttft_p95": 28362.0
+      }
+    }
+  ],
+  "summaries": [
+    {
+      "variant": "online",
+      "estimates": {
+        "completion_p95": {
+          "n": 10,
+          "mean": 44221.0,
+          "p50": 40750.0,
+          "p95": 56789.0,
+          "min": 36651.0,
+          "max": 56789.0,
+          "ci95": {
+            "low": 40645.4,
+            "high": 48560.8
+          }
+        },
+        "objective": {
+          "n": 10,
+          "mean": 80004.5,
+          "p50": 72052.0,
+          "p95": 104274.0,
+          "min": 65787.0,
+          "max": 104274.0,
+          "ci95": {
+            "low": 73015.5,
+            "high": 88048.0
+          }
+        },
+        "starved": {
+          "n": 10,
+          "mean": 5.5,
+          "p50": 5.0,
+          "p95": 8.0,
+          "min": 3.0,
+          "max": 8.0,
+          "ci95": {
+            "low": 4.4,
+            "high": 6.6
+          }
+        },
+        "throughput": {
+          "n": 10,
+          "mean": 2301.7268330847537,
+          "p50": 2302.682021231935,
+          "p95": 2537.092136767549,
+          "min": 2111.7538187950922,
+          "max": 2537.092136767549,
+          "ci95": {
+            "low": 2219.163913991619,
+            "high": 2387.191410556107
+          }
+        },
+        "ttft_p95": {
+          "n": 10,
+          "mean": 35783.5,
+          "p50": 31900.0,
+          "p95": 47485.0,
+          "min": 29136.0,
+          "max": 47485.0,
+          "ci95": {
+            "low": 32247.8,
+            "high": 39559.2
+          }
+        }
+      }
+    },
+    {
+      "variant": "online-warm",
+      "estimates": {
+        "completion_p95": {
+          "n": 10,
+          "mean": 41478.2,
+          "p50": 37889.0,
+          "p95": 56789.0,
+          "min": 33163.0,
+          "max": 56789.0,
+          "ci95": {
+            "low": 37883.2,
+            "high": 45845.4
+          }
+        },
+        "objective": {
+          "n": 10,
+          "mean": 74489.3,
+          "p50": 68795.0,
+          "p95": 104274.0,
+          "min": 58285.0,
+          "max": 104274.0,
+          "ci95": {
+            "low": 67090.0,
+            "high": 83147.4
+          }
+        },
+        "starved": {
+          "n": 10,
+          "mean": 4.8,
+          "p50": 5.0,
+          "p95": 8.0,
+          "min": 2.0,
+          "max": 8.0,
+          "ci95": {
+            "low": 3.5,
+            "high": 6.0
+          }
+        },
+        "throughput": {
+          "n": 10,
+          "mean": 2318.4156758659524,
+          "p50": 2325.734975321368,
+          "p95": 2550.9947116595317,
+          "min": 2129.2249523725995,
+          "max": 2550.9947116595317,
+          "ci95": {
+            "low": 2235.360329577844,
+            "high": 2403.876495968146
+          }
+        },
+        "ttft_p95": {
+          "n": 10,
+          "mean": 33011.1,
+          "p50": 30658.0,
+          "p95": 47485.0,
+          "min": 25122.0,
+          "max": 47485.0,
+          "ci95": {
+            "low": 29343.9,
+            "high": 37174.7
+          }
+        }
+      }
+    },
+    {
+      "variant": "fixed",
+      "estimates": {
+        "completion_p95": {
+          "n": 10,
+          "mean": 41043.8,
+          "p50": 37889.0,
+          "p95": 52445.0,
+          "min": 33163.0,
+          "max": 52445.0,
+          "ci95": {
+            "low": 37821.9,
+            "high": 44690.4
+          }
+        },
+        "objective": {
+          "n": 10,
+          "mean": 73654.9,
+          "p50": 68795.0,
+          "p95": 95930.0,
+          "min": 58285.0,
+          "max": 95930.0,
+          "ci95": {
+            "low": 67049.3,
+            "high": 81109.0
+          }
+        },
+        "starved": {
+          "n": 10,
+          "mean": 4.6,
+          "p50": 5.0,
+          "p95": 8.0,
+          "min": 2.0,
+          "max": 8.0,
+          "ci95": {
+            "low": 3.4,
+            "high": 5.8
+          }
+        },
+        "throughput": {
+          "n": 10,
+          "mean": 2321.3119049963334,
+          "p50": 2325.734975321368,
+          "p95": 2550.9947116595317,
+          "min": 2129.2249523725995,
+          "max": 2550.9947116595317,
+          "ci95": {
+            "low": 2236.646699206395,
+            "high": 2406.3877052098746
+          }
+        },
+        "ttft_p95": {
+          "n": 10,
+          "mean": 32611.1,
+          "p50": 30658.0,
+          "p95": 43485.0,
+          "min": 25122.0,
+          "max": 43485.0,
+          "ci95": {
+            "low": 29321.2,
+            "high": 36267.5
+          }
+        }
+      }
+    },
+    {
+      "variant": "fifo",
+      "estimates": {
+        "completion_p95": {
+          "n": 10,
+          "mean": 41043.8,
+          "p50": 37889.0,
+          "p95": 52445.0,
+          "min": 33163.0,
+          "max": 52445.0,
+          "ci95": {
+            "low": 37821.9,
+            "high": 44690.4
+          }
+        },
+        "objective": {
+          "n": 10,
+          "mean": 73654.9,
+          "p50": 68795.0,
+          "p95": 95930.0,
+          "min": 58285.0,
+          "max": 95930.0,
+          "ci95": {
+            "low": 67049.3,
+            "high": 81109.0
+          }
+        },
+        "starved": {
+          "n": 10,
+          "mean": 4.6,
+          "p50": 5.0,
+          "p95": 8.0,
+          "min": 2.0,
+          "max": 8.0,
+          "ci95": {
+            "low": 3.4,
+            "high": 5.8
+          }
+        },
+        "throughput": {
+          "n": 10,
+          "mean": 2321.3119049963334,
+          "p50": 2325.734975321368,
+          "p95": 2550.9947116595317,
+          "min": 2129.2249523725995,
+          "max": 2550.9947116595317,
+          "ci95": {
+            "low": 2236.646699206395,
+            "high": 2406.3877052098746
+          }
+        },
+        "ttft_p95": {
+          "n": 10,
+          "mean": 32611.1,
+          "p50": 30658.0,
+          "p95": 43485.0,
+          "min": 25122.0,
+          "max": 43485.0,
+          "ci95": {
+            "low": 29321.2,
+            "high": 36267.5
+          }
+        }
+      }
+    }
+  ],
+  "details": null
+}

@@ -7,13 +7,18 @@ uses, so a named experiment produces the same report from either frontend.
 
 ```text
 ola experiment list
-ola experiment run <id> [--model DIR] [--backend cpu|wgpu|cuda] [--set KEY=VALUE]...
-                       [--results-dir DIR] [--json] [--trace FILE]
+ola experiment run <id> [--config FILE] [--model DIR] [--backend cpu|wgpu|cuda]
+                       [--set KEY=VALUE]... [--results-dir DIR] [--json] [--trace FILE]
 ola experiment compare <baseline.json> <candidate.json>
                        [--threshold FRACTION] [--allow-workload-mismatch]
 ola serve --model DIR [--backend cpu|wgpu|cuda] [--name ID] [--addr HOST:PORT]
           [--max-active N] [--max-in-flight N] [--drain-secs S] [--trace FILE]
+          [--adaptive CALIBRATION.json] [--role standalone|worker|gateway]
+          [--worker HOST:PORT]...
 ```
+
+Features: `wgpu` and `cuda` add those backends (and the CubeCL kernel
+studies); `cubecl-cpu` adds the kernel studies with CubeCL on the CPU.
 
 - `run` prints the experiment's summary, labelled as a probe (not for
   publication) or a study, with its clock. `--results-dir` saves an
@@ -35,10 +40,17 @@ ola serve --model DIR [--backend cpu|wgpu|cuda] [--name ID] [--addr HOST:PORT]
   concurrent sessions (default 4), and serves the `ola-serve` HTTP API on
   `--addr` (default `127.0.0.1:8080`). Ctrl-C refuses new work and lets
   accepted requests finish for up to `--drain-secs` (default 30).
+  `--adaptive` takes a saved `cost-calibration` report and serves with
+  online-adapted token budgets (`ola-serve/README.md`, "Adaptive token
+  budgets"). `--role worker` and `--role gateway --worker …` run a cluster
+  (`ola-serve/README.md`, "Cluster roles").
+- `run --config FILE` reads `{"id": …, "parameters": {…}}`; `--set` wins
+  over it.
 
 Exit codes: `0` success, `1` `compare` found a regression (usable as a CI
 gate), `2` usage or run error.
 
-From the repository root, `make experiments` lists experiments and
+For recording experiments as notebook entries, see `lab/README.md` at the
+repository root. From the repository root, `make experiments` lists experiments and
 `make experiment ID=<id> [MODEL=…] [SET="key=value …"] [RESULTS_DIR=…]` runs
 one; `make serve MODEL=… [ADDR=…]` serves a model. WGPU and CUDA need `--features wgpu` or `--features cuda`.
