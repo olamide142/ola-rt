@@ -162,6 +162,101 @@ Current experiments use seeded traces, held-out evaluation, deterministic MILP-s
 9. Revisit automatic prefill/decode role scheduling.
 10. Keep pipeline parallelism separate as D6 research.
 
+## 13. Suggested additions (review of 2026-10-31)
+
+Items not covered above, each tied to the paper section, research question
+(RQ) or hypothesis (H) it serves. The first group is what §43 Results needs
+before any of sections 4–7 pays off; most of it runs in virtual time on the
+laptop.
+
+### Evidence the paper needs first
+
+- [ ] **SLO-constrained goodput metric.** H2 and RQ3 are stated in goodput,
+  but no study reports it. Add per-request TTFT/TPOT targets to `TraceRequest`
+  and report goodput and SLO attainment as `Metric`s (`ola-bench/src/experiment/metric.rs`)
+  and as an `AdaptiveObjectiveMetrics` objective.
+- [ ] **Workloads where the optimum moves** (§37.5–37.9): step shift in
+  arrival rate, prompt-distribution shift, output-distribution shift, burst,
+  and hardware degradation (scale the `CostModel` mid-trace), as
+  `SchedulingTrace` constructors next to `phased_trace` (`ola-bench/src/trace.rs`).
+  The online study so far found no adaptation benefit because the best fixed
+  budget never changes on its traces; H1 has to be shown before H2 can be.
+- [ ] **Precondition check for H1.** A study that sweeps the static grid per
+  regime and reports whether the per-regime argmin differs (with intervals).
+  Run it before any adaptive-versus-static comparison.
+- [ ] **Missing baselines** (§38) as variants of `online-adaptive-policy-study`:
+  B3 per-regime oracle static policy (regime known, best fixed budget per
+  regime), B4 rule-based threshold controller (queue depth or prompt length
+  → budget). B4 separates "adapting at all" from "optimizing well".
+- [ ] **Cost-model error injection** (§39.5, RQ5, H5): a seeded
+  `PerturbedCostModel` wrapper with T̂ = T(1 + ε), ε ~ N(0, σ²) or bounded
+  adversarial, given to the optimizer while the simulator keeps the true model.
+- [ ] **Ranking accuracy, not just absolute error** (H5): report Kendall's τ
+  between the optimizer's predicted candidate order and the order measured by
+  replay with the true model. H5 claims ordering is enough; measure ordering.
+- [ ] **Oracle output lengths for the predictor ablation** (§39.6, H7): the
+  simulator knows each request's true length, so "oracle" and "mean" predictors
+  are cheap; "interval" needs the `BeliefState` from section 6.
+- [ ] **`--cost CALIBRATION.json` on virtual-time studies** (RQ10): load a
+  `CostFit` the way `ola serve --adaptive` does, so each GPU's fitted costs
+  drive the same study. First result already in the lab: the cost-aware grouper
+  picks PowerOfTwo at the CPU ratio (≈64 tokens/call) and Unbucketed at the
+  GPU ratio (≈207). Note that the lab notebook labels this "H3", which is not
+  the paper's H3; align lab labels with the paper's H1–H7.
+
+### Runtime pieces the formalism assumes
+
+- [ ] **Online model update** (§27 step 7): refit `CostFit` from executed
+  iterations (recursive least squares over calls and tokens) and feed it to
+  `ReplayOptimizer`. Today the cost model is fixed after offline calibration.
+  Also fix the CPU fit's misspecification (negative fixed cost).
+- [ ] **Switching cost in the objective** (§15, H6, RQ6): replace
+  `min_improvement_percent` hysteresis with λ_sw·C_switch(aₙ₋₁, a) in
+  `ReplayOptimizer`, and run λ_sw = 0 versus > 0 while sweeping how often the
+  workload shifts. The existing `switches()` counter is the thrashing metric.
+- [ ] **Confidence predicate** (§35): fall back to π_safe when the replay window
+  is too small or recent prediction error exceeds a threshold, and record why.
+- [ ] **Action ablation harness** (§39.2, RQ4): freeze any `ComposedPolicy`
+  component (scheduler, admission, batch, grouping, preemption, kernels) at a
+  fixed choice, so a study can run batching only, then + chunking, then + KV,
+  then + kernel.
+- [ ] **State ablation harness** (§39.1): mask `PlanningSnapshot` fields a
+  policy may read (queue, KV, hardware, timing) and measure the loss.
+- [ ] **Expressiveness suite** (§25, RQ1): express Orca, vLLM, Sarathi-Serve,
+  FastServe-style preemption, DistServe and Llumnix as named OlaRT policy
+  configurations, with tests asserting their characteristic decisions. This
+  would be the paper's "existing techniques are restricted policy classes"
+  table, backed by code.
+- [ ] **Mechanism registry listing** (§31.2): `ola mechanisms` prints every
+  scheduler, admission, batch, grouping, preemption and kernel alternative
+  with its capabilities, from the same registry the policies select from.
+- [ ] **Declarative policy spec** (§32): a TOML or JSON policy file (state
+  read, action domains, constraints, objective, timescale, fallback) compiled
+  into an `AdaptivePolicy`'s domains and objective, starting with the
+  token-budget policy.
+- [ ] **Precision as an action** (§8.9, §9): fp16/bf16 execution in `ola-burn`
+  (weights are cast to f32 today), with a distributional-equivalence contract
+  checked against f32 outputs. Also needed to run 7B models (about 29 GiB in
+  f32).
+
+### Hardware and generality (RQ8, RQ10)
+
+- [ ] **Hardware identity in reports**: GPU model, memory, driver, CUDA
+  version, compute capability, CPU, host. `RunMetadata.device` is only a label
+  today, so reports from different GPUs cannot be told apart.
+- [ ] **Run the CUDA path once.** It compiles but has never executed (no NVRTC
+  on the laptop); section 2's "CUDA build paths" is accurate only for building.
+  Add CUDA to `paged-attention-kernel` too (WGPU and CPU only today).
+- [ ] **Vast.ai bootstrap**: a Dockerfile on `nvidia/cuda:*-devel` with a
+  prebuilt `ola --features cuda`, a suite script (smoke test, calibration,
+  generation, grouping and policy studies with the fitted cost), and
+  `lab/VAST.md`. Test the image locally with `nvidia-container-toolkit` first.
+
+### Paper consistency
+
+- [ ] Update §31 of the paper from "proposed runtime" to an implementation
+  status table (what exists, what is simulation-only, what is missing).
+
 ## Design rules
 
 - Keep logical model semantics separate from physical execution choices.
