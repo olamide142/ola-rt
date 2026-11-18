@@ -47,15 +47,15 @@ pub use experiment::{
     HOST_STUDY_MIN_WARMUPS, IdentityDifference, Interval, KvBlockPressure, KvPageSize, KvPressure,
     LlamaGeneration, MetricComparison, MetricSpec, OnlineAdaptivePolicyStudy,
     PagedAttentionKernelStudy, PagedAttentionOccupancy, ParameterSpec, ParameterValue, Parameters,
-    PrefillBucketing, PrefillStrategies, PrefixCache, Protocol, ReportComparison, ReportError,
-    ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample, SchedulerComparison,
-    TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity, compare_reports, content_digest,
-    nsight_metrics,
+    PrefillBucketing, PrefillStrategies, PrefixCache, Protocol, RegimeShiftStudy, ReportComparison,
+    ReportError, ReportParts, Requirement, RunMetadata, STUDY_MIN_REPETITIONS, Sample,
+    SchedulerComparison, TimeDomain, Unit, Variant, VariantSummary, WorkloadIdentity,
+    compare_reports, content_digest, nsight_metrics,
 };
 pub use online::{
-    LATENCY_OBJECTIVE, OnlineTuning, ReplayOptimizer, ReplaySettings, TOKEN_BUDGET_DOMAINS,
-    largest_token_budget, serving_adaptive_policy, smallest_token_budget, token_budget,
-    token_budget_policy,
+    LATENCY_OBJECTIVE, OnlineTuning, ReplayOptimizer, ReplaySelection, ReplaySettings,
+    TOKEN_BUDGET_DOMAINS, largest_token_budget, serving_adaptive_policy, smallest_token_budget,
+    token_budget, token_budget_policy,
 };
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,

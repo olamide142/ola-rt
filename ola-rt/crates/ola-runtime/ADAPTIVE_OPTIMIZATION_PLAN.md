@@ -184,6 +184,23 @@ adaptation will only pay where the best configuration moves with the
 workload, for example cost models where per-token work dominates, or knobs
 whose best value depends on load.
 
+### Switching cost and regime study (2026-11-17)
+
+`ReplayOptimizer` searches its grid by exhaustive enumeration
+(`FiniteCandidateOptimizer`), not with the MILP: replayed p95 latencies are
+not linear in θ. It now minimizes
+`J(θ) = replay_score(θ) + switch_cost(θ_prev, θ)` (`SwitchingCost`, in
+objective microseconds per changed knob) and still requires the
+`min_improvement_percent` noise margin against the current vector's own
+score; `ReplaySelection` records every term as compared. The default cost is
+zero, so the results above are unchanged. `MilpCandidateOptimizer` expresses
+the same term exactly with big-M indicators. See `POLICY_STATE.md`.
+
+`regime-shift-study` measures the per-regime optimum before testing
+adaptation, on KV-reservation headroom instead of the token budget. The
+per-regime optima were not distinguishable, and online replay did not beat
+the best static headroom; see `REGIME_STUDY.md`.
+
 ## Verification milestones
 
 1. Add typed parameter domains, constraints, and objective components. (Integer

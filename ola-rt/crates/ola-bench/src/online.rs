@@ -22,7 +22,7 @@ use ola_runtime::{
     AdaptiveConstraints, AdaptiveIntegerDomain, AdaptiveObjectiveMetrics, AdaptiveObjectiveWeights,
     AdaptiveOptimizationError, AdaptiveOptimizer, AdaptivePolicy, AdaptiveRequestObservation,
     ComposedPolicy, ExecutionPolicy, FiniteCandidateOptimizer, MemoryAwareAdmission,
-    MixedTokenBudgetPolicy, PolicyError,
+    MixedTokenBudgetPolicy, PolicyError, SwitchingCost,
 };
 
 use crate::{
@@ -191,6 +191,7 @@ fn adaptive_token_budget_policy(
             window: tuning.window,
             min_requests: tuning.window.min(8),
             min_improvement_percent: tuning.min_improvement_percent,
+            switching: SwitchingCost::default(),
         },
         token_budget_policy,
     )?;
@@ -234,8 +235,43 @@ pub struct ReplaySettings {
     /// current vector is kept.
     pub min_requests: usize,
     /// Minimum objective improvement, in percent of the current vector's
-    /// replay score, required to switch.
+    /// replay score, required to switch. It guards against replay noise
+    /// (the window is a small sample), so it is relative.
     pub min_improvement_percent: u64,
+    /// Explicit cost, in objective microseconds, of changing each knob. It
+    /// models the transition itself, so it is absolute and enters the
+    /// argmin; the default charges nothing.
+    pub switching: SwitchingCost,
+}
+
+/// How one proposal chose, with the objective exactly as it was compared.
+///
+/// `J(θ) = replay_score(θ) + switch_cost(θ_prev, θ)`; the candidate is the
+/// argmin of `J` over the grid, and it replaces `θ_prev` only if
+/// `J(candidate) < replay_score(θ_prev) − margin`, with
+/// `margin = min_improvement_percent · |replay_score(θ_prev)| / 100`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplaySelection {
+    /// Proposal number, from 1.
+    pub proposal: u64,
+    /// Replayed requests.
+    pub window_requests: usize,
+    /// `replay_score(θ_prev)`; `None` when it cannot be scored.
+    pub current_score: Option<i64>,
+    /// `argmin J`.
+    pub candidate: Vec<(&'static str, String)>,
+    /// `replay_score(candidate)`.
+    pub candidate_score: Option<i64>,
+    /// `switch_cost(θ_prev, candidate)`.
+    pub switching_cost: i64,
+    /// `J(candidate)`.
+    pub candidate_objective: Option<i64>,
+    /// Noise margin subtracted from the current score.
+    pub margin: i64,
+    /// Whether the candidate was installed.
+    pub switched: bool,
+    /// Simulated replays this proposal ran.
+    pub replays: usize,
 }
 
 /// An [`AdaptiveOptimizer`] that replays recent work for each candidate.
@@ -248,6 +284,8 @@ pub struct ReplayOptimizer<F> {
     seen: BTreeMap<RequestId, Seen>,
     proposals: u64,
     switches: u64,
+    replays: u64,
+    last: Option<ReplaySelection>,
 }
 
 impl<F> ReplayOptimizer<F>
@@ -279,7 +317,20 @@ where
             seen: BTreeMap::new(),
             proposals: 0,
             switches: 0,
+            replays: 0,
+            last: None,
         })
+    }
+
+    /// Simulated replays run by every proposal so far: the controller's
+    /// deterministic overhead, independent of host speed.
+    pub const fn replays(&self) -> u64 {
+        self.replays
+    }
+
+    /// The most recent proposal that had enough history to replay.
+    pub const fn last_selection(&self) -> Option<&ReplaySelection> {
+        self.last.as_ref()
     }
 
     /// Proposals made with enough history to replay.
@@ -421,30 +472,66 @@ where
         self.proposals += 1;
         let config = self.config(constraints);
         let weights = self.settings.weights;
+        let switching = &self.settings.switching;
         let factory = &self.factory;
-        let current_score = replay_score(factory, current, &trace, &config, weights)?;
+        let replays = std::sync::atomic::AtomicUsize::new(0);
+        let score = |theta: &[(&'static str, String)]| {
+            replays.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            replay_score(factory, theta, &trace, &config, weights)
+        };
+        let current_score = score(current)?;
         let mut search = FiniteCandidateOptimizer::new(
             self.settings.domains.clone(),
             |candidate: &[(&'static str, String)],
              _: &[AdaptiveRequestObservation],
              _: AdaptiveConstraints| {
-                replay_score(factory, candidate, &trace, &config, weights)
+                Ok(score(candidate)?
+                    .map(|operating| operating.saturating_add(switching.cost(current, candidate))))
             },
         )?;
-        let best = search.propose(current, &[], constraints)?;
-        let best_score = replay_score(factory, &best, &trace, &config, weights)?;
-        let switch = match (current_score, best_score) {
+        // No feasible candidate keeps the current vector, and says so.
+        let (best, best_score) = match search.propose(current, &[], constraints) {
+            Ok(best) => {
+                let best_score = score(&best)?;
+                (best, best_score)
+            }
+            Err(AdaptiveOptimizationError::NoCandidate) => (current.to_vec(), None),
+            Err(error) => return Err(error),
+        };
+        let switching_cost = switching.cost(current, &best);
+        let best_objective = best_score.map(|operating| operating.saturating_add(switching_cost));
+        let margin = current_score.map_or(0, |current| {
+            i64::try_from(
+                i128::from(current.unsigned_abs())
+                    * i128::from(self.settings.min_improvement_percent)
+                    / 100,
+            )
+            .unwrap_or(i64::MAX)
+        });
+        let switch = match (current_score, best_objective) {
             // The current vector cannot even be scored; take any that can.
             (None, Some(_)) => true,
             (Some(current), Some(best)) => {
-                let margin = i128::from(current.unsigned_abs())
-                    * i128::from(self.settings.min_improvement_percent)
-                    / 100;
-                i128::from(best) < i128::from(current) - margin
+                i128::from(best) < i128::from(current) - i128::from(margin)
             }
             (_, None) => false,
         };
-        if switch && best != current {
+        let switched = switch && best != current;
+        let replays = replays.into_inner();
+        self.replays += replays as u64;
+        self.last = Some(ReplaySelection {
+            proposal: self.proposals,
+            window_requests: trace.requests.len(),
+            current_score,
+            candidate: best.clone(),
+            candidate_score: best_score,
+            switching_cost,
+            candidate_objective: best_objective,
+            margin,
+            switched,
+            replays,
+        });
+        if switched {
             self.switches += 1;
             Ok(best)
         } else {
@@ -496,6 +583,7 @@ mod tests {
             window: 64,
             min_requests: 8,
             min_improvement_percent: 5,
+            switching: SwitchingCost::default(),
         }
     }
 
@@ -505,10 +593,12 @@ mod tests {
     /// Runs an overload trace under an adaptive policy starting at
     /// `2^log2` tokens, returning the optimizer and the final run.
     fn adapt(log2: u32) -> (Shared, crate::SchedulingRun) {
+        adapt_with(log2, settings())
+    }
+
+    fn adapt_with(log2: u32, settings: ReplaySettings) -> (Shared, crate::SchedulingRun) {
         let factory: Factory = budget;
-        let optimizer = Arc::new(Mutex::new(
-            ReplayOptimizer::new(settings(), factory).unwrap(),
-        ));
+        let optimizer = Arc::new(Mutex::new(ReplayOptimizer::new(settings, factory).unwrap()));
         let shared = optimizer.clone();
         let theta = vec![("log2_max_tokens", log2.to_string())];
         let policy = AdaptivePolicy::new(budget(&theta).unwrap(), theta)
@@ -656,5 +746,80 @@ mod tests {
         let optimizer = optimizer.lock().unwrap();
         assert!(optimizer.proposals() > 0);
         assert_eq!(optimizer.switches(), 0);
+    }
+
+    fn with_switching(cost: i64) -> ReplaySettings {
+        ReplaySettings {
+            min_improvement_percent: 0,
+            switching: SwitchingCost::uniform(&["log2_max_tokens"], cost),
+            ..settings()
+        }
+    }
+
+    #[test]
+    fn a_dominant_switching_cost_keeps_the_current_budget() {
+        let (optimizer, _) = adapt_with(4, with_switching(1_000_000_000));
+        let optimizer = optimizer.lock().unwrap();
+        assert!(optimizer.proposals() > 0);
+        assert_eq!(optimizer.switches(), 0);
+        let last = optimizer.last_selection().unwrap();
+        assert!(!last.switched);
+        // Staying put costs nothing, so it is the argmin of J.
+        assert_eq!(last.candidate, vec![("log2_max_tokens", "4".to_owned())]);
+        assert_eq!(last.switching_cost, 0);
+    }
+
+    #[test]
+    fn a_large_enough_improvement_pays_for_the_switch() {
+        let (optimizer, _) = adapt_with(4, with_switching(1_000));
+        let optimizer = optimizer.lock().unwrap();
+        assert!(optimizer.switches() > 0);
+        assert!(optimizer.replays() >= optimizer.proposals() * 8);
+    }
+
+    #[test]
+    fn the_recorded_objective_is_the_one_compared() {
+        let (optimizer, _) = adapt_with(4, with_switching(1_000));
+        let optimizer = optimizer.lock().unwrap();
+        let last = optimizer.last_selection().unwrap();
+        assert_eq!(
+            last.candidate_objective,
+            last.candidate_score
+                .map(|score| score + last.switching_cost)
+        );
+        if last.switched {
+            assert!(last.candidate_objective.unwrap() < last.current_score.unwrap() - last.margin);
+        }
+    }
+
+    #[test]
+    fn unscorable_candidates_never_replace_the_current_vector() {
+        fn reject(_: &[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
+            Err(PolicyError::InvalidCandidate("rejected".into()))
+        }
+        let mut optimizer = ReplayOptimizer::new(with_switching(0), reject).unwrap();
+        let observations = (0..8)
+            .map(|index| AdaptiveRequestObservation {
+                request_id: RequestId::new(index),
+                arrived_at: Timestamp::from_micros(index * 100),
+                first_token_at: Some(Timestamp::from_micros(index * 100 + 50)),
+                completed_at: Some(Timestamp::from_micros(index * 100 + 90)),
+                time_to_first_token_micros: Some(50),
+                completion_latency_micros: Some(90),
+                deadline_missed: false,
+                capability_fallback: false,
+                prompt_tokens: Some(8),
+                max_new_tokens: Some(4),
+                generated_tokens: Some(4),
+            })
+            .collect::<Vec<_>>();
+        let current = vec![("log2_max_tokens", "6".to_owned())];
+        let proposed = optimizer
+            .propose(&current, &observations, AdaptiveConstraints::default())
+            .unwrap();
+        assert_eq!(proposed, current);
+        let last = optimizer.last_selection().unwrap();
+        assert_eq!((last.current_score, last.candidate_objective), (None, None));
+        assert!(!last.switched);
     }
 }

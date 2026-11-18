@@ -233,6 +233,21 @@ overhead dominates, larger iterations win and an adaptive budget recovers
 throughput lost to a small fixed one; when per-token work dominates, capping
 prompt work keeps long prompts from stalling live decodes.
 
+## Policy state, beliefs, and switching
+
+`POLICY_STATE.md` specifies the decision loop formally and maps each
+mathematical field (state, observation, belief, action, constraints,
+outcome, parameters) to the Rust type that implements it, or marks it as
+not implemented. `OutputLengthBelief` is an empirical, censoring-aware
+estimate of a request's *remaining* output tokens, updated only after
+iterations commit; `QuantileAdmission` reserves a quantile of it and falls
+back to the worst case when there is no belief, and `BeliefPolicy` plans
+from a frozen copy. `kv_overflow_risk` reports a seeded scenario estimate
+of KV overflow risk; it is an estimate, not a guarantee, and no plan skips
+validation because of it. `SwitchingCost` charges an explicit cost per
+changed knob, exactly in `MilpCandidateOptimizer` (big-M indicators) and in
+`ola_bench::ReplayOptimizer`'s candidate selection.
+
 ## Minimal lifecycle
 
 ```rust

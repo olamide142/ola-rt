@@ -312,6 +312,58 @@ type ThetaUpdater = Box<
         + Send,
 >;
 
+/// Explicit cost of changing tunable knobs between decision epochs.
+///
+/// `switch_cost(θ_prev, θ) = Σ_k w_k · 1[θ_k ≠ θ_prev,k]` over the listed
+/// knobs only, in the optimizer's own objective units (for the replay
+/// optimizer, objective microseconds). Knobs that are not listed, including
+/// descriptive θ entries no factory reads, never count as a switch. A knob
+/// missing from `θ_prev` counts as changed when `θ` sets it: installing a
+/// value where none was known is a reconfiguration. Weights below zero are
+/// treated as zero.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SwitchingCost {
+    /// Cost charged when each knob changes.
+    pub weights: Vec<(&'static str, i64)>,
+}
+
+impl SwitchingCost {
+    /// Charges `cost` for every change of any of `knobs`.
+    pub fn uniform(knobs: &[&'static str], cost: i64) -> Self {
+        Self {
+            weights: knobs.iter().map(|knob| (*knob, cost)).collect(),
+        }
+    }
+
+    /// Whether every weight is zero, so selection ignores switching.
+    pub fn is_zero(&self) -> bool {
+        self.weights.iter().all(|(_, weight)| *weight <= 0)
+    }
+
+    /// `switch_cost(previous, candidate)`.
+    pub fn cost(
+        &self,
+        previous: &[(&'static str, String)],
+        candidate: &[(&'static str, String)],
+    ) -> i64 {
+        let value = |theta: &[(&'static str, String)], knob: &str| {
+            theta
+                .iter()
+                .find(|(key, _)| *key == knob)
+                .map(|(_, value)| value.trim().to_owned())
+        };
+        self.weights
+            .iter()
+            .filter(|(knob, weight)| {
+                *weight > 0 && {
+                    let next = value(candidate, knob);
+                    next.is_some() && next != value(previous, knob)
+                }
+            })
+            .fold(0_i64, |total, (_, weight)| total.saturating_add(*weight))
+    }
+}
+
 /// A linear integer optimizer backed by `good_lp` and its pure-Rust `microlp`
 /// solver. The finite optimizer remains the exact small-domain oracle.
 pub struct MilpCandidateOptimizer {
@@ -321,6 +373,24 @@ pub struct MilpCandidateOptimizer {
     constraints: Vec<AdaptiveLinearConstraint>,
     memory_constraints: Vec<AdaptiveMemoryConstraint>,
     constant: i64,
+    switching: SwitchingCost,
+    last_objective: Option<MilpObjectiveValue>,
+}
+
+/// Objective of the last MILP solution, split into its two terms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MilpObjectiveValue {
+    /// Linear operating cost, including the constant term.
+    pub operating: i64,
+    /// Switching cost from the vector the optimizer was given.
+    pub switching: i64,
+}
+
+impl MilpObjectiveValue {
+    /// The minimized total.
+    pub const fn total(self) -> i64 {
+        self.operating.saturating_add(self.switching)
+    }
 }
 
 impl MilpCandidateOptimizer {
@@ -355,7 +425,27 @@ impl MilpCandidateOptimizer {
             constraints: Vec::new(),
             memory_constraints: Vec::new(),
             constant: 0,
+            switching: SwitchingCost::default(),
+            last_objective: None,
         })
+    }
+
+    /// Adds `λ_sw · switch_cost(current, θ)` to the objective.
+    ///
+    /// Each weighted knob gets a binary `z_k` with
+    /// `|x_k − x_prev,k| ≤ M_k z_k`, where `x` counts grid steps and `M_k` is
+    /// the domain's step count, so `z_k = 1` exactly when the knob moves
+    /// (minimization drives it to zero otherwise). A previous value that is
+    /// missing or off the grid fixes `z_k = 1`.
+    #[must_use]
+    pub fn with_switching_cost(mut self, switching: SwitchingCost) -> Self {
+        self.switching = switching;
+        self
+    }
+
+    /// Objective of the most recent successful solve, as selected.
+    pub const fn last_objective(&self) -> Option<MilpObjectiveValue> {
+        self.last_objective
     }
 
     /// Adds an upper-bounded linear constraint.
@@ -444,9 +534,48 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
             objective += *coefficient as f64 * domain.step as f64 * decision_variables[index];
         }
 
+        // Switching indicators: (domain index, binary, previous step or
+        // None when the previous value is unknown).
+        let mut switches = Vec::new();
+        for (index, domain) in self.domains.iter().enumerate() {
+            let weight = self
+                .switching
+                .weights
+                .iter()
+                .filter(|(knob, _)| *knob == domain.name)
+                .map(|(_, weight)| (*weight).max(0))
+                .sum::<i64>();
+            if weight == 0 {
+                continue;
+            }
+            let steps = (domain_maxima[index] - domain.min) / domain.step;
+            let previous = current
+                .iter()
+                .find(|(key, _)| *key == domain.name)
+                .and_then(|(_, value)| value.trim().parse::<i64>().ok())
+                .filter(|value| (value - domain.min) % domain.step == 0)
+                .map(|value| (value - domain.min) / domain.step)
+                .filter(|step| (0..=steps).contains(step));
+            let indicator = if previous.is_some() {
+                variables.add(variable().binary())
+            } else {
+                variables.add(variable().integer().min(1.0).max(1.0))
+            };
+            objective += weight as f64 * indicator;
+            switches.push((index, indicator, previous, steps, weight));
+        }
+
         let mut model = variables
             .minimise(objective)
             .using(good_lp::solvers::microlp::microlp);
+        for &(index, indicator, previous, steps, _) in &switches {
+            if let Some(previous) = previous {
+                let big_m = steps.max(1) as f64;
+                model = model
+                    .with((decision_variables[index] - previous as f64).leq(big_m * indicator))
+                    .with((previous as f64 - decision_variables[index]).leq(big_m * indicator));
+            }
+        }
         for constraint in &self.constraints {
             let mut expression = Expression::from(0.0);
             for (name, coefficient) in &constraint.terms {
@@ -503,6 +632,39 @@ impl AdaptiveOptimizer for MilpCandidateOptimizer {
             }
         }
         candidate.sort_by_key(|(key, _)| *key);
+        let operating = objective_coefficients
+            .iter()
+            .filter_map(|(name, coefficient)| {
+                let value = candidate
+                    .iter()
+                    .find(|(key, _)| key == name)?
+                    .1
+                    .parse::<i64>()
+                    .ok()?;
+                Some(coefficient.saturating_mul(value))
+            })
+            .fold(self.constant, i64::saturating_add);
+        // Report the term the solver minimized, recomputed on the rounded
+        // solution so it matches the vector returned.
+        let switching = switches
+            .iter()
+            .filter(|&&(index, _, previous, _, _)| {
+                let step = (candidate
+                    .iter()
+                    .find(|(key, _)| *key == self.domains[index].name)
+                    .and_then(|(_, value)| value.parse::<i64>().ok())
+                    .unwrap_or(self.domains[index].min)
+                    - self.domains[index].min)
+                    / self.domains[index].step;
+                previous != Some(step)
+            })
+            .fold(0_i64, |total, &(_, _, _, _, weight)| {
+                total.saturating_add(weight)
+            });
+        self.last_objective = Some(MilpObjectiveValue {
+            operating,
+            switching,
+        });
         Ok(candidate)
     }
 }
@@ -1177,7 +1339,7 @@ impl ExecutionPolicy for AdaptivePolicy {
     }
 }
 
-fn splitmix64(state: u64) -> u64 {
+pub(crate) fn splitmix64(state: u64) -> u64 {
     let mut value = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -2153,5 +2315,144 @@ mod tests {
 
         let decision = policy.plan(&snapshot).unwrap();
         assert_eq!(decision.record.policy.components[1].name, "composed");
+    }
+
+    fn knob(value: i64) -> Vec<(&'static str, String)> {
+        vec![("budget", value.to_string())]
+    }
+
+    fn switching_milp(cost: i64) -> MilpCandidateOptimizer {
+        MilpCandidateOptimizer::new(
+            vec![AdaptiveIntegerDomain {
+                name: "budget",
+                min: 0,
+                max: 10,
+                step: 1,
+            }],
+            // Larger budgets are better by one unit per step.
+            vec![("budget", -1)],
+        )
+        .unwrap()
+        .with_switching_cost(SwitchingCost::uniform(&["budget"], cost))
+    }
+
+    #[test]
+    fn switching_cost_counts_only_listed_changed_knobs() {
+        let cost = SwitchingCost::uniform(&["budget"], 7);
+        assert_eq!(cost.cost(&knob(3), &knob(3)), 0);
+        assert_eq!(cost.cost(&knob(3), &knob(4)), 7);
+        // A missing previous value is a reconfiguration.
+        assert_eq!(cost.cost(&[], &knob(4)), 7);
+        // Descriptive entries nobody listed never count.
+        let mut described = knob(3);
+        described.push(("label", "new".into()));
+        assert_eq!(cost.cost(&knob(3), &described), 0);
+        assert!(SwitchingCost::default().is_zero());
+    }
+
+    #[test]
+    fn milp_keeps_the_current_vector_when_switching_costs_more_than_it_gains() {
+        let mut optimizer = switching_milp(20);
+        let proposed = optimizer
+            .propose(&knob(5), &[], AdaptiveConstraints::default())
+            .unwrap();
+        assert_eq!(proposed, knob(5));
+        assert_eq!(
+            optimizer.last_objective(),
+            Some(MilpObjectiveValue {
+                operating: -5,
+                switching: 0
+            })
+        );
+    }
+
+    #[test]
+    fn milp_switches_when_the_gain_exceeds_the_switching_cost() {
+        let mut optimizer = switching_milp(3);
+        let proposed = optimizer
+            .propose(&knob(5), &[], AdaptiveConstraints::default())
+            .unwrap();
+        assert_eq!(proposed, knob(10));
+        let objective = optimizer.last_objective().unwrap();
+        assert_eq!((objective.operating, objective.switching), (-10, 3));
+        assert_eq!(objective.total(), -7);
+    }
+
+    #[test]
+    fn milp_without_a_previous_value_charges_every_candidate_equally() {
+        let mut optimizer = switching_milp(20);
+        let proposed = optimizer
+            .propose(&[], &[], AdaptiveConstraints::default())
+            .unwrap();
+        assert_eq!(proposed, knob(10));
+        assert_eq!(optimizer.last_objective().unwrap().switching, 20);
+    }
+
+    #[test]
+    fn milp_switching_cost_matches_the_finite_oracle() {
+        for cost in [0, 1, 4, 5, 6, 30] {
+            for start in [0, 3, 10] {
+                let mut milp = switching_milp(cost);
+                let switching = SwitchingCost::uniform(&["budget"], cost);
+                let current = knob(start);
+                let mut finite = FiniteCandidateOptimizer::new(
+                    vec![AdaptiveIntegerDomain {
+                        name: "budget",
+                        min: 0,
+                        max: 10,
+                        step: 1,
+                    }],
+                    |candidate: &[(&'static str, String)],
+                     _: &[AdaptiveRequestObservation],
+                     _: AdaptiveConstraints| {
+                        let value = candidate[0].1.parse::<i64>().unwrap();
+                        Ok(Some(-value + switching.cost(&current, candidate)))
+                    },
+                )
+                .unwrap();
+                let exact = finite
+                    .propose(&current, &[], AdaptiveConstraints::default())
+                    .unwrap();
+                let solved = milp
+                    .propose(&current, &[], AdaptiveConstraints::default())
+                    .unwrap();
+                let total = |theta: &[(&'static str, String)]| {
+                    -theta[0].1.parse::<i64>().unwrap() + switching.cost(&current, theta)
+                };
+                assert_eq!(total(&solved), total(&exact), "cost {cost}, start {start}");
+                assert_eq!(milp.last_objective().unwrap().total(), total(&solved));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_optimizer_proposals_keep_the_installed_vector() {
+        let mut policy = AdaptivePolicy::new(ComposedPolicy::default(), knob(5))
+            .with_factory(|_: &[(&'static str, String)]| {
+                Ok(Box::new(ComposedPolicy::default()) as Box<dyn ExecutionPolicy>)
+            })
+            .with_optimizer(
+                |_: &[(&'static str, String)],
+                 _: &[AdaptiveRequestObservation],
+                 _: AdaptiveConstraints| {
+                    Err(AdaptiveOptimizationError::Infeasible(
+                        "solver failed".into(),
+                    ))
+                },
+            );
+        policy.observe(&ExecutorIteration {
+            id: crate::IterationId::default(),
+            at: Timestamp::ZERO,
+            events: Vec::new(),
+            execution_plan: ExecutionPlan::default(),
+            decision: DecisionRecord::default(),
+            divergences: Vec::new(),
+            execution_batches: Vec::new(),
+            active_requests: 0,
+            queued_requests: 0,
+            kv_cache_bytes: 0,
+            reserved_kv_bytes: 0,
+        });
+        assert_eq!(policy.theta(), &knob(5)[..]);
     }
 }

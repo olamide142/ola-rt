@@ -55,6 +55,7 @@ impl ExperimentRegistry {
             Box::new(SchedulerComparison),
             Box::new(AdaptivePolicyStudy),
             Box::new(OnlineAdaptivePolicyStudy),
+            Box::new(super::RegimeShiftStudy),
             Box::new(KvPressure),
             Box::new(PrefixCache),
             Box::new(KvPageSize),
@@ -1043,6 +1044,7 @@ impl OnlineAdaptivePolicyStudy {
                 window,
                 min_requests: window.min(8),
                 min_improvement_percent,
+                switching: ola_runtime::SwitchingCost::default(),
             },
             AdaptivePolicyStudy::adaptive_policy,
         )

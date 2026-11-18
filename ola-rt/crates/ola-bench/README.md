@@ -274,6 +274,17 @@ first token, in virtual time.
   choice), `fixed` (the offline choice), and `fifo`, on traces whose
   workload shifts from mixed short/long requests to an overload burst.
 
+`ReplaySettings::switching` charges an explicit cost per changed knob in the
+selection objective (zero by default), and `ReplayOptimizer::last_selection`
+records each term as compared.
+
+`regime-shift-study` first measures whether the best KV-reservation headroom
+differs between an early-stopping regime and a run-to-limit regime (each run
+alone, paired intervals), then compares a fixed baseline, every fixed grid
+point, a hindsight `oracle-static`, online replay with and without switching
+cost, and a remaining-output belief quantile. Results are in
+`../ola-runtime/REGIME_STUDY.md`.
+
 Results and their limits are in `../ola-runtime/ADAPTIVE_OPTIMIZATION_PLAN.md`.
 Replays use the simulator's `CostModel`, so on hardware the optimizer is only
 as good as a calibrated one.

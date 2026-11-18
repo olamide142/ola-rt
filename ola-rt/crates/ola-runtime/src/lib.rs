@@ -3,6 +3,7 @@
 mod adaptive;
 mod admission;
 mod batch;
+mod belief;
 mod builder;
 mod composed;
 mod config;
@@ -24,11 +25,11 @@ pub use adaptive::{
     AdaptiveMemoryConstraint, AdaptiveObjectiveMetrics, AdaptiveObjectiveWeights,
     AdaptiveOptimizationError, AdaptiveOptimizer, AdaptiveParameterConfig, AdaptivePolicy,
     AdaptivePolicyConfig, AdaptivePolicyFactory, AdaptiveRequestObservation,
-    FiniteCandidateOptimizer, MilpCandidateOptimizer,
+    FiniteCandidateOptimizer, MilpCandidateOptimizer, MilpObjectiveValue, SwitchingCost,
 };
 pub use admission::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AdmissionReason, MemoryAwareAdmission,
-    UnconstrainedAdmission, WatermarkAdmission,
+    QuantileAdmission, UnconstrainedAdmission, WatermarkAdmission,
 };
 pub use batch::{
     BatchCandidate, BatchContext, BatchExecutionMode, BatchPhase, BatchPolicy, BatchPressure,
@@ -36,6 +37,10 @@ pub use batch::{
     FifoTokenBudgetPolicy, MixedTokenBudgetPolicy, PowerOfTwoPrefillBatcher, PrefillBatcher,
     PrefillGroupingEstimate, PrefillGroupingStrategy, QueueAdaptiveTokenBudget,
     UnboundedBatchPolicy, UnbucketedPrefillBatcher,
+};
+pub use belief::{
+    BeliefPolicy, BeliefUnavailable, KvRiskEstimate, LiveKvDemand, OutputBeliefConfig,
+    OutputLengthBelief, RemainingOutputDistribution, kv_overflow_risk, output_limit_bucket,
 };
 pub use builder::ExecutorBuilder;
 pub use composed::{ComposedPolicy, HeadOfLine};

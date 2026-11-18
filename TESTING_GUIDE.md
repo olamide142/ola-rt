@@ -110,6 +110,7 @@ No model needed:
 | `scheduler-comparison` | study, virtual | FIFO, priority, EDF, SJF, and backfill on one trace (`trace=` `mixed_short_long`, `prefill_decode_competition`, `priority_classes`, `deadlines`, `overload`, `impossible`). |
 | `adaptive-policy-study` | study, virtual | A token budget chosen offline on seed 0, against FIFO on held-out seeds. |
 | `online-adaptive-policy-study` | study, virtual | Token budgets re-optimized online by replaying recent work, against the best offline budget and FIFO. |
+| `regime-shift-study` | study, virtual | KV-reservation headroom across an early-stopping then run-to-limit trace: per-regime best fixed action, hindsight static oracle, online replay with and without switching cost, belief quantile. |
 | `kv-pressure` | study, virtual | Worst-case KV reservation against watermark admission with preemption (`trace=` `early_stopping`, `mixed_short_long`, `overload`). |
 | `prefix-cache` | study, virtual | Prefill reuse for prompts sharing a system prompt. |
 | `kv-page-size` | study, virtual | Internal fragmentation and prefix reuse across page sizes. |

@@ -1,9 +1,9 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use ola_core::{ModelId, RequestId};
 use ola_model::KvCacheProfile;
 
-use crate::{MemoryState, PolicyDescriptor};
+use crate::{MemoryState, OutputLengthBelief, PolicyDescriptor};
 
 /// Read-only inputs supplied to an executor admission policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -298,6 +298,72 @@ impl AdmissionPolicy for WatermarkAdmission {
     }
 }
 
+/// Reserves the prompt plus a quantile of the request's remaining-output
+/// belief, and the worst case when there is no belief.
+///
+/// With a usable [`OutputLengthBelief`] it behaves exactly like
+/// [`WatermarkAdmission`] with `headroom = q_p(R) − 1`, where `q_p(R)` is the
+/// `quantile` of the remaining output (the last token never enters the
+/// cache): the pool is over-committed, so it must run with
+/// [`ComposedPolicy::with_preemption`](crate::ComposedPolicy::with_preemption),
+/// which checks free blocks and preempts when the bet fails. Without a
+/// belief (cold start, too few samples) it is [`MemoryAwareAdmission`].
+///
+/// The belief only sizes reservations. Requests whose worst case can never
+/// fit are still rejected, plan validation still bounds the sum of
+/// reservations by the pool, and the physical block check and allocation
+/// recovery are unchanged. The quantile is not a calibrated guarantee.
+#[derive(Clone, Debug)]
+pub struct QuantileAdmission {
+    belief: Arc<OutputLengthBelief>,
+    quantile: f64,
+}
+
+impl QuantileAdmission {
+    /// Admits with the `quantile` of each request's remaining output;
+    /// quantiles outside `(0, 1)` reserve the worst case.
+    pub fn new(belief: Arc<OutputLengthBelief>, quantile: f64) -> Self {
+        Self { belief, quantile }
+    }
+
+    /// Headroom beyond the prompt this policy would reserve, or `None` when
+    /// it falls back to the worst case.
+    pub fn headroom_tokens(&self, context: &AdmissionContext) -> Option<usize> {
+        if !(self.quantile > 0.0 && self.quantile < 1.0) {
+            return None;
+        }
+        let remaining = self
+            .belief
+            .remaining_for(
+                context.request_id,
+                &context.model_id,
+                context.max_new_tokens,
+            )
+            .ok()?
+            .quantile(self.quantile);
+        Some(remaining.saturating_sub(1))
+    }
+}
+
+impl AdmissionPolicy for QuantileAdmission {
+    fn descriptor(&self) -> PolicyDescriptor {
+        PolicyDescriptor::new("quantile-admission")
+            .with_config("quantile", self.quantile)
+            .with_config("samples", self.belief.recorded_samples())
+    }
+
+    fn enforces_model_kv_capacity(&self) -> bool {
+        true
+    }
+
+    fn decide(&self, context: &AdmissionContext) -> AdmissionDecision {
+        match self.headroom_tokens(context) {
+            Some(headroom_tokens) => WatermarkAdmission { headroom_tokens }.decide(context),
+            None => MemoryAwareAdmission.decide(context),
+        }
+    }
+}
+
 fn estimate_kv_bytes(context: &AdmissionContext) -> Option<u64> {
     let profile = context.kv_cache?;
     // The first selected output token is not a decode input yet, so at most
@@ -417,6 +483,58 @@ mod tests {
         };
         assert!(matches!(
             watermark.decide(&impossible),
+            AdmissionDecision::Reject(AdmissionReason::RequestExceedsModelKvCapacity { .. })
+        ));
+    }
+
+    fn learned_belief(lengths: &[usize]) -> Arc<OutputLengthBelief> {
+        let mut belief = OutputLengthBelief::new(crate::OutputBeliefConfig {
+            min_samples: lengths.len(),
+            ..crate::OutputBeliefConfig::default()
+        });
+        for (index, &length) in lengths.iter().enumerate() {
+            let request = RequestId::new(100 + index as u64);
+            belief.admit(request, &"tiny".into(), 16);
+            belief.token(request, length, true, length < 16);
+        }
+        Arc::new(belief)
+    }
+
+    #[test]
+    fn quantile_admission_without_a_belief_is_worst_case() {
+        let cold = QuantileAdmission::new(Arc::new(OutputLengthBelief::default()), 0.9);
+        assert_eq!(cold.headroom_tokens(&context()), None);
+        assert_eq!(
+            cold.decide(&context()),
+            MemoryAwareAdmission.decide(&context())
+        );
+        let degenerate = QuantileAdmission::new(learned_belief(&[2, 2, 2, 2]), 1.0);
+        assert_eq!(
+            degenerate.decide(&context()),
+            MemoryAwareAdmission.decide(&context())
+        );
+    }
+
+    #[test]
+    fn quantile_admission_reserves_the_prompt_plus_the_remaining_quantile() {
+        let admission = QuantileAdmission::new(learned_belief(&[2, 2, 2, 12]), 0.5);
+        // Median remaining output is 2 tokens: one generated position enters
+        // the cache, so 17 + 1 = 18 positions, two 16-token pages.
+        assert_eq!(admission.headroom_tokens(&context()), Some(1));
+        assert_eq!(
+            admission.decide(&context()),
+            AdmissionDecision::Admit {
+                reserved_kv_bytes: 256,
+            }
+        );
+        // A worst case that can never fit is still rejected, whatever the
+        // belief says.
+        let impossible = AdmissionContext {
+            prompt_tokens: 70,
+            ..context()
+        };
+        assert!(matches!(
+            admission.decide(&impossible),
             AdmissionDecision::Reject(AdmissionReason::RequestExceedsModelKvCapacity { .. })
         ));
     }

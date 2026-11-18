@@ -129,6 +129,40 @@ impl SchedulingTrace {
         })
     }
 
+    /// The `early_stopping` shape with no early stops: every request runs
+    /// to its 128–256-token limit. Reserving less than the worst case only
+    /// defers the memory each request will eventually need.
+    pub fn run_to_limit(parameters: TraceParameters) -> Self {
+        Self::generate("run_to_limit", parameters, |random, _| {
+            shaped(random, 16..=64, 128..=256)
+        })
+    }
+
+    /// `self` followed by `next`, whose arrivals start `gap_micros` after
+    /// the last of `self`'s. Request `i` of the result belongs to `self`
+    /// exactly when `i < self.requests.len()`.
+    #[must_use]
+    pub fn followed_by(self, next: Self, name: &'static str, gap_micros: u64) -> Self {
+        let offset = self
+            .requests
+            .last()
+            .map_or(0, |request| request.arrival_micros)
+            .saturating_add(gap_micros);
+        let mut requests = self.requests;
+        requests.extend(next.requests.into_iter().map(|request| TraceRequest {
+            arrival_micros: request.arrival_micros.saturating_add(offset),
+            ..request
+        }));
+        Self {
+            name,
+            parameters: TraceParameters {
+                requests: requests.len(),
+                ..self.parameters
+            },
+            requests,
+        }
+    }
+
     /// Every prompt starts with the same `prefix_tokens` (a system prompt)
     /// followed by 8–32 tokens unique to the request; outputs are 8–32
     /// tokens. No request stops early, so prefixes stay comparable.

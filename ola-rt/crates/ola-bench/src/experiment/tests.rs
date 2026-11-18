@@ -434,6 +434,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         "scheduler-comparison",
         "adaptive-policy-study",
         "online-adaptive-policy-study",
+        "regime-shift-study",
         "kv-pressure",
         "prefix-cache",
         "kv-page-size",
@@ -460,6 +461,7 @@ fn every_builtin_experiment_runs_with_its_defaults() {
         // suite in debug builds.
         let overrides: &[(&str, &str)] = match descriptor.id {
             "online-adaptive-policy-study" => &[("seeds", "3"), ("requests", "40")],
+            "regime-shift-study" => &[("seeds", "3"), ("requests", "24")],
             _ => &[],
         };
         let outcome = run(descriptor.id, overrides).unwrap();
@@ -715,4 +717,33 @@ fn larger_pages_waste_more_and_reuse_less() {
         "{small}"
     );
     assert!(large <= 39.0 * 64.0 && large < small, "{large}");
+}
+
+#[test]
+fn the_regime_study_is_reproducible_and_labels_its_oracle() {
+    let overrides = [
+        ("seeds", "3"),
+        ("requests", "16"),
+        ("optimization_interval", "20"),
+    ];
+    let first = run("regime-shift-study", &overrides).unwrap();
+    let second = run("regime-shift-study", &overrides).unwrap();
+    assert_eq!(first.report.samples, second.report.samples);
+    assert_eq!(first.summary, second.summary);
+    let oracle = first
+        .report
+        .variants
+        .iter()
+        .find(|variant| variant.label == "oracle-static")
+        .unwrap();
+    assert!(oracle.policy.as_deref().unwrap().starts_with("hindsight"));
+    // Only the replay controllers report switches and replays.
+    let summary = first.report.summary("fixed-h32").unwrap();
+    assert_eq!(summary.estimates["switches"].mean, 0.0);
+    assert_eq!(summary.estimates["replays"].mean, 0.0);
+    let replay = first.report.summary("replay").unwrap();
+    assert!(replay.estimates["replays"].mean > 0.0);
+    for summary in &first.report.summaries {
+        assert_eq!(summary.estimates["failed"].mean, 0.0, "{}", summary.variant);
+    }
 }
