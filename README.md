@@ -1,940 +1,297 @@
-# OlaRT
+# Ola-RT
 
-> **An opinionated Rust runtime and research framework for adaptive, scalable AI inference.**
+> **A Compositional Rust Runtime and Research Platform for Inference Execution Policies in AI Serving**
 
-OlaRT is a long-term AI systems research project focused on the execution, optimization, scheduling, scaling, and serving of modern machine-learning workloads.
+[![Rust](https://img.shields.io/badge/rust-2024%20%7C%201.95-orange.svg)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![PhD Research](https://img.shields.io/badge/phd-Nile%20University%20of%20Nigeria-8A2BE2.svg)]()
 
-It begins as a practical runtime built on top of existing Rust ML infrastructure—primarily Burn and CubeCL—and gradually grows into a research platform for:
+Ola-RT is an inference runtime and systems research platform engineered in Rust, developed as the experimental core of doctoral research by **Victor O. Olowofeso** at **Nile University of Nigeria**.
 
-- LLM inference
-- VLM and multimodal inference
-- computer vision and OlaDetection workloads
-- GPU execution
-- request scheduling
-- KV-cache management
-- continuous batching
-- distributed inference
-- adaptive load balancing
-- heterogeneous compute
-- runtime cost modelling
-- online optimization
-- learned scheduling
-- spatial and world-model inference
+Modern AI serving systems (such as vLLM, TensorRT-LLM, and SGLang) make dozens of interdependent operational decisions per iteration: request scheduling, memory-aware admission, batch construction, chunked prefill, KV-cache preemption, kernel selection, and cluster routing. In existing runtimes, these choices are typically embedded within tight, monolithic heuristics that are difficult to formalize, compare, or replace.
 
-OlaRT is intended to remain useful throughout a multi-year PhD program: first as a learning platform, then as an inference engine, then as an experimental systems runtime, and finally as a vehicle for original research.
+Ola-RT asks a foundational systems question:
 
-**Start here:** [`TESTING_GUIDE.md`](TESTING_GUIDE.md) shows how to validate, run every experiment, and serve models; [`lab/README.md`](lab/README.md) is the research notebook workflow, and [`lab/CURRICULUM.md`](lab/CURRICULUM.md) the graded experiments to learn from. `make help` lists every command.
+> **Given a dynamic workload, model architecture, physical KV cache pressure, hardware capabilities, and latency SLOs, what should an inference runtime do next?**
+
+Ola-RT answers this by formalizing and executing **Inference Execution Policies (IEP)**: treating runtime decisions as modular, compositional, and strictly validated mathematical functions over observable system state.
 
 ---
 
-## Why OlaRT?
+## Key Highlights
 
-Modern AI applications often look deceptively simple:
+- **Formal Policy Composition:** Decomposes runtime control into explicit stages (Scheduler, Admission, Batching, Prefill Chunking, Preemption, Kernel Selection, Routing) with formal plan validation.
+- **Physical KV Cache & Paged Attention:** Paged KV management with block tables, zero-copy block allocation, memory fragmentation metrics, and both portable online-softmax and CubeCL GPU attention kernels.
+- **Continuous Batching & Chunked Prefill:** Iteration-level scheduling, resumable prefill chunks, shared token budgets, and cost-calibrated prompt bucketing balancing padding overhead against kernel invocation costs.
+- **Memory-Aware Admission & Preemption:** Worst-case KV reservation alongside quantile-based headroom admission ($q_\alpha$) driven by Kaplan-Meier remaining-output length beliefs, backed by watermark preemption and recompute semantics.
+- **Switching Costs & Adaptive Optimization:** Explicit transition penalty modeling ($c_{\text{switch}}$) and dual-hysteresis `ReplayOptimizer` to prevent policy thrashing during online workload adaptation.
+- **Distributed Cluster Coordination:** Sans-IO `Coordinator` supporting Round Robin, Least Loaded, Power-of-Two, KV Headroom, and Prefix Affinity routing, small-batch MILP optimization, and TCP session state handoff via `ola-net`.
+- **Reproducible Experimental Science:** 14 registered experiment studies and probes across virtual-time, host-time, and untimed domains (`ola-bench`), evaluated with paired trials, bootstrap 95% confidence intervals, and automated regression detection.
+- **Full Model Serving:** Strict Hugging Face checkpoint loading (SafeTensors + Tokenizers) for Llama (e.g. SmolLM2, TinyLlama, Llama-3) and Mistral architectures on CPU and WGPU/CUDA, with an OpenAI-compatible SSE streaming HTTP server (`ola-serve`).
+
+---
+
+## Theoretical Foundation: Inference Execution Policies (IEP)
+
+In Ola-RT, serving is modeled as a discrete-time closed-loop control system:
 
 ```text
-input → model → output
+       ┌────────────────────────────────────────────────────────┐
+       │                                                        │
+       ▼                                                        │
+  PlanningSnapshot (Sₙ)                                         │ Telemetry (Tₙ)
+       │                                                        │ (TTFT, TBT,
+       ▼                                                        │  KV pressure,
+┌──────────────┐     ExecutionPlan (Aₙ)    ┌─────────────────┐  │  padding waste)
+│ Policy (π)   │ ────────────────────────► │ Validator (Γ)   │  │
+└──────────────┘                           └────────┬────────┘  │
+                                                    │           │
+                                           Admitted │           │
+                                           Plan (GP)│           │
+                                                    ▼           │
+                                           ┌─────────────────┐  │
+                                           │ Engine Executor │ ─┘
+                                           └─────────────────┘
 ```
 
-The systems underneath are not.
+$$\mathcal{S}_n \xrightarrow{\pi} \mathcal{A}_n \xrightarrow{\Gamma} G_P \xrightarrow{\text{execute}} \mathcal{T}_n \to \mathcal{S}_{n+1}$$
+
+1. **State Observation ($\mathcal{S}_n$):** At iteration $n$, the runtime constructs an immutable `PlanningSnapshot` containing the queued requests $Q_n$, active execution set $\mathcal{A}_n$, memory/block table occupancy $M_n$, and remaining-output length beliefs $B_n$.
+2. **Policy Evaluation ($\pi$):** The active policy proposes an `ExecutionPlan` $\mathcal{A}_n = \pi(\mathcal{S}_n)$, specifying which requests to admit, which active sequences to advance, how many prefill tokens to chunk, and whether to preempt work.
+3. **Plan Validation ($\Gamma$):** Before any tensor executes, the plan is checked against strict runtime safety invariants:
+   $$\Gamma(\mathcal{S}_n, \mathcal{A}_n) \in \{0, 1\}$$
+   Validation guarantees candidate membership, request uniqueness, token budget legality, physical KV page availability, and device concurrency bounds. If $\Gamma = 0$, the plan is rejected and the engine falls back to a deterministic, starvation-safe baseline $G_{\text{safe}}$.
+4. **Execution & Telemetry ($\mathcal{T}_n$):** The validated plan $G_P$ is dispatched to the model and compute layer. Observed iteration metrics (latencies, token counts, padding waste, cache utilization) feed back to update runtime beliefs and online optimizers.
+
+### Modular Policy Decomposition
+
+Instead of a black-box monolithic scheduler, policies compose through explicit interfaces:
+
+| Policy Component | Interface Input | Output Decision | Formal Constraint / Role |
+| :--- | :--- | :--- | :--- |
+| **Scheduler** | Queued requests $Q_n$ | Ranked request order | Defines queue priority (FIFO, Priority, EDF, SJF, Backfill) |
+| **Admission Control** | Ranked queue & KV state | Admitted / deferred subset | Ensures KV headroom (worst-case or belief quantile $q_\alpha$) |
+| **Batch Policy** | Admitted & active requests | Selected iteration candidates | Enforces continuous batching & token budgets |
+| **Prefill Bucketer** | Selected prefill chunks | Tensor bucket grouping | Minimizes padding waste vs kernel launch overhead |
+| **Preemption Policy** | Active set & KV exhaustion | Preemption victims | Recovers physical blocks with recompute/swap semantics |
+| **Kernel Selector** | Tensor shapes & device | Kernel provider dispatch | Selects between portable reference and fused CubeCL kernels |
+| **Cluster Router** | Ingress requests & workers | Worker placement / deferral | Multi-node load balancing & small-batch MILP routing |
+
+---
+
+## Workspace Architecture
+
+Ola-RT is organized as a modular, 12-crate Rust workspace. Dependencies point strictly inward to preserve clean research boundaries:
 
 ```text
-Request
-  ↓
-Preprocessing
-  ↓
-Model execution
-  ↓
-Tensor operations
-  ↓
-Kernel selection
-  ↓
-Memory management
-  ↓
-GPU execution
-  ↓
-Caching
-  ↓
-Scheduling
-  ↓
-Batching
-  ↓
-Distributed placement
-  ↓
-Response
+                                [ Clients / CLI / UI ]
+                                          │
+                                          ▼
+                                   ┌──────────────┐
+                                   │  ola-serve   │  (OpenAI-compatible HTTP / SSE streaming)
+                                   └──────┬───────┘
+                                          │
+                                          ▼
+   ┌──────────────┐                ┌──────────────┐                ┌──────────────┐
+   │   ola-cli    │ ─────────────► │ ola-cluster  │ ◄────────────► │   ola-net    │
+   │  (CLI tools) │                │  (Sans-IO    │                │ (TCP framing │
+   └──────┬───────┘                │  coordinator)│                │  & handoff)  │
+          │                        └──────┬───────┘                └──────────────┘
+          │                               │
+          ▼                               ▼
+   ┌──────────────┐                ┌──────────────┐                ┌──────────────┐
+   │    ola-ui    │ ─────────────► │ ola-runtime  │ ◄────────────► │  ola-kernel  │
+   │   (Ratatui   │                │ (Executor,   │                │  (Paged-attn │
+   │  workbench)  │                │  policies,   │                │   contracts) │
+   └──────────────┘                │  validation) │                └──────────────┘
+          │                        └──────┬───────┘
+          │                               │
+          ▼                               ▼
+   ┌──────────────┐                ┌──────────────┐
+   │  ola-bench   │ ─────────────► │   ola-burn   │  (Llama & Mistral architectures,
+   │ (Simulation, │                └──────┬───────┘   Burn / CubeCL adapters)
+   │  14 studies) │                       │
+   └──────────────┘                       ▼
+          │                        ┌──────────────┐
+          │                        │  ola-model   │  (Catalog & architecture factories)
+          │                        └──────┬───────┘
+          │                               │
+          ▼                               ▼
+   ┌──────────────┐                ┌──────────────┐
+   │ ola-observe  │ ─────────────► │   ola-core   │  (Domain types, IDs, monotonic time)
+   │   (Traces)   │                └──────────────┘
+   └──────────────┘
 ```
 
-OlaRT exists to make these decisions explicit, observable, replaceable, and researchable.
+### Crate Boundaries
 
-The long-term question is:
-
-> **How should modern AI workloads execute when latency, throughput, memory, modality, hardware, cost, and service-level objectives all matter at once?**
+| Crate | Responsibility | Must Not Own |
+| :--- | :--- | :--- |
+| [`ola-core`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-core) | Backend-neutral domain types, request identities, timestamps, generation configs | Queues, policy logic, Burn tensors |
+| [`ola-model`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-model) | Model catalog, artifact sources, architecture factories | Tensor execution, scheduling, downloads |
+| [`ola-runtime`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-runtime) | Execution engine, lifecycle state machine, policy traits, `ExecutionPlan`, paged KV cache | Sockets, HTTP, model weights |
+| [`ola-kernel`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-kernel) | Replaceable attention kernel contracts, portable reference, CubeCL GPU kernels | Scheduling, model weights, KV allocation |
+| [`ola-burn`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-burn) | Adapting Burn primitives to Ola-RT (Llama, Mistral, CPU/WGPU/CUDA devices) | Scheduling, admission, serving |
+| [`ola-observe`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-observe) | Monotonic event measurements, latency derivation, JSON Lines execution traces | Lifecycle mutation, policy decisions |
+| [`ola-serve`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-serve) | OpenAI-compatible HTTP service, SSE token streaming, graceful draining | Execution policy, tensor manipulation |
+| [`ola-bench`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-bench) | Virtual-time simulation, workload traces, cost models, percentile bootstrap statistics | Runtime production state |
+| [`ola-cluster`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-cluster) | Sans-IO cluster coordinator, worker summaries, routing baselines, MILP batch router | Raw sockets, wall-clock time, kernel execution |
+| [`ola-net`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-net) | Tokio byte stream wire framing, control messages, binary session transfer frames | Cluster policy, model weights |
+| [`ola-cli`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-cli) | Unified command-line interface (`ola experiment run`, `compare`, `serve`) | Direct runtime mutation |
+| [`ola-ui`](file:///home/olamide/dev/ola-rt/ola-rt/crates/ola-ui) | Ratatui terminal workbench, local generation, live KV benchmarks | Model kernels, scheduling policy |
 
 ---
 
-## Philosophy
+## Supported Models and Hardware
 
-OlaRT follows a simple architectural philosophy:
+### Architectures
+- **Llama:** Grouped-Query Attention (GQA), SwiGLU activations, split-half Rotary Position Embeddings (RoPE), RMSNorm, and unshared output projections.
+- **Mistral:** Grouped-Query Attention with support for sliding window attention patterns.
+- *Tested Checkpoints:* SmolLM2-135M, TinyLlama-1.1B, Llama-3.2-1B, TinyMistral-248M.
 
-> **Own the abstractions that matter to inference research. Reuse everything else until there is a reason not to.**
+### Execution Backends
+- **Portable CPU:** Pure Rust compute path via Burn. Requires zero GPU dependencies or drivers—ideal for CI and running virtual-time experiments.
+- **WGPU:** Cross-platform GPU execution (Vulkan/Metal/DirectX), numerically validated on consumer hardware (tested on NVIDIA GeForce GTX 1650).
+- **Native CUDA:** Direct NVIDIA hardware execution via CubeCL/CUDA.
+- **Strict Conformance:** Includes an independent scalar logit reference oracle (`CONFORMANCE.md`) to verify zero numerical drift across optimizations.
 
-Burn and CubeCL already provide excellent primitives for tensors, kernels, backends, autodiff, and GPU execution.
+---
 
-OlaRT does not initially try to replace them.
+## Quickstart
 
-Instead:
+### Prerequisites
+- Rust 1.95+ (2024 edition)
+- `make` and standard build tools
 
-```text
-Application
-    ↓
-OlaRT API
-    ↓
-OlaRT Runtime
-    ↓
-OlaRT Scheduler / Memory / Cache / Serving
-    ↓
-Compute Adapter
-    ↓
-Burn
-    ↓
-CubeCL
-    ↓
-CPU / CUDA / Metal / Vulkan / other backends
+### 1. Build and Verify
+Run the complete CPU quality gate (formatting, type checking, unit tests, clippy with warnings denied, and documentation links):
+
+```bash
+make verify
 ```
 
-Over time, any layer may be replaced when doing so becomes useful for research.
-
-This is similar in spirit to how higher-level frameworks compose lower-level ecosystems into a coherent developer experience.
-
-OlaRT should feel like its own system even when Burn powers parts of the compute stack.
-
----
-
-# Goals
-
-OlaRT aims to become:
-
-- an understandable inference runtime
-- a batteries-included Rust framework for AI serving experiments
-- a research platform for adaptive inference
-- a benchmark environment for scheduling and load-balancing algorithms
-- a shared execution layer for LLM, VLM, vision, and detection workloads
-- a platform where papers can be reproduced and extended
-- a long-lived PhD research laboratory
-
-OlaRT is **not** initially trying to become:
-
-- a PyTorch replacement
-- a Burn replacement
-- a complete training framework
-- the fastest inference engine in the world
-- a production cloud platform
-- a dependency-free ML stack
-
----
-
-# Core Architecture
-
-```text
-                         OlaRT
-
-┌──────────────────────────────────────────────────────────────┐
-│                         Public API                           │
-│                                                              │
-│ Runtime │ Model │ Request │ Session │ Device │ Deployment    │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│                     Inference Runtime                        │
-│                                                              │
-│ lifecycle │ batching │ scheduling │ admission │ observability │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-                ┌──────────────┼──────────────┐
-                ▼              ▼              ▼
-        Memory Manager     Cache Manager   Cost Model
-                │              │              │
-                └──────────────┼──────────────┘
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│                     Execution Layer                          │
-│                                                              │
-│ LLM │ VLM │ Vision │ OlaDetection │ Future Modalities        │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│                    Compute Abstraction                       │
-│                                                              │
-│ Burn Adapter │ Native Ola Backend │ Future Backends          │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-                     Burn / CubeCL / CUDA
-                               │
-                               ▼
-                            Hardware
+Or run tests directly with Cargo:
+```bash
+cargo test --manifest-path ola-rt/Cargo.toml --workspace
 ```
 
----
+### 2. Run Virtual-Time Experiments (No GPU Required)
+All theoretical policy evaluations run deterministically in virtual time on CPU without needing a GPU:
 
-# Major Subsystems
+```bash
+# List all registered experiments, clock domains, and parameters
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- experiment list
 
-## Runtime
+# 1. Compare schedulers (FIFO, Priority, EDF, SJF, Backfill) under overload
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+  experiment run scheduler-comparison --set trace=overload seeds=10
 
-The runtime owns the lifecycle of inference work.
+# 2. Evaluate prefill bucketing strategies (padding waste vs kernel invocations)
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+  experiment run prefill-bucketing
 
-Responsibilities may include:
+# 3. Benchmark KV memory pressure with watermark admission and preemption
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+  experiment run kv-pressure --set trace=early_stopping seeds=10
 
-- model registration
-- model loading
-- request admission
-- execution sessions
-- batching
-- queueing
-- scheduling
-- resource accounting
-- cancellation
-- timeout handling
-- streaming
-- instrumentation
+# 4. Compare baseline report against a candidate with bootstrap CI separation
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+  experiment compare baseline.json candidate.json --threshold 0.05
+```
 
-Example future API:
+### 3. Serve Models over HTTP (OpenAI-Compatible)
+Launch a local Hugging Face model checkpoint as an HTTP inference service:
 
-```rust
-let runtime = OlaRuntime::builder()
-    .model("llama", model)
-    .scheduler(Scheduler::Adaptive)
-    .continuous_batching(true)
-    .metrics(true)
-    .build()?;
+```bash
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-cli -- \
+  serve --model /path/to/smollm2-135m-instruct --addr 127.0.0.1:8080
+```
 
-runtime.serve("0.0.0.0:8080").await?;
+Query the server using standard OpenAI-compatible Server-Sent Events (SSE) streaming:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "smollm2",
+    "messages": [{"role": "user", "content": "What is an inference execution policy?"}],
+    "stream": true
+  }'
+```
+
+### 4. Interactive Terminal Workbench
+Launch the interactive Ratatui TUI to inspect real-time generation, KV block allocation, and scheduling replays:
+
+```bash
+cargo run --release --manifest-path ola-rt/Cargo.toml -p ola-ui
 ```
 
 ---
 
-## Compute
+## Experimental Rigor & Research Methodology
 
-Initially, Burn is expected to provide much of the tensor and model execution machinery.
+Ola-RT enforces strict scientific protocols across all benchmarks and studies:
 
-Potential architecture:
-
-```text
-OlaRT
-  ↓
-ComputeBackend trait
-  ↓
-BurnBackend
-  ↓
-Burn
-  ↓
-CubeCL
-  ↓
-GPU
-```
-
-Later:
-
-```text
-ComputeBackend
-   ├── BurnBackend
-   ├── OlaCpuBackend
-   ├── OlaCudaBackend
-   └── ExperimentalBackend
-```
-
-The public OlaRT API should avoid leaking backend-specific types whenever possible.
+1. **Explicit Clock Domains:**
+   - **Virtual Time:** Driven by a deterministic simulation clock and calibrated cost model. Results are 100% reproducible across different hardware.
+   - **Host Time:** High-resolution monotonic CPU wall-clock timestamps for end-to-end execution.
+   - **Device Time:** GPU kernel profiling timestamps (Nsight Compute / CubeCL).
+   - **Untimed:** Pure algorithmic metrics (padding overhead, token counts, eviction counts).
+2. **Statistical Significance:** Studies execute paired, order-rotated trials across multiple seeds with warmups. All reported summaries include means and **95% bootstrap confidence intervals** ($B = 2{,}000$).
+3. **Automated Regression Gating:** `ola experiment compare` compares candidate runs against baselines and flags regressions only when confidence intervals separate by more than a configurable threshold (e.g. 5%).
+4. **Lab Notebook System:** The [`lab/`](file:///home/olamide/dev/ola-rt/lab/README.md) workflow tracks hypotheses, configuration digests, versioned JSON reports, and traces in auditable notebook directories (`make lab-new`, `make lab-run`, `make lab-compare`).
 
 ---
 
-## LLM Runtime
+## Research Trajectory & Papers
 
-OlaRT will support the full LLM serving lifecycle:
+Ola-RT serves as the experimental vehicle for a multi-stage PhD research program:
 
-```text
-Prompt
-  ↓
-Tokenization
-  ↓
-Prefill
-  ↓
-KV Cache
-  ↓
-Decode
-  ↓
-Sampling
-  ↓
-Streaming Response
-```
-
-Research and implementation areas include:
-
-- transformer execution
-- prefill/decode separation
-- KV-cache allocation
-- paged KV caches
-- prefix caching
-- quantized KV caches
-- continuous batching
-- speculative decoding
-- sequence scheduling
-- token streaming
-- multi-GPU execution
+- **Working Paper:**
+  > *A Compositional Formalization of Inference Execution Policies in Ola-RT*
+  > Victor O. Olowofeso, Nile University of Nigeria.
+  > Working draft reference: [`papers/OLA_RT_FORMALIZATION_REFERENCE.md`](file:///home/olamide/dev/ola-rt/papers/OLA_RT_FORMALIZATION_REFERENCE.md).
+- **Core Research Questions:**
+  1. **Policy Composition:** Can LLM execution policies be formalized compositionally with executable boundary invariants?
+  2. **Memory Risk & Quantile Admission:** How does quantile-based KV cache headroom reservation ($q_\alpha$) mitigate preemption overhead compared to worst-case static allocation?
+  3. **Switching Costs & Adaptive Batching:** How do switching cost penalties ($c_{\text{switch}}$) and inertia guards prevent thrashing in online token-budget optimization?
+  4. **Dynamic Kernel Dispatch:** When does accelerator-specific fused attention outperform portable references across dynamic batch sizes?
+  5. **Disaggregated Serving:** How do small-batch MILP routers coordinate heterogeneous prefill and decode workers under network transfer costs?
 
 ---
 
-## VLM Runtime
+## Project Roadmap
 
-VLM workloads introduce different scheduling and memory behaviour.
-
-```text
-Image ─→ Vision Encoder ─→ Visual Tokens ─┐
-                                          ├→ Multimodal Model
-Text ───────────────→ Text Tokens ────────┘
-```
-
-OlaRT will investigate:
-
-- visual token generation
-- image preprocessing
-- dynamic image resolution
-- multimodal prompt execution
-- encoder caching
-- visual token caching
-- multimodal KV cache
-- mixed text/image batches
-- VLM-aware scheduling
-- VLM-aware cost estimation
-- multimodal SLOs
+- [x] **Phase 0 — Foundations:** Pure Rust request lifecycles, memory accounting, FIFO baseline, Burn compute adapters, and determinism.
+- [x] **Phase 1 — Single-Node Inference Engine:** Paged KV cache, continuous batching, chunked prefill, pluggable schedulers (Priority/EDF/SJF/Backfill), watermark preemption, quantile admission, calibrated cost models, and SSE streaming HTTP serving.
+- [ ] **Phase 2 — Multimodal & Adaptive Runtime:** Vision-Language Model (VLM) execution, dynamic image tiling, multimodal prompt scheduling, and learned cost estimation.
+- [ ] **Phase 3 — Distributed Cluster Optimization:** Scaling the sans-IO coordinator to multi-node clusters, dynamic session migration, and cross-node speculative decoding.
 
 ---
 
-## OlaDetection
+## Citation
 
-OlaDetection is the vision/detection research track built on OlaRT.
+If you use Ola-RT in your academic research, please cite:
 
-Potential workloads include:
-
-- object detection
-- segmentation
-- SAM-style inference
-- document segmentation
-- OCR pipelines
-- image-region understanding
-- exam-document processing
-- vision-transformer inference
-
-The main systems questions are not only model quality.
-
-They include:
-
-- how to batch images of different resolutions
-- when to tile large images
-- how to cache image encodings
-- how to schedule mixed vision workloads
-- how to route vision jobs across accelerators
-- how to trade resolution against latency
-- how to compose detection, OCR, and language stages efficiently
-
----
-
-# Scheduling
-
-Scheduling is a first-class research surface.
-
-Baseline strategies:
-
-- FIFO
-- round robin
-- shortest-job-first
-- priority scheduling
-- deadline-aware scheduling
-
-Future strategies may consider:
-
-- sequence length
-- modality
-- image resolution
-- predicted compute cost
-- KV-cache footprint
-- queue length
-- memory pressure
-- GPU utilization
-- SLO deadline
-- model residency
-- cache locality
-- energy/cost
-- batch compatibility
-
-The runtime should make schedulers pluggable.
-
-```rust
-trait Scheduler {
-    fn schedule(&mut self, state: &RuntimeState) -> Schedule;
+```bibtex
+@misc{olowofeso2026olart,
+  author       = {Victor O. Olowofeso},
+  title        = {Ola-RT: A Compositional Rust Runtime and Research Platform for Inference Execution Policies in AI Serving},
+  year         = {2026},
+  publisher    = {GitHub},
+  howpublished = {\url{https://github.com/voolowofeso/ola-rt}},
+  institution  = {Nile University of Nigeria}
 }
 ```
 
 ---
 
-# Adaptive Load Balancing
+## License
 
-OlaRT eventually targets clusters rather than single GPUs.
+Ola-RT is dual-licensed under either:
 
-```text
-                    Requests
-                       │
-                       ▼
-                 Ola Router
-                       │
-             Adaptive Placement
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-        GPU 0        GPU 1        GPU 2
-```
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
-A placement decision may depend on:
-
-- GPU memory
-- compute utilization
-- current queue
-- active model
-- model residency
-- cache locality
-- network topology
-- request modality
-- deadline
-- predicted runtime
-
-Future techniques may include:
-
-- heuristics
-- queueing theory
-- online optimization
-- stochastic optimization
-- contextual bandits
-- reinforcement learning
-- learned cost models
-
----
-
-# Optimization
-
-Runtime decisions can be viewed as optimization problems.
-
-A runtime state might be represented as:
-
-\[
-s_t = (Q_t, M_t, U_t, C_t, H_t)
-\]
-
-where:
-
-- \(Q_t\): request queues
-- \(M_t\): memory state
-- \(U_t\): utilization
-- \(C_t\): cache state
-- \(H_t\): hardware state
-
-A runtime action might assign requests to resources:
-
-\[
-a_t = \text{placement / batching / scheduling decision}
-\]
-
-Possible objectives:
-
-\[
-\min \alpha L + \beta C + \gamma M + \delta V
-\]
-
-where:
-
-- \(L\): latency
-- \(C\): compute or monetary cost
-- \(M\): memory pressure
-- \(V\): SLO violations
-
-This creates a direct bridge between inference engineering and optimization research.
-
----
-
-# Observability
-
-Every serious experiment needs observability.
-
-OlaRT should eventually expose:
-
-- request latency
-- queue latency
-- TTFT
-- TPOT
-- tokens/sec
-- requests/sec
-- batch size
-- cache hit rate
-- KV-cache occupancy
-- GPU memory
-- GPU utilization
-- kernel latency
-- scheduler decisions
-- placement decisions
-- request migration
-- model residency
-- error rates
-
-Example trace:
-
-```text
-Request 842
-  │
-  ├── queue       3.2 ms
-  ├── batch       1.1 ms
-  ├── prefill    21.7 ms
-  ├── decode     78.4 ms
-  └── response    0.8 ms
-```
-
----
-
-# Repository Structure
-
-The exact structure will evolve.
-
-```text
-ola-rt/
-│
-├── crates/
-│   ├── ola-core/
-│   ├── ola-runtime/
-│   ├── ola-model/
-│   ├── ola-compute/
-│   ├── ola-burn/
-│   ├── ola-memory/
-│   ├── ola-cache/
-│   ├── ola-scheduler/
-│   ├── ola-serve/
-│   ├── ola-observe/
-│   ├── ola-llm/
-│   ├── ola-vlm/
-│   ├── ola-detection/
-│   ├── ola-distributed/
-│   └── ola-bench/
-│
-├── experiments/
-├── benchmarks/
-├── examples/
-├── docs/
-│   ├── architecture/
-│   ├── research/
-│   ├── papers/
-│   └── notes/
-│
-├── IMPLEMENTATION.md   # local, untracked planning guide
-└── README.md
-```
-
-Do not create every crate immediately.
-
-The repository should grow only when boundaries become real.
-
----
-
-# Dependency Strategy
-
-OlaRT is intentionally pragmatic.
-
-Likely dependencies may include:
-
-- Burn
-- CubeCL
-- SafeTensors
-- Hugging Face tokenizers
-- Tokio
-- Axum
-- Serde
-- Tracing
-- OpenTelemetry
-- Criterion
-- Rayon
-- CUDA ecosystem crates where useful
-
-Dependencies are divided into three categories.
-
-## Infrastructure
-
-Usually safe to depend on:
-
-- HTTP
-- serialization
-- logging
-- configuration
-- CLI parsing
-- tokenizers
-- model formats
-
-## Compute infrastructure
-
-Initially reused:
-
-- Burn tensors
-- Burn modules
-- Burn backends
-- CubeCL kernels
-- vendor libraries
-
-## Research-critical abstractions
-
-OlaRT should increasingly own:
-
-- inference lifecycle
-- scheduler
-- admission control
-- batching
-- KV-cache policy
-- memory accounting
-- cost modelling
-- load balancing
-- distributed placement
-- adaptive execution policy
-- research instrumentation
-
----
-
-# Roadmap
-
-## Phase 0 — Foundations
-
-**September–December 2026**
-
-Goal: understand the stack while establishing OlaRT's architecture.
-
-Status as of 2026-10-16 (see `progress_report.md` for evidence):
-
-- [ ] micrograd-style scalar autograd exercise
-- [ ] tiny educational tensor implementation
-- [x] understand Burn tensor/backend/device abstractions
-- [x] implement transformer components in Burn
-- [ ] understand CubeCL — in progress: CubeCL paged-attention extension in `ola-kernel` is not yet validated
-- [ ] CPU/SIMD experiments
-- [ ] GPU kernel experiments — in progress: see CubeCL item above
-- [ ] benchmark Burn against custom kernels
-- [ ] define OlaRT public API — deferred until execution-policy boundaries settle (`todo.md` P8)
-- [x] implement request abstraction
-- [x] model registry
-- [x] runtime state
-- [x] basic inference session
-- [x] basic LLM execution
-- [x] prefill/decode split
-- [x] simple KV cache — paged, with block tables
-- [x] metrics
-- [x] FIFO scheduler
-- [x] multi-request simulation
-
-End-of-phase target:
-
-```text
-clients
-  ↓
-OlaRT
-  ↓
-scheduler
-  ↓
-LLM runtime
-  ↓
-Burn
-  ↓
-GPU
-```
-
----
-
-## Phase 1 — Inference Engine
-
-**PhD Year 1**
-
-Goal: turn OlaRT into a credible single-node inference research engine.
-
-Areas:
-
-- LLM execution
-- continuous batching
-- KV-cache management
-- quantization
-- kernel profiling
-- model loading
-- streaming
-- SLO metrics
-- scheduler benchmarks
-- GPU memory accounting
-- reproducible workloads
-
-Research baseline:
-
-```text
-FIFO
-vs
-SJF
-vs
-memory-aware
-vs
-deadline-aware
-```
-
-Expected outputs:
-
-- stable OlaRT runtime
-- benchmark suite
-- technical report
-- reproducible scheduler experiments
-- first workshop/paper-quality research question
-
----
-
-## Phase 2 — Multimodal and Adaptive Runtime
-
-**PhD Year 2**
-
-Goal: make OlaRT modality-aware and adaptive.
-
-Areas:
-
-- VLM runtime
-- OlaDetection
-- image/video workloads
-- multimodal batching
-- dynamic resolution
-- encoder caching
-- modality-aware cost models
-- adaptive scheduling
-- multi-GPU placement
-- heterogeneous hardware
-- learned workload prediction
-
-Research questions:
-
-- Should LLM and VLM requests share the same scheduling policy?
-- Can multimodal request cost be predicted before execution?
-- Can image resolution be adapted to meet SLOs?
-- Can runtime state determine model or kernel choices?
-
-Expected outputs:
-
-- multimodal benchmark suite
-- VLM scheduler
-- OlaDetection execution pipeline
-- adaptive runtime paper
-- open-source release suitable for external reproduction
-
----
-
-## Phase 3 — Distributed Optimization
-
-**PhD Year 3**
-
-Goal: investigate distributed, adaptive inference as an optimization problem.
-
-Areas:
-
-- cluster scheduling
-- adaptive load balancing
-- distributed KV cache
-- request migration
-- cache-aware placement
-- model replication
-- autoscaling
-- online optimization
-- RL or bandit schedulers
-- heterogeneous clusters
-- robustness and fault tolerance
-
-Target research loop:
-
-```text
-observe
-  ↓
-predict
-  ↓
-optimize
-  ↓
-schedule
-  ↓
-execute
-  ↓
-measure
-  └────→ observe
-```
-
-Expected outputs:
-
-- thesis-level system
-- multiple publishable experiments
-- distributed OlaRT prototype
-- final comparative evaluation
-- thesis chapters derived directly from the runtime
-
----
-
-# Experiment Standard
-
-Every serious experiment should live in:
-
-```text
-experiments/
-```
-
-Recommended structure:
-
-```text
-experiments/012_memory_aware_scheduler/
-├── README.md
-├── config/
-├── src/
-├── data/
-├── results/
-└── plots/
-```
-
-Each experiment should document:
-
-1. research question
-2. hypothesis
-3. baseline
-4. hardware
-5. workload
-6. metrics
-7. implementation
-8. results
-9. interpretation
-10. limitations
-11. next experiment
-
-Negative results stay in the repository.
-
----
-
-# Research Notes
-
-Use:
-
-```text
-docs/research/
-```
-
-Suggested format:
-
-```text
-2026-09-burn-backends.md
-2026-10-gpu-memory.md
-2026-11-kv-cache.md
-2026-12-scheduling.md
-2027-03-continuous-batching.md
-2027-08-vlm-serving.md
-```
-
-Every note should answer:
-
-- What did I investigate?
-- What did I expect?
-- What happened?
-- Why?
-- What remains unclear?
-- What experiment comes next?
-
----
-
-# Benchmarking Rules
-
-Every performance claim must include:
-
-- hardware
-- software versions
-- model
-- input distribution
-- warmup
-- repetitions
-- latency percentiles
-- throughput
-- memory usage
-- baseline
-- configuration
-- failure cases
-
-No optimization is considered successful merely because one run was faster.
-
----
-
-# Long-Term Vision
-
-OlaRT should eventually support:
-
-```text
-                Models
-
-       LLM   VLM   Vision   Spatial
-          \    |      |       /
-           \   |      |      /
-               OlaRT
-                 │
-        ┌────────┼────────┐
-        ▼        ▼        ▼
-     Memory   Scheduler  Cache
-        │        │        │
-        └────────┼────────┘
-                 ▼
-            Cost Model
-                 │
-                 ▼
-            Optimizer
-                 │
-                 ▼
-             Hardware
-                 │
-                 ▼
-             Feedback
-                 │
-                 └──────────────→ Runtime
-```
-
-The end goal is not simply to execute models.
-
-The end goal is to study **adaptive AI execution**:
-
-> Given a workload, model, hardware state, cache state, resource budget, and service objective, what should the runtime do next?
-
----
-
-# Status
-
-The authoritative implementation snapshot is the timestamped
-[`progress_report.md`](progress_report.md).
-
-**Current phase:** foundations transitioning into the first inference-engine
-vertical slice — October 2026.
-
-Current engineering focus:
-
-- compare prompt-length bucketing and token-budget policies using measured
-  padding overhead;
-- optimize tensor-batched prefill/decode and page-native attention;
-- compare batching policies using the new lifecycle and iteration measurements;
-- optimize page-native attention with accelerator-specific fusion.
-
----
-
-# Final Principle
-
-OlaRT should evolve according to one rule:
-
-> **Do not rebuild a lower-level component merely because it exists. Rebuild or replace it when doing so enables understanding, control, performance, or research that the current abstraction prevents.**
-
-OlaRT begins as a framework built on Burn.
-
-It should grow into an inference engine.
-
-Then into a multimodal runtime.
-
-Then into a distributed systems laboratory.
-
-And finally into a platform for original research in adaptive, scalable AI inference.
+at your option.

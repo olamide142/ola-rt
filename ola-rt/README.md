@@ -21,15 +21,18 @@ workload against which those abstractions can be tested.
 
 | Crate | Responsibility | Must not own |
 | --- | --- | --- |
-| `ola-core` | Backend-neutral domain types and identifiers | Queues, policy, Burn tensors |
+| `ola-core` | Backend-neutral domain types, identifiers, timestamps, configs | Queues, policy, Burn tensors |
 | `ola-model` | Model catalog, artifact sources, architecture selection | Tensor execution, scheduling, downloads |
-| `ola-runtime` | Model registry, request lifecycle, state, scheduling | HTTP, model kernels |
-| `ola-kernel` | Replaceable tensor-kernel contracts and portable references | Scheduling, model weights, KV allocation |
-| `ola-burn` | Adapting Burn concepts to OlaRT interfaces | Scheduling or serving |
-| `ola-observe` | Runtime event measurements and latency derivation | Lifecycle mutation, policy decisions |
-| `ola-serve` | Transport-neutral service boundary | HTTP-framework details, execution policy |
-| `ola-bench` | Deterministic workload construction, replay, summaries | Runtime production logic |
-| `ola-ui` | Ratatui workbench and integration contracts | Model kernels, scheduling policy |
+| `ola-runtime` | Execution engine, lifecycle state, execution policies, plans, paged KV pools | Sockets, HTTP, model weights |
+| `ola-kernel` | Replaceable tensor-kernel contracts, portable references, CubeCL kernels | Scheduling, model weights, KV allocation |
+| `ola-burn` | Adapting Burn primitives to OlaRT (Llama, Mistral, devices) | Scheduling, admission, serving |
+| `ola-observe` | Runtime event measurements, traces, latency derivation | Lifecycle mutation, policy decisions |
+| `ola-serve` | HTTP service boundary (SSE streaming, OpenAI-compatible chat completions) | Execution policy, tensor manipulation |
+| `ola-bench` | Deterministic workload construction, virtual-time simulation, bootstrap statistics | Runtime production state |
+| `ola-cluster` | Sans-IO cluster coordination, worker summaries, routing policies, MILP router | Raw sockets, wall-clock time, kernel execution |
+| `ola-net` | Tokio byte stream wire protocol, control and binary session frames | Cluster policy, model weights |
+| `ola-cli` | Unified CLI (`ola experiment run`, `compare`, `serve`) | Direct runtime mutation |
+| `ola-ui` | Ratatui terminal workbench and experiment inspector | Model kernels, scheduling policy |
 
 Dependencies point inward. `ola-core` knows nothing about the other crates.
 `ola-model` describes available artifacts and selects an architecture factory.
@@ -130,67 +133,42 @@ Implemented:
 - model metadata and registration;
 - model catalog and backend-neutral architecture-factory selection;
 - tokenizer, causal-model, and per-request generation-session contracts;
-- queued/running/terminal lifecycle state;
-- FIFO scheduling through a replaceable trait;
-- explicit queue, active-set, memory, and timing state;
-- deterministic fixed-size KV block allocation and fragmentation metrics;
-- a synchronous multi-request executor with iteration-level stepping and
-  aggregate live KV-memory accounting;
-- page-rounded, memory-aware admission against model KV pools and optional
-  device-wide budgets;
-- replaceable iteration batch composition with auditable plans and a
-  starvation-safe FIFO input-token budget;
-- model-grouped prefill and decode execution with explicit tensor/individual
-  records and real Burn Llama variable-length tensor paths;
-- bounded resumable Llama prefill with request-local cursors, shared
-  prefill/decode token budgets, progress events, atomic segment reservation,
-  and cancellation-safe KV release;
-- tensor-batched resumable chunks with variable lengths and unequal absolute
-  positions;
-- replaceable prompt-length bucketing with explicit dense-padding accounting
-  and a workload-aware cost policy balancing padding against invocation count;
-- backend-neutral observation of iteration work, interval rates, cumulative
-  counters, and terminal request latency boundaries;
-- a transport-neutral generation service;
-- a Ratatui workbench with background local Llama generation, KV benchmarks,
-  and FIFO runtime experiments;
-- deterministic fixed-workload generation and replay;
-- deterministic prefill-grouping comparison with padding and invocation
-  summaries;
-- execution-backed prefill-strategy comparison against a loaded model with
-  output-equivalence, warm-ups, alternating paired trials, retained samples,
-  latency percentiles, throughput, and peak-KV measurements;
-- measured invocation-cost calibration and fresh order-rotated three-way
-  comparison of unbucketed, power-of-two, and adaptive grouping;
-- execution-backed complete-versus-chunked prefill comparison with output
-  equivalence and scheduler-work measurements;
-- versioned JSON benchmark reports with exact workload/protocol metadata, raw
-  paired samples, integer timing data, summaries, and create-new persistence;
-- basic latency summaries;
-- a Burn device adapter;
-- a first replaceable kernel contract with validated paged-attention inputs,
-  stable implementation metadata, and a portable online-softmax reference;
-- opt-in WGPU and native CUDA Burn backends, with WGPU inference numerically
-  validated on the development GPU;
-- strict parsing of compatible Hugging Face Llama configurations;
+- queued/running/terminal lifecycle state machine;
+- pluggable schedulers: FIFO, Priority, Earliest Deadline First (EDF), Shortest Job First (SJF), and conservative Backfill;
+- memory-aware admission: worst-case KV reservation and quantile-based headroom admission under remaining-output beliefs;
+- preemption and recovery under KV memory pressure with watermark admission and recompute semantics;
+- explicit queue, active-set, memory, and timing state via immutable `PlanningSnapshot`;
+- auditable `ExecutionPlan` with strict `validate` invariant checking before iteration execution;
+- deterministic fixed-size KV block allocation, page tables, and fragmentation metrics;
+- synchronous multi-request executor with iteration-level stepping and aggregate live KV-memory accounting;
+- model-grouped prefill and decode execution with explicit tensor/individual records and real Burn Llama & Mistral variable-length tensor paths;
+- bounded resumable prefill with request-local cursors, shared prefill/decode token budgets, progress events, atomic segment reservation, and cancellation-safe KV release;
+- tensor-batched resumable chunks with variable lengths and unequal absolute positions;
+- replaceable prompt-length bucketing with explicit dense-padding accounting and a workload-aware cost policy balancing padding against invocation count;
+- switching cost modeling, inertia penalty, and dual-hysteresis `ReplayOptimizer` for online adaptive token budget optimization;
+- backend-neutral observation of iteration work, interval rates, cumulative counters, and terminal request latency boundaries;
+- replaceable kernel contracts with validated paged-attention inputs, portable online-softmax reference, and CubeCL paged attention;
+- opt-in WGPU and native CUDA Burn backends, with WGPU inference numerically validated on development GPUs;
+- strict parsing of compatible Hugging Face Llama and Mistral configurations;
 - Hugging Face tokenizer and single-file SafeTensors loading;
-- a correctness-first Burn Llama decoder with grouped-query attention;
+- correctness-first Burn Llama and Mistral decoders with grouped-query attention;
 - configurable physical KV page storage backed by runtime block tables;
 - isolated greedy generation sessions using cached single-token decode;
-- executor-driven local UI generation with retained token and text results;
-- a pinned external checkpoint and independent scalar conformance oracle.
+- transport-neutral generation service and asynchronous HTTP serving with SSE streaming (`ola-serve`);
+- sans-IO cluster coordinator (`ola-cluster`) with routing baselines (Round Robin, Least Loaded, Power of Two Choices, KV Headroom, Prefix Affinity) and small-batch MILP router (`optimize_batch_routing`);
+- TCP wire protocol and framing (`ola-net`) with control frames and binary session state handoff;
+- Ratatui workbench (`ola-ui`) with background local generation, KV benchmarks, and runtime experiments;
+- unified command-line tool (`ola-cli`) supporting experiment execution, report comparison, and multi-role HTTP serving (standalone, worker, gateway);
+- 14 reproducible experiment studies and probes across virtual-time, host-time, and untimed domains (`ola-bench`), with paired trials, bootstrap 95% confidence intervals, and automated regression detection.
 
 Deliberately deferred:
 
 - tensors in the public runtime API;
-- fused accelerator attention, eviction, preemption, and prefix reuse;
-- fused multi-request paged attention and preemption;
-- probabilistic sampling;
+- probabilistic sampling (beyond greedy decoding);
+- multi-node RDMA / NCCL tensor parallelism;
 - sharded and remotely materialized checkpoints;
 - RoPE-scaled and tied-embedding Llama variants;
-- asynchronous serving and HTTP;
-- GPU telemetry and accelerator-specific fused kernels;
-- persistence and distributed execution.
+- hardware-specific fused FlashAttention kernels for non-standard memory layouts.
 
 ## Small Llama probe
 
