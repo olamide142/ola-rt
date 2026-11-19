@@ -5,6 +5,12 @@
 //! batched invocation and as one invocation per request keeps dense tokens
 //! and invocation counts from moving together, which a single grouping
 //! would not, so all three coefficients are identifiable.
+//!
+//! The optional padding-aware fit splits dense tokens into real and padded
+//! positions: `micros = fixed + per_real_token × real + per_padding_token ×
+//! padding + per_invocation × invocations`. Its shapes add batches whose
+//! rows have different lengths, so padding varies independently of real
+//! tokens.
 
 use std::{error::Error, fmt, time::Instant};
 
@@ -27,6 +33,8 @@ pub const CALIBRATION_RESAMPLES: usize = 1_000;
 pub struct CostObservation {
     /// Real plus padding input positions.
     pub dense_tokens: f64,
+    /// Padding positions included in `dense_tokens`.
+    pub padding_tokens: f64,
     /// Model invocations.
     pub invocations: f64,
     /// Measured iteration time.
@@ -59,6 +67,51 @@ pub struct CostIntervals {
     pub per_dense_token_micros: Interval,
     /// Interval for `per_invocation_micros`.
     pub per_invocation_micros: Interval,
+}
+
+/// Fitted iteration cost with separate real and padded position costs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaddedCostFit {
+    /// Cost of an iteration independent of work.
+    pub fixed_micros: f64,
+    /// Cost per real input position.
+    pub per_real_token_micros: f64,
+    /// Cost per padded input position.
+    pub per_padding_token_micros: f64,
+    /// Cost per model invocation.
+    pub per_invocation_micros: f64,
+    /// Root-mean-square residual.
+    pub residual_rms_micros: f64,
+    /// Coefficient of determination over the fitted observations.
+    pub r_squared: f64,
+    /// Observations fitted.
+    pub observations: usize,
+    /// 95% bootstrap intervals, when enough resamples were well conditioned.
+    pub intervals: Option<PaddedCostIntervals>,
+}
+
+/// 95% bootstrap intervals for each padding-aware coefficient.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaddedCostIntervals {
+    /// Interval for `fixed_micros`.
+    pub fixed_micros: Interval,
+    /// Interval for `per_real_token_micros`.
+    pub per_real_token_micros: Interval,
+    /// Interval for `per_padding_token_micros`.
+    pub per_padding_token_micros: Interval,
+    /// Interval for `per_invocation_micros`.
+    pub per_invocation_micros: Interval,
+}
+
+impl PaddedCostFit {
+    /// Predicted iteration time for one observation's shape.
+    pub fn predict(&self, observation: &CostObservation) -> f64 {
+        let [_, real, padding, invocations] = padded_row(observation);
+        self.fixed_micros
+            + self.per_real_token_micros * real
+            + self.per_padding_token_micros * padding
+            + self.per_invocation_micros * invocations
+    }
 }
 
 impl CostFit {
@@ -115,6 +168,18 @@ impl CostFit {
         })
     }
 
+    /// Predicted iteration time for one observation's shape.
+    pub fn predict(&self, observation: &CostObservation) -> f64 {
+        self.fixed_micros
+            + self.per_dense_token_micros * observation.dense_tokens
+            + self.per_invocation_micros * observation.invocations
+    }
+
+    /// Coefficient of determination of this fit over `observations`.
+    pub fn r_squared(&self, observations: &[CostObservation]) -> f64 {
+        r_squared(observations, |observation| self.predict(observation))
+    }
+
     /// Returns the measurements policies read from the planning snapshot.
     pub fn policy_measurements(&self) -> PolicyMeasurements {
         PolicyMeasurements {
@@ -130,6 +195,8 @@ pub enum CalibrationError {
     TooFewObservations(usize),
     /// Dense tokens and invocations do not vary independently.
     Singular,
+    /// A padding-aware fit was requested, but no observation had padding.
+    NoPadding,
     /// Measuring an iteration failed.
     Measurement(String),
 }
@@ -140,11 +207,14 @@ impl fmt::Display for CalibrationError {
             Self::TooFewObservations(count) => {
                 write!(
                     formatter,
-                    "calibration needs at least 4 observations, got {count}"
+                    "calibration needs at least one more observation than coefficients, got {count}"
                 )
             }
             Self::Singular => formatter.write_str(
                 "dense tokens and invocations do not vary independently; widen the shape grid",
+            ),
+            Self::NoPadding => formatter.write_str(
+                "no observation has padding; add mixed-length shapes for a padding-aware fit",
             ),
             Self::Measurement(message) => {
                 write!(formatter, "calibration measurement failed: {message}")
@@ -188,48 +258,165 @@ pub fn fit_cost_model(observations: &[CostObservation]) -> Result<CostFit, Calib
     })
 }
 
+/// Fits the padding-aware cost model by ordinary least squares, with seeded
+/// bootstrap intervals over observations.
+///
+/// # Errors
+///
+/// Returns [`CalibrationError`] for too few or degenerate observations, or
+/// when no observation contains padding.
+pub fn fit_padded_cost_model(
+    observations: &[CostObservation],
+) -> Result<PaddedCostFit, CalibrationError> {
+    if observations.len() < 5 {
+        return Err(CalibrationError::TooFewObservations(observations.len()));
+    }
+    if observations
+        .iter()
+        .all(|observation| observation.padding_tokens == 0.0)
+    {
+        return Err(CalibrationError::NoPadding);
+    }
+    let [fixed, per_real, per_padding, per_invocation] =
+        padded_least_squares(observations).ok_or(CalibrationError::Singular)?;
+    let mut fit = PaddedCostFit {
+        fixed_micros: fixed,
+        per_real_token_micros: per_real,
+        per_padding_token_micros: per_padding,
+        per_invocation_micros: per_invocation,
+        residual_rms_micros: 0.0,
+        r_squared: 0.0,
+        observations: observations.len(),
+        intervals: bootstrap_coefficients(observations, padded_least_squares).map(
+            |[
+                fixed_micros,
+                per_real_token_micros,
+                per_padding_token_micros,
+                per_invocation_micros,
+            ]| {
+                PaddedCostIntervals {
+                    fixed_micros,
+                    per_real_token_micros,
+                    per_padding_token_micros,
+                    per_invocation_micros,
+                }
+            },
+        ),
+    };
+    fit.residual_rms_micros = (observations
+        .iter()
+        .map(|observation| (observation.micros - fit.predict(observation)).powi(2))
+        .sum::<f64>()
+        / count(observations.len()))
+    .sqrt();
+    fit.r_squared = r_squared(observations, |observation| fit.predict(observation));
+    Ok(fit)
+}
+
+/// `1 − SS_res / SS_tot` of `predict` over `observations`.
+fn r_squared(observations: &[CostObservation], predict: impl Fn(&CostObservation) -> f64) -> f64 {
+    let mean = observations
+        .iter()
+        .map(|observation| observation.micros)
+        .sum::<f64>()
+        / count(observations.len());
+    let (residual, total) =
+        observations
+            .iter()
+            .fold((0.0, 0.0), |(residual, total), observation| {
+                (
+                    residual + (observation.micros - predict(observation)).powi(2),
+                    total + (observation.micros - mean).powi(2),
+                )
+            });
+    if total > 0.0 {
+        1.0 - residual / total
+    } else {
+        0.0
+    }
+}
+
+fn padded_least_squares(observations: &[CostObservation]) -> Option<[f64; 4]> {
+    solve(observations, padded_row)
+}
+
 fn least_squares(observations: &[CostObservation]) -> Option<[f64; 3]> {
-    // Normal equations XᵀX β = Xᵀy with X rows [1, dense, invocations].
-    let mut matrix = [[0.0_f64; 4]; 3];
+    solve(observations, dense_row)
+}
+
+/// Regressors `[1, dense, invocations]` of the three-coefficient fit.
+fn dense_row(observation: &CostObservation) -> [f64; 3] {
+    [1.0, observation.dense_tokens, observation.invocations]
+}
+
+/// Regressors `[1, real, padding, invocations]` of the padding-aware fit.
+fn padded_row(observation: &CostObservation) -> [f64; 4] {
+    [
+        1.0,
+        observation.dense_tokens - observation.padding_tokens,
+        observation.padding_tokens,
+        observation.invocations,
+    ]
+}
+
+/// Solves the normal equations `XᵀX β = Xᵀy` for rows produced by `row`.
+fn solve<const N: usize>(
+    observations: &[CostObservation],
+    row: impl Fn(&CostObservation) -> [f64; N],
+) -> Option<[f64; N]> {
+    // Each row of `matrix` is one normal equation; the last column is Xᵀy.
+    let mut matrix = vec![vec![0.0_f64; N + 1]; N];
     for observation in observations {
-        let row = [1.0, observation.dense_tokens, observation.invocations];
+        let row = row(observation);
         for (i, left) in row.iter().enumerate() {
             for (j, right) in row.iter().enumerate() {
                 matrix[i][j] += left * right;
             }
-            matrix[i][3] += left * observation.micros;
+            matrix[i][N] += left * observation.micros;
         }
     }
     let scale = matrix
         .iter()
-        .flat_map(|row| row[..3].iter())
+        .flat_map(|row| row[..N].iter())
         .fold(0.0_f64, |largest, value| largest.max(value.abs()));
     // Gaussian elimination with partial pivoting.
-    for column in 0..3 {
-        let pivot = (column..3)
+    for column in 0..N {
+        let pivot = (column..N)
             .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))?;
         if matrix[pivot][column].abs() <= scale * 1e-12 {
             return None;
         }
         matrix.swap(column, pivot);
-        let pivot_row = matrix[column];
+        let pivot_row = matrix[column].clone();
         for (index, row) in matrix.iter_mut().enumerate() {
             if index != column {
                 let factor = row[column] / pivot_row[column];
-                for (target, source) in row.iter_mut().zip(pivot_row).skip(column) {
+                for (target, source) in row.iter_mut().zip(&pivot_row).skip(column) {
                     *target -= factor * source;
                 }
             }
         }
     }
-    Some([
-        matrix[0][3] / matrix[0][0],
-        matrix[1][3] / matrix[1][1],
-        matrix[2][3] / matrix[2][2],
-    ])
+    Some(std::array::from_fn(|index| {
+        matrix[index][N] / matrix[index][index]
+    }))
 }
 
 fn bootstrap(observations: &[CostObservation]) -> Option<CostIntervals> {
+    let [fixed_micros, per_dense_token_micros, per_invocation_micros] =
+        bootstrap_coefficients(observations, least_squares)?;
+    Some(CostIntervals {
+        fixed_micros,
+        per_dense_token_micros,
+        per_invocation_micros,
+    })
+}
+
+/// Seeded percentile-bootstrap intervals for the coefficients `fit` returns.
+fn bootstrap_coefficients<const N: usize>(
+    observations: &[CostObservation],
+    fit: impl Fn(&[CostObservation]) -> Option<[f64; N]>,
+) -> Option<[Interval; N]> {
     let seed = observations
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, observation| {
@@ -254,7 +441,7 @@ fn bootstrap(observations: &[CostObservation]) -> Option<CostIntervals> {
             (0..observations.len())
                 .map(|_| observations[usize::try_from(random.between_u64(0, last)).unwrap_or(0)]),
         );
-        if let Some(fit) = least_squares(&resample) {
+        if let Some(fit) = fit(&resample) {
             fits.push(fit);
         }
     }
@@ -274,11 +461,7 @@ fn bootstrap(observations: &[CostObservation]) -> Option<CostIntervals> {
             high: rank(975),
         }
     };
-    Some(CostIntervals {
-        fixed_micros: interval(0),
-        per_dense_token_micros: interval(1),
-        per_invocation_micros: interval(2),
-    })
+    Some(std::array::from_fn(interval))
 }
 
 /// Gives every prompt its own group, forcing one invocation per request.
@@ -314,8 +497,46 @@ pub fn measure_iteration_costs(
     let mut observations = Vec::with_capacity(widths.len() * lengths.len() * 2);
     for &width in widths {
         for &length in lengths {
+            let prompts = vec![length.max(1); width.max(1)];
             for split in [false, true] {
-                observations.push(measure_one(model, width, length, split)?);
+                observations.push(measure_one(model, &prompts, split)?);
+            }
+        }
+    }
+    Ok(observations)
+}
+
+/// Prompt lengths of one mixed-length shape: one row of `length` and
+/// `width − 1` rows a quarter as long, or `None` when no padding would result.
+pub fn mixed_length_prompts(width: usize, length: usize) -> Option<Vec<usize>> {
+    let short = (length / 4).max(1);
+    (width >= 2 && short < length).then(|| {
+        std::iter::once(length)
+            .chain(std::iter::repeat_n(short, width - 1))
+            .collect()
+    })
+}
+
+/// Measures mixed-length shapes, batched and split, for the padding-aware
+/// fit. Batched, the short rows are padded to the long one; split, nothing
+/// is padded. Widths below two and lengths below two contribute nothing.
+///
+/// # Errors
+///
+/// Returns [`CalibrationError::Measurement`] if the executor fails.
+pub fn measure_mixed_iteration_costs(
+    model: &CausalLanguageModel,
+    widths: &[usize],
+    lengths: &[usize],
+) -> Result<Vec<CostObservation>, CalibrationError> {
+    let mut observations = Vec::with_capacity(widths.len() * lengths.len() * 2);
+    for &width in widths {
+        for &length in lengths {
+            let Some(prompts) = mixed_length_prompts(width, length) else {
+                continue;
+            };
+            for split in [false, true] {
+                observations.push(measure_one(model, &prompts, split)?);
             }
         }
     }
@@ -324,8 +545,7 @@ pub fn measure_iteration_costs(
 
 fn measure_one(
     model: &CausalLanguageModel,
-    width: usize,
-    length: usize,
+    prompt_lengths: &[usize],
     split: bool,
 ) -> Result<CostObservation, CalibrationError> {
     const MODEL_ID: &str = "calibration";
@@ -335,7 +555,7 @@ fn measure_one(
     } else {
         ComposedPolicy::default()
     };
-    let mut executor = Executor::with_max_active_requests(Runtime::default(), width.max(1))
+    let mut executor = Executor::with_max_active_requests(Runtime::default(), prompt_lengths.len())
         .map_err(|error| failed(&error))?
         .with_policy(policy);
     executor
@@ -344,9 +564,9 @@ fn measure_one(
             model.clone(),
         )
         .map_err(|error| failed(&error))?;
-    for _ in 0..width.max(1) {
+    for &length in prompt_lengths {
         let mut request = RequestSpec::text(MODEL_ID, "");
-        request.inputs = vec![Input::Tokens(vec![1; length.max(1)])];
+        request.inputs = vec![Input::Tokens(vec![1; length])];
         request.generation.max_new_tokens = 1;
         request.generation.temperature = 0.0;
         executor
@@ -364,6 +584,13 @@ fn measure_one(
                 .execution_batches
                 .iter()
                 .map(ola_runtime::ExecutionBatch::dense_input_tokens)
+                .sum::<usize>(),
+        ),
+        padding_tokens: count(
+            iteration
+                .execution_batches
+                .iter()
+                .map(|batch| batch.padding_tokens)
                 .sum::<usize>(),
         ),
         invocations: count(iteration.execution_batches.len()),
@@ -391,6 +618,7 @@ mod tests {
                     let jitter = (noise.between_u64(0, 20) as f64) - 10.0;
                     observations.push(CostObservation {
                         dense_tokens: dense,
+                        padding_tokens: 0.0,
                         invocations,
                         micros: fixed + per_dense * dense + per_invocation * invocations + jitter,
                     });
@@ -429,6 +657,89 @@ mod tests {
         );
         // Deterministic: the same observations give the same fit.
         assert_eq!(fit_cost_model(&synthetic(200.0, 4.0, 300.0)).unwrap(), fit);
+    }
+
+    /// Equal-length and mixed-length shapes, batched and split, from known
+    /// padding-aware coefficients with small, deterministic noise.
+    fn synthetic_padded(
+        fixed: f64,
+        per_real: f64,
+        per_padding: f64,
+        per_invocation: f64,
+    ) -> Vec<CostObservation> {
+        let mut observations = Vec::new();
+        let mut noise = SplitMix64::new(11);
+        for width in [1_usize, 2, 4] {
+            for length in [8_usize, 16, 32] {
+                let mut shapes = vec![vec![length; width]];
+                shapes.extend(mixed_length_prompts(width, length));
+                for prompts in shapes {
+                    let real = prompts.iter().sum::<usize>() as f64;
+                    let longest = *prompts.iter().max().unwrap() as f64;
+                    let batched_padding = longest * prompts.len() as f64 - real;
+                    for (invocations, padding) in [(1.0, batched_padding), (width as f64, 0.0)] {
+                        let jitter = (noise.between_u64(0, 20) as f64) - 10.0;
+                        observations.push(CostObservation {
+                            dense_tokens: real + padding,
+                            padding_tokens: padding,
+                            invocations,
+                            micros: fixed
+                                + per_real * real
+                                + per_padding * padding
+                                + per_invocation * invocations
+                                + jitter,
+                        });
+                    }
+                }
+            }
+        }
+        observations
+    }
+
+    #[test]
+    fn padding_aware_fit_separates_real_and_padded_positions() {
+        let observations = synthetic_padded(200.0, 4.0, 1.0, 300.0);
+        let fit = fit_padded_cost_model(&observations).unwrap();
+
+        assert!((fit.fixed_micros - 200.0).abs() < 10.0);
+        assert!((fit.per_real_token_micros - 4.0).abs() < 0.2);
+        assert!((fit.per_padding_token_micros - 1.0).abs() < 0.2);
+        assert!((fit.per_invocation_micros - 300.0).abs() < 10.0);
+        assert!(fit.r_squared > 0.999, "R² {}", fit.r_squared);
+        let intervals = fit.intervals.unwrap();
+        for (interval, truth) in [
+            (intervals.per_real_token_micros, 4.0),
+            (intervals.per_padding_token_micros, 1.0),
+        ] {
+            assert!(
+                interval.low <= truth && truth <= interval.high,
+                "{interval:?} misses {truth}"
+            );
+        }
+        // The single dense rate cannot express cheap padding, so it fits worse.
+        let dense = fit_cost_model(&observations).unwrap();
+        assert!(dense.r_squared(&observations) < fit.r_squared);
+        assert!(dense.residual_rms_micros > fit.residual_rms_micros);
+    }
+
+    #[test]
+    fn padding_aware_fit_needs_padded_observations() {
+        assert_eq!(
+            fit_padded_cost_model(&synthetic(200.0, 4.0, 300.0)),
+            Err(CalibrationError::NoPadding)
+        );
+        assert_eq!(
+            fit_padded_cost_model(&synthetic_padded(1.0, 1.0, 1.0, 1.0)[..4]),
+            Err(CalibrationError::TooFewObservations(4))
+        );
+    }
+
+    #[test]
+    fn mixed_length_shapes_pad_short_rows_to_one_long_row() {
+        assert_eq!(mixed_length_prompts(4, 16), Some(vec![16, 4, 4, 4]));
+        assert_eq!(mixed_length_prompts(2, 3), Some(vec![3, 1]));
+        assert_eq!(mixed_length_prompts(1, 16), None);
+        assert_eq!(mixed_length_prompts(4, 1), None);
     }
 
     #[test]

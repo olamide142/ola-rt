@@ -4,6 +4,7 @@
 //! cargo run --release -p ola-bench --example reviewer_eval -- schedulers <out.csv>
 //! cargo run --release -p ola-bench --example reviewer_eval -- bucketing  <out.csv>
 //! cargo run --release -p ola-bench --example reviewer_eval -- timing     <out.csv>
+//! cargo run --release -p ola-bench --example reviewer_eval -- prefill_sets <out.csv>
 //! ```
 //!
 //! * `schedulers`: FIFO, priority, EDF, SJF, backfill on the
@@ -13,6 +14,9 @@
 //!   many random prompt-length sets from several distributions.
 //! * `timing`: host wall-clock duration of `plan`, `validate`, and
 //!   `observe` per call, with the queue and live sizes at that call.
+//! * `prefill_sets`: one seeded prompt-length set per distribution and set
+//!   size (4, 8, 16) from the `bucketing` distributions, for running
+//!   `llama-prefill-strategies` on a real model.
 //!
 //! Set `OLA_COST=fixed,per_invocation,per_dense_token` (microseconds) to
 //! replace the simulator's default cost model with fitted coefficients,
@@ -53,7 +57,8 @@ fn main() {
         "schedulers" => schedulers(&mut file),
         "bucketing" => bucketing(&mut file),
         "timing" => timing(&mut file),
-        _ => panic!("mode must be schedulers, bucketing, or timing"),
+        "prefill_sets" => prefill_sets(&mut file),
+        _ => panic!("mode must be schedulers, bucketing, timing, or prefill_sets"),
     }
     eprintln!("wrote {out}");
 }
@@ -194,6 +199,25 @@ fn next(state: &mut u64) -> u64 {
 
 fn uniform(state: &mut u64, lo: usize, hi: usize) -> usize {
     lo + (next(state) as usize) % (hi - lo + 1)
+}
+
+fn prefill_sets(out: &mut impl Write) {
+    writeln!(out, "distribution,set_size,lengths").unwrap();
+    // A different seed from `bucketing`, so these sets are fresh draws.
+    let mut state = 20_261_119_u64;
+    for dist in [
+        "uniform_1_128",
+        "bimodal_80_20",
+        "heavy_tail",
+        "clustered_48_64",
+    ] {
+        for set_size in [4_usize, 8, 16] {
+            let lengths = (0..set_size)
+                .map(|_| sample_length(dist, &mut state).to_string())
+                .collect::<Vec<_>>();
+            writeln!(out, "{dist},{set_size},\"{}\"", lengths.join(",")).unwrap();
+        }
+    }
 }
 
 fn sample_length(dist: &str, state: &mut u64) -> usize {
