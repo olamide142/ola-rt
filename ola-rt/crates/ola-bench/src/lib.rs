@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 
 pub use calibration::{
     CALIBRATION_RESAMPLES, COST_CALIBRATION, CalibrationError, CostFit, CostIntervals,
-    CostObservation, PaddedCostFit, PaddedCostIntervals, fit_cost_model, fit_padded_cost_model,
+    CostObservation, DecodeFit, DecodeObservation, PaddedCostFit, PaddedCostIntervals,
+    fit_cost_model, fit_decode_cost, fit_padded_cost_model, measure_decode_iteration_costs,
     measure_iteration_costs, measure_mixed_iteration_costs, mixed_length_prompts,
 };
 pub use cluster_simulation::{
@@ -80,9 +81,9 @@ pub use scheduling_summary::{
     optimize_virtual_time_candidate, summarize_run,
 };
 pub use simulation::{
-    CostModel, Perturbation, SchedulingRun, SimulationConfig, SimulationError, TrialIteration,
-    TrialOutcome, TrialRequest, run_observed_trial, run_perturbed_trial, run_scheduling_trial,
-    trace_request_spec,
+    CostModel, DecodeCost, Perturbation, SchedulingRun, SimulationConfig, SimulationError,
+    TrialIteration, TrialOutcome, TrialRequest, run_observed_trial, run_perturbed_trial,
+    run_scheduling_trial, trace_request_spec,
 };
 pub use synthetic::{
     KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_group_prompt,

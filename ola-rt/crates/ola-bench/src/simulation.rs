@@ -16,8 +16,8 @@ use std::{
 use ola_core::Input;
 use ola_core::{ModelDescriptor, Priority, RequestId, RequestSpec, Timestamp};
 use ola_runtime::{
-    ExecutionBatch, ExecutionPolicy, Executor, ExecutorError, ExecutorEvent, ExecutorIteration,
-    PlannedDeferral, PolicyDescriptor, RequestStatus, Runtime, RuntimeState,
+    BatchPhase, ExecutionBatch, ExecutionPolicy, Executor, ExecutorError, ExecutorEvent,
+    ExecutorIteration, PlannedDeferral, PolicyDescriptor, RequestStatus, Runtime, RuntimeState,
 };
 
 use crate::{
@@ -33,6 +33,10 @@ pub(crate) const MODEL_ID: &str = "synthetic";
 /// where dense tokens include right padding. The defaults are illustrative,
 /// chosen so that invocation overhead and token work are both visible; P4
 /// calibration can replace them with measured values.
+///
+/// Two optional refinements leave that formula unchanged when unset:
+/// `per_padding_token_micros` prices padded positions separately from real
+/// ones, and `decode` prices decode invocations by rows instead of tokens.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CostModel {
     /// Cost of an iteration boundary, independent of work.
@@ -41,6 +45,19 @@ pub struct CostModel {
     pub per_invocation_micros: u64,
     /// Cost of one dense input position.
     pub per_dense_token_micros: u64,
+    /// Cost of one padded position, when it differs from a real one.
+    pub per_padding_token_micros: Option<u64>,
+    /// Cost of decode invocations, when it differs from prefill pricing.
+    pub decode: Option<DecodeCost>,
+}
+
+/// Cost of one decode invocation: `per_invocation + per_row × rows`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeCost {
+    /// Cost of launching one decode invocation.
+    pub per_invocation_micros: u64,
+    /// Cost of one decoded row.
+    pub per_row_micros: u64,
 }
 
 impl Default for CostModel {
@@ -49,6 +66,8 @@ impl Default for CostModel {
             fixed_micros: 200,
             per_invocation_micros: 300,
             per_dense_token_micros: 4,
+            per_padding_token_micros: None,
+            decode: None,
         }
     }
 }
@@ -74,11 +93,31 @@ impl CostModel {
     /// Returns the virtual duration of an iteration that ran `batches`.
     pub fn iteration_micros(&self, batches: &[ExecutionBatch]) -> u64 {
         batches.iter().fold(self.fixed_micros, |total, batch| {
-            let dense = u64::try_from(batch.dense_input_tokens()).unwrap_or(u64::MAX);
-            total
-                .saturating_add(self.per_invocation_micros)
-                .saturating_add(self.per_dense_token_micros.saturating_mul(dense))
+            total.saturating_add(self.invocation_micros(batch))
         })
+    }
+
+    /// Returns the virtual duration of one invocation, without the
+    /// iteration's fixed cost.
+    pub fn invocation_micros(&self, batch: &ExecutionBatch) -> u64 {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        if let (BatchPhase::Decode, Some(decode)) = (batch.phase, self.decode) {
+            return decode.per_invocation_micros.saturating_add(
+                decode
+                    .per_row_micros
+                    .saturating_mul(count(batch.request_ids.len())),
+            );
+        }
+        let tokens = match self.per_padding_token_micros {
+            None => self
+                .per_dense_token_micros
+                .saturating_mul(count(batch.dense_input_tokens())),
+            Some(per_padding) => self
+                .per_dense_token_micros
+                .saturating_mul(count(batch.input_tokens))
+                .saturating_add(per_padding.saturating_mul(count(batch.padding_tokens))),
+        };
+        self.per_invocation_micros.saturating_add(tokens)
     }
 }
 
@@ -689,6 +728,41 @@ mod tests {
         assert_eq!(
             cost.iteration_micros(&[batch(10, 2), batch(1, 0)]),
             200 + 300 + 48 + 300 + 4
+        );
+    }
+
+    #[test]
+    fn padding_and_decode_costs_refine_pricing_only_when_set() {
+        let batch = |phase, rows: u64, input_tokens, padding_tokens| ExecutionBatch {
+            started_at: Timestamp::ZERO,
+            finished_at: Timestamp::ZERO,
+            phase,
+            request_ids: (1..=rows).map(ola_core::RequestId::new).collect(),
+            mode: ola_runtime::BatchExecutionMode::Tensor,
+            input_tokens,
+            padding_tokens,
+            kernel: None,
+        };
+        let prefill = batch(ola_runtime::BatchPhase::Prefill, 2, 10, 6);
+        let decode = batch(ola_runtime::BatchPhase::Decode, 3, 3, 0);
+        let refined = CostModel {
+            per_padding_token_micros: Some(1),
+            decode: Some(DecodeCost {
+                per_invocation_micros: 500,
+                per_row_micros: 70,
+            }),
+            ..CostModel::default()
+        };
+
+        // Unset, padding costs like a real token and decode like prefill.
+        let plain = CostModel::default();
+        assert_eq!(plain.invocation_micros(&prefill), 300 + 4 * 16);
+        assert_eq!(plain.invocation_micros(&decode), 300 + 4 * 3);
+        assert_eq!(refined.invocation_micros(&prefill), 300 + 4 * 10 + 6);
+        assert_eq!(refined.invocation_micros(&decode), 500 + 70 * 3);
+        assert_eq!(
+            refined.iteration_micros(&[prefill, decode]),
+            200 + 300 + 46 + 500 + 210
         );
     }
 

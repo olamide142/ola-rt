@@ -857,6 +857,11 @@ impl Experiment for CostCalibration {
                     "1 adds mixed-length batches and a padding-aware fit; 0 keeps the default",
                     0,
                 ),
+                ParameterSpec::integer(
+                    "decode",
+                    "1 adds timed decode iterations and a decode cost fit; 0 keeps the default",
+                    0,
+                ),
             ],
         }
     }
@@ -869,14 +874,22 @@ impl Experiment for CostCalibration {
         let model = loaded(context)?;
         let widths = lengths(parameters, "widths")?;
         let prompt_lengths = lengths(parameters, "lengths")?;
-        let mixed = match parameters.integer("mixed_lengths")? {
-            0 => false,
-            1 => true,
-            _ => {
-                return Err(ExperimentError::InvalidParameter {
-                    name: "mixed_lengths".to_owned(),
-                    reason: "expected 0 or 1".into(),
-                });
+        let flag = |name: &str| match parameters.integer(name)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ExperimentError::InvalidParameter {
+                name: name.to_owned(),
+                reason: "expected 0 or 1".into(),
+            }),
+        };
+        let mixed = flag("mixed_lengths")?;
+        let decode = flag("decode")?;
+        let decode_sweep = || {
+            if decode {
+                crate::measure_decode_iteration_costs(model, &widths, &prompt_lengths)
+                    .map_err(run_error)
+            } else {
+                Ok(Vec::new())
             }
         };
         let sweep = || {
@@ -893,12 +906,20 @@ impl Experiment for CostCalibration {
         let warmups = parameters.size("warmups")?;
         for _ in 0..warmups {
             sweep()?;
+            decode_sweep()?;
         }
         let mut pooled = Vec::new();
         let mut fits = Vec::new();
         let mut padded_fits = Vec::new();
         let mut sweep_r_squared = Vec::new();
+        let mut decode_pooled = Vec::new();
+        let mut decode_fits = Vec::new();
         for _ in 0..parameters.integer("repetitions")? {
+            let decode_observations = decode_sweep()?;
+            if decode {
+                decode_fits.push(crate::fit_decode_cost(&decode_observations).map_err(run_error)?);
+            }
+            decode_pooled.extend(decode_observations);
             let observations = sweep()?;
             let fit = crate::fit_cost_model(&observations).map_err(run_error)?;
             if mixed {
@@ -911,6 +932,11 @@ impl Experiment for CostCalibration {
         let pooled_fit = crate::fit_cost_model(&pooled).map_err(run_error)?;
         let pooled_padded_fit = if mixed {
             Some(crate::fit_padded_cost_model(&pooled).map_err(run_error)?)
+        } else {
+            None
+        };
+        let pooled_decode_fit = if decode {
+            Some(crate::fit_decode_cost(&decode_pooled).map_err(run_error)?)
         } else {
             None
         };
@@ -942,6 +968,20 @@ impl Experiment for CostCalibration {
                 ratio("padded_r_squared"),
             ]);
         }
+        if decode {
+            metrics.extend([
+                micros("decode_intercept_micros"),
+                micros("per_decode_row_micros"),
+                micros("per_decode_context_token_micros"),
+                micros("decode_residual_rms_micros"),
+                MetricSpec::new(
+                    "decode_r_squared",
+                    Unit::Ratio,
+                    TimeDomain::Host,
+                    Direction::Higher,
+                ),
+            ]);
+        }
         let samples = fits
             .iter()
             .enumerate()
@@ -965,6 +1005,18 @@ impl Experiment for CostCalibration {
                         ("padded_per_invocation_micros", padded.per_invocation_micros),
                         ("padded_residual_rms_micros", padded.residual_rms_micros),
                         ("padded_r_squared", padded.r_squared),
+                    ]));
+                }
+                if let Some(decode) = decode_fits.get(index) {
+                    sample.extend(values(&[
+                        ("decode_intercept_micros", decode.intercept_micros),
+                        ("per_decode_row_micros", decode.per_row_micros),
+                        (
+                            "per_decode_context_token_micros",
+                            decode.per_context_token_micros,
+                        ),
+                        ("decode_residual_rms_micros", decode.residual_rms_micros),
+                        ("decode_r_squared", decode.r_squared),
                     ]));
                 }
                 sample
@@ -1046,6 +1098,28 @@ impl Experiment for CostCalibration {
                 },
             });
         }
+        if let Some(fit) = pooled_decode_fit {
+            let interval = |index: usize| interval_json(fit.intervals.map(|i| i[index]));
+            details["decode_fit"] = serde_json::json!({
+                "observations": fit.observations,
+                "intercept_micros": fit.intercept_micros,
+                "per_row_micros": fit.per_row_micros,
+                "per_context_token_micros": fit.per_context_token_micros,
+                "residual_rms_micros": fit.residual_rms_micros,
+                "r_squared": fit.r_squared,
+                "ci95": {
+                    "intercept_micros": interval(0),
+                    "per_row_micros": interval(1),
+                    "per_context_token_micros": interval(2),
+                },
+            });
+            details["decode_observation_columns"] =
+                serde_json::json!(["rows", "context_tokens", "micros"]);
+            details["decode_observations"] = decode_pooled
+                .iter()
+                .map(|o| serde_json::json!([o.rows, o.context_tokens, o.micros]))
+                .collect();
+        }
         outcome.report.details = Some(details);
         let estimate = |name: &str| outcome.report.summaries[0].estimates[name];
         let describe = |name: &str| {
@@ -1080,6 +1154,15 @@ impl Experiment for CostCalibration {
                 describe("per_padding_token_micros"),
                 describe("padded_per_invocation_micros"),
                 pooled_padded_fit.map_or(0.0, |fit| fit.r_squared),
+            ));
+        }
+        if let Some(fit) = pooled_decode_fit {
+            outcome.summary.push_str(&format!(
+                " · decode: intercept {} · per row {} · per context token {} · R² {:.4}",
+                describe("decode_intercept_micros"),
+                describe("per_decode_row_micros"),
+                describe("per_decode_context_token_micros"),
+                fit.r_squared,
             ));
         }
         Ok(outcome)

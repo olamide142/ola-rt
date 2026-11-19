@@ -1178,6 +1178,8 @@ mod tests {
                 fixed_micros: 50,
                 per_invocation_micros: 50,
                 per_dense_token_micros: 40,
+                per_padding_token_micros: None,
+                decode: None,
             },
             ..SimulationConfig::default()
         };
