@@ -29,8 +29,12 @@ each one is how you learn the system.
    `BACKEND=wgpu` or `cuda`); kernel studies add `FEATURES=cubecl-cpu` or
    `FEATURES=wgpu`. The tool builds a release `ola` once per feature set,
    each in its own `ola-rt/target/lab-…` directory: the first build of a
-   new set compiles the whole GPU stack and can take ten minutes or more;
-   later runs reuse it.
+   new set compiles the whole GPU stack; later runs reuse it. A cold CUDA
+   build (`ola-cli`, `reviewer_eval`, and the `run_llama` example) took
+   about 5 minutes on a vast.ai RTX 4090 (24 GB, driver 580.178.04) with a
+   64-thread AMD EPYC 9354P, and about 6 minutes on a vast.ai RTX 4090
+   (24 GB, driver 615.71.09) with a 256-thread AMD EPYC 7702; both with
+   CUDA 12.6 on Ubuntu 24.04 and Rust 1.100.0.
 3. **Before reading the summary, write the Question, Hypothesis, and
    Prediction** in `notes.md`. A prediction written afterwards teaches you
    nothing. (`make lab-new` prints the summary; look away, or write the
