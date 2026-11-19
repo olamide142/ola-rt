@@ -16,7 +16,10 @@
 //!
 //! Set `OLA_COST=fixed,per_invocation,per_dense_token` (microseconds) to
 //! replace the simulator's default cost model with fitted coefficients,
-//! e.g. from `ola experiment run cost-calibration --model <dir>`.
+//! e.g. from `ola experiment run cost-calibration --model <dir>`. Arrival
+//! rates and deadline estimates are then scaled by the ratio of a reference
+//! decode iteration's cost (one invocation, eight rows) under the fitted and
+//! default models, so "light", "moderate", and "overload" keep their meaning.
 
 #![allow(missing_docs)]
 
@@ -76,6 +79,20 @@ fn cost_model() -> CostModel {
     }
 }
 
+/// Ratio of a reference decode iteration's cost (one invocation, eight
+/// one-token rows) under the active cost model to the default one. Exactly
+/// 1.0 without `OLA_COST`.
+fn load_scale() -> f64 {
+    let reference = |c: CostModel| {
+        (c.fixed_micros + c.per_invocation_micros + 8 * c.per_dense_token_micros) as f64
+    };
+    reference(cost_model()) / reference(CostModel::default())
+}
+
+fn scaled(micros: u64) -> u64 {
+    ((micros as f64) * load_scale()).round().max(1.0) as u64
+}
+
 // ---------------------------------------------------------------------------
 
 fn scheduler_policies() -> Vec<(&'static str, Box<dyn ExecutionPolicy>)> {
@@ -106,15 +123,21 @@ fn schedulers(out: &mut impl Write) {
         out,
         "trace,interarrival_us,seed,policy,requests,completed,completion_p50_us,completion_p95_us,\
          ttft_p95_us,throughput_tps,with_deadline,deadline_missed,starved,\
-         hi_requests,hi_completion_p50_us,hi_completion_p95_us,lo_requests,lo_completion_p50_us,lo_completion_p95_us"
+         hi_requests,hi_completion_p50_us,hi_completion_p95_us,lo_requests,lo_completion_p50_us,lo_completion_p95_us,load"
     )
     .unwrap();
+    eprintln!("load scale {:.3}", load_scale());
     let config = SimulationConfig {
         cost: cost_model(),
         ..SimulationConfig::default()
     };
     for trace_name in ["priority_classes", "deadlines"] {
-        for interarrival in [4_000_u64, 2_000, 1_000] {
+        for (load, nominal) in [
+            ("light", 4_000_u64),
+            ("moderate", 2_000),
+            ("overload", 1_000),
+        ] {
+            let interarrival = scaled(nominal);
             for seed in 1..=30_u64 {
                 let p = TraceParameters {
                     seed,
@@ -123,7 +146,7 @@ fn schedulers(out: &mut impl Write) {
                 };
                 let trace = match trace_name {
                     "priority_classes" => SchedulingTrace::priority_classes(p),
-                    _ => SchedulingTrace::deadlines(p, 504),
+                    _ => SchedulingTrace::deadlines(p, scaled(504)),
                 };
                 let (labels, policies): (Vec<_>, Vec<_>) = scheduler_policies().into_iter().unzip();
                 let comparison =
@@ -135,7 +158,7 @@ fn schedulers(out: &mut impl Write) {
                     let lo = class("priority=0");
                     writeln!(
                         out,
-                        "{trace_name},{interarrival},{seed},{label},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{}",
+                        "{trace_name},{interarrival},{seed},{label},{},{},{},{},{},{:.3},{},{},{},{},{},{},{},{},{},{load}",
                         s.requests,
                         s.completed,
                         s.completion.p50_micros,
@@ -340,7 +363,7 @@ fn timing(out: &mut impl Write) {
                 let trace = SchedulingTrace::overload(TraceParameters {
                     seed,
                     requests: 600,
-                    mean_interarrival_micros: 150,
+                    mean_interarrival_micros: scaled(150),
                 });
                 let store = Arc::new(Mutex::new(Timings::default()));
                 let timed = Timed {
