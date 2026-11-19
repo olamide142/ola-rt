@@ -20,7 +20,9 @@
 //!   generated. Writes one JSON line per request with simulated times.
 //!
 //! Set `OLA_COST=fixed,per_invocation,per_dense_token` (microseconds) to the
-//! calibrated coefficients for both commands.
+//! calibrated coefficients for both commands. Three more values,
+//! `per_padding_token,decode_per_invocation,decode_per_row`, price padding
+//! and decode invocations separately (see `CostModel`).
 
 #![allow(missing_docs)]
 
@@ -31,8 +33,8 @@ use std::{
 };
 
 use ola_bench::{
-    CostModel, KvGeometry, SchedulingTrace, SimulationConfig, TraceParameters, TraceRequest,
-    TrialOutcome, run_observed_trial,
+    CostModel, DecodeCost, KvGeometry, SchedulingTrace, SimulationConfig, TraceParameters,
+    TraceRequest, TrialOutcome, run_observed_trial,
 };
 use ola_runtime::{ComposedPolicy, MemoryAwareAdmission};
 use serde_json::{Value, json};
@@ -55,15 +57,31 @@ fn cost_model() -> Result<CostModel, Box<dyn Error>> {
         return Ok(CostModel::default());
     };
     let parts = numbers(&text)?;
-    let [fixed, per_invocation, per_dense] = parts[..] else {
-        return Err("OLA_COST=fixed,per_invocation,per_dense_token".into());
+    let (&[fixed, per_invocation, per_dense], rest) = parts.split_at(parts.len().min(3)) else {
+        return Err(COST_USAGE.into());
+    };
+    let (per_padding, decode) = match *rest {
+        [] => (None, None),
+        [per_padding, decode_per_invocation, decode_per_row] => (
+            Some(per_padding),
+            Some(DecodeCost {
+                per_invocation_micros: decode_per_invocation,
+                per_row_micros: decode_per_row,
+            }),
+        ),
+        _ => return Err(COST_USAGE.into()),
     };
     Ok(CostModel {
         fixed_micros: fixed,
         per_invocation_micros: per_invocation,
         per_dense_token_micros: per_dense,
+        per_padding_token_micros: per_padding,
+        decode,
     })
 }
+
+const COST_USAGE: &str = "OLA_COST=fixed,per_invocation,per_dense_token\
+     [,per_padding_token,decode_per_invocation,decode_per_row]";
 
 fn numbers(text: &str) -> Result<Vec<u64>, Box<dyn Error>> {
     Ok(text
@@ -74,10 +92,14 @@ fn numbers(text: &str) -> Result<Vec<u64>, Box<dyn Error>> {
 
 /// Same scaling as `reviewer_eval`: a reference decode iteration (one
 /// invocation, eight one-token rows) under the active cost model relative
-/// to the default.
+/// to the default. With a decode cost, the reference uses it.
 fn load_scale(cost: CostModel) -> f64 {
     let reference = |c: CostModel| {
-        (c.fixed_micros + c.per_invocation_micros + 8 * c.per_dense_token_micros) as f64
+        let invocation = match c.decode {
+            Some(decode) => decode.per_invocation_micros + 8 * decode.per_row_micros,
+            None => c.per_invocation_micros + 8 * c.per_dense_token_micros,
+        };
+        (c.fixed_micros + invocation) as f64
     };
     reference(cost) / reference(CostModel::default())
 }

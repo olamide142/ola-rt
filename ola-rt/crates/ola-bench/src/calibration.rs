@@ -128,6 +128,8 @@ impl CostFit {
             fixed_micros: micros(self.fixed_micros),
             per_invocation_micros: micros(self.per_invocation_micros),
             per_dense_token_micros: micros(self.per_dense_token_micros),
+            per_padding_token_micros: None,
+            decode: None,
         }
     }
 
@@ -258,6 +260,115 @@ pub fn fit_cost_model(observations: &[CostObservation]) -> Result<CostFit, Calib
     })
 }
 
+/// A measured iteration that least squares and the bootstrap can fit.
+trait Observed: Copy {
+    /// Measured iteration time.
+    fn micros(&self) -> f64;
+    /// Values hashed into the bootstrap seed.
+    fn seed_values(&self) -> [f64; 3];
+}
+
+impl Observed for CostObservation {
+    fn micros(&self) -> f64 {
+        self.micros
+    }
+
+    fn seed_values(&self) -> [f64; 3] {
+        [self.dense_tokens, self.invocations, self.micros]
+    }
+}
+
+/// One measured decode iteration: a single invocation decoding `rows`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodeObservation {
+    /// Rows decoded by the invocation.
+    pub rows: f64,
+    /// Cached positions the rows attend over, summed across rows.
+    pub context_tokens: f64,
+    /// Measured iteration time.
+    pub micros: f64,
+}
+
+impl Observed for DecodeObservation {
+    fn micros(&self) -> f64 {
+        self.micros
+    }
+
+    fn seed_values(&self) -> [f64; 3] {
+        [self.rows, self.context_tokens, self.micros]
+    }
+}
+
+/// Fitted decode iteration cost:
+/// `micros = intercept + per_row × rows + per_context_token × context`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DecodeFit {
+    /// Cost of a decode iteration independent of rows, including the
+    /// iteration's fixed cost.
+    pub intercept_micros: f64,
+    /// Cost per decoded row.
+    pub per_row_micros: f64,
+    /// Cost per cached position attended over.
+    pub per_context_token_micros: f64,
+    /// Root-mean-square residual.
+    pub residual_rms_micros: f64,
+    /// Coefficient of determination over the fitted observations.
+    pub r_squared: f64,
+    /// Observations fitted.
+    pub observations: usize,
+    /// 95% bootstrap intervals for intercept, per row, and per context token.
+    pub intervals: Option<[Interval; 3]>,
+}
+
+impl DecodeFit {
+    /// Predicted iteration time for one observation's shape.
+    pub fn predict(&self, observation: &DecodeObservation) -> f64 {
+        self.intercept_micros
+            + self.per_row_micros * observation.rows
+            + self.per_context_token_micros * observation.context_tokens
+    }
+}
+
+/// Fits decode cost by ordinary least squares, with seeded bootstrap
+/// intervals over observations.
+///
+/// # Errors
+///
+/// Returns [`CalibrationError`] for too few or degenerate observations.
+pub fn fit_decode_cost(observations: &[DecodeObservation]) -> Result<DecodeFit, CalibrationError> {
+    if observations.len() < 4 {
+        return Err(CalibrationError::TooFewObservations(observations.len()));
+    }
+    let row = |observation: &DecodeObservation| [1.0, observation.rows, observation.context_tokens];
+    let [intercept, per_row, per_context] =
+        solve(observations, row).ok_or(CalibrationError::Singular)?;
+    let mut fit = DecodeFit {
+        intercept_micros: intercept,
+        per_row_micros: per_row,
+        per_context_token_micros: per_context,
+        residual_rms_micros: 0.0,
+        r_squared: 0.0,
+        observations: observations.len(),
+        intervals: bootstrap_coefficients(observations, |resample| solve(resample, row)),
+    };
+    let residual = observations
+        .iter()
+        .map(|observation| (observation.micros - fit.predict(observation)).powi(2))
+        .sum::<f64>();
+    let mean = observations.iter().map(|o| o.micros).sum::<f64>() / count(observations.len());
+    let total = observations
+        .iter()
+        .map(|observation| (observation.micros - mean).powi(2))
+        .sum::<f64>();
+    fit.residual_rms_micros = (residual / count(observations.len())).sqrt();
+    fit.r_squared = if total > 0.0 {
+        1.0 - residual / total
+    } else {
+        0.0
+    };
+    Ok(fit)
+}
+
 /// Fits the padding-aware cost model by ordinary least squares, with seeded
 /// bootstrap intervals over observations.
 ///
@@ -360,9 +471,9 @@ fn padded_row(observation: &CostObservation) -> [f64; 4] {
 }
 
 /// Solves the normal equations `XᵀX β = Xᵀy` for rows produced by `row`.
-fn solve<const N: usize>(
-    observations: &[CostObservation],
-    row: impl Fn(&CostObservation) -> [f64; N],
+fn solve<T: Observed, const N: usize>(
+    observations: &[T],
+    row: impl Fn(&T) -> [f64; N],
 ) -> Option<[f64; N]> {
     // Each row of `matrix` is one normal equation; the last column is Xᵀy.
     let mut matrix = vec![vec![0.0_f64; N + 1]; N];
@@ -372,7 +483,7 @@ fn solve<const N: usize>(
             for (j, right) in row.iter().enumerate() {
                 matrix[i][j] += left * right;
             }
-            matrix[i][N] += left * observation.micros;
+            matrix[i][N] += left * observation.micros();
         }
     }
     let scale = matrix
@@ -413,23 +524,20 @@ fn bootstrap(observations: &[CostObservation]) -> Option<CostIntervals> {
 }
 
 /// Seeded percentile-bootstrap intervals for the coefficients `fit` returns.
-fn bootstrap_coefficients<const N: usize>(
-    observations: &[CostObservation],
-    fit: impl Fn(&[CostObservation]) -> Option<[f64; N]>,
+fn bootstrap_coefficients<T: Observed, const N: usize>(
+    observations: &[T],
+    fit: impl Fn(&[T]) -> Option<[f64; N]>,
 ) -> Option<[Interval; N]> {
     let seed = observations
         .iter()
         .fold(0xcbf2_9ce4_8422_2325_u64, |hash, observation| {
-            [
-                observation.dense_tokens,
-                observation.invocations,
-                observation.micros,
-            ]
-            .iter()
-            .flat_map(|value| value.to_bits().to_le_bytes())
-            .fold(hash, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            })
+            observation
+                .seed_values()
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
         });
     let mut random = SplitMix64::new(seed);
     let last = u64::try_from(observations.len() - 1).unwrap_or(u64::MAX);
@@ -541,6 +649,81 @@ pub fn measure_mixed_iteration_costs(
         }
     }
     Ok(observations)
+}
+
+/// Measures one decode iteration per (width, length) shape: `width`
+/// requests of `length` tokens are prefilled in one iteration, then the next
+/// iteration, which decodes every row in one invocation, is timed.
+///
+/// # Errors
+///
+/// Returns [`CalibrationError::Measurement`] if the executor fails or the
+/// timed iteration is not a single decode invocation.
+pub fn measure_decode_iteration_costs(
+    model: &CausalLanguageModel,
+    widths: &[usize],
+    lengths: &[usize],
+) -> Result<Vec<DecodeObservation>, CalibrationError> {
+    let mut observations = Vec::with_capacity(widths.len() * lengths.len());
+    for &width in widths {
+        for &length in lengths {
+            observations.push(measure_decode_one(model, width.max(1), length.max(1))?);
+        }
+    }
+    Ok(observations)
+}
+
+fn measure_decode_one(
+    model: &CausalLanguageModel,
+    width: usize,
+    length: usize,
+) -> Result<DecodeObservation, CalibrationError> {
+    const MODEL_ID: &str = "calibration";
+    let failed = |error: &dyn fmt::Display| CalibrationError::Measurement(error.to_string());
+    let mut executor = Executor::with_max_active_requests(Runtime::default(), width)
+        .map_err(|error| failed(&error))?
+        .with_policy(ComposedPolicy::default());
+    executor
+        .register_model(
+            ModelDescriptor::language(MODEL_ID, "calibration"),
+            model.clone(),
+        )
+        .map_err(|error| failed(&error))?;
+    for _ in 0..width {
+        let mut request = RequestSpec::text(MODEL_ID, "");
+        request.inputs = vec![Input::Tokens(vec![1; length])];
+        request.generation.max_new_tokens = 2;
+        request.generation.temperature = 0.0;
+        executor
+            .submit(request, Timestamp::ZERO)
+            .map_err(|error| failed(&error))?;
+    }
+    executor
+        .step_iteration(Timestamp::from_micros(1))
+        .map_err(|error| failed(&error))?;
+    let started = Instant::now();
+    let iteration = executor
+        .step_iteration(Timestamp::from_micros(2))
+        .map_err(|error| failed(&error))?;
+    let micros = started.elapsed().as_secs_f64() * 1_000_000.0;
+    let [batch] = iteration.execution_batches.as_slice() else {
+        return Err(CalibrationError::Measurement(format!(
+            "expected one decode invocation, got {}",
+            iteration.execution_batches.len()
+        )));
+    };
+    if batch.phase != ola_runtime::BatchPhase::Decode {
+        return Err(CalibrationError::Measurement(
+            "the timed iteration did not decode".into(),
+        ));
+    }
+    let rows = batch.request_ids.len();
+    Ok(DecodeObservation {
+        rows: count(rows),
+        // Each row attends over its prompt and its first generated token.
+        context_tokens: count(rows * (length + 1)),
+        micros,
+    })
 }
 
 fn measure_one(
@@ -723,6 +906,37 @@ mod tests {
     }
 
     #[test]
+    fn decode_fit_recovers_per_row_and_context_costs() {
+        let mut noise = SplitMix64::new(5);
+        let mut observations = Vec::new();
+        for rows in [1.0, 2.0, 4.0, 8.0] {
+            for length in [16.0, 64.0, 128.0] {
+                let context = rows * (length + 1.0);
+                let jitter = (noise.between_u64(0, 20) as f64) - 10.0;
+                observations.push(DecodeObservation {
+                    rows,
+                    context_tokens: context,
+                    micros: 30_000.0 + 25_000.0 * rows + 2.0 * context + jitter,
+                });
+            }
+        }
+        let fit = fit_decode_cost(&observations).unwrap();
+
+        assert!((fit.intercept_micros - 30_000.0).abs() < 20.0);
+        assert!((fit.per_row_micros - 25_000.0).abs() < 20.0);
+        assert!((fit.per_context_token_micros - 2.0).abs() < 0.1);
+        assert!(fit.r_squared > 0.999_99);
+        // With twelve points the interval is narrow; it sits on the truth.
+        let [_, per_row, _] = fit.intervals.unwrap();
+        assert!(per_row.low < per_row.high);
+        assert!((per_row.low - 25_000.0).abs() < 20.0 && (per_row.high - 25_000.0).abs() < 20.0);
+        assert_eq!(
+            fit_decode_cost(&observations[..3]),
+            Err(CalibrationError::TooFewObservations(3))
+        );
+    }
+
+    #[test]
     fn padding_aware_fit_needs_padded_observations() {
         assert_eq!(
             fit_padded_cost_model(&synthetic(200.0, 4.0, 300.0)),
@@ -772,6 +986,8 @@ mod tests {
                 fixed_micros: 0,
                 per_invocation_micros: 8,
                 per_dense_token_micros: 2,
+                per_padding_token_micros: None,
+                decode: None,
             }
         );
         assert_eq!(fit.invocation_overhead_tokens(), Some(3));
@@ -840,6 +1056,8 @@ mod tests {
                 fixed_micros: 200,
                 per_invocation_micros: 300,
                 per_dense_token_micros: 4,
+                per_padding_token_micros: None,
+                decode: None,
             }
         );
         assert!(fit.intervals.is_some());

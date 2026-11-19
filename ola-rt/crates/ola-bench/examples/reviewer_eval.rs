@@ -81,6 +81,8 @@ fn cost_model() -> CostModel {
         fixed_micros: parts[0],
         per_invocation_micros: parts[1],
         per_dense_token_micros: parts[2],
+        per_padding_token_micros: None,
+        decode: None,
     }
 }
 
