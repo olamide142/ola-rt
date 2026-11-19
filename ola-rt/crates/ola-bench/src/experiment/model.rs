@@ -852,6 +852,11 @@ impl Experiment for CostCalibration {
                 ParameterSpec::text("lengths", "Comma-separated prompt lengths", "4,8,16"),
                 ParameterSpec::integer("warmups", "Discarded grid sweeps", 1),
                 ParameterSpec::integer("repetitions", "Measured grid sweeps, one fit each", 5),
+                ParameterSpec::integer(
+                    "mixed_lengths",
+                    "1 adds mixed-length batches and a padding-aware fit; 0 keeps the default",
+                    0,
+                ),
             ],
         }
     }
@@ -864,57 +869,115 @@ impl Experiment for CostCalibration {
         let model = loaded(context)?;
         let widths = lengths(parameters, "widths")?;
         let prompt_lengths = lengths(parameters, "lengths")?;
-        let sweep =
-            || crate::measure_iteration_costs(model, &widths, &prompt_lengths).map_err(run_error);
+        let mixed = match parameters.integer("mixed_lengths")? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(ExperimentError::InvalidParameter {
+                    name: "mixed_lengths".to_owned(),
+                    reason: "expected 0 or 1".into(),
+                });
+            }
+        };
+        let sweep = || {
+            let mut observations = crate::measure_iteration_costs(model, &widths, &prompt_lengths)
+                .map_err(run_error)?;
+            if mixed {
+                observations.extend(
+                    crate::measure_mixed_iteration_costs(model, &widths, &prompt_lengths)
+                        .map_err(run_error)?,
+                );
+            }
+            Ok::<_, ExperimentError>(observations)
+        };
         let warmups = parameters.size("warmups")?;
         for _ in 0..warmups {
             sweep()?;
         }
         let mut pooled = Vec::new();
         let mut fits = Vec::new();
+        let mut padded_fits = Vec::new();
+        let mut sweep_r_squared = Vec::new();
         for _ in 0..parameters.integer("repetitions")? {
             let observations = sweep()?;
-            fits.push(crate::fit_cost_model(&observations).map_err(run_error)?);
+            let fit = crate::fit_cost_model(&observations).map_err(run_error)?;
+            if mixed {
+                sweep_r_squared.push(fit.r_squared(&observations));
+                padded_fits.push(crate::fit_padded_cost_model(&observations).map_err(run_error)?);
+            }
+            fits.push(fit);
             pooled.extend(observations);
         }
         let pooled_fit = crate::fit_cost_model(&pooled).map_err(run_error)?;
+        let pooled_padded_fit = if mixed {
+            Some(crate::fit_padded_cost_model(&pooled).map_err(run_error)?)
+        } else {
+            None
+        };
+        let shapes = pooled.len() / fits.len().max(1);
 
         let micros = |name| MetricSpec::new(name, Unit::Micros, TimeDomain::Host, Direction::Lower);
+        let mut metrics = vec![
+            micros("fixed_micros"),
+            micros("per_dense_token_micros"),
+            micros("per_invocation_micros"),
+            MetricSpec::new(
+                "invocation_overhead_tokens",
+                Unit::Tokens,
+                TimeDomain::Host,
+                Direction::Neither,
+            ),
+            micros("residual_rms_micros"),
+        ];
+        if mixed {
+            let ratio =
+                |name| MetricSpec::new(name, Unit::Ratio, TimeDomain::Host, Direction::Higher);
+            metrics.extend([
+                ratio("r_squared"),
+                micros("padded_fixed_micros"),
+                micros("per_real_token_micros"),
+                micros("per_padding_token_micros"),
+                micros("padded_per_invocation_micros"),
+                micros("padded_residual_rms_micros"),
+                ratio("padded_r_squared"),
+            ]);
+        }
+        let samples = fits
+            .iter()
+            .enumerate()
+            .map(|(index, fit)| {
+                let mut sample = values(&[
+                    ("fixed_micros", fit.fixed_micros),
+                    ("per_dense_token_micros", fit.per_dense_token_micros),
+                    ("per_invocation_micros", fit.per_invocation_micros),
+                    (
+                        "invocation_overhead_tokens",
+                        fit.invocation_overhead_tokens().map_or(0.0, as_f64),
+                    ),
+                    ("residual_rms_micros", fit.residual_rms_micros),
+                ]);
+                if let Some(padded) = padded_fits.get(index) {
+                    sample.extend(values(&[
+                        ("r_squared", sweep_r_squared[index]),
+                        ("padded_fixed_micros", padded.fixed_micros),
+                        ("per_real_token_micros", padded.per_real_token_micros),
+                        ("per_padding_token_micros", padded.per_padding_token_micros),
+                        ("padded_per_invocation_micros", padded.per_invocation_micros),
+                        ("padded_residual_rms_micros", padded.residual_rms_micros),
+                        ("padded_r_squared", padded.r_squared),
+                    ]));
+                }
+                sample
+            })
+            .collect();
         let mut outcome = finish(
             &self.descriptor(),
             context,
             parameters,
             "shape-grid",
             Vec::new(),
-            vec![
-                micros("fixed_micros"),
-                micros("per_dense_token_micros"),
-                micros("per_invocation_micros"),
-                MetricSpec::new(
-                    "invocation_overhead_tokens",
-                    Unit::Tokens,
-                    TimeDomain::Host,
-                    Direction::Neither,
-                ),
-                micros("residual_rms_micros"),
-            ],
-            vec![(
-                plain_variant("fit"),
-                fits.iter()
-                    .map(|fit| {
-                        values(&[
-                            ("fixed_micros", fit.fixed_micros),
-                            ("per_dense_token_micros", fit.per_dense_token_micros),
-                            ("per_invocation_micros", fit.per_invocation_micros),
-                            (
-                                "invocation_overhead_tokens",
-                                fit.invocation_overhead_tokens().map_or(0.0, as_f64),
-                            ),
-                            ("residual_rms_micros", fit.residual_rms_micros),
-                        ])
-                    })
-                    .collect(),
-            )],
+            metrics,
+            vec![(plain_variant("fit"), samples)],
             String::new(),
         )?;
         // `finish` records single-pass probes; this study ran warm-up sweeps.
@@ -925,7 +988,7 @@ impl Experiment for CostCalibration {
         };
         let intervals = pooled_fit.intervals;
         let cost = pooled_fit.cost_model();
-        outcome.report.details = Some(serde_json::json!({
+        let mut details = serde_json::json!({
             "pooled_fit": {
                 "observations": pooled_fit.observations,
                 "fixed_micros": pooled_fit.fixed_micros,
@@ -946,13 +1009,44 @@ impl Experiment for CostCalibration {
             },
             "observations": pooled
                 .iter()
-                .map(|observation| serde_json::json!([
-                    observation.dense_tokens,
-                    observation.invocations,
-                    observation.micros,
-                ]))
+                .map(|observation| if mixed {
+                    serde_json::json!([
+                        observation.dense_tokens,
+                        observation.invocations,
+                        observation.micros,
+                        observation.padding_tokens,
+                    ])
+                } else {
+                    serde_json::json!([
+                        observation.dense_tokens,
+                        observation.invocations,
+                        observation.micros,
+                    ])
+                })
                 .collect::<Vec<_>>(),
-        }));
+        });
+        if let Some(padded) = pooled_padded_fit {
+            let intervals = padded.intervals;
+            details["pooled_fit"]["r_squared"] = serde_json::json!(pooled_fit.r_squared(&pooled));
+            details["observation_columns"] =
+                serde_json::json!(["dense_tokens", "invocations", "micros", "padding_tokens"]);
+            details["padded_fit"] = serde_json::json!({
+                "observations": padded.observations,
+                "fixed_micros": padded.fixed_micros,
+                "per_real_token_micros": padded.per_real_token_micros,
+                "per_padding_token_micros": padded.per_padding_token_micros,
+                "per_invocation_micros": padded.per_invocation_micros,
+                "residual_rms_micros": padded.residual_rms_micros,
+                "r_squared": padded.r_squared,
+                "ci95": {
+                    "fixed_micros": interval_json(intervals.map(|i| i.fixed_micros)),
+                    "per_real_token_micros": interval_json(intervals.map(|i| i.per_real_token_micros)),
+                    "per_padding_token_micros": interval_json(intervals.map(|i| i.per_padding_token_micros)),
+                    "per_invocation_micros": interval_json(intervals.map(|i| i.per_invocation_micros)),
+                },
+            });
+        }
+        outcome.report.details = Some(details);
         let estimate = |name: &str| outcome.report.summaries[0].estimates[name];
         let describe = |name: &str| {
             let estimate = estimate(name);
@@ -969,7 +1063,7 @@ impl Experiment for CostCalibration {
         outcome.summary = format!(
             "{} sweeps × {} shapes · fixed {} · per token {} · per call {} · overhead ≈ {} tokens · residual {:.1} µs",
             fits.len(),
-            widths.len() * prompt_lengths.len() * 2,
+            shapes,
             describe("fixed_micros"),
             describe("per_dense_token_micros"),
             describe("per_invocation_micros"),
@@ -978,6 +1072,16 @@ impl Experiment for CostCalibration {
                 .map_or_else(|| "n/a".to_owned(), |tokens| tokens.to_string()),
             pooled_fit.residual_rms_micros,
         );
+        if mixed {
+            outcome.summary.push_str(&format!(
+                " · R² {:.4} · padding-aware: per real token {} · per padded position {} · per call {} · R² {:.4}",
+                pooled_fit.r_squared(&pooled),
+                describe("per_real_token_micros"),
+                describe("per_padding_token_micros"),
+                describe("padded_per_invocation_micros"),
+                pooled_padded_fit.map_or(0.0, |fit| fit.r_squared),
+            ));
+        }
         Ok(outcome)
     }
 }
