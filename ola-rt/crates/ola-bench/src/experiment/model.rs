@@ -25,8 +25,8 @@ use super::{
     Variant, WorkloadIdentity, content_digest,
 };
 use crate::{
-    PrefillBenchmarkReport, PrefillExecutionConfig, PrefillFairnessLatency, PrefillFairnessRun,
-    PrefillReportSample, PrefillThreeWayTrialConfig, PrefillTrialConfig,
+    OutputCheck, PrefillBenchmarkReport, PrefillExecutionConfig, PrefillFairnessLatency,
+    PrefillFairnessRun, PrefillReportSample, PrefillThreeWayTrialConfig, PrefillTrialConfig,
     benchmark_chunked_prefill_execution, benchmark_prefill_fairness_trials,
     benchmark_prefill_trials, benchmark_three_way_prefill_trials,
     calibrate_prefill_invocation_overhead,
@@ -34,6 +34,17 @@ use crate::{
 
 const MODEL_ID: &str = "experiment-model";
 const PREFILL_STRATEGIES: &str = "llama-prefill-strategies";
+
+fn output_check(parameters: &Parameters) -> Result<OutputCheck, ExperimentError> {
+    match parameters.text("output_check")? {
+        "exact" => Ok(OutputCheck::Exact),
+        "lengths" => Ok(OutputCheck::Lengths),
+        _ => Err(ExperimentError::InvalidParameter {
+            name: "output_check".to_owned(),
+            reason: "expected `exact` or `lengths`".into(),
+        }),
+    }
+}
 
 fn loaded(context: &ExperimentContext) -> Result<&CausalLanguageModel, ExperimentError> {
     context
@@ -225,6 +236,11 @@ impl Experiment for PrefillStrategies {
                     "Measured comparison trials, rotating strategy order",
                     5,
                 ),
+                ParameterSpec::text(
+                    "output_check",
+                    "Agreement required across strategies: exact tokens, or equal lengths (GPU)",
+                    "exact",
+                ),
             ],
         }
     }
@@ -241,6 +257,7 @@ impl Experiment for PrefillStrategies {
                 .map(|length| vec![1; length])
                 .collect(),
             max_new_tokens: parameters.size("max_new_tokens")?,
+            output_check: output_check(parameters)?,
         };
         let calibration_comparison = benchmark_prefill_trials(
             model,
@@ -376,6 +393,7 @@ impl Experiment for ChunkedPrefill {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1; 7], vec![1; 5]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             chunk_size,
         )
@@ -385,6 +403,7 @@ impl Experiment for ChunkedPrefill {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1; 2], vec![1; 15], vec![1; 4], vec![1; 7]],
                 max_new_tokens: 3,
+                output_check: OutputCheck::Exact,
             },
             2,
             &fairness_chunk_sizes,

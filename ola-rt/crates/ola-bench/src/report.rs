@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LatencySummary, PrefillExecutionConfig, PrefillExecutionSummary, PrefillStrategy,
+    LatencySummary, OutputCheck, PrefillExecutionConfig, PrefillExecutionSummary, PrefillStrategy,
     PrefillStrategyTrials, PrefillThreeWayComparison, PrefillThreeWayTrialConfig,
     PrefillTrialComparison, PrefillTrialConfig,
 };
@@ -63,6 +63,7 @@ impl From<&PrefillReportProtocol> for PrefillTrialConfig {
             execution: PrefillExecutionConfig {
                 prompts: protocol.prompts.clone(),
                 max_new_tokens: protocol.max_new_tokens,
+                output_check: OutputCheck::Exact,
             },
             warmup_trials: protocol.warmup_trials,
             measured_trials: protocol.measured_trials,
@@ -473,6 +474,7 @@ mod tests {
             execution: PrefillExecutionConfig {
                 prompts: vec![vec![1, 2], vec![3, 4, 5]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             warmup_trials: 1,
             measured_trials: 1,
@@ -509,6 +511,7 @@ mod tests {
             execution: PrefillExecutionConfig {
                 prompts: vec![vec![1, 2], vec![3, 4, 5]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             warmup_trials: 1,
             measured_trials: 2,
@@ -595,6 +598,7 @@ mod tests {
             execution: PrefillExecutionConfig {
                 prompts: vec![vec![1, 2], vec![3, 4, 5]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             warmup_trials: 1,
             measured_trials: 2,

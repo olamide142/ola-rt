@@ -347,6 +347,39 @@ pub struct PrefillExecutionConfig {
     pub prompts: Vec<Vec<u32>>,
     /// Maximum generated tokens per request, including the prefill token.
     pub max_new_tokens: usize,
+    /// How runs of different strategies must agree for the comparison to hold.
+    pub output_check: OutputCheck,
+}
+
+/// How execution-backed comparisons decide that two runs did the same work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputCheck {
+    /// Every request must generate identical tokens.
+    #[default]
+    Exact,
+    /// Every request must generate the same number of tokens.
+    ///
+    /// For GPU backends whose f32 matmuls run on TF32 tensor cores: kernel
+    /// selection depends on the padded shape, which perturbs logits enough
+    /// to flip near-tied greedy choices while each strategy still performs
+    /// the same work.
+    Lengths,
+}
+
+impl OutputCheck {
+    /// Whether `actual` agrees with `expected` under this check.
+    pub fn accepts(self, expected: &[Vec<u32>], actual: &[Vec<u32>]) -> bool {
+        match self {
+            Self::Exact => expected == actual,
+            Self::Lengths => {
+                expected.len() == actual.len()
+                    && expected
+                        .iter()
+                        .zip(actual)
+                        .all(|(expected, actual)| expected.len() == actual.len())
+            }
+        }
+    }
 }
 
 impl PrefillExecutionConfig {
@@ -666,7 +699,10 @@ pub fn benchmark_prefill_execution(
         execute_prefill_strategy(model, config, UnbucketedPrefillBatcher)?;
     let (power_of_two, bucketed_outputs) =
         execute_prefill_strategy(model, config, PowerOfTwoPrefillBatcher)?;
-    if baseline_outputs != bucketed_outputs {
+    if !config
+        .output_check
+        .accepts(&baseline_outputs, &bucketed_outputs)
+    {
         return Err(ExecutionBenchmarkError::OutputMismatch);
     }
     Ok(PrefillExecutionComparison {
@@ -700,7 +736,10 @@ pub fn benchmark_chunked_prefill_execution(
         UnbucketedPrefillBatcher,
         Some(chunk_size),
     )?;
-    if unchunked_outputs != chunked_outputs {
+    if !config
+        .output_check
+        .accepts(&unchunked_outputs, &chunked_outputs)
+    {
         return Err(ExecutionBenchmarkError::OutputMismatch);
     }
     Ok(ChunkedPrefillComparison {
@@ -739,7 +778,7 @@ pub fn benchmark_prefill_fairness(
     for &chunk_size in chunk_sizes {
         let (run, outputs) =
             run_prefill_fairness(model, config, max_active_requests, Some(chunk_size))?;
-        if outputs != baseline_outputs {
+        if !config.output_check.accepts(&baseline_outputs, &outputs) {
             return Err(ExecutionBenchmarkError::OutputMismatch);
         }
         chunked.push(run);
@@ -802,14 +841,14 @@ pub fn benchmark_prefill_fairness_trials(
                 run_prefill_fairness(model, config, max_active_requests, chunk_size)?;
             if trial_outputs
                 .as_ref()
-                .is_some_and(|expected| expected != &outputs)
+                .is_some_and(|expected| !config.output_check.accepts(expected, &outputs))
             {
                 return Err(ExecutionBenchmarkError::OutputMismatch);
             }
             trial_outputs.get_or_insert(outputs.clone());
             if expected_outputs
                 .as_ref()
-                .is_some_and(|expected| expected != &outputs)
+                .is_some_and(|expected| !config.output_check.accepts(expected, &outputs))
             {
                 return Err(ExecutionBenchmarkError::OutputMismatch);
             }
@@ -863,7 +902,7 @@ pub fn benchmark_prefill_trials(
             execute_strategy_pair(model, &config.execution, first)?;
         if expected_outputs
             .as_ref()
-            .is_some_and(|expected| expected != &outputs)
+            .is_some_and(|expected| !config.execution.output_check.accepts(expected, &outputs))
         {
             return Err(ExecutionBenchmarkError::OutputMismatch);
         }
@@ -990,7 +1029,7 @@ pub fn benchmark_three_way_prefill_trials(
         } = execute_three_strategy_trial(model, config, order)?;
         if expected_outputs
             .as_ref()
-            .is_some_and(|expected| expected != &outputs)
+            .is_some_and(|expected| !config.execution.output_check.accepts(expected, &outputs))
         {
             return Err(ExecutionBenchmarkError::OutputMismatch);
         }
@@ -1066,7 +1105,7 @@ fn execute_three_strategy_trial(
     let mut unbucketed = None;
     let mut power_of_two = None;
     let mut cost_aware = None;
-    let mut outputs = None;
+    let mut outputs: Option<Vec<Vec<u32>>> = None;
     for strategy in order {
         let (summary, current_outputs) = execute_named_strategy(
             model,
@@ -1074,10 +1113,12 @@ fn execute_three_strategy_trial(
             strategy,
             config.adaptive_invocation_overhead_tokens,
         )?;
-        if outputs
-            .as_ref()
-            .is_some_and(|expected| expected != &current_outputs)
-        {
+        if outputs.as_ref().is_some_and(|expected| {
+            !config
+                .execution
+                .output_check
+                .accepts(expected, &current_outputs)
+        }) {
             return Err(ExecutionBenchmarkError::OutputMismatch);
         }
         outputs.get_or_insert(current_outputs);
@@ -1144,7 +1185,7 @@ fn execute_strategy_pair(
     };
     let (first_summary, first_outputs) = run(first)?;
     let (second_summary, second_outputs) = run(second)?;
-    if first_outputs != second_outputs {
+    if !config.output_check.accepts(&first_outputs, &second_outputs) {
         return Err(ExecutionBenchmarkError::OutputMismatch);
     }
     let (unbucketed, power_of_two) = match first {
@@ -1791,6 +1832,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_check_lengths_tolerates_flipped_tokens_but_not_different_work() {
+        let expected = vec![vec![7, 9], vec![3]];
+        let flipped = vec![vec![7, 8], vec![4]];
+        let shorter = vec![vec![7], vec![3]];
+
+        assert!(OutputCheck::Exact.accepts(&expected, &expected));
+        assert!(!OutputCheck::Exact.accepts(&expected, &flipped));
+        assert!(OutputCheck::Lengths.accepts(&expected, &flipped));
+        assert!(!OutputCheck::Lengths.accepts(&expected, &shorter));
+        assert!(!OutputCheck::Lengths.accepts(&expected, &expected[..1]));
+    }
+
+    #[test]
     fn fixed_workload_replays_deterministically() {
         let workload = FixedWorkload {
             model: "tiny".into(),
@@ -1901,6 +1955,7 @@ mod tests {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1, 2], vec![1, 2, 3], vec![1, 2, 3, 4, 5], vec![1; 7]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
         )
         .unwrap();
@@ -1931,6 +1986,7 @@ mod tests {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1, 2, 3, 4, 5], vec![5, 6, 7, 8]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             2,
         )
@@ -1956,6 +2012,7 @@ mod tests {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1], vec![1; 9], vec![1; 2]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             2,
             &[2, 4],
@@ -1993,6 +2050,7 @@ mod tests {
             &PrefillExecutionConfig {
                 prompts: vec![vec![1], vec![1; 9], vec![1; 2]],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
             2,
             &[2, 4],
@@ -2015,6 +2073,7 @@ mod tests {
             &PrefillExecutionConfig {
                 prompts: vec![Vec::new()],
                 max_new_tokens: 2,
+                output_check: OutputCheck::Exact,
             },
         )
         .unwrap_err();
@@ -2034,6 +2093,7 @@ mod tests {
                 execution: PrefillExecutionConfig {
                     prompts: vec![vec![1, 2], vec![1, 2, 3], vec![1; 5], vec![1; 7]],
                     max_new_tokens: 2,
+                    output_check: OutputCheck::Exact,
                 },
                 warmup_trials: 1,
                 measured_trials: 4,
@@ -2082,6 +2142,7 @@ mod tests {
                 execution: PrefillExecutionConfig {
                     prompts: vec![vec![1]],
                     max_new_tokens: 1,
+                    output_check: OutputCheck::Exact,
                 },
                 warmup_trials: 1,
                 measured_trials: 0,
@@ -2119,6 +2180,7 @@ mod tests {
                 execution: PrefillExecutionConfig {
                     prompts: vec![vec![1, 2], vec![1, 2, 3], vec![1; 5], vec![1; 7]],
                     max_new_tokens: 2,
+                    output_check: OutputCheck::Exact,
                 },
                 warmup_trials: 1,
                 measured_trials: 3,
