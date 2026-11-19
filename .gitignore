@@ -4,3 +4,7 @@ IMPLEMENTATION.md
 practice/
 targets/
 .codex/
+
+# Output of lab/gpu_experiments.sh
+/gpu-experiments-results/
+/gpu-experiments-results.tar.gz
