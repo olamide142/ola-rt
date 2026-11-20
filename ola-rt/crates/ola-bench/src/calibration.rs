@@ -20,7 +20,7 @@ use ola_runtime::{
     ComposedPolicy, Executor, PolicyDescriptor, PolicyMeasurements, PrefillBatcher, Runtime,
 };
 
-use crate::{CostModel, Interval, random::SplitMix64};
+use crate::{CostModel, DecodeCost, Interval, random::SplitMix64};
 
 /// ID of the calibration experiment.
 pub const COST_CALIBRATION: &str = "cost-calibration";
@@ -145,6 +145,50 @@ impl CostFit {
             let tokens = ratio as usize;
             tokens
         })
+    }
+
+    /// The most complete cost model a `cost-calibration` report supports.
+    ///
+    /// Starts from [`Self::cost_model`] of the three-coefficient fit. When
+    /// the report has the padding-aware fit (`mixed_lengths=1`), its fixed,
+    /// per-call, per-real-token, and per-padded-position costs replace the
+    /// prefill pricing; when it also has the decode fit (`decode=1`),
+    /// decode is priced separately at the decode intercept less that fixed
+    /// cost per invocation and the fitted cost per row. The decode fit's
+    /// per-context-token term has no place in [`CostModel`] and is left
+    /// out, so decode is priced as if contexts were empty.
+    pub fn full_cost_model_from_report(report: &crate::ExperimentReport) -> Option<CostModel> {
+        let mut cost = Self::from_report(report)?.cost_model();
+        let estimates = &report.summary("fit")?.estimates;
+        let mean = |name: &str| estimates.get(name).map(|estimate| estimate.mean);
+        let micros = |value: f64| {
+            // Rounded, clamped, and far below u64::MAX for real timings.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rounded = value.max(0.0).round() as u64;
+            rounded
+        };
+        let (Some(fixed), Some(call), Some(real), Some(padding)) = (
+            mean("padded_fixed_micros"),
+            mean("padded_per_invocation_micros"),
+            mean("per_real_token_micros"),
+            mean("per_padding_token_micros"),
+        ) else {
+            return Some(cost);
+        };
+        cost.fixed_micros = micros(fixed);
+        cost.per_invocation_micros = micros(call);
+        cost.per_dense_token_micros = micros(real);
+        cost.per_padding_token_micros = Some(micros(padding));
+        if let (Some(intercept), Some(row)) = (
+            mean("decode_intercept_micros"),
+            mean("per_decode_row_micros"),
+        ) {
+            cost.decode = Some(DecodeCost {
+                per_invocation_micros: micros(intercept - fixed),
+                per_row_micros: micros(row),
+            });
+        }
+        Some(cost)
     }
 
     /// Reads the per-repetition mean fit from a `cost-calibration` report,
@@ -1061,8 +1105,51 @@ mod tests {
             }
         );
         assert!(fit.intervals.is_some());
+        // Without padding or decode fits, the full model is the three-term one.
+        assert_eq!(
+            CostFit::full_cost_model_from_report(&report),
+            Some(fit.cost_model())
+        );
+
+        // With them, padding and decode are priced separately.
+        let mut full = report.clone();
+        let extra = [
+            ("padded_fixed_micros", 100.4),
+            ("padded_per_invocation_micros", 250.0),
+            ("per_real_token_micros", 5.0),
+            ("per_padding_token_micros", 1.2),
+            ("decode_intercept_micros", 160.0),
+            ("per_decode_row_micros", 40.0),
+        ];
+        let estimates = &mut full
+            .summaries
+            .iter_mut()
+            .find(|summary| summary.variant == "fit")
+            .unwrap()
+            .estimates;
+        let template = estimates["fixed_micros"];
+        for (name, value) in extra {
+            let mut estimate = template;
+            estimate.mean = value;
+            estimates.insert(name.to_owned(), estimate);
+        }
+        assert_eq!(
+            CostFit::full_cost_model_from_report(&full),
+            Some(CostModel {
+                fixed_micros: 100,
+                per_invocation_micros: 250,
+                per_dense_token_micros: 5,
+                per_padding_token_micros: Some(1),
+                decode: Some(DecodeCost {
+                    per_invocation_micros: 60,
+                    per_row_micros: 40,
+                }),
+            })
+        );
+
         let mut other = report;
         other.experiment.id = "scheduler-comparison".into();
         assert_eq!(CostFit::from_report(&other), None);
+        assert_eq!(CostFit::full_cost_model_from_report(&other), None);
     }
 }

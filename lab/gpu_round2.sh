@@ -9,7 +9,8 @@
 #   r2old  re-simulates the first round's E1 observations (OLD_E1) with
 #       the same cost, for a side-by-side table
 #   r3  E4: `ola serve` with and without `--adaptive ADAPTIVE` at moderate
-#       load and overload, fresh server per run; only when ADAPTIVE is set
+#       load and overload, fresh server per run, logging every optimizer
+#       call (`--adaptive-log`); only when ADAPTIVE is set
 #
 # Usage, from the repository root:
 #   bash lab/gpu_round2.sh                      # setup build models r1 r2 r2old pack
@@ -256,7 +257,8 @@ phase_r3() {
         mkdir -p "$run"
         log "R3 run $load / seed $seed / $variant"
         local extra=(--trace "$run/server-trace.jsonl")
-        [ "$variant" = adaptive ] && extra+=(--adaptive "$dir/adaptive-report.json")
+        [ "$variant" = adaptive ] &&
+          extra+=(--adaptive "$dir/adaptive-report.json" --adaptive-log "$run/adaptive-log.jsonl")
         start_server "$run" "${extra[@]}"
         "$REPLAY" export priority_classes "$seed" "$REQUESTS" "$load" "$run/trace.jsonl"
         replay "$run" "$(kv_geometry "$run/models.json")"
@@ -273,6 +275,9 @@ phase_r3() {
     python3 "$ROOT/lab/replay/soak_summary.py" --trace "$run/server-trace.jsonl" \
       --out "$run/iterations.csv" "$run" | tail -1
   done | tee "$dir/iterations.md"
+  # Optimizer calls, switches, and the host stall each call caused.
+  python3 "$ROOT/lab/replay/adaptive_log_summary.py" "$dir"/*-adaptive/adaptive-log.jsonl \
+    | tee "$dir/adaptive.md"
 }
 
 phase_pack() {
