@@ -20,7 +20,9 @@
 //!
 //! Set `OLA_COST=fixed,per_invocation,per_dense_token` (microseconds) to
 //! replace the simulator's default cost model with fitted coefficients,
-//! e.g. from `ola experiment run cost-calibration --model <dir>`. Arrival
+//! e.g. from `ola experiment run cost-calibration --model <dir>`. Three more
+//! values, `per_padding_token,decode_per_invocation,decode_per_row`, price
+//! padding and decode separately, as in `replay_trace`. Arrival
 //! rates and deadline estimates are then scaled by the ratio of a reference
 //! decode iteration's cost (one invocation, eight rows) under the fitted and
 //! default models, so "light", "moderate", and "overload" keep their meaning.
@@ -34,7 +36,7 @@ use std::{
 };
 
 use ola_bench::{
-    CostModel, DEFAULT_STARVATION_FACTOR, KvGeometry, OnlineTuning, SchedulingTrace,
+    CostModel, DEFAULT_STARVATION_FACTOR, DecodeCost, KvGeometry, OnlineTuning, SchedulingTrace,
     SimulationConfig, TraceParameters, compare_schedulers, run_observed_trial,
     serving_adaptive_policy,
 };
@@ -70,19 +72,28 @@ fn cost_model() -> CostModel {
     };
     let parts: Vec<u64> = value
         .split(',')
-        .map(|x| x.trim().parse().expect("OLA_COST must be three integers"))
+        .map(|x| x.trim().parse().expect("OLA_COST must be integers"))
         .collect();
-    assert_eq!(
-        parts.len(),
-        3,
-        "OLA_COST=fixed,per_invocation,per_dense_token"
-    );
+    let (decode, per_padding) = match parts.len() {
+        3 => (None, None),
+        6 => (
+            Some(DecodeCost {
+                per_invocation_micros: parts[4],
+                per_row_micros: parts[5],
+            }),
+            Some(parts[3]),
+        ),
+        _ => panic!(
+            "OLA_COST=fixed,per_invocation,per_dense_token\
+             [,per_padding_token,decode_per_invocation,decode_per_row]"
+        ),
+    };
     CostModel {
         fixed_micros: parts[0],
         per_invocation_micros: parts[1],
         per_dense_token_micros: parts[2],
-        per_padding_token_micros: None,
-        decode: None,
+        per_padding_token_micros: per_padding,
+        decode,
     }
 }
 
@@ -91,7 +102,11 @@ fn cost_model() -> CostModel {
 /// 1.0 without `OLA_COST`.
 fn load_scale() -> f64 {
     let reference = |c: CostModel| {
-        (c.fixed_micros + c.per_invocation_micros + 8 * c.per_dense_token_micros) as f64
+        let invocation = match c.decode {
+            Some(decode) => decode.per_invocation_micros + 8 * decode.per_row_micros,
+            None => c.per_invocation_micros + 8 * c.per_dense_token_micros,
+        };
+        (c.fixed_micros + invocation) as f64
     };
     reference(cost_model()) / reference(CostModel::default())
 }
@@ -292,8 +307,12 @@ fn bucketing(out: &mut impl Write) {
                 let useful: usize = lengths.iter().sum();
                 for (name, batcher) in &strategies {
                     let (padding, invocations) = shape(batcher.as_ref(), &lengths);
+                    let per_padding = cost
+                        .per_padding_token_micros
+                        .unwrap_or(cost.per_dense_token_micros);
                     let modelled = invocations as u64 * cost.per_invocation_micros
-                        + (useful + padding) as u64 * cost.per_dense_token_micros;
+                        + useful as u64 * cost.per_dense_token_micros
+                        + padding as u64 * per_padding;
                     writeln!(
                         out,
                         "{dist},{set_size},{trial},{name},{useful},{padding},{invocations},{modelled}"
