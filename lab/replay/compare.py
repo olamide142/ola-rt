@@ -10,7 +10,8 @@ from the same arrival.
 For each run and metric it reports real and simulated P50 and P95, the
 relative error `(sim - real) / real` with a 95% paired bootstrap interval
 over requests, and the per-request absolute relative error (median and
-P90). Writes a CSV and prints a Markdown table.
+P90). Writes a CSV and prints a Markdown table, then the mean absolute
+error across seeds for each trace, load, and statistic.
 
     compare.py --out summary.csv RUN_DIR [RUN_DIR ...]
 
@@ -132,6 +133,18 @@ def main():
             f"| {row['rel_error']:+.1%} [{row['rel_error_low']:+.1%}, {row['rel_error_high']:+.1%}] "
             f"| {row['per_request_abs_rel_p50']:.1%} / {row['per_request_abs_rel_p90']:.1%} |"
         )
+
+    # Mean absolute error across seeds, per trace, load, and statistic.
+    groups = {}
+    for row in rows:
+        key = (row["trace"], row["load"], row["metric"], row["statistic"])
+        groups.setdefault(key, []).append((row["seed"], row["rel_error"]))
+    print("\n| trace | load | metric | stat | seeds | mean abs. error | per-seed error |")
+    print("|---|---|---|---|---|---|---|")
+    for (trace, load, metric, statistic), errors in groups.items():
+        mean = sum(abs(error) for _, error in errors) / len(errors)
+        seeds = ", ".join(f"{seed}: {error:+.1%}" for seed, error in sorted(errors))
+        print(f"| {trace} | {load} | {metric} | {statistic} | {len(errors)} | {mean:.1%} | {seeds} |")
     return 0
 
 

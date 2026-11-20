@@ -8,3 +8,5 @@ targets/
 # Output of lab/gpu_experiments.sh
 /gpu-experiments-results/
 /gpu-experiments-results.tar.gz
+/gpu-experiments-2-results/
+/gpu-experiments-2-results.tar.gz
