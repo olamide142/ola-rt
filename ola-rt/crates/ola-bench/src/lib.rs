@@ -55,9 +55,9 @@ pub use experiment::{
     compare_reports, content_digest, nsight_metrics,
 };
 pub use online::{
-    LATENCY_OBJECTIVE, OnlineTuning, ReplayOptimizer, ReplaySelection, ReplaySettings,
-    TOKEN_BUDGET_DOMAINS, largest_token_budget, serving_adaptive_policy, smallest_token_budget,
-    token_budget, token_budget_policy,
+    LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord, ReplayOptimizer, ReplaySelection,
+    ReplaySettings, TOKEN_BUDGET_DOMAINS, largest_token_budget, serving_adaptive_policy,
+    serving_adaptive_policy_logged, smallest_token_budget, token_budget, token_budget_policy,
 };
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,

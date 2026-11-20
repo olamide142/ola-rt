@@ -9,7 +9,10 @@ use std::{
     time::Duration,
 };
 
-use ola_bench::{CostFit, CostModel, ExperimentReport, OnlineTuning, serving_adaptive_policy};
+use ola_bench::{
+    CostFit, CostModel, ExperimentReport, OnlineTuning, serving_adaptive_policy,
+    serving_adaptive_policy_logged,
+};
 use ola_core::{ModelDescriptor, MonotonicClock};
 use ola_observe::DeviceTelemetry;
 use ola_runtime::{ComposedPolicy, Executor, MemoryAwareAdmission, Runtime};
@@ -30,6 +33,7 @@ struct Options {
     trace: Option<PathBuf>,
     workers: Vec<String>,
     adaptive: Option<PathBuf>,
+    adaptive_log: Option<PathBuf>,
 }
 
 fn parse(rest: &[&str]) -> Result<Options, String> {
@@ -46,6 +50,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
         trace: None,
         workers: Vec::new(),
         adaptive: None,
+        adaptive_log: None,
     };
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
@@ -71,6 +76,7 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             "--trace" => options.trace = Some(PathBuf::from(value()?)),
             "--worker" => options.workers.push(value()?),
             "--adaptive" => options.adaptive = Some(PathBuf::from(value()?)),
+            "--adaptive-log" => options.adaptive_log = Some(PathBuf::from(value()?)),
             "--drain-secs" => {
                 let text = value()?;
                 let seconds = text
@@ -80,6 +86,9 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
             }
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
+    }
+    if options.adaptive_log.is_some() && options.adaptive.is_none() {
+        return Err(format!("--adaptive-log needs --adaptive\n\n{USAGE}"));
     }
     if options.role != "gateway" {
         options.model = model.ok_or_else(|| format!("serve needs --model DIR\n\n{USAGE}"))?;
@@ -92,19 +101,29 @@ fn parse(rest: &[&str]) -> Result<Options, String> {
 }
 
 /// The cost model fitted by a saved `cost-calibration` report, which
-/// `--adaptive` replays recent work with.
+/// `--adaptive` replays recent work with: padding and decode are priced
+/// separately when the report has those fits.
 fn calibrated_cost(path: &std::path::Path) -> Result<CostModel, String> {
     let report = ExperimentReport::read_compatible(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    CostFit::from_report(&report)
-        .map(|fit| fit.cost_model())
-        .ok_or_else(|| {
-            format!(
-                "{} is not a cost-calibration report; run `ola experiment run cost-calibration \
+    CostFit::full_cost_model_from_report(&report).ok_or_else(|| {
+        format!(
+            "{} is not a cost-calibration report; run `ola experiment run cost-calibration \
                  --model DIR --results-dir DIR` first",
-                path.display()
-            )
-        })
+            path.display()
+        )
+    })
+}
+
+/// Opens a new output file for `--trace` or `--adaptive-log`, refusing to
+/// overwrite one.
+fn create_new(path: &std::path::Path) -> Result<BufWriter<std::fs::File>, String> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(BufWriter::new)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))
 }
 
 /// Device memory and utilization for `/health` on accelerator backends;
@@ -152,18 +171,40 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
             executor.with_policy(ComposedPolicy::default().with_admission(MemoryAwareAdmission))
         }
         Some(cost) => {
-            write_line(
-                out,
-                format!(
-                    "adaptive token budgets: replaying with fixed={} µs, per call={} µs, \
-                     per token={} µs",
-                    cost.fixed_micros, cost.per_invocation_micros, cost.per_dense_token_micros
-                ),
-            )?;
-            executor.with_policy(
-                serving_adaptive_policy(cost, options.max_active, OnlineTuning::default())
-                    .map_err(|error| error.to_string())?,
-            )
+            let mut summary = format!(
+                "adaptive token budgets: replaying with fixed={} µs, per call={} µs, \
+                 per token={} µs",
+                cost.fixed_micros, cost.per_invocation_micros, cost.per_dense_token_micros
+            );
+            if let Some(padding) = cost.per_padding_token_micros {
+                summary.push_str(&format!(", per padded position={padding} µs"));
+            }
+            if let Some(decode) = cost.decode {
+                summary.push_str(&format!(
+                    ", decode per call={} µs, per row={} µs (context length not priced)",
+                    decode.per_invocation_micros, decode.per_row_micros
+                ));
+            }
+            write_line(out, summary)?;
+            let tuning = OnlineTuning::default();
+            let policy = match &options.adaptive_log {
+                None => serving_adaptive_policy(cost, options.max_active, tuning),
+                Some(path) => {
+                    let mut log = create_new(path)?;
+                    serving_adaptive_policy_logged(
+                        cost,
+                        options.max_active,
+                        tuning,
+                        move |record| {
+                            // One line per call, flushed so a killed server keeps them.
+                            if let Ok(line) = serde_json::to_string(record) {
+                                let _ = writeln!(log, "{line}").and_then(|()| log.flush());
+                            }
+                        },
+                    )
+                }
+            };
+            executor.with_policy(policy.map_err(|error| error.to_string())?)
         }
     };
     executor
@@ -180,14 +221,7 @@ pub fn serve(rest: &[&str], out: &mut impl Write) -> Result<u8, String> {
         ..DriverConfig::default()
     };
     let trace_sink = match &options.trace {
-        Some(path) => {
-            let file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|error| format!("could not create trace {}: {error}", path.display()))?;
-            Some(Box::new(BufWriter::new(file)) as Box<dyn Write + Send>)
-        }
+        Some(path) => Some(Box::new(create_new(path)?) as Box<dyn Write + Send>),
         None => None,
     };
     let driver = Driver::spawn_instrumented(

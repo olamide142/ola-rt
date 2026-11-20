@@ -33,7 +33,8 @@ const USAGE: &str = "usage:
                          [--threshold FRACTION] [--allow-workload-mismatch]
   ola serve --model DIR [--backend cpu|wgpu|cuda] [--name ID] [--addr HOST:PORT]
             [--max-active N] [--max-in-flight N] [--drain-secs S] [--trace FILE]
-            [--adaptive CALIBRATION.json] [--role standalone|worker|gateway]
+            [--adaptive CALIBRATION.json [--adaptive-log FILE]]
+            [--role standalone|worker|gateway]
             [--worker HOST:PORT]...
 
 Exit codes: 0 success, 1 regression found by compare, 2 error.";

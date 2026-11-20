@@ -15,7 +15,9 @@
 //!
 //! [`CostModel`]: crate::CostModel
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
+
+use serde::Serialize;
 
 use ola_core::{RequestId, Timestamp};
 use ola_runtime::{
@@ -162,15 +164,47 @@ pub fn serving_adaptive_policy(
     max_active_requests: usize,
     tuning: OnlineTuning,
 ) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
-    adaptive_token_budget_policy(largest_token_budget(), cost, max_active_requests, tuning)
+    adaptive_token_budget_policy(
+        largest_token_budget(),
+        cost,
+        max_active_requests,
+        tuning,
+        None,
+    )
 }
 
-/// [`serving_adaptive_policy`] starting from `theta`.
+/// [`serving_adaptive_policy`] that also passes a [`ProposalRecord`] for
+/// every optimizer call to `log`, on the executor's thread. Proposals are
+/// unchanged; `log` should be quick, since the executor waits on it.
+///
+/// # Errors
+///
+/// Fails if `tuning` is unusable.
+pub fn serving_adaptive_policy_logged(
+    cost: CostModel,
+    max_active_requests: usize,
+    tuning: OnlineTuning,
+    log: impl FnMut(&ProposalRecord) + Send + 'static,
+) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
+    adaptive_token_budget_policy(
+        largest_token_budget(),
+        cost,
+        max_active_requests,
+        tuning,
+        Some(Box::new(log)),
+    )
+}
+
+/// Callback that receives each optimizer call's record.
+type ProposalLog = Box<dyn FnMut(&ProposalRecord) + Send>;
+
+/// [`serving_adaptive_policy`] starting from `theta`, optionally logged.
 fn adaptive_token_budget_policy(
     theta: Vec<(&'static str, String)>,
     cost: CostModel,
     max_active_requests: usize,
     tuning: OnlineTuning,
+    log: Option<ProposalLog>,
 ) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
     let geometry = KvGeometry::default();
     let config = SimulationConfig {
@@ -197,7 +231,7 @@ fn adaptive_token_budget_policy(
     )?;
     let inner = token_budget_policy(&theta)
         .map_err(|error| AdaptiveOptimizationError::InvalidDomain(error.to_string()))?;
-    Ok(AdaptivePolicy::new(inner, theta)
+    let policy = AdaptivePolicy::new(inner, theta)
         .with_fallback(ComposedPolicy::default().with_admission(MemoryAwareAdmission))
         .with_constraints(AdaptiveConstraints {
             max_active_requests: Some(max_active_requests),
@@ -205,8 +239,15 @@ fn adaptive_token_budget_policy(
             available_memory_bytes: None,
         })
         .with_optimization_interval(tuning.interval.max(1))
-        .with_factory(token_budget_policy)
-        .with_optimizer(optimizer))
+        .with_factory(token_budget_policy);
+    Ok(match log {
+        Some(log) => policy.with_optimizer(LoggedOptimizer {
+            inner: optimizer,
+            log,
+            calls: 0,
+        }),
+        None => policy.with_optimizer(optimizer),
+    })
 }
 
 /// What the optimizer has learned about one request from observations.
@@ -540,6 +581,87 @@ where
     }
 }
 
+/// One `propose` call of a serving adaptive policy, as
+/// [`serving_adaptive_policy_logged`] reports it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ProposalRecord {
+    /// Call number, from 1.
+    pub call: u64,
+    /// Host wall time inside the call, in microseconds: how long the
+    /// executor's observation stalled for it.
+    pub host_micros: u64,
+    /// Whether there was enough history to replay; without it the call
+    /// keeps the current vector at once.
+    pub replayed: bool,
+    /// Requests in the replayed window.
+    pub window_requests: usize,
+    /// Simulated replays the call ran.
+    pub replays: usize,
+    /// `replay_score` of the vector in force.
+    pub current_score: Option<i64>,
+    /// `replay_score` of the best candidate.
+    pub candidate_score: Option<i64>,
+    /// Whether the call installed a different vector.
+    pub switched: bool,
+    /// Parameter vector in force before the call.
+    pub from: BTreeMap<String, String>,
+    /// Parameter vector after the call.
+    pub to: BTreeMap<String, String>,
+    /// Error, when the call failed and the policy kept its vector.
+    pub error: Option<String>,
+}
+
+/// A [`ReplayOptimizer`] that reports every call to `log` without changing
+/// what it proposes.
+struct LoggedOptimizer<F, L> {
+    inner: ReplayOptimizer<F>,
+    log: L,
+    calls: u64,
+}
+
+impl<F, L> AdaptiveOptimizer for LoggedOptimizer<F, L>
+where
+    F: Fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError> + Send + Sync,
+    L: FnMut(&ProposalRecord) + Send,
+{
+    fn propose(
+        &mut self,
+        current: &[(&'static str, String)],
+        observations: &[AdaptiveRequestObservation],
+        constraints: AdaptiveConstraints,
+    ) -> Result<Vec<(&'static str, String)>, AdaptiveOptimizationError> {
+        let proposals = self.inner.proposals();
+        let started = Instant::now();
+        let result = self.inner.propose(current, observations, constraints);
+        let host_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.calls += 1;
+        let selection = self
+            .inner
+            .last_selection()
+            .filter(|_| self.inner.proposals() > proposals);
+        let vector = |theta: &[(&'static str, String)]| {
+            theta
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        (self.log)(&ProposalRecord {
+            call: self.calls,
+            host_micros,
+            replayed: selection.is_some(),
+            window_requests: selection.map_or(0, |s| s.window_requests),
+            replays: selection.map_or(0, |s| s.replays),
+            current_score: selection.and_then(|s| s.current_score),
+            candidate_score: selection.and_then(|s| s.candidate_score),
+            switched: selection.is_some_and(|s| s.switched),
+            from: vector(current),
+            to: result.as_deref().map_or_else(|_| vector(current), vector),
+            error: result.as_ref().err().map(ToString::to_string),
+        });
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -692,6 +814,7 @@ mod tests {
                 window: 8,
                 min_improvement_percent: 0,
             },
+            None,
         )
         .unwrap();
         let (adapted, descriptor) = serve(adaptive, &requests);
@@ -702,6 +825,38 @@ mod tests {
         // Budgets reorder work; greedy outputs stay the same.
         assert_eq!(adapted, baseline);
         assert!(!descriptor.contains("log2_max_tokens=4,"), "{descriptor}");
+
+        // Logging every call changes nothing it decides.
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&records);
+        let logged = adaptive_token_budget_policy(
+            smallest_token_budget(),
+            CostModel::default(),
+            4,
+            OnlineTuning {
+                interval: 5,
+                window: 8,
+                min_improvement_percent: 0,
+            },
+            Some(Box::new(move |record: &ProposalRecord| {
+                sink.lock().unwrap().push(record.clone());
+            })),
+        )
+        .unwrap();
+        let (logged_outputs, logged_descriptor) = serve(logged, &requests);
+        assert_eq!(logged_outputs, adapted);
+        assert_eq!(logged_descriptor, descriptor);
+        let records = records.lock().unwrap();
+        assert!(records.iter().any(|record| record.switched), "{records:?}");
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record.call, index as u64 + 1);
+            assert_eq!(record.switched, record.from != record.to);
+            assert!(record.replayed || record.replays == 0);
+        }
+        // Each call starts from where the previous one left the vector.
+        for pair in records.windows(2) {
+            assert_eq!(pair[1].from, pair[0].to);
+        }
     }
 
     #[test]
