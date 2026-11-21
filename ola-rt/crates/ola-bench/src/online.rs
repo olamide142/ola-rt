@@ -206,6 +206,25 @@ fn adaptive_token_budget_policy(
     tuning: OnlineTuning,
     log: Option<ProposalLog>,
 ) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
+    adaptive_token_budget_policy_with(
+        theta,
+        cost,
+        max_active_requests,
+        tuning,
+        SwitchingCost::default(),
+        log,
+    )
+}
+
+/// [`adaptive_token_budget_policy`] with an explicit switching cost.
+fn adaptive_token_budget_policy_with(
+    theta: Vec<(&'static str, String)>,
+    cost: CostModel,
+    max_active_requests: usize,
+    tuning: OnlineTuning,
+    switching: SwitchingCost,
+    log: Option<ProposalLog>,
+) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
     let geometry = KvGeometry::default();
     let config = SimulationConfig {
         max_active_requests,
@@ -225,7 +244,7 @@ fn adaptive_token_budget_policy(
             window: tuning.window,
             min_requests: tuning.window.min(8),
             min_improvement_percent: tuning.min_improvement_percent,
-            switching: SwitchingCost::default(),
+            switching,
         },
         token_budget_policy,
     )?;
@@ -611,6 +630,141 @@ pub struct ProposalRecord {
     pub error: Option<String>,
 }
 
+/// Host time an adaptive policy costs the executor it runs on, which the
+/// virtual-time simulator otherwise treats as free.
+///
+/// A serving adaptive policy runs its optimizer inside `observe`, on the
+/// executor's thread, so every replaying call stalls the next iteration:
+/// `per_call_micros + per_replayed_request_micros × replays × window`.
+/// A call without enough history returns at once and costs nothing. An
+/// installed switch may cost more on hardware (for example, first use of
+/// new kernel shapes); `per_switch_micros` charges that, once per switch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdaptationCost {
+    /// Fixed stall of a replaying call.
+    pub per_call_micros: u64,
+    /// Stall per replayed request per replay.
+    pub per_replayed_request_micros: u64,
+    /// Extra stall after a call that installed a different vector.
+    pub per_switch_micros: u64,
+}
+
+impl AdaptationCost {
+    /// The stall measured on the RTX 4090 host of the second GPU round
+    /// (vast.ai machine 26487, 2026-11-20, E4 runs): a least-squares fit of
+    /// 50 logged calls gives 6,476 µs plus 59.4 µs per replayed request per
+    /// replay, so about 120 ms for the full 30-replay, 64-request call. The
+    /// switch cost there was not measured and is zero.
+    pub const RTX_4090_E4: Self = Self {
+        per_call_micros: 6_476,
+        per_replayed_request_micros: 59,
+        per_switch_micros: 0,
+    };
+
+    /// The stall `record`'s call costs under this model.
+    pub fn stall_micros(&self, record: &ProposalRecord) -> u64 {
+        if !record.replayed {
+            return 0;
+        }
+        let replayed = (record.replays as u64).saturating_mul(record.window_requests as u64);
+        let switch = if record.switched {
+            self.per_switch_micros
+        } else {
+            0
+        };
+        self.per_call_micros
+            .saturating_add(self.per_replayed_request_micros.saturating_mul(replayed))
+            .saturating_add(switch)
+    }
+
+    /// The [`SwitchingCost`] that charges this model's switch stall to the
+    /// latency objective: a stall delays every request in flight by the
+    /// same amount, so it moves both p95 completion and p95 TTFT by about
+    /// `per_switch_micros`. A switch's cost is shared by `knobs` changing
+    /// together, so each knob carries all of it.
+    pub fn latency_switching_cost(&self, knobs: &[&'static str]) -> SwitchingCost {
+        SwitchingCost::uniform(
+            knobs,
+            i64::try_from(self.per_switch_micros.saturating_mul(2)).unwrap_or(i64::MAX),
+        )
+    }
+}
+
+/// Accumulates the stall an [`AdaptationCost`] assigns to each logged call,
+/// for the simulator to charge after the iteration that made it.
+#[derive(Clone, Debug, Default)]
+pub struct AdaptationMeter {
+    inner: std::sync::Arc<std::sync::Mutex<MeterState>>,
+}
+
+#[derive(Debug, Default)]
+struct MeterState {
+    pending_micros: u64,
+    total_micros: u64,
+    calls: u64,
+    replaying_calls: u64,
+    switches: u64,
+}
+
+impl AdaptationMeter {
+    fn record(&self, cost: AdaptationCost, record: &ProposalRecord) {
+        let stall = cost.stall_micros(record);
+        let mut state = self.inner.lock().expect("adaptation meter");
+        state.pending_micros = state.pending_micros.saturating_add(stall);
+        state.total_micros = state.total_micros.saturating_add(stall);
+        state.calls += 1;
+        state.replaying_calls += u64::from(record.replayed);
+        state.switches += u64::from(record.switched);
+    }
+
+    /// Stall charged since the last call, which it clears; pass it as the
+    /// charge of [`crate::run_charged_trial`].
+    pub fn take_micros(&self) -> u64 {
+        std::mem::take(&mut self.inner.lock().expect("adaptation meter").pending_micros)
+    }
+
+    /// Stall charged over the meter's life.
+    pub fn total_micros(&self) -> u64 {
+        self.inner.lock().expect("adaptation meter").total_micros
+    }
+
+    /// Optimizer calls, calls that replayed, and switches.
+    pub fn counts(&self) -> (u64, u64, u64) {
+        let state = self.inner.lock().expect("adaptation meter");
+        (state.calls, state.replaying_calls, state.switches)
+    }
+}
+
+/// [`serving_adaptive_policy`] whose calls are priced by `adaptation` into
+/// the returned meter, for virtual-time studies that charge the stall with
+/// [`crate::run_charged_trial`]. `switching` enters the optimizer's
+/// objective as [`ReplaySettings::switching`] does.
+///
+/// # Errors
+///
+/// Fails if `tuning` is unusable.
+pub fn charged_adaptive_policy(
+    cost: CostModel,
+    max_active_requests: usize,
+    tuning: OnlineTuning,
+    adaptation: AdaptationCost,
+    switching: SwitchingCost,
+) -> Result<(AdaptivePolicy, AdaptationMeter), AdaptiveOptimizationError> {
+    let meter = AdaptationMeter::default();
+    let sink = meter.clone();
+    let policy = adaptive_token_budget_policy_with(
+        largest_token_budget(),
+        cost,
+        max_active_requests,
+        tuning,
+        switching,
+        Some(Box::new(move |record: &ProposalRecord| {
+            sink.record(adaptation, record);
+        })),
+    )?;
+    Ok((policy, meter))
+}
+
 /// A [`ReplayOptimizer`] that reports every call to `log` without changing
 /// what it proposes.
 struct LoggedOptimizer<F, L> {
@@ -930,6 +1084,72 @@ mod tests {
         let optimizer = optimizer.lock().unwrap();
         assert!(optimizer.switches() > 0);
         assert!(optimizer.replays() >= optimizer.proposals() * 8);
+    }
+
+    #[test]
+    fn adaptation_cost_charges_replaying_calls_and_switches() {
+        let record = |replayed, switched| ProposalRecord {
+            call: 1,
+            host_micros: 0,
+            replayed,
+            window_requests: 64,
+            replays: 30,
+            current_score: None,
+            candidate_score: None,
+            switched,
+            from: BTreeMap::new(),
+            to: BTreeMap::new(),
+            error: None,
+        };
+        let cost = AdaptationCost {
+            per_switch_micros: 1_000,
+            ..AdaptationCost::RTX_4090_E4
+        };
+        assert_eq!(cost.stall_micros(&record(false, false)), 0);
+        assert_eq!(
+            cost.stall_micros(&record(true, false)),
+            6_476 + 59 * 30 * 64
+        );
+        assert_eq!(
+            cost.stall_micros(&record(true, true)),
+            6_476 + 59 * 30 * 64 + 1_000
+        );
+        assert_eq!(
+            cost.latency_switching_cost(&["budget"]),
+            SwitchingCost::uniform(&["budget"], 2_000)
+        );
+    }
+
+    #[test]
+    fn a_charged_policy_meters_its_calls_without_changing_its_choices() {
+        let trace = SchedulingTrace::mixed_short_long(TraceParameters {
+            seed: 3,
+            requests: 80,
+            mean_interarrival_micros: 1_000,
+        });
+        let config = SimulationConfig::default();
+        let tuning = OnlineTuning {
+            interval: 8,
+            ..OnlineTuning::default()
+        };
+        let plain = serving_adaptive_policy(CostModel::default(), 8, tuning).unwrap();
+        let (charged, meter) = charged_adaptive_policy(
+            CostModel::default(),
+            8,
+            tuning,
+            AdaptationCost::RTX_4090_E4,
+            SwitchingCost::default(),
+        )
+        .unwrap();
+        let plain = run_scheduling_trial(&trace, plain, &config).unwrap();
+        // Metered but not charged: identical runs.
+        let metered = run_scheduling_trial(&trace, charged, &config).unwrap();
+        assert_eq!(metered, plain);
+        let (calls, replaying, _) = meter.counts();
+        assert!(calls > 0 && replaying > 0);
+        assert!(meter.total_micros() >= replaying * 6_476);
+        assert_eq!(meter.take_micros(), meter.total_micros());
+        assert_eq!(meter.take_micros(), 0);
     }
 
     #[test]

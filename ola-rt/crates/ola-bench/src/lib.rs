@@ -55,8 +55,9 @@ pub use experiment::{
     compare_reports, content_digest, nsight_metrics,
 };
 pub use online::{
-    LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord, ReplayOptimizer, ReplaySelection,
-    ReplaySettings, TOKEN_BUDGET_DOMAINS, largest_token_budget, serving_adaptive_policy,
+    AdaptationCost, AdaptationMeter, LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord,
+    ReplayOptimizer, ReplaySelection, ReplaySettings, TOKEN_BUDGET_DOMAINS,
+    charged_adaptive_policy, largest_token_budget, serving_adaptive_policy,
     serving_adaptive_policy_logged, smallest_token_budget, token_budget, token_budget_policy,
 };
 pub use plan_report::{
@@ -82,8 +83,8 @@ pub use scheduling_summary::{
 };
 pub use simulation::{
     CostModel, DecodeCost, Perturbation, SchedulingRun, SimulationConfig, SimulationError,
-    TrialIteration, TrialOutcome, TrialRequest, run_observed_trial, run_perturbed_trial,
-    run_scheduling_trial, trace_request_spec,
+    TrialIteration, TrialOutcome, TrialRequest, run_charged_trial, run_observed_trial,
+    run_perturbed_trial, run_scheduling_trial, trace_request_spec,
 };
 pub use synthetic::{
     KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_group_prompt,

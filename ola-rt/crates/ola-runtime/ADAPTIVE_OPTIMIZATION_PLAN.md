@@ -201,6 +201,13 @@ adaptation, on KV-reservation headroom instead of the token budget. The
 per-regime optima were not distinguishable, and online replay did not beat
 the best static headroom; see `REGIME_STUDY.md`.
 
+`SWITCHING_STUDY.md` (2026-11-21) prices the optimizer's measured host
+stall into virtual time (`AdaptationCost`, `run_charged_trial`). It finds
+the token budget inert at 4 slots and separating between regimes only at
+16. Even there, switching at the arrival boundary does not beat the static
+budget, because the backlog, which the replay window ignores, outlives the
+regime.
+
 ## Verification milestones
 
 1. Add typed parameter domains, constraints, and objective components. (Integer
