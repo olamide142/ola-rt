@@ -35,7 +35,8 @@ and `client`. The first line records provenance and has no `arrival_us`.
 Each request runs to its sampled output length.
 
     python3 lab/replay/servegen.py --model m-large --start 36000 --hours 4 \\
-        --clients 8 --rate-scale 0.05 --time-scale 10 --out servegen.jsonl
+        --clients 8 --rate-scale 0.05 --time-scale 10 --seeds 1,2,3 \\
+        --out servegen-{seed}.jsonl
 
 Standard library only.
 """
@@ -147,8 +148,8 @@ def main():
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--max-input", type=int, default=4096)
     parser.add_argument("--max-output", type=int, default=1024)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--out", required=True)
+    parser.add_argument("--seeds", default="1", help="comma-separated; one trace per seed from one fetch")
+    parser.add_argument("--out", required=True, help="output path; {seed} is replaced by the seed")
     args = parser.parse_args()
 
     end = args.start + int(args.hours * 3600)
@@ -165,10 +166,24 @@ def main():
     chosen = [c for c in chosen if volume[c] > 0]
     print(f"busiest {len(chosen)}: {chosen}", file=sys.stderr)
 
-    rng = random.Random(args.seed)
+    def dataset_of(client):
+        text = raw(args.ref, f"data/{args.category}/{args.model}/chunk-{client}-dataset.json")
+        return client, parse_dataset(text)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        datasets = dict(pool.map(dataset_of, chosen))
+    seeds = [int(seed) for seed in args.seeds.split(",")]
+    for seed in seeds:
+        out = args.out.replace("{seed}", str(seed))
+        requests = generate(args, chosen, traces, datasets, random.Random(seed))
+        write(out, args, seed, chosen, requests)
+
+
+def generate(args, chosen, traces, datasets, rng):
+    """One sample of the workload, ServeGen's way."""
     requests = []
     for client in chosen:
-        dataset = parse_dataset(raw(args.ref, f"data/{args.category}/{args.model}/chunk-{client}-dataset.json"))
+        dataset = datasets[client]
         # Length distributions are published at a coarser step than rates
         # (every 6 h for m-large); each window uses the latest at or before it.
         published = sorted(dataset)
@@ -199,17 +214,25 @@ def main():
                     }
                 )
     requests.sort(key=lambda r: r["arrival_us"])
+    return requests
+
+
+def write(path, args, seed, chosen, requests):
     origin = requests[0]["arrival_us"] if requests else 0
-    with open(args.out, "w") as out:
-        provenance = {key: getattr(args, key) for key in vars(args) if key != "out"}
-        provenance.update(source=f"https://github.com/{REPO}", chosen_clients=chosen, requests=len(requests))
+    with open(path, "w") as out:
+        provenance = {key: getattr(args, key) for key in vars(args) if key not in ("out", "seeds")}
+        provenance.update(
+            seed=seed,
+            source=f"https://github.com/{REPO}",
+            chosen_clients=chosen,
+            requests=len(requests),
+        )
         out.write(json.dumps({"servegen": provenance}) + "\n")
         for request in requests:
             request["arrival_us"] -= origin
             out.write(json.dumps(request) + "\n")
     span = (requests[-1]["arrival_us"] / 1e6) if requests else 0
-    print(f"wrote {len(requests)} requests over {span:.0f} s to {args.out}", file=sys.stderr)
-
+    print(f"wrote {len(requests)} requests over {span:.0f} s to {path}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
