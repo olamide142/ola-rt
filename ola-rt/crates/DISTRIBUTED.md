@@ -297,12 +297,64 @@ multiple processes; a second machine is only needed to measure real links.
   (NCCL/MPI) that Burn and CubeCL don't provide across hosts, and per-layer
   all-reduce over commodity networks is rarely worth it. Revisit for
   multiple GPUs in one host.
-- **Coordinator high availability.** One coordinator; if it dies the cluster
-  stops accepting work. Consensus/replication is a separate project.
+- **Coordinator high availability.** The current runtime has one coordinator;
+  the proposed D7 consensus work below is not implemented yet.
 - **Security.** Workers bind to localhost by default and use a shared token;
   TLS and real authentication come later.
 - **Elastic autoscaling** of machines, as opposed to placement over a fixed
   worker set.
+
+## D7 — coordinator consensus and failover (proposal)
+
+Use [OpenRaft](https://docs.rs/openraft/latest/openraft/) as the embedded
+consensus engine. Consensus membership is among coordinator replicas, not
+inference workers. This avoids implementing Raft itself and avoids requiring
+an external KV service for the in-runtime HA path. OpenRaft still requires
+ola-rt to provide durable log/state-machine storage and coordinator-peer
+transport; its API explicitly leaves those application integrations to the
+caller.
+
+The Raft state machine must represent logical coordinator state, not GPU/KV
+session memory: request specifications and ownership, worker identities and
+epochs, pending and staged-migration state, policy configuration, and enough
+token/recovery bookkeeping to prevent duplicate client output. Worker
+generation sessions remain authoritative on workers and volatile; after leader
+change, the new leader must reconcile workers and use the existing recompute or
+migration-recovery paths. Client stream continuity across gateway process loss
+is a separate guarantee and is not implied by Raft.
+
+Required safety boundary:
+
+- Replicate timestamped coordinator inputs as ordered commands and apply only
+  committed commands to each replica's deterministic coordinator state.
+- Only the current committed leader may dispatch worker commands or emit
+  client events. Replicated outputs on followers are suppressed.
+- Fence stale leaders at workers with a monotonically increasing coordinator
+  term/epoch; a Raft election alone cannot stop an isolated old leader from
+  using already-open worker links.
+- Give worker commands stable identities so a new leader can reconcile or
+  safely retry commands whose acknowledgement was lost.
+- Persist the Raft log, votes, committed index, and state-machine snapshots;
+  an in-memory store is suitable only for protocol tests, not HA.
+
+Implementation sequence:
+
+1. Extract a deterministic coordinator command/application boundary and
+   specify which outputs are leader-only side effects.
+2. Prototype that state machine behind OpenRaft using an in-memory test store
+   and simulated peer transport; exercise partitions, leader changes, and
+   duplicate command delivery.
+3. Add durable storage and a versioned coordinator-peer protocol, then run a
+   three-replica cluster with static initial membership.
+4. Add worker fencing and recovery/reconciliation before claiming failover
+   safety; test worker partitions and coordinator restart with active requests.
+
+This proposal does not add consensus to the current single-gateway policy
+feedback loop. A controller can continue to change routing weights there
+without Raft. If the requirement is only shared configuration or service
+discovery, an external consensus-backed store such as etcd is a different,
+smaller deployment choice; it would not by itself replicate coordinator
+request ownership or provide inference failover.
 
 ## Implementation status
 
