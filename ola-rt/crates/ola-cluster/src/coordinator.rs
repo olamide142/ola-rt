@@ -697,17 +697,18 @@ impl Coordinator {
         self.policy.descriptor()
     }
 
-    /// Validates and installs adaptive routing weights atomically.
+    /// Validates and installs adaptive routing weights atomically, returning
+    /// the descriptor of the configuration that is now active.
     ///
     /// The coordinator generation advances only after the policy accepts the
     /// proposal, so future snapshots reflect the new policy version.
     pub fn update_policy_weights(
         &mut self,
         weights: crate::ClusterWeights,
-    ) -> Result<(), ClusterPolicyError> {
+    ) -> Result<PolicyDescriptor, ClusterPolicyError> {
         self.policy.update_weights(weights)?;
         self.generation = self.generation.saturating_add(1);
-        Ok(())
+        Ok(self.policy_descriptor())
     }
 
     /// Recent terminal request observations, oldest first, capped at 256.

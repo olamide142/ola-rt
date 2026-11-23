@@ -30,6 +30,7 @@ use ola_core::{
     Clock, ClusterRequestId, GenerationConfig, Input, MonotonicClock, Priority, RequestSpec,
     WorkerId,
 };
+use ola_runtime::PolicyDescriptor;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
@@ -193,7 +194,7 @@ impl ClusterGateway {
             .await
     }
 
-    /// Installs adaptive routing weights on the live gateway coordinator.
+    /// Installs adaptive routing weights and returns the active policy descriptor.
     ///
     /// # Errors
     ///
@@ -202,7 +203,7 @@ impl ClusterGateway {
     pub async fn update_routing_weights(
         &self,
         weights: ClusterWeights,
-    ) -> Result<(), ClusterGatewayError> {
+    ) -> Result<PolicyDescriptor, ClusterGatewayError> {
         self.ask(|reply| Command::UpdateRoutingWeights { weights, reply })
             .await
             .ok_or_else(|| ClusterGatewayError::Request("gateway driver stopped".into()))?
@@ -244,7 +245,7 @@ enum Command {
     },
     UpdateRoutingWeights {
         weights: ClusterWeights,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<PolicyDescriptor, String>>,
     },
     FeedbackSnapshot {
         reply: oneshot::Sender<ClusterFeedbackSnapshot>,

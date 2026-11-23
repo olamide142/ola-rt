@@ -180,7 +180,7 @@ impl TcpCoordinator {
         self.calibration.get(worker).copied()
     }
 
-    /// Installs new adaptive routing weights on the coordinator policy.
+    /// Installs new adaptive routing weights and returns the active descriptor.
     ///
     /// # Errors
     ///
@@ -189,11 +189,11 @@ impl TcpCoordinator {
     pub fn update_policy_weights(
         &mut self,
         weights: crate::ClusterWeights,
-    ) -> Result<(), TcpCoordinatorError> {
-        self.coordinator
+    ) -> Result<ola_runtime::PolicyDescriptor, TcpCoordinatorError> {
+        Ok(self
+            .coordinator
             .update_policy_weights(weights)
-            .map_err(CoordinatorError::Policy)?;
-        Ok(())
+            .map_err(CoordinatorError::Policy)?)
     }
 
     /// Expires silent worker leases without performing network I/O.
