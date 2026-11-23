@@ -232,6 +232,60 @@ What this means for the design:
   phase; per-window or SLO-attainment objectives would credit a switch that
   helps the later regime.
 
+## A production day: ServeGen (2026-11-23)
+
+`lab/replay/servegen.py` builds traces from ServeGen's per-client workload
+fits (Alibaba Cloud Model Studio, NSDI '26), fetched over HTTPS from commit
+`d70c8b2` with nothing cloned or cached. It uses the four busiest
+`language/m-large` clients over one day, compressed 6× (one trace hour is 10
+minutes), at rate scale 0.0000824: about 1,280 requests per seed, 10 seeds.
+That rate puts the heaviest regime near 80% of the simulated RTX 4090's
+decode capacity (about 35 tokens/s at any slot count, because each decode
+row costs about 25 ms). The first attempt, about 5× heavier, never drained
+the night and was discarded.
+
+The day has three regimes, each lasting hours:
+
+| Regime | Requests per seed | Median input | Median output |
+| --- | ---: | ---: | ---: |
+| night 00–08 | 307 | ~75 | ~440 |
+| day 08–18 | 623 | ~26 | ~55–60 |
+| evening 18–24 | 353 | ~575–640 | ~15–46 |
+
+`servegen_regimes` scores eight named policies per regime and over the
+day (mean of p95 completion + p95 TTFT, in seconds). `oracle-switch`
+installs each regime's best policy at that regime's first arrival.
+
+**At 4 slots (the `ola serve` default)**, FIFO is best at night and
+`sjf-total` is best by day and in the evening. Against the best single
+policy (`sjf-total`):
+
+| | night | day | evening | whole day |
+| --- | --- | --- | --- | --- |
+| `oracle-switch` − `sjf-total` (s) | **−10.46 [−11.86, −8.79]** | +0.00 [+0.00, +0.01] | +0.00 [+0.00, +0.00] | +0.09 [−0.44, +0.65] |
+
+This is the first case where a switch pays after a real regime transition.
+The night's p95 falls by about 8% at no cost in the other regimes, because
+the regimes last far longer than the backlog takes to drain. **The
+whole-day p95 does not show it.** Pooling every request into one p95 hides
+a per-regime gain, which is why the objective has to be scored per regime
+or per window (as SLOs are) for adaptation to be credited.
+
+**At 16 slots** the scheduling policies converge (FIFO, both SJF variants
+and backfill tie in every regime), and the oracle gains nothing: +0.43 s
+[+0.14, +0.75] over the day against `fifo-1024/25`. Token budgets that cap
+prompt work (`fifo-512/50`, `fifo-128/100`) are much worse everywhere.
+
+Run it:
+
+```sh
+python3 lab/replay/servegen.py --model m-large --hours 24 --clients 4 \
+    --rate-scale 0.0000824 --time-scale 6 --seeds 1,2,3,4,5,6,7,8,9,10 \
+    --out 'sg-{seed}.jsonl'
+OLA_COST=10745,30227,482,97,13047,24568 MAX_ACTIVE=4 \
+  cargo run --release -p ola-bench --example servegen_regimes -- sg-*.jsonl
+```
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit
