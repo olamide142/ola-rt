@@ -25,16 +25,29 @@ from statistics import mean
 
 
 def load(path):
-    rows = defaultdict(dict)  # (trace, load) -> {(budget): {seed: objective}}
+    """(trace, load) -> {action: {seed: objective}}. An action is a named
+    policy (`policy_regimes`) or a `(log2_max_tokens, share)` budget
+    (`budget_regimes`)."""
+    rows = defaultdict(dict)
     for row in csv.DictReader(open(path)):
         regime = (row["trace"], row["load"])
-        budget = (int(row["log2_max_tokens"]), int(row["prefill_share_percent"]))
-        rows[regime].setdefault(budget, {})[int(row["seed"])] = int(row["objective_us"])
+        if "policy" in row:
+            action = row["policy"]
+        else:
+            action = (int(row["log2_max_tokens"]), int(row["prefill_share_percent"]))
+        rows[regime].setdefault(action, {})[int(row["seed"])] = int(row["objective_us"])
     return rows
 
 
-def label(budget):
-    return f"{1 << budget[0]}t/{budget[1]}%"
+def label(action):
+    if isinstance(action, str):
+        return action
+    return f"{1 << action[0]}t/{action[1]}%"
+
+
+def reference(regime_rows):
+    """The action every other is compared with: the largest budget, or FIFO."""
+    return (10, 100) if (10, 100) in regime_rows else "fifo"
 
 
 def bootstrap(diffs, draws=4000, seed=0):
@@ -60,6 +73,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("csv")
     parser.add_argument("--loads", help="comma-separated loads to keep")
+    parser.add_argument(
+        "--across",
+        action="store_true",
+        help="also pair different trace families at the same load (a change of workload mix)",
+    )
     args = parser.parse_args()
     rows = load(args.csv)
     if args.loads:
@@ -67,18 +85,19 @@ def main():
         rows = {r: v for r, v in rows.items() if r[1] in keep}
 
     print("## Best fixed budget per regime\n")
-    print("| trace | load | best | mean objective (ms) | largest (1024t/100%) | Δ largest (ms) [95% CI] |")
+    print("| trace | load | best | mean objective (ms) | reference | Δ reference (ms) [95% CI] |")
     print("|---|---|---|---:|---:|---|")
     optimum = {}
     for regime in sorted(rows):
         r = rows[regime]
         b = best(r)
         optimum[regime] = b
-        largest = (10, 100)
-        d, lo, hi = paired(r, b, largest) if b != largest else (0, 0, 0)
+        ref = reference(r)
+        d, lo, hi = paired(r, b, ref) if b != ref else (0, 0, 0)
         print(
             f"| {regime[0]} | {regime[1]} | {label(b)} | {mean(r[b].values()) / 1e3:.0f} | "
-            f"{mean(r[largest].values()) / 1e3:.0f} | {d / 1e3:+.0f} [{lo / 1e3:+.0f}, {hi / 1e3:+.0f}] |"
+            f"{label(ref)} {mean(r[ref].values()) / 1e3:.0f} | "
+            f"{d / 1e3:+.0f} [{lo / 1e3:+.0f}, {hi / 1e3:+.0f}] |"
         )
 
     print("\n## Regime pairs whose preferred budget changes\n")
@@ -91,8 +110,12 @@ def main():
     print("|---|---|---|---|---|---|---|---:|")
     found = 0
     for a, b in itertools.combinations(sorted(rows), 2):
-        if a[0] != b[0]:
-            continue  # a regime change is a load change within one trace family
+        same_family = a[0] == b[0]
+        same_load = a[1] == b[1]
+        # A regime change is a load change within one trace family, or with
+        # --across a change of family (workload mix) at the same load.
+        if not (same_family or (args.across and same_load)):
+            continue
         sa, sb = optimum[a], optimum[b]
         if sa == sb:
             continue
@@ -108,7 +131,7 @@ def main():
         static_total = mean(rows[a][static].values()) + mean(rows[b][static].values())
         oracle_total = mean(rows[a][sa].values()) + mean(rows[b][sb].values())
         print(
-            f"| {a[0]} {a[1]} | {b[1]} | {label(sa)} | {label(sb)} | "
+            f"| {a[0]} {a[1]} | {b[0] if not same_family else ''} {b[1]} | {label(sa)} | {label(sb)} | "
             f"{da[0] / 1e3:+.0f} [{da[1] / 1e3:+.0f}, {da[2] / 1e3:+.0f}] | "
             f"{db[0] / 1e3:+.0f} [{db[1] / 1e3:+.0f}, {db[2] / 1e3:+.0f}] | "
             f"{label(static)} | {(static_total - oracle_total) / 2e3:.0f} |"

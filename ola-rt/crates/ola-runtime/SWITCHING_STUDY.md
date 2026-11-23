@@ -173,6 +173,65 @@ this pair nothing can: `oracle-switch` does not either. The cheapest
 configuration of the full design, `state-hmm-charged`, costs 0.65–0.79 s
 (0.3–0.5%) to run where adapting has nothing to gain.
 
+## Other knobs, and whether separation survives back to back (2026-11-23)
+
+`policy_regimes` sweeps seven named policies with memory-aware admission:
+FIFO, shortest-job-first by prompt (`sjf-prompt`) and by prompt plus output
+limit (`sjf-total`), FIFO with backfill, two token budgets, and `sjf-total`
+with a budget. It covers the same traces and loads with 10 seeds, and
+`regimes.py --across` also pairs different workload mixes at one load.
+
+Unlike the token budget, **the scheduler separates regimes even at 4
+slots**:
+
+- `prefill_decode_competition` light prefers `sjf-total`, by 4.4 s
+  [2.1, 7.1] over FIFO; moderate load and overload prefer FIFO, by 13.9 s
+  and 20.4 s.
+- At 16 slots, a burst prefers `sjf-total` and overload prefers
+  `fifo-512/50`, by 10.9 s and 15.4 s.
+- Mix changes separate too: in a burst, `mixed_short_long` prefers
+  `sjf-total` and `prefill_decode_competition` prefers FIFO.
+
+`scenario_switching` runs five of these pairs back to back, in both orders
+(120 requests per phase, 10 seeds). It compares each phase's best policy
+held throughout with `oracle-switch`, which installs the second phase's
+best at its first arrival, free of cost.
+
+| Slots | Order (best policy) | Best static | `oracle-switch` Δ (s) [95% CI] |
+| ---: | --- | --- | --- |
+| 4 | pdc light (`sjf-total`) → pdc moderate (`fifo`) | `fifo` | +0.67 [+0.38, +1.06] |
+| 4 | pdc moderate → pdc light | `fifo` | +0.64 [+0.29, +0.99] |
+| 4 | pdc light → pdc overload | `fifo` | +0.09 [+0.00, +0.18] |
+| 4 | pdc overload → pdc light | `fifo` | +147.37 [+143.65, +151.05] |
+| 4 | mixed burst (`sjf-total`) → pdc burst (`fifo`) | `fifo` | −0.09 [−0.22, +0.04] |
+| 4 | pdc burst → mixed burst | `fifo` | +10.41 [+9.40, +11.49] |
+| 4 | early light (`fifo`) → pdc light (`sjf-total`) | `fifo` | +96.69 [+83.17, +109.75] |
+| 4 | pdc light → early light | `fifo` | +0.16 [+0.00, +0.47] |
+| 16 | pdc burst (`sjf-total`) → pdc overload (`fifo-512/50`) | `fifo-512/50` | +0.01 [−0.06, +0.07] |
+| 16 | pdc overload → pdc burst | `fifo-512/50` | +14.75 [+12.29, +17.89] |
+
+**In no case does the perfect switch beat the best static policy.**
+Switching *into* shortest-job-first while the previous regime's backlog is
+still queued is catastrophic, up to +147 s, because SJF starves the
+backlog's long jobs and the whole-trace p95 is set by them. Every
+separation above was measured from an empty executor, and none of it
+transfers to a regime entered with a backlog.
+
+What this means for the design:
+
+- **A regime's best policy depends on the state it is entered in**, not
+  only on the workload. Separation has to be tested *conditional on the
+  inherited backlog*, which a state-seeded evaluator does and an
+  isolated-regime sweep cannot.
+- **The phases are too short.** At 120 requests, the transient after a
+  change is a large share of each phase. Switching can only pay when
+  regimes last long compared with the drain time, which needs traces with
+  realistic regime lengths: production traces such as ServeGen's, not
+  synthetic pairs.
+- **The objective may hide the gain.** A whole-trace p95 is set by the worst
+  phase; per-window or SLO-attainment objectives would credit a switch that
+  helps the later regime.
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit
