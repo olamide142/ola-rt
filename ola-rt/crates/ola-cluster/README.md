@@ -39,6 +39,28 @@ weights are fixed between [`AdaptiveClusterPolicy::set_weights`] calls; it
 does not learn online. Every policy only considers ready workers that host
 the request's model; ties break by worker ID.
 
+## Distributed policy feedback
+
+The coordinator remains the single routing authority; workers report state and
+execute coordinator commands rather than independently reaching consensus on
+routes. It retains the latest 256 observations in each feedback category:
+terminal requests, worker state, migration outcomes, and acknowledged policy
+updates. `Coordinator::feedback_snapshot` and
+`TcpCoordinator::feedback_snapshot` return a point-in-time copy that also
+includes the active policy descriptor and configuration. These bounded
+histories are best-effort recent feedback, not a durable event log; consumers
+should tolerate older observations rolling out of the window.
+
+An embedding service using `ola-serve` can read
+`ClusterGateway::feedback_snapshot` and submit a validated
+`ClusterGateway::update_routing_weights` proposal. The gateway serializes these
+operations with coordinator work. The default adaptive policy accepts weight
+updates; other policies may reject them. Weight updates affect coordinator
+routing immediately, but they do not constitute consensus or replicated
+failover, and the gateway does not expose these controls as HTTP endpoints.
+This creates an integration seam for an external adaptation loop without
+requiring a KV connector or a separate orchestrator in the runtime.
+
 ## Local clusters
 
 [`WorkerHost`] wraps an `Executor` and speaks the coordinator's message

@@ -511,6 +511,8 @@ pub struct ClusterPolicyUpdateObservation {
 /// Bounded distributed feedback available to a cluster adaptation controller.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClusterFeedbackSnapshot {
+    /// Active routing policy and its current configuration.
+    pub policy: PolicyDescriptor,
     /// Recent terminal request outcomes, oldest first.
     pub requests: Vec<ClusterRequestObservation>,
     /// Recent worker-state snapshots and coordinator state changes.
@@ -739,6 +741,7 @@ impl Coordinator {
     /// Clones all bounded observation histories into one controller input.
     pub fn feedback_snapshot(&self) -> ClusterFeedbackSnapshot {
         ClusterFeedbackSnapshot {
+            policy: self.policy_descriptor(),
             requests: self.request_observations.iter().cloned().collect(),
             workers: self.worker_observations.iter().cloned().collect(),
             migrations: self.migration_observations.iter().cloned().collect(),
