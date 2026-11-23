@@ -12,6 +12,13 @@
 //! the model partly detect its own actions; the replay evaluator reads them
 //! directly instead. See `REGIME_DESIGN.md` in `ola-runtime`.
 //!
+//! A regime can also differ in what arrives rather than when: a production
+//! day's night and day can share an arrival rate and differ in output
+//! length. [`SizeWindows`] gives one feature vector per `size` requests
+//! whose sizes are known (log mean prompt and log mean output limit). Sizes
+//! are exogenous too; the policy only changes the order they are reported
+//! in, which a window's means are insensitive to.
+//!
 //! [`PageHinkley`] is the scalar change detector the HMM is compared with.
 
 /// Lower bound on a fitted variance, so a constant feature cannot make a
@@ -72,6 +79,48 @@ fn window_features(gaps: &[f64]) -> Vec<f64> {
         0.0
     };
     vec![mean.ln_1p(), cv]
+}
+
+/// Groups requests' sizes into feature windows of `size` requests.
+#[derive(Clone, Debug)]
+pub struct SizeWindows {
+    size: usize,
+    sizes: Vec<(f64, f64)>,
+}
+
+impl SizeWindows {
+    /// Windows of `size` requests; `size` below one is raised to one.
+    pub fn new(size: usize) -> Self {
+        Self {
+            size: size.max(1),
+            sizes: Vec::new(),
+        }
+    }
+
+    /// Records one request's prompt and output limit, in tokens, and
+    /// returns the features of the window it completes, if any:
+    /// `[ln(1 + mean prompt), ln(1 + mean output limit)]`.
+    pub fn push(&mut self, prompt_tokens: usize, max_new_tokens: usize) -> Option<Vec<f64>> {
+        self.sizes
+            .push((prompt_tokens as f64, max_new_tokens as f64));
+        if self.sizes.len() < self.size {
+            return None;
+        }
+        let n = self.sizes.len() as f64;
+        let prompt = self.sizes.iter().map(|s| s.0).sum::<f64>() / n;
+        let output = self.sizes.iter().map(|s| s.1).sum::<f64>() / n;
+        self.sizes.clear();
+        Some(vec![prompt.ln_1p(), output.ln_1p()])
+    }
+
+    /// Features of every complete window of `sizes`, for fitting.
+    pub fn features(sizes: &[(usize, usize)], size: usize) -> Vec<Vec<f64>> {
+        let mut windows = Self::new(size);
+        sizes
+            .iter()
+            .filter_map(|&(prompt, output)| windows.push(prompt, output))
+            .collect()
+    }
 }
 
 /// A hidden Markov model with diagonal Gaussian emissions.
@@ -502,5 +551,15 @@ mod tests {
         assert_eq!(quiet, 0);
         let alarm = (0..10).position(|_| detector.push(9.9));
         assert!(alarm.is_some_and(|step| step < 5));
+    }
+
+    #[test]
+    fn size_windows_average_each_window_of_requests() {
+        let windows = SizeWindows::features(&[(9, 99), (9, 99), (999, 0), (999, 2), (5, 5)], 2);
+        assert_eq!(windows.len(), 2);
+        assert!((windows[0][0] - 10f64.ln()).abs() < 1e-12);
+        assert!((windows[0][1] - 100f64.ln()).abs() < 1e-12);
+        assert!((windows[1][0] - 1000f64.ln()).abs() < 1e-12);
+        assert!((windows[1][1] - 2f64.ln()).abs() < 1e-12);
     }
 }

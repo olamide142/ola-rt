@@ -34,9 +34,9 @@ use std::io::Write;
 
 use ola_bench::{
     AdaptationCost, AdaptationMeter, ArrivalWindows, CostModel, DecodeCost, GaussianHmm,
-    KvGeometry, OnlineTuning, RegimeTrigger, ReplayHorizon, SchedulingRun, SchedulingTrace,
-    SimulationConfig, TraceParameters, charged_adaptive_policy, largest_token_budget,
-    run_charged_trial, token_budget_policy,
+    KvGeometry, OnlineTuning, RegimeFeatures, RegimeTrigger, ReplayHorizon, SchedulingRun,
+    SchedulingTrace, SimulationConfig, TraceParameters, charged_adaptive_policy,
+    largest_token_budget, run_charged_trial, token_budget_policy,
 };
 use ola_runtime::{AdaptivePolicy, ExecutionPolicy, SwitchingCost};
 
@@ -208,6 +208,7 @@ fn main() {
     eprintln!("regime model: {regimes:?}");
     let trigger = RegimeTrigger {
         model: regimes,
+        features: RegimeFeatures::Arrivals,
         window_arrivals: WINDOW_ARRIVALS,
         confidence: 0.9,
         refresh_calls: None,

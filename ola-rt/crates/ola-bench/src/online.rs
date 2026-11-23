@@ -29,7 +29,7 @@ use ola_runtime::{
 
 use crate::{
     ArrivalWindows, CostModel, GaussianHmm, KvGeometry, RegimeFilter, SchedulingTrace,
-    SimulationConfig, TraceParameters, TraceRequest, run_scheduling_trial,
+    SimulationConfig, SizeWindows, TraceParameters, TraceRequest, run_scheduling_trial,
     scheduling_summary::run_observations,
 };
 
@@ -232,6 +232,37 @@ fn adaptive_token_budget_policy_with(
     trigger: Option<RegimeTrigger>,
     log: Option<ProposalLog>,
 ) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
+    adaptive_policy_over(
+        theta,
+        TOKEN_BUDGET_DOMAINS.to_vec(),
+        token_budget_policy,
+        cost,
+        max_active_requests,
+        tuning,
+        switching,
+        trigger,
+        log,
+    )
+}
+
+/// Builds the policy a parameter vector describes.
+pub type PolicyFactory =
+    fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>;
+
+/// A serving adaptive policy over any grid: `factory` builds each point of
+/// `domains`, both live and in replays, starting from `theta`.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_policy_over(
+    theta: Vec<(&'static str, String)>,
+    domains: Vec<AdaptiveIntegerDomain>,
+    factory: PolicyFactory,
+    cost: CostModel,
+    max_active_requests: usize,
+    tuning: OnlineTuning,
+    switching: SwitchingCost,
+    trigger: Option<RegimeTrigger>,
+    log: Option<ProposalLog>,
+) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
     let geometry = KvGeometry::default();
     let config = SimulationConfig {
         max_active_requests,
@@ -245,7 +276,7 @@ fn adaptive_token_budget_policy_with(
     };
     let optimizer = ReplayOptimizer::new(
         ReplaySettings {
-            domains: TOKEN_BUDGET_DOMAINS.to_vec(),
+            domains,
             weights: LATENCY_OBJECTIVE,
             config,
             window: tuning.window,
@@ -255,9 +286,9 @@ fn adaptive_token_budget_policy_with(
             horizon: tuning.horizon,
             trigger,
         },
-        token_budget_policy,
+        factory,
     )?;
-    let inner = token_budget_policy(&theta)
+    let inner = factory(&theta)
         .map_err(|error| AdaptiveOptimizationError::InvalidDomain(error.to_string()))?;
     let policy = AdaptivePolicy::new(inner, theta)
         .with_fallback(ComposedPolicy::default().with_admission(MemoryAwareAdmission))
@@ -267,7 +298,7 @@ fn adaptive_token_budget_policy_with(
             available_memory_bytes: None,
         })
         .with_optimization_interval(tuning.interval.max(1))
-        .with_factory(token_budget_policy);
+        .with_factory(factory);
     Ok(match log {
         Some(log) => policy.with_optimizer(LoggedOptimizer {
             inner: optimizer,
@@ -328,14 +359,28 @@ pub struct ReplaySettings {
 /// [`GaussianHmm`] over arrival windows (see `REGIME_DESIGN.md`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegimeTrigger {
-    /// Fitted regime model over [`ArrivalWindows`] features.
+    /// Fitted regime model over `features` windows.
     pub model: GaussianHmm,
-    /// Arrival gaps per feature window; must match the fit.
+    /// What the model's emissions describe; must match the fit.
+    pub features: RegimeFeatures,
+    /// Arrival gaps, or sized requests, per feature window; must match the
+    /// fit.
     pub window_arrivals: usize,
     /// Posterior probability the new most probable regime must reach.
     pub confidence: f64,
     /// Replay anyway after this many calls without a replay; `None` never.
     pub refresh_calls: Option<u64>,
+}
+
+/// What a [`RegimeTrigger`]'s regime model observes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RegimeFeatures {
+    /// [`ArrivalWindows`]: when requests arrive.
+    #[default]
+    Arrivals,
+    /// [`SizeWindows`]: what arrives, as each request's size is reported
+    /// (at admission).
+    Sizes,
 }
 
 /// A [`RegimeTrigger`]'s running state.
@@ -344,6 +389,7 @@ struct TriggerState {
     settings: RegimeTrigger,
     filter: RegimeFilter,
     windows: ArrivalWindows,
+    sizes: SizeWindows,
     /// Regime the last replay was triggered for.
     regime: Option<usize>,
     /// A change seen and not yet replayed for.
@@ -356,6 +402,7 @@ impl TriggerState {
         Self {
             filter: RegimeFilter::new(settings.model.clone()),
             windows: ArrivalWindows::new(settings.window_arrivals),
+            sizes: SizeWindows::new(settings.window_arrivals),
             regime: None,
             pending: false,
             calls_since_replay: 0,
@@ -363,18 +410,32 @@ impl TriggerState {
         }
     }
 
-    /// Folds in new arrivals, in time order.
-    fn arrivals(&mut self, arrivals: impl IntoIterator<Item = u64>) {
-        for arrival in arrivals {
-            if let Some(features) = self.windows.push(arrival) {
-                self.filter.update(&features);
-                if let Some((state, probability)) = self.filter.most_probable()
-                    && probability >= self.settings.confidence
-                    && self.regime != Some(state)
-                {
-                    self.regime = Some(state);
-                    self.pending = true;
-                }
+    /// Folds in new arrivals, in time order, and newly reported sizes
+    /// `(prompt, output limit)`, in arrival order; the model's features
+    /// pick which it reads.
+    fn observe(
+        &mut self,
+        arrivals: impl IntoIterator<Item = u64>,
+        sizes: impl IntoIterator<Item = (usize, usize)>,
+    ) {
+        let windows = match self.settings.features {
+            RegimeFeatures::Arrivals => arrivals
+                .into_iter()
+                .filter_map(|arrival| self.windows.push(arrival))
+                .collect::<Vec<_>>(),
+            RegimeFeatures::Sizes => sizes
+                .into_iter()
+                .filter_map(|(prompt, output)| self.sizes.push(prompt, output))
+                .collect(),
+        };
+        for features in windows {
+            self.filter.update(&features);
+            if let Some((state, probability)) = self.filter.most_probable()
+                && probability >= self.settings.confidence
+                && self.regime != Some(state)
+            {
+                self.regime = Some(state);
+                self.pending = true;
             }
         }
     }
@@ -541,6 +602,7 @@ where
     fn ingest(&mut self, observations: &[AdaptiveRequestObservation]) {
         self.calls += 1;
         let mut arrivals = Vec::new();
+        let mut sized = Vec::new();
         for observation in observations {
             if !self.seen.contains_key(&observation.request_id) {
                 arrivals.push(observation.arrived_at.as_micros());
@@ -554,8 +616,14 @@ where
                 last_call: 0,
             });
             seen.last_call = self.calls;
+            let was_sized = seen.prompt_tokens.is_some() && seen.max_new_tokens.is_some();
             seen.prompt_tokens = seen.prompt_tokens.or(observation.prompt_tokens);
             seen.max_new_tokens = seen.max_new_tokens.or(observation.max_new_tokens);
+            if let (false, Some(prompt), Some(limit)) =
+                (was_sized, seen.prompt_tokens, seen.max_new_tokens)
+            {
+                sized.push((seen.arrived_at, prompt, limit));
+            }
             if let Some(generated) = observation.generated_tokens {
                 seen.generated_tokens = seen.generated_tokens.max(generated);
             }
@@ -563,7 +631,11 @@ where
         }
         if let Some(trigger) = &mut self.trigger {
             arrivals.sort_unstable();
-            trigger.arrivals(arrivals);
+            sized.sort_unstable();
+            trigger.observe(
+                arrivals,
+                sized.into_iter().map(|(_, prompt, limit)| (prompt, limit)),
+            );
         }
         // Keep the window's worth of completed requests and anything live.
         let mut completed = self
@@ -999,10 +1071,44 @@ pub fn charged_adaptive_policy(
     switching: SwitchingCost,
     trigger: Option<RegimeTrigger>,
 ) -> Result<(AdaptivePolicy, AdaptationMeter), AdaptiveOptimizationError> {
+    charged_adaptive_policy_over(
+        largest_token_budget(),
+        TOKEN_BUDGET_DOMAINS.to_vec(),
+        token_budget_policy,
+        cost,
+        max_active_requests,
+        tuning,
+        adaptation,
+        switching,
+        trigger,
+    )
+}
+
+/// [`charged_adaptive_policy`] over any grid: `factory` builds each point
+/// of `domains`, live and in replays, starting from `theta`. Use it to
+/// adapt knobs other than the token budget, such as the scheduler.
+///
+/// # Errors
+///
+/// Fails if `tuning` or `domains` is unusable, or `factory` rejects `theta`.
+#[allow(clippy::too_many_arguments)]
+pub fn charged_adaptive_policy_over(
+    theta: Vec<(&'static str, String)>,
+    domains: Vec<AdaptiveIntegerDomain>,
+    factory: PolicyFactory,
+    cost: CostModel,
+    max_active_requests: usize,
+    tuning: OnlineTuning,
+    adaptation: AdaptationCost,
+    switching: SwitchingCost,
+    trigger: Option<RegimeTrigger>,
+) -> Result<(AdaptivePolicy, AdaptationMeter), AdaptiveOptimizationError> {
     let meter = AdaptationMeter::default();
     let sink = meter.clone();
-    let policy = adaptive_token_budget_policy_with(
-        largest_token_budget(),
+    let policy = adaptive_policy_over(
+        theta,
+        domains,
+        factory,
         cost,
         max_active_requests,
         tuning,
@@ -1446,6 +1552,7 @@ mod tests {
                 ReplaySettings {
                     trigger: Some(RegimeTrigger {
                         model: model.clone(),
+                        features: RegimeFeatures::Arrivals,
                         window_arrivals: 8,
                         confidence: 0.9,
                         refresh_calls,
@@ -1468,6 +1575,47 @@ mod tests {
         assert_eq!(run(None), (2, 0));
         // A refresh every 40 calls adds replays without a change.
         assert!(run(Some(40)).0 > 2);
+    }
+
+    #[test]
+    fn a_size_trigger_replays_when_what_arrives_changes() {
+        // A steady arrival rate throughout; requests turn from short to long
+        // halfway, which only their sizes show.
+        let size = |i: u64| {
+            let jitter = (i % 3) as usize;
+            if i < 80 {
+                (10 + jitter, 8 + jitter)
+            } else {
+                (500 + jitter, 800 + jitter)
+            }
+        };
+        let sizes = (0..160).map(size).collect::<Vec<_>>();
+        let model = GaussianHmm::fit(&[SizeWindows::features(&sizes, 8)], 2, 30).unwrap();
+        let mut optimizer = ReplayOptimizer::new(
+            ReplaySettings {
+                trigger: Some(RegimeTrigger {
+                    model,
+                    features: RegimeFeatures::Sizes,
+                    window_arrivals: 8,
+                    confidence: 0.9,
+                    refresh_calls: None,
+                }),
+                ..settings()
+            },
+            budget,
+        )
+        .unwrap();
+        let current = vec![("log2_max_tokens", "10".to_owned())];
+        for (index, &(prompt, limit)) in sizes.iter().enumerate() {
+            let at = index as u64 * 100_000;
+            let completed = observation(index as u64 + 1, at, Some((prompt, limit)), limit, true);
+            optimizer
+                .propose(&current, &[completed], AdaptiveConstraints::default())
+                .unwrap();
+        }
+        // The first confident regime, then the change to long requests.
+        assert_eq!(optimizer.proposals(), 2);
+        assert_eq!(optimizer.regime().unwrap().0, 1);
     }
 
     #[test]
