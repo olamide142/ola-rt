@@ -20,6 +20,12 @@
 //!   of arrival times: the night differs from the day mainly in output
 //!   length, which arrivals do not show.
 //!
+//! - `table-arrivals` and `table-sizes` replay nothing: they install a
+//!   regime-to-policy table whenever the HMM's most probable regime reaches
+//!   90%. The table is learned on the held-out seeds by decoding their
+//!   regimes with the same HMM (not the true labels) and scoring each
+//!   policy on each decoded regime's requests.
+//!
 //! Every controller starts at `sjf-total`, the best single policy. Scores
 //! are p95 completion plus p95 TTFT per regime and over the day; each is
 //! compared with `sjf-total` on paired per-seed differences.
@@ -30,16 +36,17 @@
 //!   sg-*.jsonl --fit fit-*.jsonl
 //! ```
 //!
-//! `MAX_ACTIVE` (default 4) overrides the slot count, `REGIME_STATES`
+//! `ADAPTIVE` (comma-separated) runs only the named replay and trigger
+//! controllers. `MAX_ACTIVE` (default 4) overrides the slot count, `REGIME_STATES`
 //! (default 3, one per regime) the HMMs' state count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use ola_bench::{
     AdaptationCost, AdaptationMeter, ArrivalWindows, CostModel, DecodeCost, GaussianHmm,
-    KvGeometry, OnlineTuning, RegimeFeatures, RegimeTrigger, ReplayHorizon, SchedulingRun,
-    SchedulingTrace, SimulationConfig, SizeWindows, charged_adaptive_policy_over,
-    run_charged_trial,
+    KvGeometry, OnlineTuning, RegimeFeatures, RegimeFilter, RegimeTrigger, ReplayHorizon,
+    SchedulingRun, SchedulingTrace, SimulationConfig, SizeWindows, charged_adaptive_policy_over,
+    run_charged_trial, run_scheduling_trial,
 };
 use ola_runtime::{
     AdaptiveIntegerDomain, AdaptivePolicy, ComposedPolicy, ExecutionPolicy, JobCost,
@@ -209,12 +216,169 @@ fn arrivals(trace: &SchedulingTrace) -> Vec<u64> {
     trace.requests.iter().map(|r| r.arrival_micros).collect()
 }
 
+/// A trigger's feature windows, fed per request.
+struct Windows {
+    features: RegimeFeatures,
+    arrivals: ArrivalWindows,
+    sizes: SizeWindows,
+}
+
+impl Windows {
+    fn new(trigger: &RegimeTrigger) -> Self {
+        Self {
+            features: trigger.features,
+            arrivals: ArrivalWindows::new(trigger.window_arrivals),
+            sizes: SizeWindows::new(trigger.window_arrivals),
+        }
+    }
+
+    fn arrival(&mut self, at: u64) -> Option<Vec<f64>> {
+        (self.features == RegimeFeatures::Arrivals)
+            .then(|| self.arrivals.push(at))
+            .flatten()
+    }
+
+    fn size(&mut self, prompt: usize, limit: usize) -> Option<Vec<f64>> {
+        (self.features == RegimeFeatures::Sizes)
+            .then(|| self.sizes.push(prompt, limit))
+            .flatten()
+    }
+}
+
+/// The trigger model's most probable state for each request of `trace`:
+/// that of the window the request completes or falls in, filtered online
+/// in arrival order. Requests after the last window take its state.
+fn decode(trace: &SchedulingTrace, trigger: &RegimeTrigger) -> Vec<usize> {
+    let mut windows = Windows::new(trigger);
+    let mut filter = RegimeFilter::new(trigger.model.clone());
+    let mut states = Vec::new();
+    let mut pending = 0;
+    for request in &trace.requests {
+        pending += 1;
+        let features = windows
+            .arrival(request.arrival_micros)
+            .or_else(|| windows.size(request.prompt_tokens, request.max_new_tokens));
+        if let Some(features) = features {
+            filter.update(&features);
+            let (state, _) = filter.most_probable().expect("posterior");
+            states.extend(std::iter::repeat_n(state, pending));
+            pending = 0;
+        }
+    }
+    let last = states.last().copied().unwrap_or(0);
+    states.extend(std::iter::repeat_n(last, pending));
+    states
+}
+
+/// Each trigger state's best policy, learned offline on `fits`: requests
+/// are grouped by their decoded state (not the true regime) and every
+/// policy is scored per group.
+fn learn_table(
+    fits: &[SchedulingTrace],
+    trigger: &RegimeTrigger,
+    config: &SimulationConfig,
+) -> Vec<&'static str> {
+    let decoded = fits
+        .iter()
+        .map(|trace| decode(trace, trigger))
+        .collect::<Vec<_>>();
+    let runs = POLICIES.map(|name| {
+        fits.iter()
+            .map(|trace| {
+                run_scheduling_trial(trace, indexed_policy(&theta(name)).expect("policy"), config)
+                    .expect("trial")
+            })
+            .collect::<Vec<_>>()
+    });
+    (0..trigger.model.states())
+        .map(|state| {
+            let score = |policy: usize| {
+                mean(
+                    &runs[policy]
+                        .iter()
+                        .zip(&decoded)
+                        .filter(|(_, states)| states.contains(&state))
+                        .map(|(run, states)| objective(run, |index| states[index] == state))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let best = (0..POLICIES.len())
+                .min_by(|a, b| score(*a).total_cmp(&score(*b)))
+                .expect("policies");
+            eprintln!(
+                "{:?} state {state}: {}",
+                trigger.features,
+                POLICIES
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| format!("{name} {:.1}", score(i)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            POLICIES[best]
+        })
+        .collect()
+}
+
+/// Installs `table[state]` whenever the trigger model's most probable
+/// state reaches its confidence: a learned regime-to-policy map applied
+/// online, with no replay. Starts at `start`.
+fn regime_table(
+    trigger: RegimeTrigger,
+    table: Vec<&'static str>,
+    start: &'static str,
+) -> AdaptivePolicy {
+    let initial = theta(start);
+    let mut windows = Windows::new(&trigger);
+    let mut filter = RegimeFilter::new(trigger.model.clone());
+    let (mut arrived, mut sized) = (HashSet::new(), HashSet::new());
+    AdaptivePolicy::new(indexed_policy(&initial).expect("policy"), initial)
+        .with_factory(indexed_policy)
+        .with_update(move |_, observations, theta_now| {
+            let mut arrivals = Vec::new();
+            let mut sizes = Vec::new();
+            for observation in observations {
+                let at = observation.arrived_at.as_micros();
+                if arrived.insert(observation.request_id) {
+                    arrivals.push(at);
+                }
+                if let (Some(prompt), Some(limit)) =
+                    (observation.prompt_tokens, observation.max_new_tokens)
+                    && sized.insert(observation.request_id)
+                {
+                    sizes.push((at, prompt, limit));
+                }
+            }
+            arrivals.sort_unstable();
+            sizes.sort_unstable();
+            let mut features = arrivals
+                .into_iter()
+                .filter_map(|at| windows.arrival(at))
+                .collect::<Vec<_>>();
+            features.extend(
+                sizes
+                    .into_iter()
+                    .filter_map(|(_, prompt, limit)| windows.size(prompt, limit)),
+            );
+            for features in features {
+                filter.update(&features);
+            }
+            if let Some((state, probability)) = filter.most_probable()
+                && probability >= trigger.confidence
+            {
+                *theta_now = theta(table[state]);
+            }
+        })
+}
+
 /// Per-controller run accounting, summed over seeds.
 #[derive(Default)]
 struct Tally {
     rows: Vec<Vec<f64>>,
     replaying_calls: u64,
-    switches: u64,
+    /// Switches the optimizer installed; `None` for controllers without
+    /// one, whose switches are not counted.
+    switches: Option<u64>,
     stall_micros: u64,
 }
 
@@ -310,10 +474,27 @@ fn main() {
             by_sizes,
         ),
     ];
+    let only = std::env::var("ADAPTIVE").ok();
+    let adaptive_controllers = adaptive_controllers
+        .into_iter()
+        .filter(|c| {
+            only.as_ref()
+                .is_none_or(|only| only.split(',').any(|n| n == c.0))
+        })
+        .collect::<Vec<_>>();
+    let tables = [
+        ("table-arrivals", &arrival_trigger),
+        ("table-sizes", &size_trigger),
+    ]
+    .map(|(label, trigger)| (label, trigger, learn_table(&fits, trigger, &config)));
+    for (label, _, table) in &tables {
+        eprintln!("{label}: {table:?}");
+    }
     let names = POLICIES
         .into_iter()
         .chain(["oracle-switch"])
         .chain(adaptive_controllers.iter().map(|c| c.0))
+        .chain(tables.iter().map(|t| t.0))
         .collect::<Vec<_>>();
 
     // Seeds are independent; run them on parallel threads.
@@ -321,7 +502,8 @@ fn main() {
         let handles = traces
             .iter()
             .map(|(trace, regime_of)| {
-                let (grid, config) = (&grid, &config);
+                let (grid, config, tables, adaptive_controllers) =
+                    (&grid, &config, &tables, &adaptive_controllers);
                 scope.spawn(move || {
                     let schedule = (0..REGIMES.len())
                         .filter_map(|regime| {
@@ -338,7 +520,11 @@ fn main() {
                         .map(|name| (name, indexed_policy(&theta(name)).expect("policy"), None))
                         .collect();
                     controllers.push(("oracle-switch", Box::new(oracle_switch(schedule)), None));
-                    for (label, adaptation, interval, horizon, trigger) in adaptive_controllers {
+                    for (label, trigger, table) in tables {
+                        let policy = regime_table((*trigger).clone(), table.clone(), "sjf-total");
+                        controllers.push((label, Box::new(policy), None));
+                    }
+                    for &(label, adaptation, interval, horizon, trigger) in adaptive_controllers {
                         let (policy, meter) = charged_adaptive_policy_over(
                             theta("sjf-total"),
                             grid.clone(),
@@ -371,8 +557,9 @@ fn main() {
                                 run.requests.iter().all(|r| r.completed_micros.is_some()),
                                 "{label} left work unfinished"
                             );
-                            let (_, replaying, switches) =
+                            let (_, replaying, _) =
                                 meter.as_ref().map_or((0, 0, 0), AdaptationMeter::counts);
+                            let switches = meter.as_ref().map(|meter| meter.counts().2);
                             let stall = meter.as_ref().map_or(0, AdaptationMeter::total_micros);
                             (label, scores(&run, regime_of), replaying, switches, stall)
                         })
@@ -391,7 +578,9 @@ fn main() {
             let tally = results.entry(label).or_default();
             tally.rows.push(row);
             tally.replaying_calls += replaying;
-            tally.switches += switches;
+            if let Some(switches) = switches {
+                *tally.switches.get_or_insert(0) += switches;
+            }
             tally.stall_micros += stall;
         }
     }
@@ -436,9 +625,12 @@ fn main() {
             .join(" | ");
         let tally = &results[name];
         println!(
-            "| {name} | {cells} | {:.1} | {:.1} | {:.2} |",
+            "| {name} | {cells} | {:.1} | {} | {:.2} |",
             tally.replaying_calls as f64 / seeds,
-            tally.switches as f64 / seeds,
+            tally.switches.map_or("–".into(), |switches| format!(
+                "{:.1}",
+                switches as f64 / seeds
+            )),
             tally.stall_micros as f64 / seeds / 1e6,
         );
     }

@@ -103,8 +103,12 @@ window, at O(K²) per step, which is cheap enough for `observe`.
   beat it on detection delay and false alarms, or justify itself by
   providing the duration estimate.
 
-Sizes are seen only at admission, so until queued sizes are reported the
-fast signal is the arrival process alone.
+Sizes are seen only at admission. On a ServeGen day that is enough:
+regimes that share an arrival process but differ in length mix are
+separated by an HMM over windows of admitted requests' sizes
+(`RegimeFeatures::Sizes`), which arrivals alone cannot do. A learned
+state → θ table applied on the posterior (`servegen_adaptive`'s
+`table-sizes`) matched the oracle with no replay. See `SWITCHING_STUDY.md`.
 
 ## Order of work
 
@@ -120,6 +124,8 @@ next one starts.
    the regime posterior changes). Success: fewer calls and a lower charged stall than interval 40,
    at equal or better objective; detection delay and false alarms measured
    on `followed_by` traces.
+   *Implemented, with a size-feature option; a state → θ table learned
+   offline replaces the triggered replay on the ServeGen day.*
 3. **Gain-over-horizon switch rule** (`ola-bench`). It replaces the
    relative 5% margin with item 4's absolute test.
 4. **Runtime observability** (`ola-runtime`, coordinated with the policy

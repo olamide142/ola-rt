@@ -286,6 +286,91 @@ OLA_COST=10745,30227,482,97,13047,24568 MAX_ACTIVE=4 \
   cargo run --release -p ola-bench --example servegen_regimes -- sg-*.jsonl
 ```
 
+## A real controller on the ServeGen day (2026-11-23)
+
+`servegen_adaptive` replaces the oracle with online controllers that choose
+between FIFO and `sjf-total`. It runs at 4 slots on the same 10 traces and
+charges the RTX 4090 stall. Every controller starts at `sjf-total`. The
+HMMs have 3 states and are fitted on 10 held-out seeds (11–20).
+
+| controller | night − `sjf-total` (s) | day | evening | whole day | replays | stall (s) |
+| --- | --- | --- | --- | --- | ---: | ---: |
+| `oracle-switch` | −10.46 [−11.86, −8.79] | +0.00 | +0.00 | +0.09 [−0.44, +0.65] | – | – |
+| `replay-past` (every 40 iterations) | −8.00 [−9.12, −6.58] | +0.67 [+0.25, +1.25] | +0.28 [+0.15, +0.42] | +0.82 [+0.03, +1.67] | 2,431 | 50.9 |
+| `replay-state` (every 40 iterations) | −9.08 [−10.61, −7.47] | +0.62 [+0.27, +1.10] | +0.71 [+0.28, +1.23] | +1.03 [+0.37, +1.69] | 2,431 | 52.1 |
+| `hmm-past` (arrival trigger) | −2.67 [−5.67, +0.00] | +0.08 | +0.24 | +0.04 [−0.27, +0.42] | 8.2 | 0.16 |
+| `hmm-state` (arrival trigger) | −2.05 [−4.62, +0.00] | +0.09 | +0.70 [+0.25, +1.21] | +0.20 [−0.04, +0.53] | 8.2 | 0.17 |
+| `sizes-state` (size trigger) | −1.08 [−3.25, +0.00] | +0.03 | +0.17 | +0.22 [−0.00, +0.59] | 3.4 | 0.06 |
+| **`table-sizes`** | **−10.89 [−12.48, −9.08]** | +0.22 [−0.15, +0.73] | +0.00 | −0.02 [−0.71, +0.70] | 0 | 0 |
+| `table-arrivals` | −10.90 [−12.49, −9.08] | +0.46 [+0.07, +1.01] | +1.18 [+0.81, +1.56] | +0.36 [−0.24, +0.97] | 0 | 0 |
+
+The `-free` variants (stall uncharged) are identical to the charged ones,
+to two decimals: once a trigger gates the replays, the stall no longer
+matters.
+
+**Periodic replay finds the night and gives it back elsewhere.**
+Replaying every 40 iterations recovers 77–87% of the night gain, but
+switching wrongly by day and in the evening makes it significantly worse
+over the whole day. `replay-state` switches about 41 times a day.
+
+**Triggered replay is cheap but chooses badly.** The 3-state arrival HMM
+replays about 8 times a day, but the night, day and evening barely differ
+in arrival process (the fitted means overlap). The size HMM over windows
+of 8 admitted requests (`RegimeFeatures::Sizes`: log mean prompt, log mean
+output limit) recovers the day's structure without labels:
+- night: prompt ≈ 150, output ≈ 370;
+- day: ≈ 120 / 80;
+- evening: ≈ 630 / 40.
+
+It replays about 3 times a day. Detection is no longer the problem; the
+decision is. One replay of a 64-request window at the start of a regime
+does not show FIFO's advantage, which builds up in the p95 over hours of
+long jobs. So the triggered controllers mostly keep `sjf-total`.
+
+**Regimes recur, so learn the map once.** `table-sizes` replays nothing.
+- **Learning the table (offline):** the held-out seeds are decoded with
+  the size HMM, and FIFO and `sjf-total` are scored on each decoded
+  state's requests. No true labels are used.
+- **Using it (online):** the controller installs a state's policy when that
+  state's posterior reaches 90%.
+
+The learned table is night → FIFO, day and evening → `sjf-total`, the same
+as the oracle's. It captures the whole night gain at no cost, gives up a
+non-significant 0.22 s by day (detection lag at the transition), and loses
+nothing in the evening. The arrival HMM's table is FIFO in every state, so
+`table-arrivals` is plain FIFO.
+
+At 16 slots, where the policies converge, both tables learn FIFO
+everywhere and match `sjf-total` within 0.01 s: the table does no harm
+where there is nothing to gain.
+
+This is the "recurring states carry a cached best θ" item of
+`REGIME_DESIGN.md`. On this workload it is the whole controller, and the
+replay is unnecessary.
+
+Caveats specific to this result:
+- **Output lengths are oracle knowledge.** In these traces `max_new_tokens`
+  is each request's sampled output length. So `sjf-total` and the size
+  features both know true output lengths. In production `max_tokens` is a
+  client-set cap, so both would be weaker.
+- **The table comes from the same deployment.** It is learned on other
+  days drawn from the same distribution. A shifted workload needs a refit,
+  or a replay to confirm the table entry.
+- **The objective is per regime.** The whole-day pooled p95 still shows no
+  difference.
+
+```sh
+python3 lab/replay/servegen.py --model m-large --hours 24 --clients 4 \
+    --rate-scale 0.0000824 --time-scale 6 --seeds 11,12,13,14,15,16,17,18,19,20 \
+    --out 'fit-{seed}.jsonl'
+OLA_COST=10745,30227,482,97,13047,24568 \
+  cargo run --release -p ola-bench --example servegen_adaptive -- \
+  sg-{1..10}.jsonl --fit fit-{11..20}.jsonl
+```
+
+All controllers take about 45 minutes on 12 cores. `ADAPTIVE=none` runs
+only the static policies, the oracle and the tables, in under a minute.
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit
