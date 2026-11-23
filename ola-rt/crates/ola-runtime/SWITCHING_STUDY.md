@@ -101,6 +101,34 @@ request arrives.
   `AdaptationCost::latency_switching_cost` converts a measured switch stall
   into objective units for when one exists.
 
+## Step 1: replaying from the live state (2026-11-23)
+
+`ReplayHorizon::FromState` seeds each replay with the queued and running
+requests, followed by projected arrivals (see the variant's docs for the
+approximations). It is the same study and seeds, with three more
+controllers; `lab/replay/switching.py` prints the table.
+
+| Controller | overload→burst Δ (s) | Switches | burst→overload Δ (s) | Switches | Stall (s) |
+| --- | --- | ---: | --- | ---: | ---: |
+| `adaptive-free` (past) | +1.20 [+0.00, +2.74] | 0.6 | +0.00 | 0.1 | 0 |
+| `state-free` | +0.00 [+0.00, +0.00] | 0.0 | +0.05 [+0.00, +0.12] | 0.3 | 0 |
+| `adaptive-charged` (past) | +2.31 [+1.05, +4.02] | 0.6 | +0.95 [+0.93, +0.96] | 0.1 | 0.66–0.67 |
+| `state-charged` | +3.06 [+2.92, +3.21] | 0.0 | +3.48 [+3.42, +3.54] | 0.3 | 1.65–1.96 |
+| `state-charged-i160` | +0.85 [+0.73, +1.00] | 0.0 | +0.67 [+0.67, +0.67] | 0.0 | 0.40–0.53 |
+
+- **Seeding from state removes the wrong switches.** The past replay moved
+  away from the best budget after overload→burst and lost 1.2 s. The
+  state replay stays, matching `fixed-1024/100`.
+- **It cannot win here, because there is nothing to win.** `oracle-switch`
+  does not beat the fixed budget on this pair either, so the success test
+  for step 1 (beat `fixed-1024/100` with the stall charged) is not reachable
+  on this trace pair. A scenario where switching can pay is needed before
+  it can be passed.
+- **Each decision costs about 2.5× more.** The replayed trace includes the
+  backlog, so the modeled stall (proportional to replayed requests) rises.
+  That makes the trigger (step 2) and asynchronous replay (step 6) more
+  important.
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit

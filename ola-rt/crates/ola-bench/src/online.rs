@@ -134,6 +134,8 @@ pub struct OnlineTuning {
     pub window: usize,
     /// Replay improvement, in percent, required to switch.
     pub min_improvement_percent: u64,
+    /// What each candidate is replayed against.
+    pub horizon: ReplayHorizon,
 }
 
 impl Default for OnlineTuning {
@@ -143,6 +145,7 @@ impl Default for OnlineTuning {
             interval: 40,
             window: 64,
             min_improvement_percent: 5,
+            horizon: ReplayHorizon::Past,
         }
     }
 }
@@ -245,6 +248,7 @@ fn adaptive_token_budget_policy_with(
             min_requests: tuning.window.min(8),
             min_improvement_percent: tuning.min_improvement_percent,
             switching,
+            horizon: tuning.horizon,
         },
         token_budget_policy,
     )?;
@@ -277,6 +281,10 @@ struct Seen {
     max_new_tokens: Option<usize>,
     generated_tokens: usize,
     completed: bool,
+    /// The last `propose` call whose observations mentioned the request.
+    /// Every iteration reports every queued and running request, so one
+    /// missing from the latest call has left (for example, cancelled).
+    last_call: u64,
 }
 
 /// How a [`ReplayOptimizer`] searches and when it switches.
@@ -302,6 +310,39 @@ pub struct ReplaySettings {
     /// models the transition itself, so it is absolute and enters the
     /// argmin; the default charges nothing.
     pub switching: SwitchingCost,
+    /// What each candidate is replayed against.
+    pub horizon: ReplayHorizon,
+}
+
+/// What a [`ReplayOptimizer`] replays each candidate against.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReplayHorizon {
+    /// The last `window` completed requests, from an empty executor: how
+    /// the candidate would have done on the recent past. Requests still
+    /// queued or running are left out, so under load the window describes
+    /// arrivals from about one queueing delay ago.
+    #[default]
+    Past,
+    /// The executor's present and near future: every request still running
+    /// or queued, followed by projected arrivals, so a candidate is scored
+    /// on the backlog it would actually inherit.
+    ///
+    /// The simulator cannot start with requests in flight, so each is
+    /// approximated as arriving at time zero:
+    ///
+    /// - a request already decoding keeps its remaining output limit and a
+    ///   one-token prompt (the cost model does not price context length,
+    ///   so its decodes cost the same; the stand-in prefill is one batched
+    ///   invocation for all of them);
+    /// - an admitted request still prefilling keeps its prompt and limit;
+    /// - a queued request, whose size is not reported until admission,
+    ///   borrows the size and early stop of a completed window request.
+    ///
+    /// Running requests' remaining output is unknown, so it is taken to be
+    /// their limit: pessimistic. Projected arrivals repeat the gaps between
+    /// the most recent `window` arrivals, including those still queued, so
+    /// the rate is current; their sizes cycle through the completed window.
+    FromState,
 }
 
 /// How one proposal chose, with the objective exactly as it was compared.
@@ -342,6 +383,8 @@ pub struct ReplayOptimizer<F> {
     settings: ReplaySettings,
     factory: F,
     seen: BTreeMap<RequestId, Seen>,
+    /// `propose` calls so far, with or without a replay.
+    calls: u64,
     proposals: u64,
     switches: u64,
     replays: u64,
@@ -375,6 +418,7 @@ where
             settings,
             factory,
             seen: BTreeMap::new(),
+            calls: 0,
             proposals: 0,
             switches: 0,
             replays: 0,
@@ -404,6 +448,7 @@ where
     }
 
     fn ingest(&mut self, observations: &[AdaptiveRequestObservation]) {
+        self.calls += 1;
         for observation in observations {
             let seen = self.seen.entry(observation.request_id).or_insert(Seen {
                 arrived_at: observation.arrived_at,
@@ -411,7 +456,9 @@ where
                 max_new_tokens: None,
                 generated_tokens: 0,
                 completed: false,
+                last_call: 0,
             });
+            seen.last_call = self.calls;
             seen.prompt_tokens = seen.prompt_tokens.or(observation.prompt_tokens);
             seen.max_new_tokens = seen.max_new_tokens.or(observation.max_new_tokens);
             if let Some(generated) = observation.generated_tokens {
@@ -435,8 +482,18 @@ where
         }
     }
 
-    /// The recent completed workload, arrivals relative to the earliest.
+    /// The workload each candidate is replayed against, or `None` before
+    /// `min_requests` requests have completed.
     fn window_trace(&self) -> Option<SchedulingTrace> {
+        match self.settings.horizon {
+            ReplayHorizon::Past => self.past_trace(),
+            ReplayHorizon::FromState => self.state_trace(),
+        }
+    }
+
+    /// The window's completed requests as `(arrived_at, prompt, limit,
+    /// eos_after)`, by arrival.
+    fn completed_window(&self) -> Vec<(Timestamp, usize, usize, Option<usize>)> {
         let mut requests = self
             .seen
             .values()
@@ -451,10 +508,92 @@ where
                 Some((seen.arrived_at, prompt_tokens, max_new_tokens, eos_after))
             })
             .collect::<Vec<_>>();
+        requests.sort_by_key(|(arrived_at, ..)| *arrived_at);
+        requests
+    }
+
+    /// [`ReplayHorizon::FromState`]: live requests at time zero, then
+    /// projected arrivals.
+    fn state_trace(&self) -> Option<SchedulingTrace> {
+        let window = self.completed_window();
+        if window.len() < self.settings.min_requests.max(1) {
+            return None;
+        }
+        let request = |arrival_micros, prompt_tokens, max_new_tokens, eos_after| TraceRequest {
+            arrival_micros,
+            prompt_tokens,
+            max_new_tokens,
+            priority: 0,
+            deadline_micros: None,
+            eos_after,
+            shared_prefix: None,
+        };
+        let mut live = self
+            .seen
+            .values()
+            .filter(|seen| !seen.completed && seen.last_call == self.calls)
+            .collect::<Vec<_>>();
+        live.sort_by_key(|seen| seen.arrived_at);
+        let mut borrowed = window.iter().cycle();
+        let mut requests = Vec::with_capacity(live.len() + window.len());
+        // Running first, then prefilling, then queued, as FIFO would hold them.
+        for seen in &live {
+            if let (Some(_), Some(limit)) = (seen.prompt_tokens, seen.max_new_tokens)
+                && seen.generated_tokens > 0
+            {
+                let remaining = limit.saturating_sub(seen.generated_tokens).max(1);
+                requests.push(request(0, 1, remaining, None));
+            }
+        }
+        for seen in &live {
+            if let (Some(prompt), Some(limit)) = (seen.prompt_tokens, seen.max_new_tokens)
+                && seen.generated_tokens == 0
+            {
+                requests.push(request(0, prompt, limit, None));
+            }
+        }
+        for seen in &live {
+            if seen.prompt_tokens.is_none() {
+                let &(_, prompt, limit, eos_after) = borrowed.next()?;
+                requests.push(request(0, prompt, limit, eos_after));
+            }
+        }
+        // Projected arrivals at the most recent gaps.
+        let mut arrivals = self
+            .seen
+            .values()
+            .map(|seen| seen.arrived_at.as_micros())
+            .collect::<Vec<_>>();
+        arrivals.sort_unstable();
+        let recent = &arrivals[arrivals.len().saturating_sub(self.settings.window + 1)..];
+        let gaps = recent
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        let mut at = 0_u64;
+        for (index, &(_, prompt, limit, eos_after)) in window.iter().enumerate() {
+            at = at.saturating_add(gaps.get(index % gaps.len().max(1)).copied().unwrap_or(0));
+            requests.push(request(at, prompt, limit, eos_after));
+        }
+        let count = requests.len();
+        Some(SchedulingTrace {
+            name: "online-state",
+            parameters: TraceParameters {
+                seed: 0,
+                requests: count,
+                mean_interarrival_micros: at / (count as u64).max(1),
+            },
+            requests,
+        })
+    }
+
+    /// [`ReplayHorizon::Past`]: the recent completed workload, arrivals
+    /// relative to the earliest.
+    fn past_trace(&self) -> Option<SchedulingTrace> {
+        let requests = self.completed_window();
         if requests.len() < self.settings.min_requests.max(1) {
             return None;
         }
-        requests.sort_by_key(|(arrived_at, ..)| *arrived_at);
         let start = requests[0].0.as_micros();
         let end = requests[requests.len() - 1].0.as_micros();
         let count = requests.len();
@@ -858,6 +997,7 @@ mod tests {
             config: SimulationConfig::default(),
             window: 64,
             min_requests: 8,
+            horizon: ReplayHorizon::Past,
             min_improvement_percent: 5,
             switching: SwitchingCost::default(),
         }
@@ -967,6 +1107,7 @@ mod tests {
                 interval: 5,
                 window: 8,
                 min_improvement_percent: 0,
+                horizon: ReplayHorizon::Past,
             },
             None,
         )
@@ -991,6 +1132,7 @@ mod tests {
                 interval: 5,
                 window: 8,
                 min_improvement_percent: 0,
+                horizon: ReplayHorizon::Past,
             },
             Some(Box::new(move |record: &ProposalRecord| {
                 sink.lock().unwrap().push(record.clone());
@@ -1084,6 +1226,99 @@ mod tests {
         let optimizer = optimizer.lock().unwrap();
         assert!(optimizer.switches() > 0);
         assert!(optimizer.replays() >= optimizer.proposals() * 8);
+    }
+
+    fn observation(
+        id: u64,
+        arrived: u64,
+        size: Option<(usize, usize)>,
+        generated: usize,
+        completed: bool,
+    ) -> AdaptiveRequestObservation {
+        AdaptiveRequestObservation {
+            request_id: RequestId::new(id),
+            arrived_at: Timestamp::from_micros(arrived),
+            first_token_at: None,
+            completed_at: completed.then(|| Timestamp::from_micros(arrived + 1_000)),
+            time_to_first_token_micros: None,
+            completion_latency_micros: None,
+            deadline_missed: false,
+            capability_fallback: false,
+            prompt_tokens: size.map(|(prompt, _)| prompt),
+            max_new_tokens: size.map(|(_, limit)| limit),
+            generated_tokens: (generated > 0).then_some(generated),
+        }
+    }
+
+    #[test]
+    fn the_state_horizon_replays_the_backlog_then_projected_arrivals() {
+        let mut optimizer = ReplayOptimizer::new(
+            ReplaySettings {
+                horizon: ReplayHorizon::FromState,
+                ..settings()
+            },
+            budget,
+        )
+        .unwrap();
+        // Eight completed requests 100 µs apart; the last stopped early.
+        let mut first = (1..=8)
+            .map(|id| {
+                observation(
+                    id,
+                    id * 100,
+                    Some((10, 20)),
+                    if id == 8 { 5 } else { 20 },
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        // One decoding, one admitted but not yet prefilled, one queued.
+        first.push(observation(9, 900, Some((30, 40)), 15, false));
+        first.push(observation(10, 950, Some((50, 60)), 0, false));
+        first.push(observation(11, 1_000, None, 0, false));
+        optimizer.ingest(&first);
+        let trace = optimizer.window_trace().unwrap();
+        let shape = |request: &TraceRequest| {
+            (
+                request.arrival_micros,
+                request.prompt_tokens,
+                request.max_new_tokens,
+                request.eos_after,
+            )
+        };
+        let shapes = trace.requests.iter().map(shape).collect::<Vec<_>>();
+        assert_eq!(
+            shapes[0],
+            (0, 1, 25, None),
+            "decoding: remaining limit, stand-in prompt"
+        );
+        assert_eq!(shapes[1], (0, 50, 60, None), "prefilling: as admitted");
+        assert_eq!(
+            shapes[2],
+            (0, 10, 20, None),
+            "queued: borrows a completed size"
+        );
+        // Projected: the eight completed sizes at the recent gaps (100, 100,
+        // ..., then 50 and 50 between the live arrivals), in order.
+        assert_eq!(trace.requests.len(), 3 + 8);
+        assert_eq!(shapes[3], (100, 10, 20, None));
+        assert_eq!(shapes[10].3, Some(5));
+        assert!(
+            trace
+                .requests
+                .windows(2)
+                .all(|w| w[0].arrival_micros <= w[1].arrival_micros)
+        );
+
+        // The queued request is no longer reported (for example, cancelled):
+        // it leaves the backlog.
+        optimizer.ingest(&[
+            observation(9, 900, None, 16, false),
+            observation(10, 950, None, 0, false),
+        ]);
+        let trace = optimizer.window_trace().unwrap();
+        assert_eq!(trace.requests.len(), 2 + 8);
+        assert_eq!(shape(&trace.requests[0]), (0, 1, 24, None));
     }
 
     #[test]

@@ -15,7 +15,10 @@
 //! - `adaptive-charged`, the same with the stall measured on the RTX 4090
 //!   host (`AdaptationCost::RTX_4090_E4`) added to the clock;
 //! - `adaptive-charged-i10` and `-i160`, the charged policy re-planning every
-//!   10 or 160 iterations instead of 40.
+//!   10 or 160 iterations instead of 40;
+//! - `state-free`, `state-charged` and `state-charged-i160`, the same policy
+//!   replaying from the executor's live state (`ReplayHorizon::FromState`)
+//!   instead of the recent past.
 //!
 //! ```sh
 //! OLA_COST=10745,30227,482,97,13047,24568 \
@@ -28,8 +31,8 @@ use std::io::Write;
 
 use ola_bench::{
     AdaptationCost, AdaptationMeter, CostModel, DecodeCost, KvGeometry, OnlineTuning,
-    SchedulingRun, SchedulingTrace, SimulationConfig, TraceParameters, charged_adaptive_policy,
-    largest_token_budget, run_charged_trial, token_budget_policy,
+    ReplayHorizon, SchedulingRun, SchedulingTrace, SimulationConfig, TraceParameters,
+    charged_adaptive_policy, largest_token_budget, run_charged_trial, token_budget_policy,
 };
 use ola_runtime::{AdaptivePolicy, ExecutionPolicy, SwitchingCost};
 
@@ -192,15 +195,16 @@ fn main() {
                 )
             };
             let boundary = trace.requests[PHASE_REQUESTS].arrival_micros;
-            let tuning = |interval: u64| OnlineTuning {
+            let tuning = |interval: u64, horizon: ReplayHorizon| OnlineTuning {
                 interval,
+                horizon,
                 ..OnlineTuning::default()
             };
-            let adaptive = |adaptation: AdaptationCost, interval: u64| {
+            let adaptive = |adaptation: AdaptationCost, interval: u64, horizon: ReplayHorizon| {
                 charged_adaptive_policy(
                     cost,
                     max_active,
-                    tuning(interval),
+                    tuning(interval, horizon),
                     adaptation,
                     SwitchingCost::default(),
                 )
@@ -223,13 +227,32 @@ fn main() {
                     None,
                 ),
             ];
-            for (label, adaptation, interval) in [
-                ("adaptive-free", AdaptationCost::default(), 40),
-                ("adaptive-charged", AdaptationCost::RTX_4090_E4, 40),
-                ("adaptive-charged-i10", AdaptationCost::RTX_4090_E4, 10),
-                ("adaptive-charged-i160", AdaptationCost::RTX_4090_E4, 160),
+            let (past, state) = (ReplayHorizon::Past, ReplayHorizon::FromState);
+            for (label, adaptation, interval, horizon) in [
+                ("adaptive-free", AdaptationCost::default(), 40, past),
+                ("adaptive-charged", AdaptationCost::RTX_4090_E4, 40, past),
+                (
+                    "adaptive-charged-i10",
+                    AdaptationCost::RTX_4090_E4,
+                    10,
+                    past,
+                ),
+                (
+                    "adaptive-charged-i160",
+                    AdaptationCost::RTX_4090_E4,
+                    160,
+                    past,
+                ),
+                ("state-free", AdaptationCost::default(), 40, state),
+                ("state-charged", AdaptationCost::RTX_4090_E4, 40, state),
+                (
+                    "state-charged-i160",
+                    AdaptationCost::RTX_4090_E4,
+                    160,
+                    state,
+                ),
             ] {
-                let (policy, meter) = adaptive(adaptation, interval);
+                let (policy, meter) = adaptive(adaptation, interval, horizon);
                 controllers.push((label.into(), Box::new(policy), Some(meter)));
             }
             for (label, policy, meter) in controllers {

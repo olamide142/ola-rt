@@ -130,6 +130,7 @@ fn build(
                         min_requests: tuning.window.min(8),
                         min_improvement_percent: tuning.min_improvement_percent,
                         switching: SwitchingCost::uniform(&[HEADROOM.name], switching_cost),
+                        horizon: crate::ReplayHorizon::Past,
                     },
                     factory,
                 )

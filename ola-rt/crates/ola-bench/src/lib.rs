@@ -56,7 +56,7 @@ pub use experiment::{
 };
 pub use online::{
     AdaptationCost, AdaptationMeter, LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord,
-    ReplayOptimizer, ReplaySelection, ReplaySettings, TOKEN_BUDGET_DOMAINS,
+    ReplayHorizon, ReplayOptimizer, ReplaySelection, ReplaySettings, TOKEN_BUDGET_DOMAINS,
     charged_adaptive_policy, largest_token_budget, serving_adaptive_policy,
     serving_adaptive_policy_logged, smallest_token_budget, token_budget, token_budget_policy,
 };
