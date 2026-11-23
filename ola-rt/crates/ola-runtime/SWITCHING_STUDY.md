@@ -129,6 +129,50 @@ controllers; `lab/replay/switching.py` prints the table.
   That makes the trigger (step 2) and asynchronous replay (step 6) more
   important.
 
+## Step 2: an HMM regime trigger (2026-11-23)
+
+`RegimeTrigger` puts a two-state `GaussianHmm` (`regime_filter.rs`) in
+front of the replay. Its emissions are 8-gap arrival windows (log mean gap
+and coefficient of variation), and it is fitted by Baum–Welch on held-out
+seeds 101–130. The optimizer is called every iteration but replays only
+when the most probable regime changes with at least 90% posterior.
+
+### Detection (`regime_detection`, 20 seeds)
+
+| Change | Detector | Delay (arrivals) | Alarms with no change, per run | Predicted / actual remaining windows |
+| --- | --- | ---: | ---: | --- |
+| 20× rate (overload ↔ burst) | HMM | 8.0 | 0 | 28.0 / 13.0 |
+| 20× rate | Page–Hinkley | 8.0 | 0 | — |
+| 2× rate (moderate ↔ overload) | HMM | 10.0–10.4 | 0.9 (moderate only) | 19.7–21.5 / 12.7–12.8 |
+| 2× rate | Page–Hinkley | 35.6–38.8 | 0 | — |
+
+- A 20× change is caught within one window by either detector.
+- On a 2× change the HMM is about 3.5× faster, but raises about one false
+  alarm per run on moderate-only traces; Page–Hinkley raises none. The 90%
+  confidence threshold sets this trade-off.
+- **The duration estimate is about twice too long.** Each training trace
+  holds one change, so the fit learns a stay probability of about 0.96,
+  and a geometric duration cannot represent fixed-length phases. A
+  semi-Markov model, or training traces with realistic regime lengths, is
+  needed before `1/(1−p)` can drive the switch rule.
+
+### Closed loop (`regime_switching`, same seeds)
+
+| Controller | overload→burst Δ (s) | burst→overload Δ (s) | Replays | Stall (s) |
+| --- | --- | --- | ---: | ---: |
+| `adaptive-charged` (past, every 40) | +2.31 [+1.05, +4.02] | +0.95 [+0.93, +0.96] | 8 | 0.66–0.67 |
+| `past-hmm-charged` | +0.20 [+0.18, +0.22] | +0.04 [+0.04, +0.04] | about 2 | 0.02–0.10 |
+| `state-charged` (every 40) | +3.06 [+2.92, +3.21] | +3.48 [+3.42, +3.54] | 8 | 1.65–1.96 |
+| `state-hmm-charged` | +0.79 [+0.77, +0.81] | +0.65 [+0.64, +0.66] | about 2 | 0.33–0.39 |
+
+Both HMM-triggered controllers check on all 321–341 iterations but replay
+about twice: once on the first confident regime and once at the change.
+That cuts the cost of adapting by 4–12× against the 40-iteration interval,
+and neither switches wrongly. Neither beats the fixed budget, because on
+this pair nothing can: `oracle-switch` does not either. The cheapest
+configuration of the full design, `state-hmm-charged`, costs 0.65–0.79 s
+(0.3–0.5%) to run where adapting has nothing to gain.
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit

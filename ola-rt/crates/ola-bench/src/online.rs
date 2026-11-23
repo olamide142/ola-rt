@@ -28,8 +28,9 @@ use ola_runtime::{
 };
 
 use crate::{
-    CostModel, KvGeometry, SchedulingTrace, SimulationConfig, TraceParameters, TraceRequest,
-    run_scheduling_trial, scheduling_summary::run_observations,
+    ArrivalWindows, CostModel, GaussianHmm, KvGeometry, RegimeFilter, SchedulingTrace,
+    SimulationConfig, TraceParameters, TraceRequest, run_scheduling_trial,
+    scheduling_summary::run_observations,
 };
 
 /// Token-budget grid shared by the adaptive studies and `ola serve
@@ -215,17 +216,20 @@ fn adaptive_token_budget_policy(
         max_active_requests,
         tuning,
         SwitchingCost::default(),
+        None,
         log,
     )
 }
 
-/// [`adaptive_token_budget_policy`] with an explicit switching cost.
+/// [`adaptive_token_budget_policy`] with an explicit switching cost and an
+/// optional regime trigger.
 fn adaptive_token_budget_policy_with(
     theta: Vec<(&'static str, String)>,
     cost: CostModel,
     max_active_requests: usize,
     tuning: OnlineTuning,
     switching: SwitchingCost,
+    trigger: Option<RegimeTrigger>,
     log: Option<ProposalLog>,
 ) -> Result<AdaptivePolicy, AdaptiveOptimizationError> {
     let geometry = KvGeometry::default();
@@ -249,6 +253,7 @@ fn adaptive_token_budget_policy_with(
             min_improvement_percent: tuning.min_improvement_percent,
             switching,
             horizon: tuning.horizon,
+            trigger,
         },
         token_budget_policy,
     )?;
@@ -312,6 +317,82 @@ pub struct ReplaySettings {
     pub switching: SwitchingCost,
     /// What each candidate is replayed against.
     pub horizon: ReplayHorizon,
+    /// When set, a call replays only when the workload regime changes (or a
+    /// refresh is due); otherwise it keeps the current vector at no cost.
+    /// Pair it with an optimization interval of one, so every iteration's
+    /// arrivals are seen as they happen.
+    pub trigger: Option<RegimeTrigger>,
+}
+
+/// Replays only on a change of workload regime, estimated by a
+/// [`GaussianHmm`] over arrival windows (see `REGIME_DESIGN.md`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegimeTrigger {
+    /// Fitted regime model over [`ArrivalWindows`] features.
+    pub model: GaussianHmm,
+    /// Arrival gaps per feature window; must match the fit.
+    pub window_arrivals: usize,
+    /// Posterior probability the new most probable regime must reach.
+    pub confidence: f64,
+    /// Replay anyway after this many calls without a replay; `None` never.
+    pub refresh_calls: Option<u64>,
+}
+
+/// A [`RegimeTrigger`]'s running state.
+#[derive(Clone, Debug)]
+struct TriggerState {
+    settings: RegimeTrigger,
+    filter: RegimeFilter,
+    windows: ArrivalWindows,
+    /// Regime the last replay was triggered for.
+    regime: Option<usize>,
+    /// A change seen and not yet replayed for.
+    pending: bool,
+    calls_since_replay: u64,
+}
+
+impl TriggerState {
+    fn new(settings: RegimeTrigger) -> Self {
+        Self {
+            filter: RegimeFilter::new(settings.model.clone()),
+            windows: ArrivalWindows::new(settings.window_arrivals),
+            regime: None,
+            pending: false,
+            calls_since_replay: 0,
+            settings,
+        }
+    }
+
+    /// Folds in new arrivals, in time order.
+    fn arrivals(&mut self, arrivals: impl IntoIterator<Item = u64>) {
+        for arrival in arrivals {
+            if let Some(features) = self.windows.push(arrival) {
+                self.filter.update(&features);
+                if let Some((state, probability)) = self.filter.most_probable()
+                    && probability >= self.settings.confidence
+                    && self.regime != Some(state)
+                {
+                    self.regime = Some(state);
+                    self.pending = true;
+                }
+            }
+        }
+    }
+
+    /// Whether this call should replay.
+    fn due(&mut self) -> bool {
+        self.calls_since_replay += 1;
+        self.pending
+            || self
+                .settings
+                .refresh_calls
+                .is_some_and(|refresh| self.calls_since_replay >= refresh)
+    }
+
+    fn replayed(&mut self) {
+        self.pending = false;
+        self.calls_since_replay = 0;
+    }
 }
 
 /// What a [`ReplayOptimizer`] replays each candidate against.
@@ -389,6 +470,7 @@ pub struct ReplayOptimizer<F> {
     switches: u64,
     replays: u64,
     last: Option<ReplaySelection>,
+    trigger: Option<TriggerState>,
 }
 
 impl<F> ReplayOptimizer<F>
@@ -415,7 +497,6 @@ where
              -> Result<Option<i64>, AdaptiveOptimizationError> { Ok(None) },
         )?;
         Ok(Self {
-            settings,
             factory,
             seen: BTreeMap::new(),
             calls: 0,
@@ -423,6 +504,8 @@ where
             switches: 0,
             replays: 0,
             last: None,
+            trigger: settings.trigger.clone().map(TriggerState::new),
+            settings,
         })
     }
 
@@ -442,6 +525,14 @@ where
         self.proposals
     }
 
+    /// The trigger's most probable workload regime and its probability,
+    /// once it has seen a window; `None` without a trigger.
+    pub fn regime(&self) -> Option<(usize, f64)> {
+        self.trigger
+            .as_ref()
+            .and_then(|trigger| trigger.filter.most_probable())
+    }
+
     /// Proposals that changed the parameter vector.
     pub const fn switches(&self) -> u64 {
         self.switches
@@ -449,7 +540,11 @@ where
 
     fn ingest(&mut self, observations: &[AdaptiveRequestObservation]) {
         self.calls += 1;
+        let mut arrivals = Vec::new();
         for observation in observations {
+            if !self.seen.contains_key(&observation.request_id) {
+                arrivals.push(observation.arrived_at.as_micros());
+            }
             let seen = self.seen.entry(observation.request_id).or_insert(Seen {
                 arrived_at: observation.arrived_at,
                 prompt_tokens: None,
@@ -465,6 +560,10 @@ where
                 seen.generated_tokens = seen.generated_tokens.max(generated);
             }
             seen.completed |= observation.completed_at.is_some();
+        }
+        if let Some(trigger) = &mut self.trigger {
+            arrivals.sort_unstable();
+            trigger.arrivals(arrivals);
         }
         // Keep the window's worth of completed requests and anything live.
         let mut completed = self
@@ -665,9 +764,15 @@ where
         constraints: AdaptiveConstraints,
     ) -> Result<Vec<(&'static str, String)>, AdaptiveOptimizationError> {
         self.ingest(observations);
+        if self.trigger.as_mut().is_some_and(|trigger| !trigger.due()) {
+            return Ok(current.to_vec());
+        }
         let Some(trace) = self.window_trace() else {
             return Ok(current.to_vec());
         };
+        if let Some(trigger) = &mut self.trigger {
+            trigger.replayed();
+        }
         self.proposals += 1;
         let config = self.config(constraints);
         let weights = self.settings.weights;
@@ -767,6 +872,9 @@ pub struct ProposalRecord {
     pub to: BTreeMap<String, String>,
     /// Error, when the call failed and the policy kept its vector.
     pub error: Option<String>,
+    /// The trigger's most probable workload regime after the call, when the
+    /// optimizer has a trigger and has seen a window.
+    pub regime: Option<usize>,
 }
 
 /// Host time an adaptive policy costs the executor it runs on, which the
@@ -876,8 +984,9 @@ impl AdaptationMeter {
 
 /// [`serving_adaptive_policy`] whose calls are priced by `adaptation` into
 /// the returned meter, for virtual-time studies that charge the stall with
-/// [`crate::run_charged_trial`]. `switching` enters the optimizer's
-/// objective as [`ReplaySettings::switching`] does.
+/// [`crate::run_charged_trial`]. `switching` and `trigger` act as
+/// [`ReplaySettings::switching`] and [`ReplaySettings::trigger`] do; with a
+/// trigger, set `tuning.interval` to one.
 ///
 /// # Errors
 ///
@@ -888,6 +997,7 @@ pub fn charged_adaptive_policy(
     tuning: OnlineTuning,
     adaptation: AdaptationCost,
     switching: SwitchingCost,
+    trigger: Option<RegimeTrigger>,
 ) -> Result<(AdaptivePolicy, AdaptationMeter), AdaptiveOptimizationError> {
     let meter = AdaptationMeter::default();
     let sink = meter.clone();
@@ -897,6 +1007,7 @@ pub fn charged_adaptive_policy(
         max_active_requests,
         tuning,
         switching,
+        trigger,
         Some(Box::new(move |record: &ProposalRecord| {
             sink.record(adaptation, record);
         })),
@@ -950,6 +1061,7 @@ where
             from: vector(current),
             to: result.as_deref().map_or_else(|_| vector(current), vector),
             error: result.as_ref().err().map(ToString::to_string),
+            regime: self.inner.regime().map(|(state, _)| state),
         });
         result
     }
@@ -998,6 +1110,7 @@ mod tests {
             window: 64,
             min_requests: 8,
             horizon: ReplayHorizon::Past,
+            trigger: None,
             min_improvement_percent: 5,
             switching: SwitchingCost::default(),
         }
@@ -1322,6 +1435,42 @@ mod tests {
     }
 
     #[test]
+    fn a_regime_trigger_replays_only_when_the_regime_changes() {
+        // 80 slow arrivals, then 80 fast ones, each completing at once.
+        let mut arrivals = (0..80).map(|i| i * 400_000).collect::<Vec<u64>>();
+        let switch = arrivals[79];
+        arrivals.extend((1..=80).map(|i| switch + i * 20_000));
+        let model = GaussianHmm::fit(&[ArrivalWindows::features(&arrivals, 8)], 2, 30).unwrap();
+        let run = |refresh_calls| {
+            let mut optimizer = ReplayOptimizer::new(
+                ReplaySettings {
+                    trigger: Some(RegimeTrigger {
+                        model: model.clone(),
+                        window_arrivals: 8,
+                        confidence: 0.9,
+                        refresh_calls,
+                    }),
+                    ..settings()
+                },
+                budget,
+            )
+            .unwrap();
+            let current = vec![("log2_max_tokens", "10".to_owned())];
+            for (index, &arrival) in arrivals.iter().enumerate() {
+                let completed = observation(index as u64 + 1, arrival, Some((10, 8)), 8, true);
+                optimizer
+                    .propose(&current, &[completed], AdaptiveConstraints::default())
+                    .unwrap();
+            }
+            (optimizer.proposals(), optimizer.regime().unwrap().0)
+        };
+        // The first confident regime, then the change: two replays in 160 calls.
+        assert_eq!(run(None), (2, 0));
+        // A refresh every 40 calls adds replays without a change.
+        assert!(run(Some(40)).0 > 2);
+    }
+
+    #[test]
     fn adaptation_cost_charges_replaying_calls_and_switches() {
         let record = |replayed, switched| ProposalRecord {
             call: 1,
@@ -1335,6 +1484,7 @@ mod tests {
             from: BTreeMap::new(),
             to: BTreeMap::new(),
             error: None,
+            regime: None,
         };
         let cost = AdaptationCost {
             per_switch_micros: 1_000,
@@ -1374,6 +1524,7 @@ mod tests {
             tuning,
             AdaptationCost::RTX_4090_E4,
             SwitchingCost::default(),
+            None,
         )
         .unwrap();
         let plain = run_scheduling_trial(&trace, plain, &config).unwrap();

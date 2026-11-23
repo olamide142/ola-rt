@@ -1,6 +1,7 @@
 # Regime-aware adaptation: design
 
-Status: **proposal** (2026-11-23), being implemented in order. Builds on
+Status: steps 1 and 2 implemented (2026-11-23); results in
+`SWITCHING_STUDY.md`. Builds on
 `SWITCHING_STUDY.md` (evidence) and `ADAPTIVE_POLICY.md` (mechanism).
 
 ## Definitions

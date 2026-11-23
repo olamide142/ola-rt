@@ -18,7 +18,10 @@
 //!   10 or 160 iterations instead of 40;
 //! - `state-free`, `state-charged` and `state-charged-i160`, the same policy
 //!   replaying from the executor's live state (`ReplayHorizon::FromState`)
-//!   instead of the recent past.
+//!   instead of the recent past;
+//! - `past-hmm-charged` and `state-hmm-charged`, which check every iteration
+//!   but replay only when a two-regime HMM over arrival windows, fitted on
+//!   held-out seeds, changes its most probable regime with 90% confidence.
 //!
 //! ```sh
 //! OLA_COST=10745,30227,482,97,13047,24568 \
@@ -30,9 +33,10 @@
 use std::io::Write;
 
 use ola_bench::{
-    AdaptationCost, AdaptationMeter, CostModel, DecodeCost, KvGeometry, OnlineTuning,
-    ReplayHorizon, SchedulingRun, SchedulingTrace, SimulationConfig, TraceParameters,
-    charged_adaptive_policy, largest_token_budget, run_charged_trial, token_budget_policy,
+    AdaptationCost, AdaptationMeter, ArrivalWindows, CostModel, DecodeCost, GaussianHmm,
+    KvGeometry, OnlineTuning, RegimeTrigger, ReplayHorizon, SchedulingRun, SchedulingTrace,
+    SimulationConfig, TraceParameters, charged_adaptive_policy, largest_token_budget,
+    run_charged_trial, token_budget_policy,
 };
 use ola_runtime::{AdaptivePolicy, ExecutionPolicy, SwitchingCost};
 
@@ -138,6 +142,47 @@ fn objective(run: &SchedulingRun, keep: impl Fn(usize) -> bool) -> u64 {
     p95(completion) + p95(ttft)
 }
 
+/// Arrival gaps per regime-filter window.
+const WINDOW_ARRIVALS: usize = 8;
+
+/// The two phases back to back: `order` is `overload>burst` or
+/// `burst>overload`; phase 1 holds the first `PHASE_REQUESTS` requests.
+fn shifted(order: &'static str, seed: u64, scale: f64) -> SchedulingTrace {
+    let gap = |nominal: u64| ((nominal as f64) * scale).round().max(1.0) as u64;
+    let phase = |nominal: u64, offset: u64| {
+        SchedulingTrace::prefill_decode_competition(TraceParameters {
+            seed: seed + offset,
+            requests: PHASE_REQUESTS,
+            mean_interarrival_micros: gap(nominal),
+        })
+    };
+    let overload = phase(OVERLOAD_NOMINAL_MICROS, 0);
+    let burst = phase(BURST_NOMINAL_MICROS, 1_000);
+    if order == "overload>burst" {
+        overload.followed_by(burst, order, gap(BURST_NOMINAL_MICROS))
+    } else {
+        burst.followed_by(overload, order, gap(OVERLOAD_NOMINAL_MICROS))
+    }
+}
+
+/// A two-regime arrival model fitted on held-out seeds (101–130) of both
+/// orders, so no evaluated trace is in its training data.
+fn fit_regimes(scale: f64) -> GaussianHmm {
+    let sequences = ["overload>burst", "burst>overload"]
+        .into_iter()
+        .flat_map(|order| (101..=130).map(move |seed| shifted(order, seed, scale)))
+        .map(|trace| {
+            let arrivals = trace
+                .requests
+                .iter()
+                .map(|request| request.arrival_micros)
+                .collect::<Vec<_>>();
+            ArrivalWindows::features(&arrivals, WINDOW_ARRIVALS)
+        })
+        .collect::<Vec<_>>();
+    GaussianHmm::fit(&sequences, 2, 50).expect("training windows")
+}
+
 fn main() {
     let out = std::env::args()
         .nth(1)
@@ -159,7 +204,14 @@ fn main() {
         cost,
         ..SimulationConfig::default()
     };
-    let gap = |nominal: u64| ((nominal as f64) * scale).round().max(1.0) as u64;
+    let regimes = fit_regimes(scale);
+    eprintln!("regime model: {regimes:?}");
+    let trigger = RegimeTrigger {
+        model: regimes,
+        window_arrivals: WINDOW_ARRIVALS,
+        confidence: 0.9,
+        refresh_calls: None,
+    };
     let overload_budget = budget(9, 50);
     let burst_budget = largest_token_budget();
     writeln!(
@@ -170,29 +222,11 @@ fn main() {
     .unwrap();
     for order in ["overload>burst", "burst>overload"] {
         for seed in 1..=seeds {
-            let phase = |nominal: u64, offset: u64| {
-                SchedulingTrace::prefill_decode_competition(TraceParameters {
-                    seed: seed + offset,
-                    requests: PHASE_REQUESTS,
-                    mean_interarrival_micros: gap(nominal),
-                })
-            };
-            let overload = phase(OVERLOAD_NOMINAL_MICROS, 0);
-            let burst = phase(BURST_NOMINAL_MICROS, 1_000);
-            let (trace, first_best, second_best) = if order == "overload>burst" {
-                let g = gap(BURST_NOMINAL_MICROS);
-                (
-                    overload.followed_by(burst, "overload>burst", g),
-                    overload_budget.clone(),
-                    burst_budget.clone(),
-                )
+            let trace = shifted(order, seed, scale);
+            let (first_best, second_best) = if order == "overload>burst" {
+                (overload_budget.clone(), burst_budget.clone())
             } else {
-                let g = gap(OVERLOAD_NOMINAL_MICROS);
-                (
-                    burst.followed_by(overload, "burst>overload", g),
-                    burst_budget.clone(),
-                    overload_budget.clone(),
-                )
+                (burst_budget.clone(), overload_budget.clone())
             };
             let boundary = trace.requests[PHASE_REQUESTS].arrival_micros;
             let tuning = |interval: u64, horizon: ReplayHorizon| OnlineTuning {
@@ -200,13 +234,17 @@ fn main() {
                 horizon,
                 ..OnlineTuning::default()
             };
-            let adaptive = |adaptation: AdaptationCost, interval: u64, horizon: ReplayHorizon| {
+            let adaptive = |adaptation: AdaptationCost,
+                            interval: u64,
+                            horizon: ReplayHorizon,
+                            trigger: Option<RegimeTrigger>| {
                 charged_adaptive_policy(
                     cost,
                     max_active,
                     tuning(interval, horizon),
                     adaptation,
                     SwitchingCost::default(),
+                    trigger,
                 )
                 .expect("adaptive policy")
             };
@@ -228,31 +266,20 @@ fn main() {
                 ),
             ];
             let (past, state) = (ReplayHorizon::Past, ReplayHorizon::FromState);
-            for (label, adaptation, interval, horizon) in [
-                ("adaptive-free", AdaptationCost::default(), 40, past),
-                ("adaptive-charged", AdaptationCost::RTX_4090_E4, 40, past),
-                (
-                    "adaptive-charged-i10",
-                    AdaptationCost::RTX_4090_E4,
-                    10,
-                    past,
-                ),
-                (
-                    "adaptive-charged-i160",
-                    AdaptationCost::RTX_4090_E4,
-                    160,
-                    past,
-                ),
-                ("state-free", AdaptationCost::default(), 40, state),
-                ("state-charged", AdaptationCost::RTX_4090_E4, 40, state),
-                (
-                    "state-charged-i160",
-                    AdaptationCost::RTX_4090_E4,
-                    160,
-                    state,
-                ),
+            let charged = AdaptationCost::RTX_4090_E4;
+            let hmm = Some(trigger.clone());
+            for (label, adaptation, interval, horizon, trigger) in [
+                ("adaptive-free", AdaptationCost::default(), 40, past, None),
+                ("adaptive-charged", charged, 40, past, None),
+                ("adaptive-charged-i10", charged, 10, past, None),
+                ("adaptive-charged-i160", charged, 160, past, None),
+                ("state-free", AdaptationCost::default(), 40, state, None),
+                ("state-charged", charged, 40, state, None),
+                ("state-charged-i160", charged, 160, state, None),
+                ("past-hmm-charged", charged, 1, past, hmm.clone()),
+                ("state-hmm-charged", charged, 1, state, hmm.clone()),
             ] {
-                let (policy, meter) = adaptive(adaptation, interval, horizon);
+                let (policy, meter) = adaptive(adaptation, interval, horizon, trigger);
                 controllers.push((label.into(), Box::new(policy), Some(meter)));
             }
             for (label, policy, meter) in controllers {

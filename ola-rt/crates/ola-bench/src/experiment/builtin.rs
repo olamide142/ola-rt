@@ -1046,6 +1046,7 @@ impl OnlineAdaptivePolicyStudy {
                 min_improvement_percent,
                 switching: ola_runtime::SwitchingCost::default(),
                 horizon: crate::ReplayHorizon::Past,
+                trigger: None,
             },
             AdaptivePolicyStudy::adaptive_policy,
         )

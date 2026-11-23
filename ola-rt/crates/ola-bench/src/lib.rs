@@ -6,6 +6,7 @@ mod experiment;
 mod online;
 mod plan_report;
 mod random;
+mod regime_filter;
 mod report;
 mod scheduling_summary;
 mod simulation;
@@ -56,8 +57,8 @@ pub use experiment::{
 };
 pub use online::{
     AdaptationCost, AdaptationMeter, LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord,
-    ReplayHorizon, ReplayOptimizer, ReplaySelection, ReplaySettings, TOKEN_BUDGET_DOMAINS,
-    charged_adaptive_policy, largest_token_budget, serving_adaptive_policy,
+    RegimeTrigger, ReplayHorizon, ReplayOptimizer, ReplaySelection, ReplaySettings,
+    TOKEN_BUDGET_DOMAINS, charged_adaptive_policy, largest_token_budget, serving_adaptive_policy,
     serving_adaptive_policy_logged, smallest_token_budget, token_budget, token_budget_policy,
 };
 pub use plan_report::{
@@ -69,6 +70,7 @@ pub use plan_report::{
     PlanReportRanking, PlanReportReleaseReason, PlanReportRow, PlanReportSelection,
     PlanReportSelectionStage,
 };
+pub use regime_filter::{ArrivalWindows, GaussianHmm, PageHinkley, RegimeFilter};
 pub use report::{
     PREFILL_REPORT_SCHEMA_VERSION, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
     PrefillReportError, PrefillReportProtocol, PrefillReportSample, PrefillReportStrategySummary,

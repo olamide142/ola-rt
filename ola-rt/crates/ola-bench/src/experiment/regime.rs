@@ -131,6 +131,7 @@ fn build(
                         min_improvement_percent: tuning.min_improvement_percent,
                         switching: SwitchingCost::uniform(&[HEADROOM.name], switching_cost),
                         horizon: crate::ReplayHorizon::Past,
+                        trigger: None,
                     },
                     factory,
                 )
