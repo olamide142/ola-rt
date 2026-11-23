@@ -46,9 +46,9 @@ pub struct AdaptiveClusterPolicy {
 impl AdaptiveClusterPolicy {
     /// Creates an adaptive policy with the default balanced objective.
     pub fn new(weights: ClusterWeights) -> Result<Self, ClusterPolicyError> {
-        if weights.load == 0 && weights.kv_headroom == 0 {
+        if weights.load == 0 && weights.kv_headroom == 0 && weights.network == 0 {
             return Err(ClusterPolicyError::InvalidSnapshot(
-                "adaptive cluster weights cannot both be zero".into(),
+                "adaptive cluster weights cannot all be zero".into(),
             ));
         }
         Ok(Self {
@@ -64,9 +64,9 @@ impl AdaptiveClusterPolicy {
 
     /// Installs a new objective atomically.
     pub fn set_weights(&mut self, weights: ClusterWeights) -> Result<(), ClusterPolicyError> {
-        if weights.load == 0 && weights.kv_headroom == 0 {
+        if weights.load == 0 && weights.kv_headroom == 0 && weights.network == 0 {
             return Err(ClusterPolicyError::InvalidSnapshot(
-                "adaptive cluster weights cannot both be zero".into(),
+                "adaptive cluster weights cannot all be zero".into(),
             ));
         }
         self.weights = weights;
@@ -107,17 +107,35 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
                 .push(request);
         }
         for (model, requests) in grouped {
-            let workers = snapshot
-                .eligible_workers(&model)
-                .map(|(worker, view)| RoutingWorker {
-                    worker: worker.clone(),
-                    capacity: view.summary.max_active_requests,
-                    current_load: view.load(),
-                    kv_headroom_tokens: view.kv_headroom_tokens(&model).unwrap_or(usize::MAX),
-                    load_cost: (view.load() as u64)
-                        .saturating_mul(self.weights.load.max(1))
-                        .saturating_add(view.network_cost_us.saturating_mul(self.weights.network)),
-                    network_cost_us: view.network_cost_us,
+            let eligible = snapshot.eligible_workers(&model).collect::<Vec<_>>();
+            let max_kv_headroom = eligible
+                .iter()
+                .filter_map(|(_, view)| view.kv_headroom_tokens(&model))
+                .max()
+                .unwrap_or(0);
+            let workers = eligible
+                .into_iter()
+                .map(|(worker, view)| {
+                    let kv_headroom = view.kv_headroom_tokens(&model);
+                    let kv_penalty =
+                        max_kv_headroom.saturating_sub(kv_headroom.unwrap_or(max_kv_headroom));
+                    RoutingWorker {
+                        worker: worker.clone(),
+                        capacity: view.summary.max_active_requests,
+                        current_load: view.load(),
+                        kv_headroom_tokens: kv_headroom.unwrap_or(usize::MAX),
+                        load_cost: (view.load() as u64)
+                            .saturating_mul(self.weights.load)
+                            .saturating_add(
+                                u64::try_from(kv_penalty)
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_mul(self.weights.kv_headroom),
+                            )
+                            .saturating_add(
+                                view.network_cost_us.saturating_mul(self.weights.network),
+                            ),
+                        network_cost_us: view.network_cost_us,
+                    }
                 })
                 .collect::<Vec<_>>();
             if workers.is_empty() {

@@ -35,9 +35,11 @@ Routing baselines are [`RoundRobinRouting`], [`LeastLoadedRouting`],
 [`AdaptiveClusterPolicy`] picks the least-loaded or KV-headroom baseline by
 its weights, then reassigns each model's batch with a MILP
 ([`optimize_batch_routing`]) under worker request and KV capacity. Its
-weights are fixed between [`AdaptiveClusterPolicy::set_weights`] calls; it
-does not learn online. Every policy only considers ready workers that host
-the request's model; ties break by worker ID.
+optimizer minimizes a weighted cost for current load, KV headroom pressure,
+and calibrated network cost. Its weights are fixed between
+[`AdaptiveClusterPolicy::set_weights`] calls; it does not learn online. Every
+policy only considers ready workers that host the request's model; ties break
+by worker ID.
 
 ## Distributed policy feedback
 
