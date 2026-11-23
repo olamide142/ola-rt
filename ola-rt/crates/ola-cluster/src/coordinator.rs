@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ClusterAction, ClusterDecision, ClusterDecisionRecord, ClusterPlan, ClusterPlanError,
     ClusterPolicy, ClusterPolicyError, ClusterSnapshot, DeferReason, PendingRequest, RejectReason,
-    RouteCandidate, RouteReason, WorkerHealth, WorkerRole, WorkerSummary, WorkerView,
+    RouteCandidate, RouteReason, RouteRecord, WorkerHealth, WorkerRole, WorkerSummary, WorkerView,
 };
+
+const REQUEST_OBSERVATION_WINDOW: usize = 256;
 
 /// An instruction from the coordinator to one worker.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -358,6 +360,14 @@ pub struct CoordinatorOutput {
     pub client: Vec<(ClusterRequestId, ClientEvent)>,
     /// Trace records, in order.
     pub trace: Vec<ClusterTraceRecord>,
+    /// Completed request measurements for downstream consumers.
+    pub observations: Vec<ClusterRequestObservation>,
+    /// Worker state snapshots received while producing this output.
+    pub worker_observations: Vec<ClusterWorkerObservation>,
+    /// Confirmed migration handoffs produced while handling this output.
+    pub migration_observations: Vec<ClusterMigrationObservation>,
+    /// Worker policy updates confirmed while handling this output.
+    pub policy_update_observations: Vec<ClusterPolicyUpdateObservation>,
 }
 
 impl CoordinatorOutput {
@@ -366,6 +376,12 @@ impl CoordinatorOutput {
         self.commands.extend(other.commands);
         self.client.extend(other.client);
         self.trace.extend(other.trace);
+        self.observations.extend(other.observations);
+        self.worker_observations.extend(other.worker_observations);
+        self.migration_observations
+            .extend(other.migration_observations);
+        self.policy_update_observations
+            .extend(other.policy_update_observations);
     }
 
     fn record(
@@ -395,6 +411,121 @@ pub struct ClusterIteration {
     pub plan: ClusterPlan,
     /// What the policy considered.
     pub decision: ClusterDecisionRecord,
+}
+
+/// Terminal outcome measured by the coordinator for one cluster request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterRequestOutcome {
+    /// The request produced its complete response.
+    Completed,
+    /// A worker refused admission or execution failed.
+    Failed,
+    /// The request was cancelled.
+    Cancelled,
+}
+
+/// Coordinator-time measurements emitted once when a request becomes terminal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterRequestObservation {
+    /// Cluster-wide request identity.
+    pub request: ClusterRequestId,
+    /// Worker that handled the final attempt, if any.
+    pub worker: Option<WorkerId>,
+    /// Routing decisions applied to this request, in order (including recovery reroutes).
+    pub routes: Vec<ClusterRouteObservation>,
+    /// Terminal result.
+    pub outcome: ClusterRequestOutcome,
+    /// Arrival to first worker acceptance, in microseconds.
+    pub queue_micros: Option<u64>,
+    /// Arrival to first generated token, in microseconds.
+    pub time_to_first_token_micros: Option<u64>,
+    /// Arrival to terminal outcome, in microseconds, including failures and cancellations.
+    pub elapsed_micros: u64,
+    /// Generated token count known at completion.
+    pub generated_tokens: usize,
+}
+
+/// One recorded assignment and the candidates considered by its policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterRouteObservation {
+    /// Worker selected by the plan.
+    pub selected_worker: WorkerId,
+    /// Candidate workers and the policy's stated reason.
+    pub decision: RouteRecord,
+}
+
+/// A worker summary as observed by the coordinator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterWorkerObservation {
+    /// Worker the summary describes.
+    pub worker: WorkerId,
+    /// Coordinator time at which the summary was received.
+    pub received_at: Timestamp,
+    /// Worker summary, including health, load, roles, models, and KV pools.
+    pub summary: WorkerSummary,
+}
+
+/// A successfully committed request handoff between workers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterMigrationObservation {
+    /// Request that moved.
+    pub request: ClusterRequestId,
+    /// Whether ownership moved or the handoff returned to its source.
+    pub outcome: ClusterMigrationOutcome,
+    /// Worker that exported the session.
+    pub from: WorkerId,
+    /// Worker that accepted the session.
+    pub to: WorkerId,
+    /// Whether the handoff transferred session state or recomputed it.
+    pub mode: String,
+    /// Session bytes sent, zero for recompute.
+    pub bytes: u64,
+    /// Coordinator time at commit.
+    pub at: Option<Timestamp>,
+}
+
+/// Result of a staged migration attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterMigrationOutcome {
+    /// Target accepted the session and ownership moved.
+    Committed,
+    /// Target refused or was lost, so the source resumed ownership.
+    RolledBack,
+}
+
+/// A worker acknowledgement of a routing policy update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterPolicyUpdateObservation {
+    /// Worker that accepted the update.
+    pub worker: WorkerId,
+    /// Coordinator time at acknowledgement.
+    pub at: Timestamp,
+    /// Accepted load pressure weight.
+    pub load_weight: u64,
+    /// Accepted KV headroom weight.
+    pub kv_headroom_weight: u64,
+    /// Accepted network cost weight.
+    pub network_weight: u64,
+}
+
+/// Bounded distributed feedback available to a cluster adaptation controller.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterFeedbackSnapshot {
+    /// Recent terminal request outcomes, oldest first.
+    pub requests: Vec<ClusterRequestObservation>,
+    /// Recent worker-state snapshots and coordinator state changes.
+    pub workers: Vec<ClusterWorkerObservation>,
+    /// Recent committed or rolled-back migration attempts.
+    pub migrations: Vec<ClusterMigrationObservation>,
+    /// Recent worker policy-update acknowledgements.
+    pub policy_updates: Vec<ClusterPolicyUpdateObservation>,
+}
+
+impl ClusterRequestObservation {
+    const fn with_generated_tokens(mut self, generated_tokens: usize) -> Self {
+        self.generated_tokens = generated_tokens;
+        self
+    }
 }
 
 /// A coordinator call that could not be applied; nothing changed.
@@ -495,6 +626,9 @@ struct RequestEntry {
     /// Workers that owned the request before recovery moved it. Their late
     /// reports are stale rather than protocol errors.
     former_owners: Vec<WorkerId>,
+    accepted_at: Option<Timestamp>,
+    first_token_at: Option<Timestamp>,
+    routes: Vec<ClusterRouteObservation>,
 }
 
 /// Owns cluster-level request state and routes work to workers.
@@ -514,6 +648,11 @@ pub struct Coordinator {
     iterations: u64,
     migrations: BTreeMap<ClusterRequestId, StagedMigration>,
     network_costs_us: BTreeMap<WorkerId, u64>,
+    /// Bounded coordinator history for recent adaptive observations.
+    request_observations: VecDeque<ClusterRequestObservation>,
+    worker_observations: VecDeque<ClusterWorkerObservation>,
+    migration_observations: VecDeque<ClusterMigrationObservation>,
+    policy_update_observations: VecDeque<ClusterPolicyUpdateObservation>,
     /// Commands produced outside a call that returns output, such as
     /// migration aborts during recovery; see [`Coordinator::take_commands`].
     outbox: Vec<(WorkerId, WorkerCommand)>,
@@ -543,6 +682,10 @@ impl Coordinator {
             iterations: 0,
             migrations: BTreeMap::new(),
             network_costs_us: BTreeMap::new(),
+            request_observations: VecDeque::new(),
+            worker_observations: VecDeque::new(),
+            migration_observations: VecDeque::new(),
+            policy_update_observations: VecDeque::new(),
             outbox: Vec::new(),
         }
     }
@@ -550,6 +693,114 @@ impl Coordinator {
     /// The cluster policy's descriptor.
     pub fn policy_descriptor(&self) -> PolicyDescriptor {
         self.policy.descriptor()
+    }
+
+    /// Validates and installs adaptive routing weights atomically.
+    ///
+    /// The coordinator generation advances only after the policy accepts the
+    /// proposal, so future snapshots reflect the new policy version.
+    pub fn update_policy_weights(
+        &mut self,
+        weights: crate::ClusterWeights,
+    ) -> Result<(), ClusterPolicyError> {
+        self.policy.update_weights(weights)?;
+        self.generation = self.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Recent terminal request observations, oldest first, capped at 256.
+    pub fn recent_request_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterRequestObservation> {
+        self.request_observations.iter()
+    }
+
+    /// Recent worker summaries received by the coordinator, oldest first.
+    pub fn recent_worker_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterWorkerObservation> {
+        self.worker_observations.iter()
+    }
+
+    /// Recent committed migrations, oldest first.
+    pub fn recent_migration_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterMigrationObservation> {
+        self.migration_observations.iter()
+    }
+
+    /// Recent acknowledged worker policy updates, oldest first.
+    pub fn recent_policy_update_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterPolicyUpdateObservation> {
+        self.policy_update_observations.iter()
+    }
+
+    /// Clones all bounded observation histories into one controller input.
+    pub fn feedback_snapshot(&self) -> ClusterFeedbackSnapshot {
+        ClusterFeedbackSnapshot {
+            requests: self.request_observations.iter().cloned().collect(),
+            workers: self.worker_observations.iter().cloned().collect(),
+            migrations: self.migration_observations.iter().cloned().collect(),
+            policy_updates: self.policy_update_observations.iter().cloned().collect(),
+        }
+    }
+
+    fn record_request_observation(
+        &mut self,
+        output: &mut CoordinatorOutput,
+        observation: ClusterRequestObservation,
+    ) {
+        self.policy.observe_request(&observation);
+        self.request_observations.push_back(observation.clone());
+        if self.request_observations.len() > REQUEST_OBSERVATION_WINDOW {
+            self.request_observations.pop_front();
+        }
+        output.observations.push(observation);
+    }
+
+    fn record_worker_observation(
+        &mut self,
+        output: &mut CoordinatorOutput,
+        observation: ClusterWorkerObservation,
+    ) {
+        self.retain_worker_observation(observation.clone());
+        output.worker_observations.push(observation);
+    }
+
+    fn retain_worker_observation(&mut self, observation: ClusterWorkerObservation) {
+        self.policy.observe_worker(&observation);
+        self.worker_observations.push_back(observation);
+        if self.worker_observations.len() > REQUEST_OBSERVATION_WINDOW {
+            self.worker_observations.pop_front();
+        }
+    }
+
+    fn record_migration_observation(
+        &mut self,
+        output: &mut CoordinatorOutput,
+        observation: ClusterMigrationObservation,
+    ) {
+        self.policy.observe_migration(&observation);
+        self.migration_observations.push_back(observation.clone());
+        if self.migration_observations.len() > REQUEST_OBSERVATION_WINDOW {
+            self.migration_observations.pop_front();
+        }
+        output.migration_observations.push(observation);
+    }
+
+    fn record_policy_update_observation(
+        &mut self,
+        output: &mut CoordinatorOutput,
+        observation: ClusterPolicyUpdateObservation,
+    ) {
+        self.policy.observe_policy_update(&observation);
+        self.policy_update_observations
+            .push_back(observation.clone());
+        if self.policy_update_observations.len() > REQUEST_OBSERVATION_WINDOW {
+            self.policy_update_observations.pop_front();
+        }
+        output.policy_update_observations.push(observation);
     }
 
     /// Adds a worker, described by its first summary.
@@ -564,16 +815,24 @@ impl Coordinator {
         if self.workers.contains_key(&summary.worker) {
             return Err(CoordinatorError::DuplicateWorker(summary.worker));
         }
+        let worker = summary.worker.clone();
+        let received_at = summary.reported_at;
         self.workers.insert(
-            summary.worker.clone(),
+            worker.clone(),
             WorkerEntry {
                 last_heartbeat: summary.reported_at,
-                summary,
+                summary: summary.clone(),
                 epoch: 0,
                 assigned: 0,
                 in_flight_tokens: VecDeque::new(),
             },
         );
+        let observation = ClusterWorkerObservation {
+            worker,
+            received_at,
+            summary: summary.clone(),
+        };
+        self.retain_worker_observation(observation);
         self.generation += 1;
         Ok(())
     }
@@ -593,6 +852,7 @@ impl Coordinator {
             .workers
             .get_mut(worker)
             .ok_or_else(|| CoordinatorError::UnknownWorker(worker.clone()))?;
+        let was_lost = entry.summary.health == WorkerHealth::Lost;
         if epoch < entry.epoch {
             return Err(CoordinatorError::StaleWorkerEpoch {
                 worker: worker.clone(),
@@ -605,6 +865,14 @@ impl Coordinator {
             entry.summary.health = WorkerHealth::Ready;
         }
         self.generation += 1;
+        if was_lost {
+            let summary = self.workers[worker].summary.clone();
+            self.retain_worker_observation(ClusterWorkerObservation {
+                worker: worker.clone(),
+                received_at: at,
+                summary,
+            });
+        }
         Ok(())
     }
 
@@ -622,10 +890,19 @@ impl Coordinator {
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        let mut observations = Vec::new();
         for worker in &expired {
             if let Some(entry) = self.workers.get_mut(worker) {
                 entry.summary.health = WorkerHealth::Lost;
+                observations.push(ClusterWorkerObservation {
+                    worker: worker.clone(),
+                    received_at: now,
+                    summary: entry.summary.clone(),
+                });
             }
+        }
+        for observation in observations {
+            self.retain_worker_observation(observation);
         }
         if !expired.is_empty() {
             self.generation += 1;
@@ -671,6 +948,12 @@ impl Coordinator {
             .get_mut(worker)
             .ok_or_else(|| CoordinatorError::UnknownWorker(worker.clone()))?;
         entry.summary.health = WorkerHealth::Lost;
+        let observation = ClusterWorkerObservation {
+            worker: worker.clone(),
+            received_at: now,
+            summary: entry.summary.clone(),
+        };
+        self.retain_worker_observation(observation);
         self.generation = self.generation.saturating_add(1);
         Ok(self.requeue_owned_by(&BTreeSet::from([worker.clone()]), now))
     }
@@ -689,7 +972,10 @@ impl Coordinator {
             .map(|(request, staged)| (*request, staged.source.clone()))
             .collect::<Vec<_>>();
         for (request, source) in rolled_back {
-            if self.rollback_migration(request, &source).is_ok() {
+            if self
+                .rollback_migration_at(request, &source, Some(now))
+                .is_ok()
+            {
                 self.outbox
                     .push((source, WorkerCommand::AbortMigration { request }));
             }
@@ -751,6 +1037,9 @@ impl Coordinator {
                 status: ClusterRequestStatus::Pending,
                 delivered_tokens: 0,
                 former_owners: Vec::new(),
+                accepted_at: None,
+                first_token_at: None,
+                routes: Vec::new(),
             },
         );
         self.pending.push(id);
@@ -784,6 +1073,9 @@ impl Coordinator {
                 self.generation += 1;
                 output.client.push((id, ClientEvent::Cancelled));
                 output.record(id, None, at, ClusterTraceEvent::Cancelled { worker: None });
+                let observation =
+                    self.request_observation(id, None, ClusterRequestOutcome::Cancelled, at);
+                self.record_request_observation(&mut output, observation);
             }
             ClusterRequestStatus::Assigned { worker }
             | ClusterRequestStatus::Running { worker, .. } => {
@@ -799,6 +1091,34 @@ impl Coordinator {
     /// Where a request is.
     pub fn status(&self, id: ClusterRequestId) -> Option<&ClusterRequestStatus> {
         self.requests.get(&id).map(|entry| &entry.status)
+    }
+
+    fn request_observation(
+        &self,
+        request: ClusterRequestId,
+        worker: Option<WorkerId>,
+        outcome: ClusterRequestOutcome,
+        at: Timestamp,
+    ) -> ClusterRequestObservation {
+        let entry = &self.requests[&request];
+        ClusterRequestObservation {
+            request,
+            worker,
+            routes: entry.routes.clone(),
+            outcome,
+            queue_micros: entry.accepted_at.map(|accepted| {
+                accepted
+                    .saturating_duration_since(entry.arrival_at)
+                    .as_micros() as u64
+            }),
+            time_to_first_token_micros: entry.first_token_at.map(|first| {
+                first
+                    .saturating_duration_since(entry.arrival_at)
+                    .as_micros() as u64
+            }),
+            elapsed_micros: at.saturating_duration_since(entry.arrival_at).as_micros() as u64,
+            generated_tokens: entry.delivered_tokens,
+        }
     }
 
     /// Supplies a calibrated network cost for a worker to the next plan.
@@ -893,6 +1213,16 @@ impl Coordinator {
         request: ClusterRequestId,
         source: &WorkerId,
     ) -> Result<(), CoordinatorError> {
+        self.rollback_migration_at(request, source, None)
+    }
+
+    /// Rolls back a staged migration and records the time when known.
+    pub fn rollback_migration_at(
+        &mut self,
+        request: ClusterRequestId,
+        source: &WorkerId,
+        at: Option<Timestamp>,
+    ) -> Result<(), CoordinatorError> {
         let Some(staged) = self.migrations.get(&request).cloned() else {
             return Err(CoordinatorError::UnknownRequest(request));
         };
@@ -912,9 +1242,22 @@ impl Coordinator {
             .get_mut(&request)
             .ok_or(CoordinatorError::UnknownRequest(request))?;
         entry.status = ClusterRequestStatus::Running {
-            worker: staged.source,
+            worker: staged.source.clone(),
             local: staged.source_local,
         };
+        let mut output = CoordinatorOutput::default();
+        self.record_migration_observation(
+            &mut output,
+            ClusterMigrationObservation {
+                request,
+                outcome: ClusterMigrationOutcome::RolledBack,
+                from: staged.source,
+                to: staged.target,
+                mode: staged.mode,
+                bytes: staged.bytes,
+                at,
+            },
+        );
         self.generation = self.generation.saturating_add(1);
         Ok(())
     }
@@ -931,6 +1274,18 @@ impl Coordinator {
     ) -> CoordinatorOutput {
         let mut output = CoordinatorOutput::default();
         if let Some(staged) = self.migrations.remove(&request) {
+            self.record_migration_observation(
+                &mut output,
+                ClusterMigrationObservation {
+                    request,
+                    outcome: ClusterMigrationOutcome::Committed,
+                    from: staged.source.clone(),
+                    to: staged.target.clone(),
+                    mode: staged.mode.clone(),
+                    bytes: staged.bytes,
+                    at: Some(at),
+                },
+            );
             output.record(
                 request,
                 None,
@@ -1025,6 +1380,12 @@ impl Coordinator {
                         .workers
                         .get_mut(worker)
                         .expect("validated plans assign only to joined workers");
+                    if let Some(route) = record.route(request) {
+                        entry.routes.push(ClusterRouteObservation {
+                            selected_worker: worker.clone(),
+                            decision: route.clone(),
+                        });
+                    }
                     target.assigned += 1;
                     target
                         .in_flight_tokens
@@ -1152,15 +1513,25 @@ impl Coordinator {
                 }
                 let entry = self.workers.get_mut(from).expect("checked above");
                 entry.summary = summary;
+                let summary = entry.summary.clone();
                 let in_flight = entry.in_flight();
                 while entry.in_flight_tokens.len() > in_flight {
                     entry.in_flight_tokens.pop_front();
                 }
                 self.generation += 1;
+                self.record_worker_observation(
+                    &mut output,
+                    ClusterWorkerObservation {
+                        worker: from.clone(),
+                        received_at: at,
+                        summary,
+                    },
+                );
                 return Ok(output);
             }
             WorkerMessage::Accepted { request, local } => {
                 let entry = self.owned(from, request, false)?;
+                entry.accepted_at.get_or_insert(at);
                 entry.status = ClusterRequestStatus::Running {
                     worker: from.clone(),
                     local,
@@ -1194,6 +1565,13 @@ impl Coordinator {
                         message,
                     },
                 );
+                let observation = self.request_observation(
+                    request,
+                    Some(from.clone()),
+                    ClusterRequestOutcome::Failed,
+                    at,
+                );
+                self.record_request_observation(&mut output, observation);
                 request
             }
             WorkerMessage::Token {
@@ -1210,6 +1588,10 @@ impl Coordinator {
                     return Ok(output);
                 }
                 entry.delivered_tokens = generated_tokens;
+                // `token_at` is worker-stamped for the client stream. The
+                // coordinator's `at` is the common clock domain for policy
+                // measurements across workers.
+                entry.first_token_at.get_or_insert(at);
                 output.client.push((
                     request,
                     ClientEvent::Token {
@@ -1239,6 +1621,15 @@ impl Coordinator {
                         tokens: token_ids.len(),
                     },
                 );
+                let observation = self
+                    .request_observation(
+                        request,
+                        Some(from.clone()),
+                        ClusterRequestOutcome::Completed,
+                        at,
+                    )
+                    .with_generated_tokens(token_ids.len());
+                self.record_request_observation(&mut output, observation);
                 output.client.push((
                     request,
                     ClientEvent::Finished {
@@ -1267,6 +1658,13 @@ impl Coordinator {
                         message,
                     },
                 );
+                let observation = self.request_observation(
+                    request,
+                    Some(from.clone()),
+                    ClusterRequestOutcome::Failed,
+                    at,
+                );
+                self.record_request_observation(&mut output, observation);
                 request
             }
             WorkerMessage::Cancelled { request } => {
@@ -1281,6 +1679,13 @@ impl Coordinator {
                         worker: Some(from.clone()),
                     },
                 );
+                let observation = self.request_observation(
+                    request,
+                    Some(from.clone()),
+                    ClusterRequestOutcome::Cancelled,
+                    at,
+                );
+                self.record_request_observation(&mut output, observation);
                 request
             }
             WorkerMessage::Migrated { .. } => {
@@ -1288,7 +1693,21 @@ impl Coordinator {
                 // the normal client stream has no terminal event yet.
                 return Ok(output);
             }
-            WorkerMessage::PolicyUpdated { .. } => {
+            WorkerMessage::PolicyUpdated {
+                load_weight,
+                kv_headroom_weight,
+                network_weight,
+            } => {
+                self.record_policy_update_observation(
+                    &mut output,
+                    ClusterPolicyUpdateObservation {
+                        worker: from.clone(),
+                        at,
+                        load_weight,
+                        kv_headroom_weight,
+                        network_weight,
+                    },
+                );
                 return Ok(output);
             }
             WorkerMessage::RoleUpdated { role } => {
@@ -1297,7 +1716,16 @@ impl Coordinator {
                     .get_mut(from)
                     .ok_or_else(|| CoordinatorError::UnknownWorker(from.clone()))?;
                 entry.summary.role = role;
+                let summary = entry.summary.clone();
                 self.generation = self.generation.saturating_add(1);
+                self.record_worker_observation(
+                    &mut output,
+                    ClusterWorkerObservation {
+                        worker: from.clone(),
+                        received_at: at,
+                        summary,
+                    },
+                );
                 return Ok(output);
             }
         };

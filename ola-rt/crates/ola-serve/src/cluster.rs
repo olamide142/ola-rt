@@ -22,9 +22,9 @@ use axum::{
 };
 use futures_util::stream;
 use ola_cluster::{
-    AdaptiveClusterPolicy, ClientEvent, ClusterPolicy, CoordinatorError, CoordinatorOutput,
-    TcpCoordinator, TcpCoordinatorError, WorkerHealth, WorkerHost, WorkerSession,
-    WorkerSessionError,
+    AdaptiveClusterPolicy, ClientEvent, ClusterFeedbackSnapshot, ClusterPolicy, ClusterWeights,
+    CoordinatorError, CoordinatorOutput, TcpCoordinator, TcpCoordinatorError, WorkerHealth,
+    WorkerHost, WorkerSession, WorkerSessionError,
 };
 use ola_core::{
     Clock, ClusterRequestId, GenerationConfig, Input, MonotonicClock, Priority, RequestSpec,
@@ -193,6 +193,29 @@ impl ClusterGateway {
             .await
     }
 
+    /// Installs adaptive routing weights on the live gateway coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver has stopped or the active policy rejects
+    /// the weights.
+    pub async fn update_routing_weights(
+        &self,
+        weights: ClusterWeights,
+    ) -> Result<(), ClusterGatewayError> {
+        self.ask(|reply| Command::UpdateRoutingWeights { weights, reply })
+            .await
+            .ok_or_else(|| ClusterGatewayError::Request("gateway driver stopped".into()))?
+            .map_err(ClusterGatewayError::Request)
+    }
+
+    /// Reads the coordinator's bounded recent feedback for an external policy controller.
+    pub async fn feedback_snapshot(&self) -> Result<ClusterFeedbackSnapshot, ClusterGatewayError> {
+        self.ask(|reply| Command::FeedbackSnapshot { reply })
+            .await
+            .ok_or_else(|| ClusterGatewayError::Request("gateway driver stopped".into()))
+    }
+
     async fn ask<T>(&self, command: impl FnOnce(oneshot::Sender<T>) -> Command) -> Option<T> {
         let (reply, response) = oneshot::channel();
         self.commands.send(command(reply)).ok()?;
@@ -218,6 +241,13 @@ enum Command {
     },
     Health {
         reply: oneshot::Sender<GatewayHealth>,
+    },
+    UpdateRoutingWeights {
+        weights: ClusterWeights,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    FeedbackSnapshot {
+        reply: oneshot::Sender<ClusterFeedbackSnapshot>,
     },
 }
 
@@ -305,6 +335,17 @@ async fn drive(
                                 .filter(|summary| summary.health == WorkerHealth::Ready)
                                 .count(),
                         });
+                        Ok(CoordinatorOutput::default())
+                    }
+                    Command::UpdateRoutingWeights { weights, reply } => {
+                        let result = coordinator
+                            .update_policy_weights(weights)
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                        Ok(CoordinatorOutput::default())
+                    }
+                    Command::FeedbackSnapshot { reply } => {
+                        let _ = reply.send(coordinator.feedback_snapshot());
                         Ok(CoordinatorOutput::default())
                     }
                 }

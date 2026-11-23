@@ -18,7 +18,9 @@ use ola_core::{ClusterRequestId, RequestSpec, Timestamp, WorkerId};
 use tokio::sync::mpsc;
 
 use crate::{
-    ClusterPolicy, ClusterRequestStatus, Coordinator, CoordinatorError, CoordinatorLinkError,
+    ClusterFeedbackSnapshot, ClusterMigrationObservation, ClusterPolicy,
+    ClusterPolicyUpdateObservation, ClusterRequestObservation, ClusterRequestStatus,
+    ClusterWorkerObservation, Coordinator, CoordinatorError, CoordinatorLinkError,
     CoordinatorLinkEvent, CoordinatorOutput, CoordinatorWorkerLink, LinkFrame, WorkerCommand,
     WorkerMessage,
 };
@@ -130,6 +132,39 @@ impl TcpCoordinator {
         &self.coordinator
     }
 
+    /// Recent terminal request outcomes, oldest first.
+    pub fn recent_request_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterRequestObservation> {
+        self.coordinator.recent_request_observations()
+    }
+
+    /// Recent worker-state observations, oldest first.
+    pub fn recent_worker_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterWorkerObservation> {
+        self.coordinator.recent_worker_observations()
+    }
+
+    /// Recent committed migrations, oldest first.
+    pub fn recent_migration_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterMigrationObservation> {
+        self.coordinator.recent_migration_observations()
+    }
+
+    /// Recent acknowledged worker policy updates, oldest first.
+    pub fn recent_policy_update_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterPolicyUpdateObservation> {
+        self.coordinator.recent_policy_update_observations()
+    }
+
+    /// Returns a bounded snapshot of distributed adaptation feedback.
+    pub fn feedback_snapshot(&self) -> ClusterFeedbackSnapshot {
+        self.coordinator.feedback_snapshot()
+    }
+
     /// Workers with an open link, in ID order.
     pub fn connected(&self) -> impl ExactSizeIterator<Item = &WorkerId> {
         self.links.keys()
@@ -143,6 +178,22 @@ impl TcpCoordinator {
     /// Returns the latest heartbeat-derived timing estimate for a worker.
     pub fn link_calibration(&self, worker: &WorkerId) -> Option<LinkCalibration> {
         self.calibration.get(worker).copied()
+    }
+
+    /// Installs new adaptive routing weights on the coordinator policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the active policy does not support weight
+    /// updates or rejects the proposal.
+    pub fn update_policy_weights(
+        &mut self,
+        weights: crate::ClusterWeights,
+    ) -> Result<(), TcpCoordinatorError> {
+        self.coordinator
+            .update_policy_weights(weights)
+            .map_err(CoordinatorError::Policy)?;
+        Ok(())
     }
 
     /// Expires silent worker leases without performing network I/O.
@@ -379,7 +430,8 @@ impl TcpCoordinator {
                     request: refused,
                     message,
                 })) if from == target && refused == request => {
-                    self.coordinator.rollback_migration(request, source)?;
+                    self.coordinator
+                        .rollback_migration_at(request, source, Some(at))?;
                     self.link(source)?
                         .send_command(&WorkerCommand::AbortMigration { request })
                         .await?;

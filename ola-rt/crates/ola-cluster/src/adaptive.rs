@@ -152,6 +152,10 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
     fn observe(&mut self, _iteration: &ClusterIteration) {
         self.observations = self.observations.saturating_add(1);
     }
+
+    fn update_weights(&mut self, weights: ClusterWeights) -> Result<(), ClusterPolicyError> {
+        self.set_weights(weights)
+    }
 }
 
 #[cfg(test)]
