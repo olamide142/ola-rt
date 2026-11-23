@@ -1773,3 +1773,42 @@ impl Coordinator {
         if owns { Ok(entry) } else { Err(unexpected()) }
     }
 }
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+    use crate::{AdaptiveClusterPolicy, ClusterWeights};
+
+    #[test]
+    fn feedback_snapshot_contains_active_policy_and_recent_requests() {
+        let mut coordinator = Coordinator::new(AdaptiveClusterPolicy::default());
+        let observation = ClusterRequestObservation {
+            request: ClusterRequestId::new(7),
+            worker: None,
+            routes: Vec::new(),
+            outcome: ClusterRequestOutcome::Cancelled,
+            queue_micros: None,
+            time_to_first_token_micros: None,
+            elapsed_micros: 12,
+            generated_tokens: 0,
+        };
+        let mut output = CoordinatorOutput::default();
+        coordinator.record_request_observation(&mut output, observation.clone());
+
+        let initial = coordinator.feedback_snapshot();
+        assert_eq!(initial.policy.name, "adaptive-cluster-routing");
+        assert_eq!(initial.requests, vec![observation]);
+        assert!(initial.workers.is_empty());
+        assert!(initial.migrations.is_empty());
+        assert!(initial.policy_updates.is_empty());
+
+        let installed = coordinator
+            .update_policy_weights(ClusterWeights {
+                load: 0,
+                kv_headroom: 0,
+                network: 3,
+            })
+            .unwrap();
+        assert_eq!(coordinator.feedback_snapshot().policy, installed);
+    }
+}

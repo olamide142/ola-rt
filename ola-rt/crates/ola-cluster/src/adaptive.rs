@@ -180,7 +180,7 @@ impl ClusterPolicy for AdaptiveClusterPolicy {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use ola_core::{ModelId, Priority, Timestamp, WorkerId};
+    use ola_core::{ClusterRequestId, ModelId, Priority, Timestamp, WorkerId};
 
     use super::*;
     use crate::{PendingRequest, WorkerHealth, WorkerRole, WorkerSummary, WorkerView};
@@ -209,6 +209,27 @@ mod tests {
                 network_cost_us: 0,
             },
         )
+    }
+
+    fn one_request_snapshot(
+        workers: impl IntoIterator<Item = (WorkerId, WorkerView)>,
+    ) -> ClusterSnapshot {
+        let model = ModelId::from("tiny");
+        ClusterSnapshot {
+            at: Timestamp::ZERO,
+            generation: 0,
+            workers: workers.into_iter().collect(),
+            pending: vec![PendingRequest {
+                id: ClusterRequestId::new(1),
+                model,
+                priority: Priority::NORMAL,
+                arrival_at: Timestamp::ZERO,
+                prompt_tokens: Some(1),
+                prompt: vec![1],
+                max_new_tokens: 1,
+            }],
+            routed_requests: 0,
+        }
     }
 
     #[test]
@@ -274,8 +295,8 @@ mod tests {
             routed_requests: 0,
         };
         let policy = AdaptiveClusterPolicy::new(ClusterWeights {
-            load: 1,
-            kv_headroom: 1,
+            load: 0,
+            kv_headroom: 0,
             network: 1,
         })
         .unwrap();
@@ -284,5 +305,78 @@ mod tests {
             decision.plan.actions.as_slice(),
             [crate::ClusterAction::Assign { worker, .. }] if worker == &WorkerId::new("near")
         ));
+    }
+
+    #[test]
+    fn adaptive_policy_can_route_on_load_alone() {
+        let snapshot = one_request_snapshot([worker("busy", 1), worker("idle", 0)]);
+        let policy = AdaptiveClusterPolicy::new(ClusterWeights {
+            load: 1,
+            kv_headroom: 0,
+            network: 0,
+        })
+        .unwrap();
+
+        let decision = policy.plan(&snapshot).unwrap();
+        assert!(matches!(
+            decision.plan.actions.as_slice(),
+            [crate::ClusterAction::Assign { worker, .. }] if worker == &WorkerId::new("idle")
+        ));
+    }
+
+    #[test]
+    fn adaptive_policy_can_route_on_kv_headroom_alone() {
+        let model = ModelId::from("tiny");
+        let mut more_headroom = worker("more", 0).1;
+        more_headroom.summary.kv.insert(
+            model.clone(),
+            ola_model::KvPoolStatus {
+                free_blocks: 10,
+                tokens_per_block: 1,
+                ..Default::default()
+            },
+        );
+        let mut less_headroom = worker("less", 0).1;
+        less_headroom.summary.kv.insert(
+            model,
+            ola_model::KvPoolStatus {
+                free_blocks: 8,
+                tokens_per_block: 1,
+                ..Default::default()
+            },
+        );
+        let snapshot = one_request_snapshot([
+            (WorkerId::new("less"), less_headroom),
+            (WorkerId::new("more"), more_headroom),
+        ]);
+        let policy = AdaptiveClusterPolicy::new(ClusterWeights {
+            load: 0,
+            kv_headroom: 1,
+            network: 0,
+        })
+        .unwrap();
+
+        let decision = policy.plan(&snapshot).unwrap();
+        assert!(matches!(
+            decision.plan.actions.as_slice(),
+            [crate::ClusterAction::Assign { worker, .. }] if worker == &WorkerId::new("more")
+        ));
+    }
+
+    #[test]
+    fn all_zero_weight_update_is_rejected_without_changing_policy() {
+        let mut policy = AdaptiveClusterPolicy::default();
+        let original = policy.weights();
+
+        assert!(
+            policy
+                .set_weights(ClusterWeights {
+                    load: 0,
+                    kv_headroom: 0,
+                    network: 0,
+                })
+                .is_err()
+        );
+        assert_eq!(policy.weights(), original);
     }
 }
