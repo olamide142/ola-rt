@@ -334,8 +334,29 @@ Required safety boundary:
   using already-open worker links.
 - Give worker commands stable identities so a new leader can reconcile or
   safely retry commands whose acknowledgement was lost.
+- Keep migration payloads out of the Raft log. A staged migration may contain
+  a large KV/session snapshot; replicate only a stable transfer ID, request,
+  source, target, mode, and integrity/size metadata. Store or stream the
+  payload out-of-band, with retryable lookup by transfer ID.
 - Persist the Raft log, votes, committed index, and state-machine snapshots;
   an in-memory store is suitable only for protocol tests, not HA.
+
+Migration needs a target-staging handshake so an election cannot lose the only
+copy of an exported session. The source exports under a stable transfer ID;
+the target receives and stages the payload without serving the request, then
+acknowledges the transfer ID and digest. The coordinator commits the ownership
+change only after that acknowledgement. The committed record is sufficient for
+a new leader to tell the target to activate, while uncommitted staged payloads
+can be aborted or garbage-collected after reconciliation. The staging store
+must survive the coordinator failure being protected against (for example, a
+durable target-side staging area); an in-memory coordinator buffer is not
+enough. Recompute migrations can use the same protocol with a small descriptor
+and no KV snapshot.
+
+Do not put `MigratedRequest` or `SessionState` directly in a consensus entry.
+The current TCP migration path carries that payload through the coordinator,
+so it must be refactored to the transfer-ID protocol before migration itself
+can be driven safely by replicated inputs.
 
 Implementation sequence:
 
