@@ -112,7 +112,10 @@ state → θ table applied on the posterior (`servegen_adaptive`'s
 baseline (FIFO, best by hourly score), and with tables learned on that
 score, the gain is small: 0.4% per hour for the size table and 0.6% for a
 plain clock-driven table. A sweep of ServeGen workloads found at most 6%
-hindsight headroom, which no held-out controller captured. See
+hindsight headroom, which no held-out controller captured. Screening KV
+admission headroom and the token budget the same way found at most 2.2%
+and 0.1%: under KV pressure one fixed watermark beats the worst case by
+3–30% in almost every hour, which is a static setting, not a regime. See
 `SWITCHING_STUDY.md`.
 
 ## Order of work
@@ -142,10 +145,11 @@ next one starts.
 
 ## Open questions
 
-- Which knob is worth adapting? The token budget has regimes only near 16
-  slots, on one trace family. Slots, prefill chunk size and KV headroom with
-  expensive recompute are the candidates; run `budget_regimes`-style sweeps
-  on them before building anything for them.
+- Which knob is worth adapting? On ServeGen, the scheduler, KV admission
+  headroom and the token budget all lack switching headroom worth a
+  controller (`servegen_headroom` with `GRID`). Untested: the slot count,
+  which is fixed in the runtime today, and the prefill chunk size, which
+  costs 3–27% when small but is a constraint, not a tuned parameter.
 - How far ahead should the projected arrivals reach? Is the drain time of
   the current backlog a natural horizon?
 - Should the cluster-level adaptation in `ola-cluster/src/adaptive.rs` share

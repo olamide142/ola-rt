@@ -23,21 +23,35 @@
 //!   cargo run --release -p ola-bench --example servegen_headroom -- sg-*.jsonl
 //! ```
 //!
-//! `MAX_ACTIVE` (default 4) overrides the slot count; `HEADER=1` prints the
-//! table header first.
+//! `GRID` picks the policies compared:
+//!
+//! - `scheduler` (default): the eight named policies of `servegen_regimes`;
+//! - `budget`: FIFO under every mixed token budget of
+//!   `TOKEN_BUDGET_DOMAINS` (how much prompt work each iteration carries),
+//!   and without one;
+//! - `admission`: FIFO with newest-first preemption under every KV
+//!   reservation of the `regime-shift-study` grid (a watermark headroom of
+//!   16 to 256 tokens beyond the prompt, or the worst case).
+//!
+//! `MAX_ACTIVE` (default 4) overrides the slot count, `KV_TOKENS` (default
+//! 2^20, which never binds) the KV pool size, and `PREFILL_CHUNK` (default
+//! none) splits prompts into chunks of that many tokens. Without chunking a
+//! prompt larger than a token budget waits until nothing else runs, so the
+//! `budget` grid is only meaningful with it. `HEADER=1` prints the table
+//! header first.
 
 use std::collections::BTreeSet;
 
 use ola_bench::{
     CostModel, DecodeCost, KvGeometry, SchedulingRun, SchedulingTrace, SimulationConfig,
-    run_scheduling_trial,
+    TOKEN_BUDGET_DOMAINS, run_scheduling_trial, token_budget_policy,
 };
 use ola_runtime::{
     ComposedPolicy, ExecutionPolicy, HeadOfLine, JobCost, MemoryAwareAdmission,
-    MixedTokenBudgetPolicy, PolicyError, ShortestJobFirst,
+    MixedTokenBudgetPolicy, NewestFirst, PolicyError, ShortestJobFirst, WatermarkAdmission,
 };
 
-const POLICIES: [&str; 8] = [
+const SCHEDULERS: [&str; 8] = [
     "fifo",
     "sjf-prompt",
     "sjf-total",
@@ -120,6 +134,88 @@ fn theta(name: &str) -> Vec<(&'static str, String)> {
     vec![("policy", name.to_owned())]
 }
 
+/// FIFO with newest-first preemption, reserving `log2_headroom` (a power of
+/// two of tokens beyond the prompt, 9 meaning the worst case).
+fn admission_policy(
+    theta: &[(&'static str, String)],
+) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
+    let log2 = theta
+        .iter()
+        .find(|(key, _)| *key == "log2_headroom")
+        .and_then(|(_, value)| value.parse::<u32>().ok())
+        .ok_or_else(|| PolicyError::InvalidCandidate("missing log2_headroom".into()))?;
+    let policy = ComposedPolicy::default().with_preemption(NewestFirst);
+    Ok(Box::new(if log2 >= 9 {
+        policy.with_admission(MemoryAwareAdmission)
+    } else {
+        policy.with_admission(WatermarkAdmission {
+            headroom_tokens: 1 << log2,
+        })
+    }))
+}
+
+/// FIFO under the token budget `theta` names, or without one when it names
+/// none.
+fn budget_policy(
+    theta: &[(&'static str, String)],
+) -> Result<Box<dyn ExecutionPolicy>, PolicyError> {
+    if theta.is_empty() {
+        return Ok(Box::new(
+            ComposedPolicy::default().with_admission(MemoryAwareAdmission),
+        ));
+    }
+    token_budget_policy(theta)
+}
+
+type Factory = fn(&[(&'static str, String)]) -> Result<Box<dyn ExecutionPolicy>, PolicyError>;
+
+/// A labelled parameter vector per policy.
+type Grid = Vec<(String, Vec<(&'static str, String)>)>;
+
+/// The grid `GRID` names: a label and a parameter vector per policy, and
+/// the factory that builds them.
+fn grid(name: &str) -> (Grid, Factory) {
+    match name {
+        "scheduler" => (
+            SCHEDULERS
+                .iter()
+                .map(|name| ((*name).to_owned(), theta(name)))
+                .collect(),
+            named_policy,
+        ),
+        "budget" => {
+            let [tokens, share] = TOKEN_BUDGET_DOMAINS;
+            let mut points = vec![("unbudgeted".to_owned(), Vec::new())];
+            for log2 in (tokens.min..=tokens.max).step_by(tokens.step as usize) {
+                for percent in (share.min..=share.max).step_by(share.step as usize) {
+                    points.push((
+                        format!("b{}/{percent}", 1 << log2),
+                        vec![
+                            (tokens.name, log2.to_string()),
+                            (share.name, percent.to_string()),
+                        ],
+                    ));
+                }
+            }
+            (points, budget_policy)
+        }
+        "admission" => (
+            (4..=9)
+                .map(|log2| {
+                    let label = if log2 == 9 {
+                        "worst-case".to_owned()
+                    } else {
+                        format!("h{}", 1 << log2)
+                    };
+                    (label, vec![("log2_headroom", log2.to_string())])
+                })
+                .collect(),
+            admission_policy,
+        ),
+        other => panic!("GRID must be scheduler, budget or admission, not {other}"),
+    }
+}
+
 fn p95(mut values: Vec<u64>) -> u64 {
     if values.is_empty() {
         return 0;
@@ -179,12 +275,18 @@ fn main() {
     assert!(!paths.is_empty(), "usage: servegen_headroom TRACE.jsonl...");
     let label = std::env::var("LABEL").unwrap_or_else(|_| "servegen".into());
     let slots = std::env::var("MAX_ACTIVE").map_or(4, |v| v.parse().expect("MAX_ACTIVE"));
+    let kv_tokens: u64 =
+        std::env::var("KV_TOKENS").map_or(1 << 20, |v| v.parse().expect("KV_TOKENS"));
+    let chunk = std::env::var("PREFILL_CHUNK")
+        .ok()
+        .map(|v| v.parse::<usize>().expect("PREFILL_CHUNK"));
+    let (policies, factory) = grid(&std::env::var("GRID").unwrap_or_else(|_| "scheduler".into()));
     let geometry = KvGeometry::default();
     let config = SimulationConfig {
         max_active_requests: slots,
-        prefill_chunk_size: None,
+        prefill_chunk_size: chunk,
         kv: KvGeometry {
-            capacity_bytes: geometry.bytes_per_token.saturating_mul(1 << 20),
+            capacity_bytes: geometry.bytes_per_token.saturating_mul(kv_tokens),
             ..geometry
         },
         cost: cost_model(),
@@ -216,12 +318,12 @@ fn main() {
         let handles = traces
             .iter()
             .map(|(trace, hour_of)| {
-                let config = &config;
+                let (config, policies) = (&config, &policies);
                 scope.spawn(move || {
-                    POLICIES
+                    policies
                         .iter()
-                        .map(|name| {
-                            let policy = named_policy(&theta(name)).expect("policy");
+                        .map(|(name, theta)| {
+                            let policy = factory(theta).expect("policy");
                             let run = run_scheduling_trial(trace, policy, config).expect("trial");
                             assert!(
                                 run.requests.iter().all(|r| r.completed_micros.is_some()),
@@ -240,20 +342,28 @@ fn main() {
     });
 
     let hourly_mean = |seed: usize, policy: usize| mean(&scores[seed][policy]);
-    let best = (0..POLICIES.len())
+    let best = (0..policies.len())
         .min_by(|&a, &b| {
             let total = |p| (0..scores.len()).map(|s| hourly_mean(s, p)).sum::<f64>();
             total(a).total_cmp(&total(b))
         })
         .expect("policies");
-    let mut wins = vec![0_usize; POLICIES.len()];
+    // Every policy's hourly mean, so the spread between fixed choices is
+    // visible next to the bound.
+    for (index, (name, _)) in policies.iter().enumerate() {
+        let means = (0..scores.len())
+            .map(|seed| hourly_mean(seed, index))
+            .collect::<Vec<_>>();
+        eprintln!("{label}: {name} {:.2}", mean(&means));
+    }
+    let mut wins = vec![0_usize; policies.len()];
     let bound = (0..scores.len())
         .map(|seed| {
             let hours = scores[seed][best].len();
             mean(
                 &(0..hours)
                     .map(|hour| {
-                        let (winner, value) = (0..POLICIES.len())
+                        let (winner, value) = (0..policies.len())
                             .map(|p| (p, scores[seed][p][hour]))
                             .min_by(|a, b| a.1.total_cmp(&b.1))
                             .expect("policies");
@@ -277,23 +387,23 @@ fn main() {
         .map(|(s, b)| s - b)
         .collect::<Vec<_>>();
     let (lo, hi) = bootstrap(&gains);
-    let won = POLICIES
+    let won = policies
         .iter()
         .zip(&wins)
         .filter(|(_, n)| **n > 0)
-        .map(|(name, n)| format!("{name} {n}"))
+        .map(|((name, _), n)| format!("{name} {n}"))
         .collect::<Vec<_>>()
         .join(", ");
     if std::env::var("HEADER").is_ok() {
         println!(
-            "| workload | slots | requests | best single | hourly mean (s) | hindsight bound (s) | \
+            "| workload | slots | KV tokens | requests | best single | hourly mean (s) | hindsight bound (s) | \
              headroom (s) [95% CI] | headroom % | hours won by others (>1%) |"
         );
-        println!("|---|---:|---:|---|---:|---:|---|---:|---|");
+        println!("|---|---:|---:|---:|---|---:|---:|---|---:|---|");
     }
     println!(
-        "| {label} | {slots} | {requests:.0} | {} | {:.1} | {:.1} | {:.2} [{lo:.2}, {hi:.2}] | {:.1} | {} |",
-        POLICIES[best],
+        "| {label} | {slots} | {kv_tokens} | {requests:.0} | {} | {:.1} | {:.1} | {:.2} [{lo:.2}, {hi:.2}] | {:.1} | {} |",
+        policies[best].0,
         mean(&single),
         mean(&bound),
         mean(&gains),

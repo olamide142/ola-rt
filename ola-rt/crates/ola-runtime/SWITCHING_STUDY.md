@@ -559,6 +559,81 @@ OLA_COST=10745,30227,482,97,13047,24568 ADAPTIVE=none \
   m-mid-{1..10}.jsonl --fit m-mid-{11..20}.jsonl
 ```
 
+## Other knobs: KV admission and the token budget (2026-11-25)
+
+The adaptive machinery tunes any integer grid, not only the scheduler.
+`servegen_headroom` now takes `GRID`:
+- `admission`: FIFO with newest-first preemption, reserving a watermark of
+  16 to 256 tokens beyond the prompt, or the worst case. This is the grid
+  of `regime-shift-study`.
+- `budget`: FIFO under every point of `TOKEN_BUDGET_DOMAINS` (the grid
+  `ola serve --adaptive` tunes), plus no budget.
+
+It also takes `KV_TOKENS` (pool size) and `PREFILL_CHUNK`. Workloads are m-mid
+and m-small with 16 clients at peak 30, which are the scheduler sweep's
+largest bounds, with 10 seeds.
+
+**Admission** runs on traces whose output limit is a fixed 1,024
+(`--limit fixed:1024`), so a worst-case reservation overstates what most
+requests need. With exact limits the worst case is exact and there is
+nothing to tune.
+
+| workload | slots | KV tokens | worst case | best watermark | best single | headroom |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| m-mid | 16 | 8,192 | 139.6 | 107.4 | h64 | 1.48 [1.07, 1.98] (1.4%) |
+| m-mid | 16 | 16,384 | 101.0 | 96.1 | h128 | 0.49 [0.38, 0.62] (0.5%) |
+| m-mid | 4 | 8,192 | 146.4 | 134.3 | h16 | 0.17 [0.09, 0.25] (0.1%) |
+| m-small | 16 | 8,192 | 55.7 | 48.8 | h64 | 1.06 [0.89, 1.23] (2.2%) |
+| m-small | 16 | 16,384 | 47.6 | 46.5 | h64 | 0.52 [0.40, 0.64] (1.1%) |
+| m-small | 4 | 8,192 | 59.4 | 57.8 | h32 | 0.17 [0.10, 0.26] (0.3%) |
+
+Hourly means are in seconds. With a pool that never binds, every action
+scores the same (m-mid at 16 slots: 95.95 s).
+
+Under KV pressure, the choice of action matters a lot: the worst case is
+3–30% worse than a watermark. But all the watermarks from 16 to 128 tokens
+score within 1% of each other, so one fixed watermark wins nearly every
+hour. Switching headroom is at most 2.2%, and that is a hindsight bound
+over noisy hourly picks. This is a static tuning result: replacing the
+worst case with any modest watermark (plus preemption) recovers almost
+all of it. It does not call for adaptation.
+
+**Token budget.** Without prefill chunking every budget is far worse than
+no budget. On m-mid, the scheduler grid's `fifo-1024/25` scores 418 s and
+`fifo-128/100` scores 2,054 s, against 133 s for FIFO. A prompt larger
+than the budget waits until nothing else runs. So the budget points in
+the scheduler sweep were never real contenders. With `PREFILL_CHUNK=256`:
+
+| workload | chunk | unbudgeted | best budget | headroom |
+| --- | ---: | ---: | --- | ---: |
+| m-mid | 256 | 139.8 | b1024/100 (139.75) | 0.03 [0.02, 0.03] (0.0%) |
+| m-mid | 64 | 168.5 | b1024/100 (168.5) | 0.04 [0.02, 0.07] (0.0%) |
+| m-small | 256 | 59.4 | b1024/100 (59.4) | 0.04 [0.03, 0.05] (0.1%) |
+| m-small | 64 | 68.3 | b256/100 (68.3) | 0.07 [0.05, 0.09] (0.1%) |
+
+Chunking itself costs on these traces: m-mid scores 133.0 s unchunked,
+139.8 s at a 256-token chunk and 168.5 s at 64; m-small scores 57.5, 59.4
+and 68.3 s. Once prompts are chunked, the budget hardly matters. No point
+in the grid moves the hourly mean by more than 0.1%, and at most 12
+hours in 240 are won by more than 1%.
+
+**Conclusion.** None of the three knobs (scheduler, KV admission, token
+budget) has switching headroom on ServeGen worth a controller. The
+largest bounds are 6.3% for the scheduler and 2.2% for admission, and no
+held-out controller captures them. Two static changes do pay:
+- a watermark instead of worst-case reservation under KV pressure (3–30%);
+- leaving the token budget off (or above the largest prompt) when prompts
+  are long.
+
+```sh
+lab/replay/servegen.py --model m-mid --clients 16 --peak-output-rate 30 \
+    --time-scale 6 --limit fixed:1024 --seeds $(seq -s, 1 10) --out 'm-mid-cap-{seed}.jsonl'
+OLA_COST=10745,30227,482,97,13047,24568 GRID=admission MAX_ACTIVE=16 KV_TOKENS=8192 \
+  cargo run --release -p ola-bench --example servegen_headroom -- m-mid-cap-{1..10}.jsonl
+OLA_COST=10745,30227,482,97,13047,24568 GRID=budget PREFILL_CHUNK=256 \
+  cargo run --release -p ola-bench --example servegen_headroom -- m-mid-{1..10}.jsonl
+```
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit
