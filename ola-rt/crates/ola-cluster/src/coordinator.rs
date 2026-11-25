@@ -555,6 +555,13 @@ pub enum CoordinatorError {
     },
     /// The call named a request the coordinator does not know.
     UnknownRequest(ClusterRequestId),
+    /// A committed submission did not use the next cluster request ID.
+    UnexpectedRequestId {
+        /// ID required by the coordinator's current sequence.
+        expected: ClusterRequestId,
+        /// ID supplied by the caller.
+        received: ClusterRequestId,
+    },
     /// A submitted request failed validation.
     InvalidRequest(RequestError),
     /// A worker reported on a request it does not own, or out of order.
@@ -584,6 +591,10 @@ impl fmt::Display for CoordinatorError {
                 "worker `{from}` sent a summary for worker `{summary}`"
             ),
             Self::UnknownRequest(request) => write!(formatter, "unknown request `{request}`"),
+            Self::UnexpectedRequestId { expected, received } => write!(
+                formatter,
+                "submission ID `{received}` is out of order; expected `{expected}`"
+            ),
             Self::InvalidRequest(error) => write!(formatter, "invalid request: {error:?}"),
             Self::UnexpectedMessage { from, request } => write!(
                 formatter,
@@ -1011,18 +1022,37 @@ impl Coordinator {
         self.workers.values().map(|entry| &entry.summary)
     }
 
-    /// Validates and queues a request for routing.
+    /// Validates a request and returns the next coordinator request ID without
+    /// changing state. A replicated leader can commit `(id, spec, at)` before
+    /// calling [`commit_submit`](Self::commit_submit).
     ///
     /// # Errors
     ///
-    /// Fails if the request is invalid; nothing is queued.
-    pub fn submit(
+    /// Fails if the request is invalid; coordinator state is unchanged.
+    pub fn prepare_submit(&self, spec: &RequestSpec) -> Result<ClusterRequestId, CoordinatorError> {
+        spec.validate().map_err(CoordinatorError::InvalidRequest)?;
+        Ok(ClusterRequestId::new(self.next_request))
+    }
+
+    /// Applies a previously agreed submission in request-ID order.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the request is invalid or its ID is not the next ID; nothing
+    /// is queued in either case.
+    pub fn commit_submit(
         &mut self,
+        id: ClusterRequestId,
         spec: RequestSpec,
         at: Timestamp,
-    ) -> Result<(ClusterRequestId, CoordinatorOutput), CoordinatorError> {
+    ) -> Result<CoordinatorOutput, CoordinatorError> {
         spec.validate().map_err(CoordinatorError::InvalidRequest)?;
-        let id = ClusterRequestId::new(self.next_request);
+        if id != ClusterRequestId::new(self.next_request) {
+            return Err(CoordinatorError::UnexpectedRequestId {
+                expected: ClusterRequestId::new(self.next_request),
+                received: id,
+            });
+        }
         self.next_request += 1;
         let mut output = CoordinatorOutput::default();
         output.record(
@@ -1048,6 +1078,21 @@ impl Coordinator {
         );
         self.pending.push(id);
         self.generation += 1;
+        Ok(output)
+    }
+
+    /// Validates and queues a request for routing.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the request is invalid; nothing is queued.
+    pub fn submit(
+        &mut self,
+        spec: RequestSpec,
+        at: Timestamp,
+    ) -> Result<(ClusterRequestId, CoordinatorOutput), CoordinatorError> {
+        let id = self.prepare_submit(&spec)?;
+        let output = self.commit_submit(id, spec, at)?;
         Ok((id, output))
     }
 

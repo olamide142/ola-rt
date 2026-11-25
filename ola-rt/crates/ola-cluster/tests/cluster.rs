@@ -474,6 +474,27 @@ fn stale_proposed_plan_is_rejected_without_mutating_requests() {
 }
 
 #[test]
+fn submission_can_be_validated_before_its_committed_application() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    let request_spec = spec(2, 2, None);
+    let request = coordinator.prepare_submit(&request_spec).unwrap();
+
+    assert_eq!(coordinator.pending_len(), 0);
+    assert_eq!(coordinator.status(request), None);
+    coordinator
+        .commit_submit(request, request_spec.clone(), at(1))
+        .unwrap();
+    assert_eq!(coordinator.pending_len(), 1);
+    assert_eq!(
+        coordinator.commit_submit(request, request_spec, at(2)),
+        Err(CoordinatorError::UnexpectedRequestId {
+            expected: ClusterRequestId::new(2),
+            received: request,
+        })
+    );
+}
+
+#[test]
 fn worker_leases_expire_and_new_epochs_revive_them() {
     let mut coordinator = Coordinator::new(RoundRobinRouting);
     coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();

@@ -289,9 +289,39 @@ impl TcpCoordinator {
         spec: RequestSpec,
         at: Timestamp,
     ) -> Result<(ClusterRequestId, CoordinatorOutput), TcpCoordinatorError> {
-        let (request, mut output) = self.coordinator.submit(spec, at)?;
+        let request = self.prepare_submit(&spec)?;
+        let mut output = self.commit_submit(request, spec, at)?;
         output.extend(self.plan_pending(at).await?);
         Ok((request, output))
+    }
+
+    /// Validates a request and reserves its next ID without changing state.
+    ///
+    /// A replicated gateway can commit the returned ID and request payload
+    /// before applying them with [`commit_submit`](Self::commit_submit).
+    pub fn prepare_submit(
+        &self,
+        spec: &RequestSpec,
+    ) -> Result<ClusterRequestId, TcpCoordinatorError> {
+        self.coordinator
+            .prepare_submit(spec)
+            .map_err(TcpCoordinatorError::Coordinator)
+    }
+
+    /// Applies an agreed request submission without dispatching worker work.
+    ///
+    /// # Errors
+    ///
+    /// Fails if validation fails or the request ID is out of sequence.
+    pub fn commit_submit(
+        &mut self,
+        request: ClusterRequestId,
+        spec: RequestSpec,
+        at: Timestamp,
+    ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
+        self.coordinator
+            .commit_submit(request, spec, at)
+            .map_err(TcpCoordinatorError::Coordinator)
     }
 
     /// Cancels a request and dispatches the resulting worker command.
