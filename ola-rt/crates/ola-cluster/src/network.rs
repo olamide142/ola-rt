@@ -191,10 +191,14 @@ impl TcpCoordinator {
         &mut self,
         weights: crate::ClusterWeights,
     ) -> Result<ola_runtime::PolicyDescriptor, TcpCoordinatorError> {
-        Ok(self
-            .coordinator
-            .update_policy_weights(weights)
-            .map_err(CoordinatorError::Policy)?)
+        self.coordinator
+            .apply_committed_input(crate::CoordinatorInput::UpdatePolicyWeights {
+                load: weights.load,
+                kv_headroom: weights.kv_headroom,
+                network: weights.network,
+            })
+            .map_err(TcpCoordinatorError::Coordinator)?;
+        Ok(self.coordinator.feedback_snapshot().policy)
     }
 
     /// Expires silent worker leases without performing network I/O.
@@ -672,7 +676,12 @@ impl TcpCoordinator {
 
     /// Supplies a calibrated network cost for a worker to routing policy.
     pub fn set_worker_network_cost(&mut self, worker: WorkerId, cost_us: u64) {
-        self.coordinator.set_network_cost(worker, cost_us);
+        let _ =
+            self.coordinator
+                .apply_committed_input(crate::CoordinatorInput::SetWorkerNetworkCost {
+                    worker,
+                    cost_us,
+                });
     }
 
     /// Closes one worker connection gracefully.

@@ -194,6 +194,22 @@ pub enum CoordinatorInput {
         /// Coordinator-clock time of cancellation.
         at: Timestamp,
     },
+    /// Install validated adaptive routing weights.
+    UpdatePolicyWeights {
+        /// Queue/load pressure weight.
+        load: u64,
+        /// KV headroom weight.
+        kv_headroom: u64,
+        /// Network cost weight.
+        network: u64,
+    },
+    /// Update one worker's calibrated network cost used by routing.
+    SetWorkerNetworkCost {
+        /// Worker whose link cost is updated.
+        worker: WorkerId,
+        /// Cost in microseconds.
+        cost_us: u64,
+    },
     /// Apply a report received from a worker.
     WorkerMessage {
         /// Reporting worker.
@@ -946,6 +962,21 @@ impl Coordinator {
             }
             CoordinatorInput::Cancel { request, at } => {
                 result.output = self.cancel(request, at)?;
+            }
+            CoordinatorInput::UpdatePolicyWeights {
+                load,
+                kv_headroom,
+                network,
+            } => {
+                self.update_policy_weights(crate::ClusterWeights {
+                    load,
+                    kv_headroom,
+                    network,
+                })
+                .map_err(CoordinatorError::Policy)?;
+            }
+            CoordinatorInput::SetWorkerNetworkCost { worker, cost_us } => {
+                self.set_network_cost(worker, cost_us);
             }
             CoordinatorInput::WorkerMessage {
                 worker,
@@ -2084,6 +2115,15 @@ mod feedback_tests {
                 request: ClusterRequestId::new(1),
                 at: Timestamp::from_micros(20),
             },
+            CoordinatorInput::UpdatePolicyWeights {
+                load: 2,
+                kv_headroom: 3,
+                network: 4,
+            },
+            CoordinatorInput::SetWorkerNetworkCost {
+                worker: worker.clone(),
+                cost_us: 15,
+            },
         ];
         let mut first = Coordinator::new(AdaptiveClusterPolicy::default());
         let mut second = Coordinator::new(AdaptiveClusterPolicy::default());
@@ -2096,6 +2136,11 @@ mod feedback_tests {
         }
 
         assert_eq!(first.generation, second.generation);
+        assert_eq!(
+            first.feedback_snapshot().policy,
+            second.feedback_snapshot().policy
+        );
+        assert_eq!(first.network_costs_us, second.network_costs_us);
         assert_eq!(
             first.status(ClusterRequestId::new(1)),
             second.status(ClusterRequestId::new(1))
