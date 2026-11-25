@@ -6,6 +6,7 @@ mod experiment;
 mod online;
 mod plan_report;
 mod random;
+mod regime_filter;
 mod report;
 mod scheduling_summary;
 mod simulation;
@@ -55,9 +56,11 @@ pub use experiment::{
     compare_reports, content_digest, nsight_metrics,
 };
 pub use online::{
-    LATENCY_OBJECTIVE, OnlineTuning, ProposalRecord, ReplayOptimizer, ReplaySelection,
-    ReplaySettings, TOKEN_BUDGET_DOMAINS, largest_token_budget, serving_adaptive_policy,
-    serving_adaptive_policy_logged, smallest_token_budget, token_budget, token_budget_policy,
+    AdaptationCost, AdaptationMeter, LATENCY_OBJECTIVE, OnlineTuning, PolicyFactory,
+    ProposalRecord, RegimeFeatures, RegimeTrigger, ReplayHorizon, ReplayOptimizer, ReplaySelection,
+    ReplaySettings, TOKEN_BUDGET_DOMAINS, charged_adaptive_policy, charged_adaptive_policy_over,
+    largest_token_budget, serving_adaptive_policy, serving_adaptive_policy_logged,
+    smallest_token_budget, token_budget, token_budget_policy,
 };
 pub use plan_report::{
     PLAN_REPORT_SCHEMA_VERSION, PlanReport, PlanReportAdmission, PlanReportBatch,
@@ -68,6 +71,7 @@ pub use plan_report::{
     PlanReportRanking, PlanReportReleaseReason, PlanReportRow, PlanReportSelection,
     PlanReportSelectionStage,
 };
+pub use regime_filter::{ArrivalWindows, GaussianHmm, PageHinkley, RegimeFilter, SizeWindows};
 pub use report::{
     PREFILL_REPORT_SCHEMA_VERSION, PrefillBenchmarkMetadata, PrefillBenchmarkReport,
     PrefillReportError, PrefillReportProtocol, PrefillReportSample, PrefillReportStrategySummary,
@@ -82,8 +86,8 @@ pub use scheduling_summary::{
 };
 pub use simulation::{
     CostModel, DecodeCost, Perturbation, SchedulingRun, SimulationConfig, SimulationError,
-    TrialIteration, TrialOutcome, TrialRequest, run_observed_trial, run_perturbed_trial,
-    run_scheduling_trial, trace_request_spec,
+    TrialIteration, TrialOutcome, TrialRequest, run_charged_trial, run_observed_trial,
+    run_perturbed_trial, run_scheduling_trial, trace_request_spec,
 };
 pub use synthetic::{
     KvGeometry, synthetic_artifact, synthetic_artifact_with_prefix_cache, synthetic_group_prompt,

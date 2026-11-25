@@ -399,6 +399,38 @@ pub fn run_observed_trial<P>(
 where
     P: ExecutionPolicy + 'static,
 {
+    run_charged_trial(
+        trace,
+        policy,
+        config,
+        perturbations,
+        &mut |iteration, state| {
+            observe(iteration, state);
+            0
+        },
+    )
+}
+
+/// Like [`run_observed_trial`], where `charge` also returns host time, in
+/// virtual microseconds, that the executor spent after the iteration and
+/// before the next one could start: work a live executor does on its own
+/// thread between iterations, such as an adaptive policy's optimizer call
+/// in `observe` or reconfiguring after a switch. The clock advances by it,
+/// so arrivals during it queue and every request in flight waits.
+///
+/// # Errors
+///
+/// Returns [`SimulationError`] as [`run_perturbed_trial`] does.
+pub fn run_charged_trial<P>(
+    trace: &SchedulingTrace,
+    policy: P,
+    config: &SimulationConfig,
+    perturbations: &[Perturbation],
+    charge: &mut dyn FnMut(&ExecutorIteration, &RuntimeState) -> u64,
+) -> Result<SchedulingRun, SimulationError>
+where
+    P: ExecutionPolicy + 'static,
+{
     let mut pending = perturbations.to_vec();
     pending.sort_by_key(|perturbation| perturbation.at_micros());
     let mut pending = pending.into_iter().peekable();
@@ -463,7 +495,7 @@ where
         }
 
         let iteration = executor.step_iteration(Timestamp::from_micros(clock))?;
-        observe(&iteration, executor.state());
+        let stall = charge(&iteration, executor.state());
         let finishes = config
             .cost
             .batch_finish_offsets(&iteration.execution_batches);
@@ -507,11 +539,11 @@ where
             // Nothing could run (for example, every queued request is
             // deferred). Only a new arrival can change that.
             match next_arrival {
-                Some(arrival) => clock = clock.max(arrival),
+                Some(arrival) => clock = clock.saturating_add(stall).max(arrival),
                 None => break,
             }
         } else {
-            clock = clock.saturating_add(duration.max(1));
+            clock = clock.saturating_add(duration.max(1)).saturating_add(stall);
         }
     }
 
@@ -807,6 +839,35 @@ mod tests {
                 .iter()
                 .any(|iteration| iteration.queued_requests > 0)
         );
+    }
+
+    #[test]
+    fn a_charged_stall_delays_everything_after_it_and_nothing_before() {
+        let mut trace = SchedulingTrace::mixed_short_long(PARAMETERS);
+        // Everything arrives at once, so a stall cannot change the schedule.
+        for request in &mut trace.requests {
+            request.arrival_micros = 0;
+        }
+        let config = SimulationConfig::default();
+        let free = run_scheduling_trial(&trace, fifo(), &config).unwrap();
+        let uncharged = run_charged_trial(&trace, fifo(), &config, &[], &mut |_, _| 0).unwrap();
+        assert_eq!(uncharged, free);
+
+        let mut first = true;
+        let charged = run_charged_trial(&trace, fifo(), &config, &[], &mut |_, _| {
+            if std::mem::take(&mut first) { 500 } else { 0 }
+        })
+        .unwrap();
+        let first_end = free.iterations[1].at_micros;
+        assert_eq!(charged.makespan_micros, free.makespan_micros + 500);
+        for (charged, free) in charged.requests.iter().zip(&free.requests) {
+            assert_eq!(charged.output_tokens, free.output_tokens);
+            let (done, was) = (
+                charged.completed_micros.unwrap(),
+                free.completed_micros.unwrap(),
+            );
+            assert_eq!(done, if was <= first_end { was } else { was + 500 });
+        }
     }
 
     #[test]

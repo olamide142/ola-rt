@@ -99,6 +99,73 @@ pub struct SchedulingTrace {
 }
 
 impl SchedulingTrace {
+    /// Reads a trace from JSON Lines in `replay_trace export`'s format, as
+    /// `lab/replay/servegen.py` writes it: one object per request with
+    /// `arrival_us`, `prompt_tokens` and `max_new_tokens`, and optionally
+    /// `priority`, `deadline_us` (relative to arrival), `eos_after` and
+    /// `window`. Lines without `arrival_us`, such as a provenance header,
+    /// are skipped. Requests are ordered by arrival; the second value holds
+    /// each request's `window` label in that order, for scoring by regime.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a line that is not JSON or a request missing a required
+    /// field.
+    pub fn from_json_lines(
+        name: &'static str,
+        text: &str,
+    ) -> Result<(Self, Vec<Option<u64>>), String> {
+        let mut rows = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(line)
+                .map_err(|error| format!("line {}: {error}", number + 1))?;
+            let Some(arrival_micros) = value.get("arrival_us").and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let number_field = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+            let required = |key: &str| {
+                number_field(key)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| format!("line {}: missing {key}", number + 1))
+            };
+            let request = TraceRequest {
+                arrival_micros,
+                prompt_tokens: required("prompt_tokens")?.max(1),
+                max_new_tokens: required("max_new_tokens")?.max(1),
+                priority: value
+                    .get("priority")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|p| i32::try_from(p).ok())
+                    .unwrap_or(0),
+                deadline_micros: number_field("deadline_us")
+                    .map(|relative| arrival_micros.saturating_add(relative)),
+                eos_after: number_field("eos_after").and_then(|n| usize::try_from(n).ok()),
+                shared_prefix: None,
+            };
+            rows.push((request, number_field("window")));
+        }
+        rows.sort_by_key(|(request, _)| request.arrival_micros);
+        let span = rows.last().map_or(0, |(request, _)| request.arrival_micros);
+        let count = rows.len();
+        let (requests, windows) = rows.into_iter().unzip();
+        Ok((
+            Self {
+                name,
+                parameters: TraceParameters {
+                    seed: 0,
+                    requests: count,
+                    mean_interarrival_micros: span / (count as u64).max(1),
+                },
+                requests,
+            },
+            windows,
+        ))
+    }
+
     /// 80% short requests and 20% long prompts, a quarter of which stop
     /// early. Exercises head-of-line blocking and size-aware scheduling.
     pub fn mixed_short_long(parameters: TraceParameters) -> Self {
@@ -347,6 +414,29 @@ mod tests {
             SchedulingTrace::overload(PARAMETERS),
             SchedulingTrace::impossible(PARAMETERS, 1_024),
         ]
+    }
+
+    #[test]
+    fn json_lines_traces_skip_headers_and_sort_by_arrival() {
+        let text = r#"{"servegen": {"seed": 1}}
+{"arrival_us": 500, "prompt_tokens": 30, "max_new_tokens": 4, "window": 600}
+{"arrival_us": 100, "prompt_tokens": 10, "max_new_tokens": 2, "priority": 5, "deadline_us": 50, "window": 0}
+"#;
+        let (trace, windows) = SchedulingTrace::from_json_lines("servegen", text).unwrap();
+        assert_eq!(windows, [Some(0), Some(600)]);
+        assert_eq!(trace.requests.len(), 2);
+        let first = &trace.requests[0];
+        assert_eq!(
+            (
+                first.arrival_micros,
+                first.prompt_tokens,
+                first.max_new_tokens,
+                first.priority
+            ),
+            (100, 10, 2, 5)
+        );
+        assert_eq!(first.deadline_micros, Some(150));
+        assert!(SchedulingTrace::from_json_lines("bad", "{\"arrival_us\": 1}").is_err());
     }
 
     #[test]
