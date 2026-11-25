@@ -2,6 +2,7 @@
 
 mod adaptive;
 mod client;
+mod consensus;
 mod coordinator;
 mod local;
 mod network;
@@ -18,6 +19,7 @@ mod worker;
 
 pub use adaptive::{AdaptiveClusterPolicy, ClusterWeights};
 pub use client::{CoordinatorLinkError, CoordinatorLinkEvent, CoordinatorWorkerLink, LinkFrame};
+pub use consensus::{CoordinatorRaft, CoordinatorRaftTypeConfig};
 pub use coordinator::{
     ClientEvent, ClusterFeedbackSnapshot, ClusterIteration, ClusterMigrationObservation,
     ClusterMigrationOutcome, ClusterPolicyUpdateObservation, ClusterRequestObservation,
