@@ -109,8 +109,11 @@ separated by an HMM over windows of admitted requests' sizes
 (`RegimeFeatures::Sizes`), which arrivals alone cannot do. A learned
 state → θ table applied on the posterior (`servegen_adaptive`'s
 `table-sizes`) matched the oracle with no replay. Against the right
-baseline (FIFO, best by hourly score) the gain is small: about 0.7% per
-hour, 6% in the evening. See `SWITCHING_STUDY.md`.
+baseline (FIFO, best by hourly score), and with tables learned on that
+score, the gain is small: 0.4% per hour for the size table and 0.6% for a
+plain clock-driven table. A sweep of ServeGen workloads found at most 6%
+hindsight headroom, which no held-out controller captured. See
+`SWITCHING_STUDY.md`.
 
 ## Order of work
 
