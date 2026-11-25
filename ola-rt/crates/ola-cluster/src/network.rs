@@ -22,7 +22,7 @@ use crate::{
     ClusterPolicy, ClusterPolicyUpdateObservation, ClusterRequestObservation, ClusterRequestStatus,
     ClusterWorkerObservation, Coordinator, CoordinatorError, CoordinatorLinkError,
     CoordinatorLinkEvent, CoordinatorOutput, CoordinatorWorkerLink, LinkFrame, WorkerCommand,
-    WorkerMessage,
+    WorkerMessage, WorkerSummary,
 };
 
 /// Errors raised while coordinating connected TCP workers.
@@ -34,6 +34,8 @@ pub enum TcpCoordinatorError {
     Link(CoordinatorLinkError),
     /// No connected link exists for a worker selected by the coordinator.
     MissingLink(WorkerId),
+    /// A worker already has an installed TCP link.
+    DuplicateLink(WorkerId),
     /// A worker the caller was waiting on disconnected. Its requests were
     /// recovered onto other workers.
     Disconnected(WorkerId),
@@ -62,6 +64,9 @@ impl fmt::Display for TcpCoordinatorError {
             Self::Coordinator(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),
             Self::MissingLink(worker) => write!(formatter, "no TCP link for worker `{worker}`"),
+            Self::DuplicateLink(worker) => {
+                write!(formatter, "worker `{worker}` already has a TCP link")
+            }
             Self::Disconnected(worker) => write!(formatter, "worker `{worker}` disconnected"),
             Self::MigrationRefused { worker, message } => {
                 write!(formatter, "worker `{worker}` refused migration: {message}")
@@ -116,16 +121,44 @@ impl TcpCoordinator {
         address: impl tokio::net::ToSocketAddrs,
         expected_worker: Option<WorkerId>,
     ) -> Result<WorkerId, TcpCoordinatorError> {
+        let (worker, summary) = self.connect_worker_link(address, expected_worker).await?;
+        if let Err(error) = self
+            .apply_committed_input(crate::CoordinatorInput::JoinWorker { summary })
+            .await
+        {
+            self.links.remove(&worker);
+            self.calibration.remove(&worker);
+            return Err(error);
+        }
+        Ok(worker)
+    }
+
+    /// Completes a worker handshake and installs only its transport link.
+    ///
+    /// The returned summary is not registered in scheduler state. A
+    /// consensus-backed caller should replicate `JoinWorker { summary }` and
+    /// apply it only after commit. The link is transport-local and can be
+    /// removed if the replicated join is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the handshake fails or a link already exists for that worker.
+    pub async fn connect_worker_link(
+        &mut self,
+        address: impl tokio::net::ToSocketAddrs,
+        expected_worker: Option<WorkerId>,
+    ) -> Result<(WorkerId, WorkerSummary), TcpCoordinatorError> {
         let (link, summary) =
             CoordinatorWorkerLink::connect(address, expected_worker, self.frames_tx.clone())
                 .await?;
         let worker = link.worker().clone();
-        self.apply_committed_input(crate::CoordinatorInput::JoinWorker { summary })
-            .await?;
+        if self.links.contains_key(&worker) {
+            return Err(TcpCoordinatorError::DuplicateLink(worker));
+        }
         self.calibration
             .insert(worker.clone(), LinkCalibration::default());
         self.links.insert(worker.clone(), link);
-        Ok(worker)
+        Ok((worker, summary))
     }
 
     /// The underlying sans-I/O coordinator.
