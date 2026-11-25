@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ola_bench::{KvGeometry, synthetic_artifact};
 use ola_cluster::{
-    ClusterRequestStatus, RoundRobinRouting, TcpCoordinator, WorkerHealth, WorkerHost,
-    WorkerSession,
+    ClusterRequestStatus, CoordinatorInput, RoundRobinRouting, TcpCoordinator, WorkerHealth,
+    WorkerHost, WorkerSession,
 };
 use ola_core::{Input, ModelDescriptor, RequestSpec, Timestamp, WorkerId};
 use ola_net::TcpPeer;
@@ -36,8 +36,13 @@ async fn worker_session_announces_summarizes_and_closes() {
     });
 
     let mut coordinator = TcpCoordinator::new(RoundRobinRouting);
-    let worker_id = coordinator
-        .connect_worker(address, Some(WorkerId::new("worker-a")))
+    let (worker_id, summary) = coordinator
+        .connect_worker_link(address, Some(WorkerId::new("worker-a")))
+        .await
+        .unwrap();
+    assert!(coordinator.coordinator().workers().next().is_none());
+    coordinator
+        .apply_committed_input(CoordinatorInput::JoinWorker { summary })
         .await
         .unwrap();
     let summary = coordinator.coordinator().workers().next().unwrap();

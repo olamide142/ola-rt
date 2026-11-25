@@ -18,9 +18,11 @@ use ola_core::{ClusterRequestId, RequestSpec, Timestamp, WorkerId};
 use tokio::sync::mpsc;
 
 use crate::{
-    ClusterPolicy, ClusterRequestStatus, Coordinator, CoordinatorError, CoordinatorLinkError,
+    ClusterDecision, ClusterFeedbackSnapshot, ClusterIteration, ClusterMigrationObservation,
+    ClusterPolicy, ClusterPolicyUpdateObservation, ClusterRequestObservation, ClusterRequestStatus,
+    ClusterWorkerObservation, Coordinator, CoordinatorError, CoordinatorLinkError,
     CoordinatorLinkEvent, CoordinatorOutput, CoordinatorWorkerLink, LinkFrame, WorkerCommand,
-    WorkerMessage,
+    WorkerMessage, WorkerSummary,
 };
 
 /// Errors raised while coordinating connected TCP workers.
@@ -32,6 +34,8 @@ pub enum TcpCoordinatorError {
     Link(CoordinatorLinkError),
     /// No connected link exists for a worker selected by the coordinator.
     MissingLink(WorkerId),
+    /// A worker already has an installed TCP link.
+    DuplicateLink(WorkerId),
     /// A worker the caller was waiting on disconnected. Its requests were
     /// recovered onto other workers.
     Disconnected(WorkerId),
@@ -60,6 +64,9 @@ impl fmt::Display for TcpCoordinatorError {
             Self::Coordinator(error) => error.fmt(formatter),
             Self::Link(error) => error.fmt(formatter),
             Self::MissingLink(worker) => write!(formatter, "no TCP link for worker `{worker}`"),
+            Self::DuplicateLink(worker) => {
+                write!(formatter, "worker `{worker}` already has a TCP link")
+            }
             Self::Disconnected(worker) => write!(formatter, "worker `{worker}` disconnected"),
             Self::MigrationRefused { worker, message } => {
                 write!(formatter, "worker `{worker}` refused migration: {message}")
@@ -114,20 +121,82 @@ impl TcpCoordinator {
         address: impl tokio::net::ToSocketAddrs,
         expected_worker: Option<WorkerId>,
     ) -> Result<WorkerId, TcpCoordinatorError> {
+        let (worker, summary) = self.connect_worker_link(address, expected_worker).await?;
+        if let Err(error) = self
+            .apply_committed_input(crate::CoordinatorInput::JoinWorker { summary })
+            .await
+        {
+            self.links.remove(&worker);
+            self.calibration.remove(&worker);
+            return Err(error);
+        }
+        Ok(worker)
+    }
+
+    /// Completes a worker handshake and installs only its transport link.
+    ///
+    /// The returned summary is not registered in scheduler state. A
+    /// consensus-backed caller should replicate `JoinWorker { summary }` and
+    /// apply it only after commit. The link is transport-local and can be
+    /// removed if the replicated join is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the handshake fails or a link already exists for that worker.
+    pub async fn connect_worker_link(
+        &mut self,
+        address: impl tokio::net::ToSocketAddrs,
+        expected_worker: Option<WorkerId>,
+    ) -> Result<(WorkerId, WorkerSummary), TcpCoordinatorError> {
         let (link, summary) =
             CoordinatorWorkerLink::connect(address, expected_worker, self.frames_tx.clone())
                 .await?;
         let worker = link.worker().clone();
-        self.coordinator.join(summary)?;
+        if self.links.contains_key(&worker) {
+            return Err(TcpCoordinatorError::DuplicateLink(worker));
+        }
         self.calibration
             .insert(worker.clone(), LinkCalibration::default());
         self.links.insert(worker.clone(), link);
-        Ok(worker)
+        Ok((worker, summary))
     }
 
     /// The underlying sans-I/O coordinator.
     pub const fn coordinator(&self) -> &Coordinator {
         &self.coordinator
+    }
+
+    /// Recent terminal request outcomes, oldest first.
+    pub fn recent_request_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterRequestObservation> {
+        self.coordinator.recent_request_observations()
+    }
+
+    /// Recent worker-state observations, oldest first.
+    pub fn recent_worker_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterWorkerObservation> {
+        self.coordinator.recent_worker_observations()
+    }
+
+    /// Recent committed migrations, oldest first.
+    pub fn recent_migration_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterMigrationObservation> {
+        self.coordinator.recent_migration_observations()
+    }
+
+    /// Recent acknowledged worker policy updates, oldest first.
+    pub fn recent_policy_update_observations(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ClusterPolicyUpdateObservation> {
+        self.coordinator.recent_policy_update_observations()
+    }
+
+    /// Returns a bounded snapshot of distributed adaptation feedback.
+    pub fn feedback_snapshot(&self) -> ClusterFeedbackSnapshot {
+        self.coordinator.feedback_snapshot()
     }
 
     /// Workers with an open link, in ID order.
@@ -145,9 +214,112 @@ impl TcpCoordinator {
         self.calibration.get(worker).copied()
     }
 
+    /// Installs new adaptive routing weights and returns the active descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the active policy does not support weight
+    /// updates or rejects the proposal.
+    pub fn update_policy_weights(
+        &mut self,
+        weights: crate::ClusterWeights,
+    ) -> Result<ola_runtime::PolicyDescriptor, TcpCoordinatorError> {
+        self.coordinator
+            .apply_committed_input(crate::CoordinatorInput::UpdatePolicyWeights {
+                load: weights.load,
+                kv_headroom: weights.kv_headroom,
+                network: weights.network,
+            })
+            .map_err(TcpCoordinatorError::Coordinator)?;
+        Ok(self.coordinator.feedback_snapshot().policy)
+    }
+
     /// Expires silent worker leases without performing network I/O.
     pub fn expire_workers(&mut self, now: Timestamp, timeout: Duration) -> Vec<WorkerId> {
         self.coordinator.expire_workers(now, timeout)
+    }
+
+    /// Applies a replicated state-machine input and dispatches its effects.
+    ///
+    /// A consensus adapter should invoke this only after the corresponding
+    /// [`CoordinatorInput`] has committed. Followers can instead apply the
+    /// input to their underlying [`Coordinator`] and discard its output; only
+    /// the leader should send worker commands or client events.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the state machine rejects the input or command dispatch fails.
+    pub async fn apply_committed_input(
+        &mut self,
+        input: crate::CoordinatorInput,
+    ) -> Result<crate::CoordinatorApplyResult, TcpCoordinatorError> {
+        let heartbeat = match &input {
+            crate::CoordinatorInput::Heartbeat {
+                worker,
+                at,
+                sent_at_us,
+                ..
+            } => Some((worker.clone(), *at, *sent_at_us)),
+            _ => None,
+        };
+        let result = self.coordinator.apply_committed_input(input)?;
+        if let Some((worker, at, sent_at_us)) = heartbeat {
+            self.record_calibration(&worker, at, sent_at_us);
+        }
+        self.dispatch(&result.output.commands).await?;
+        Ok(result)
+    }
+
+    /// Waits for and decodes the next worker event without applying it.
+    ///
+    /// The returned input can be proposed to a replicated log; apply it with
+    /// [`apply_committed_input`](Self::apply_committed_input) only after
+    /// commitment. Heartbeats are acknowledged at the transport layer before
+    /// they are returned. A disconnected link yields a `WorkerLost` input and
+    /// is removed locally, but scheduler state is left untouched.
+    ///
+    /// Frames already queued for a link that has since been removed are
+    /// discarded internally.
+    pub async fn next_coordinator_input(
+        &mut self,
+        at: Timestamp,
+    ) -> (WorkerId, crate::CoordinatorInput) {
+        loop {
+            let (worker, frame) = self.next_frame().await;
+            let Some(link) = self.links.get_mut(&worker) else {
+                continue;
+            };
+            match link.accept_frame(frame).await {
+                Ok(crate::CoordinatorLinkEvent::Message(message)) => {
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::WorkerMessage {
+                            worker,
+                            message,
+                            at,
+                        },
+                    );
+                }
+                Ok(crate::CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us }) => {
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::Heartbeat {
+                            worker,
+                            epoch,
+                            sent_at_us,
+                            at,
+                        },
+                    );
+                }
+                Err(_) => {
+                    self.links.remove(&worker);
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::WorkerLost { worker, at },
+                    );
+                }
+            }
+        }
     }
 
     /// Expires silent workers, requeues their requests, and dispatches a new
@@ -162,7 +334,12 @@ impl TcpCoordinator {
         now: Timestamp,
         timeout: Duration,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        self.coordinator.recover_lost_requests(now, timeout);
+        let timeout_micros = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
+        self.apply_committed_input(crate::CoordinatorInput::ExpireLeases {
+            now,
+            timeout_micros,
+        })
+        .await?;
         self.plan_pending(now).await
     }
 
@@ -176,15 +353,75 @@ impl TcpCoordinator {
         &mut self,
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        let mut output = CoordinatorOutput {
+        if let Some(decision) = self.plan_decision(at)? {
+            let (_, output) = self.commit_plan(decision, at).await?;
+            return Ok(output);
+        }
+        let output = CoordinatorOutput {
             commands: self.coordinator.take_commands(),
             ..CoordinatorOutput::default()
         };
-        if let Some((_, planned)) = self.coordinator.plan(at)? {
-            output.extend(planned);
-        }
         self.dispatch(&output.commands).await?;
         Ok(output)
+    }
+
+    /// Computes a routing decision without changing coordinator state.
+    ///
+    /// A replicated caller can append the returned decision to its consensus
+    /// log and apply it with [`commit_plan`](Self::commit_plan) after commit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the active policy cannot produce a valid decision.
+    pub fn plan_decision(
+        &self,
+        at: Timestamp,
+    ) -> Result<Option<ClusterDecision>, TcpCoordinatorError> {
+        self.coordinator
+            .plan_decision(at)
+            .map_err(TcpCoordinatorError::Coordinator)
+    }
+
+    /// Builds a serializable coordinator input for external consensus.
+    ///
+    /// Append the returned input to the replicated log, then apply it with
+    /// [`apply_committed_input`](Self::apply_committed_input) after commit.
+    /// The plan contains actions and route evidence; each replica supplies its
+    /// own descriptor for the replicated policy configuration.
+    pub fn plan_input(
+        &self,
+        at: Timestamp,
+    ) -> Result<Option<crate::CoordinatorInput>, TcpCoordinatorError> {
+        Ok(self
+            .plan_decision(at)?
+            .map(|decision| crate::CoordinatorInput::CommitPlan {
+                plan: decision.plan,
+                routes: decision.record.routes,
+                at,
+            }))
+    }
+
+    /// Applies a committed decision and dispatches its worker commands.
+    ///
+    /// Call only after the decision has been durably committed by the
+    /// replication layer. Effects from this method are leader-side effects
+    /// and must not be dispatched independently by followers.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the decision is stale/invalid or a worker command cannot be
+    /// dispatched.
+    pub async fn commit_plan(
+        &mut self,
+        decision: ClusterDecision,
+        at: Timestamp,
+    ) -> Result<(ClusterIteration, CoordinatorOutput), TcpCoordinatorError> {
+        let (iteration, mut output) = self.coordinator.commit_plan(decision, at)?;
+        let mut commands = self.coordinator.take_commands();
+        commands.append(&mut output.commands);
+        output.commands = commands;
+        self.dispatch(&output.commands).await?;
+        Ok((iteration, output))
     }
 
     /// Submits a request, plans it, and dispatches any resulting commands.
@@ -197,9 +434,40 @@ impl TcpCoordinator {
         spec: RequestSpec,
         at: Timestamp,
     ) -> Result<(ClusterRequestId, CoordinatorOutput), TcpCoordinatorError> {
-        let (request, mut output) = self.coordinator.submit(spec, at)?;
+        let request = self.prepare_submit(&spec)?;
+        let mut output = self.commit_submit(request, spec, at)?;
         output.extend(self.plan_pending(at).await?);
         Ok((request, output))
+    }
+
+    /// Validates a request and reserves its next ID without changing state.
+    ///
+    /// A replicated gateway can commit the returned ID and request payload
+    /// before applying them with [`commit_submit`](Self::commit_submit).
+    pub fn prepare_submit(
+        &self,
+        spec: &RequestSpec,
+    ) -> Result<ClusterRequestId, TcpCoordinatorError> {
+        self.coordinator
+            .prepare_submit(spec)
+            .map_err(TcpCoordinatorError::Coordinator)
+    }
+
+    /// Applies an agreed request submission without dispatching worker work.
+    ///
+    /// # Errors
+    ///
+    /// Fails if validation fails or the request ID is out of sequence.
+    pub fn commit_submit(
+        &mut self,
+        request: ClusterRequestId,
+        spec: RequestSpec,
+        at: Timestamp,
+    ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
+        self.coordinator
+            .apply_committed_input(crate::CoordinatorInput::Submit { request, spec, at })
+            .map(|result| result.output)
+            .map_err(TcpCoordinatorError::Coordinator)
     }
 
     /// Cancels a request and dispatches the resulting worker command.
@@ -212,9 +480,10 @@ impl TcpCoordinator {
         request: ClusterRequestId,
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        let output = self.coordinator.cancel(request, at)?;
-        self.dispatch(&output.commands).await?;
-        Ok(output)
+        Ok(self
+            .apply_committed_input(crate::CoordinatorInput::Cancel { request, at })
+            .await?
+            .output)
     }
 
     /// Waits for the next frame from any worker.
@@ -379,7 +648,8 @@ impl TcpCoordinator {
                     request: refused,
                     message,
                 })) if from == target && refused == request => {
-                    self.coordinator.rollback_migration(request, source)?;
+                    self.coordinator
+                        .rollback_migration_at(request, source, Some(at))?;
                     self.link(source)?
                         .send_command(&WorkerCommand::AbortMigration { request })
                         .await?;
@@ -458,7 +728,12 @@ impl TcpCoordinator {
 
     /// Supplies a calibrated network cost for a worker to routing policy.
     pub fn set_worker_network_cost(&mut self, worker: WorkerId, cost_us: u64) {
-        self.coordinator.set_network_cost(worker, cost_us);
+        let _ =
+            self.coordinator
+                .apply_committed_input(crate::CoordinatorInput::SetWorkerNetworkCost {
+                    worker,
+                    cost_us,
+                });
     }
 
     /// Closes one worker connection gracefully.
@@ -497,7 +772,11 @@ impl TcpCoordinator {
             Ok(event) => Ok((worker, Some(event))),
             Err(_) => {
                 self.links.remove(&worker);
-                self.coordinator.recover_worker(&worker, at)?;
+                self.apply_committed_input(crate::CoordinatorInput::WorkerLost {
+                    worker: worker.clone(),
+                    at,
+                })
+                .await?;
                 output.extend(self.plan_pending(at).await?);
                 Ok((worker, None))
             }
@@ -512,17 +791,23 @@ impl TcpCoordinator {
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
         match event {
             CoordinatorLinkEvent::Message(message) => {
-                let output = self.coordinator.handle(worker, message, at)?;
-                self.dispatch(&output.commands).await?;
-                Ok(output)
+                let result = self
+                    .apply_committed_input(crate::CoordinatorInput::WorkerMessage {
+                        worker: worker.clone(),
+                        message,
+                        at,
+                    })
+                    .await?;
+                Ok(result.output)
             }
             CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
-                match self.coordinator.heartbeat(worker, epoch, at) {
-                    // A delayed heartbeat from a replaced process is dropped.
-                    Ok(()) | Err(CoordinatorError::StaleWorkerEpoch { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                self.record_calibration(worker, at, sent_at_us);
+                self.apply_committed_input(crate::CoordinatorInput::Heartbeat {
+                    worker: worker.clone(),
+                    epoch,
+                    sent_at_us,
+                    at,
+                })
+                .await?;
                 Ok(CoordinatorOutput::default())
             }
         }

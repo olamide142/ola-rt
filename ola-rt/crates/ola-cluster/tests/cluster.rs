@@ -6,9 +6,9 @@ use ola_bench::{KvGeometry, synthetic_artifact, synthetic_prompt};
 use ola_cluster::{
     ClientEvent, ClusterAction, ClusterPlan, ClusterPlanError, ClusterPolicy, ClusterRequestStatus,
     ClusterSnapshot, ClusterTraceEvent, ClusterTraceRecord, Coordinator, CoordinatorError,
-    DeferReason, KvHeadroomRouting, LeastLoadedRouting, LocalCluster, PowerOfTwoRouting,
-    PrefixAffinityRouting, RejectReason, RoundRobinRouting, RouteReason, WorkerCommand,
-    WorkerHealth, WorkerHost, WorkerMessage, WorkerRole, WorkerSummary,
+    CoordinatorInput, DeferReason, KvHeadroomRouting, LeastLoadedRouting, LocalCluster,
+    PowerOfTwoRouting, PrefixAffinityRouting, RejectReason, RoundRobinRouting, RouteReason,
+    WorkerCommand, WorkerHealth, WorkerHost, WorkerMessage, WorkerRole, WorkerSummary,
 };
 use ola_core::{
     ClusterRequestId, Input, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp, WorkerId,
@@ -430,6 +430,74 @@ fn summary(worker: &str, models: &[&str], queued: usize, live: usize) -> WorkerS
         admitted_requests: 0,
         kv: BTreeMap::new(),
     }
+}
+
+#[test]
+fn policy_decision_can_be_committed_after_external_replication() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    let (request, _) = coordinator.submit(spec(2, 2, None), at(1)).unwrap();
+    let generation = coordinator.snapshot(at(2)).generation;
+
+    let proposal = coordinator.plan_decision(at(2)).unwrap().unwrap();
+    assert_eq!(coordinator.snapshot(at(2)).generation, generation);
+    assert_eq!(
+        coordinator.status(request),
+        Some(&ClusterRequestStatus::Pending)
+    );
+
+    let input = CoordinatorInput::CommitPlan {
+        plan: proposal.plan,
+        routes: proposal.record.routes,
+        at: at(2),
+    };
+    let encoded = serde_json::to_vec(&input).unwrap();
+    let decoded: CoordinatorInput = serde_json::from_slice(&encoded).unwrap();
+    let output = coordinator.apply_committed_input(decoded).unwrap().output;
+    assert_eq!(output.commands.len(), 1);
+    assert!(matches!(
+        coordinator.status(request),
+        Some(ClusterRequestStatus::Assigned { worker }) if worker == &WorkerId::new("a")
+    ));
+}
+
+#[test]
+fn stale_proposed_plan_is_rejected_without_mutating_requests() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    let (request, _) = coordinator.submit(spec(2, 2, None), at(1)).unwrap();
+    let proposal = coordinator.plan_decision(at(2)).unwrap().unwrap();
+    coordinator.set_network_cost(WorkerId::new("a"), 5);
+
+    assert!(matches!(
+        coordinator.commit_plan(proposal, at(2)),
+        Err(CoordinatorError::InvalidPlan(_))
+    ));
+    assert_eq!(
+        coordinator.status(request),
+        Some(&ClusterRequestStatus::Pending)
+    );
+}
+
+#[test]
+fn submission_can_be_validated_before_its_committed_application() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    let request_spec = spec(2, 2, None);
+    let request = coordinator.prepare_submit(&request_spec).unwrap();
+
+    assert_eq!(coordinator.pending_len(), 0);
+    assert_eq!(coordinator.status(request), None);
+    coordinator
+        .commit_submit(request, request_spec.clone(), at(1))
+        .unwrap();
+    assert_eq!(coordinator.pending_len(), 1);
+    assert_eq!(
+        coordinator.commit_submit(request, request_spec, at(2)),
+        Err(CoordinatorError::UnexpectedRequestId {
+            expected: ClusterRequestId::new(2),
+            received: request,
+        })
+    );
 }
 
 #[test]

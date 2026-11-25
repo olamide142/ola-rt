@@ -6,13 +6,17 @@ use ola_core::{ClusterRequestId, WorkerId};
 use ola_runtime::PolicyDescriptor;
 use serde::{Deserialize, Serialize};
 
-use crate::{ClusterIteration, ClusterPlan, ClusterSnapshot};
+use crate::{
+    ClusterIteration, ClusterMigrationObservation, ClusterPlan, ClusterPolicyUpdateObservation,
+    ClusterRequestObservation, ClusterSnapshot, ClusterWeights, ClusterWorkerObservation,
+};
 
 /// Turns an immutable cluster snapshot into a cluster plan.
 ///
 /// `plan` takes `&self`, so identical snapshots and configuration produce
 /// identical decisions, and a plan rejected by validation leaves the policy
-/// unchanged. Stateful policies learn only in [`observe`](Self::observe).
+/// unchanged. Stateful policies learn only from the observation callbacks for
+/// committed planning, requests, worker state, migrations, and policy updates.
 pub trait ClusterPolicy: Send {
     /// Returns the policy's stable name, configuration, and components.
     fn descriptor(&self) -> PolicyDescriptor;
@@ -25,9 +29,30 @@ pub trait ClusterPolicy: Send {
     /// coordinator then changes nothing.
     fn plan(&self, snapshot: &ClusterSnapshot) -> Result<ClusterDecision, ClusterPolicyError>;
 
-    /// Receives each committed cluster iteration; the only place a policy
-    /// may learn.
+    /// Receives each committed cluster planning iteration.
     fn observe(&mut self, _iteration: &ClusterIteration) {}
+
+    /// Receives one coordinator-measured terminal request outcome.
+    fn observe_request(&mut self, _observation: &ClusterRequestObservation) {}
+
+    /// Receives one worker summary in coordinator time.
+    fn observe_worker(&mut self, _observation: &ClusterWorkerObservation) {}
+
+    /// Receives one migration after target acceptance commits ownership.
+    fn observe_migration(&mut self, _observation: &ClusterMigrationObservation) {}
+
+    /// Receives one acknowledged worker policy update.
+    fn observe_policy_update(&mut self, _observation: &ClusterPolicyUpdateObservation) {}
+
+    /// Installs adaptive routing weights when the policy supports them.
+    ///
+    /// Implementations validate before changing active state so a rejected
+    /// proposal leaves the policy unchanged.
+    fn update_weights(&mut self, _weights: ClusterWeights) -> Result<(), ClusterPolicyError> {
+        Err(ClusterPolicyError::InvalidSnapshot(
+            "cluster policy does not support adaptive routing weights".into(),
+        ))
+    }
 }
 
 impl<P: ClusterPolicy + ?Sized> ClusterPolicy for Box<P> {
@@ -41,6 +66,26 @@ impl<P: ClusterPolicy + ?Sized> ClusterPolicy for Box<P> {
 
     fn observe(&mut self, iteration: &ClusterIteration) {
         (**self).observe(iteration);
+    }
+
+    fn observe_request(&mut self, observation: &ClusterRequestObservation) {
+        (**self).observe_request(observation);
+    }
+
+    fn observe_worker(&mut self, observation: &ClusterWorkerObservation) {
+        (**self).observe_worker(observation);
+    }
+
+    fn observe_migration(&mut self, observation: &ClusterMigrationObservation) {
+        (**self).observe_migration(observation);
+    }
+
+    fn observe_policy_update(&mut self, observation: &ClusterPolicyUpdateObservation) {
+        (**self).observe_policy_update(observation);
+    }
+
+    fn update_weights(&mut self, weights: ClusterWeights) -> Result<(), ClusterPolicyError> {
+        (**self).update_weights(weights)
     }
 }
 
@@ -77,7 +122,7 @@ impl ClusterDecisionRecord {
 }
 
 /// The workers a policy weighed for one request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RouteRecord {
     /// Request being routed.
     pub request: ClusterRequestId,
