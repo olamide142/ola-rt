@@ -18,8 +18,8 @@ use ola_core::{ClusterRequestId, RequestSpec, Timestamp, WorkerId};
 use tokio::sync::mpsc;
 
 use crate::{
-    ClusterFeedbackSnapshot, ClusterMigrationObservation, ClusterPolicy,
-    ClusterPolicyUpdateObservation, ClusterRequestObservation, ClusterRequestStatus,
+    ClusterDecision, ClusterFeedbackSnapshot, ClusterIteration, ClusterMigrationObservation,
+    ClusterPolicy, ClusterPolicyUpdateObservation, ClusterRequestObservation, ClusterRequestStatus,
     ClusterWorkerObservation, Coordinator, CoordinatorError, CoordinatorLinkError,
     CoordinatorLinkEvent, CoordinatorOutput, CoordinatorWorkerLink, LinkFrame, WorkerCommand,
     WorkerMessage,
@@ -227,15 +227,56 @@ impl TcpCoordinator {
         &mut self,
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        let mut output = CoordinatorOutput {
+        if let Some(decision) = self.plan_decision(at)? {
+            let (_, output) = self.commit_plan(decision, at).await?;
+            return Ok(output);
+        }
+        let output = CoordinatorOutput {
             commands: self.coordinator.take_commands(),
             ..CoordinatorOutput::default()
         };
-        if let Some((_, planned)) = self.coordinator.plan(at)? {
-            output.extend(planned);
-        }
         self.dispatch(&output.commands).await?;
         Ok(output)
+    }
+
+    /// Computes a routing decision without changing coordinator state.
+    ///
+    /// A replicated caller can append the returned decision to its consensus
+    /// log and apply it with [`commit_plan`](Self::commit_plan) after commit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the active policy cannot produce a valid decision.
+    pub fn plan_decision(
+        &self,
+        at: Timestamp,
+    ) -> Result<Option<ClusterDecision>, TcpCoordinatorError> {
+        self.coordinator
+            .plan_decision(at)
+            .map_err(TcpCoordinatorError::Coordinator)
+    }
+
+    /// Applies a committed decision and dispatches its worker commands.
+    ///
+    /// Call only after the decision has been durably committed by the
+    /// replication layer. Effects from this method are leader-side effects
+    /// and must not be dispatched independently by followers.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the decision is stale/invalid or a worker command cannot be
+    /// dispatched.
+    pub async fn commit_plan(
+        &mut self,
+        decision: ClusterDecision,
+        at: Timestamp,
+    ) -> Result<(ClusterIteration, CoordinatorOutput), TcpCoordinatorError> {
+        let (iteration, mut output) = self.coordinator.commit_plan(decision, at)?;
+        let mut commands = self.coordinator.take_commands();
+        commands.append(&mut output.commands);
+        output.commands = commands;
+        self.dispatch(&output.commands).await?;
+        Ok((iteration, output))
     }
 
     /// Submits a request, plans it, and dispatches any resulting commands.

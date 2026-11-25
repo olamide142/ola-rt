@@ -433,6 +433,47 @@ fn summary(worker: &str, models: &[&str], queued: usize, live: usize) -> WorkerS
 }
 
 #[test]
+fn policy_decision_can_be_committed_after_external_replication() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    let (request, _) = coordinator.submit(spec(2, 2, None), at(1)).unwrap();
+    let generation = coordinator.snapshot(at(2)).generation;
+
+    let proposal = coordinator.plan_decision(at(2)).unwrap().unwrap();
+    assert_eq!(coordinator.snapshot(at(2)).generation, generation);
+    assert_eq!(
+        coordinator.status(request),
+        Some(&ClusterRequestStatus::Pending)
+    );
+
+    let (iteration, output) = coordinator.commit_plan(proposal, at(2)).unwrap();
+    assert_eq!(iteration.plan.actions.len(), 1);
+    assert_eq!(output.commands.len(), 1);
+    assert!(matches!(
+        coordinator.status(request),
+        Some(ClusterRequestStatus::Assigned { worker }) if worker == &WorkerId::new("a")
+    ));
+}
+
+#[test]
+fn stale_proposed_plan_is_rejected_without_mutating_requests() {
+    let mut coordinator = Coordinator::new(LeastLoadedRouting);
+    coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();
+    let (request, _) = coordinator.submit(spec(2, 2, None), at(1)).unwrap();
+    let proposal = coordinator.plan_decision(at(2)).unwrap().unwrap();
+    coordinator.set_network_cost(WorkerId::new("a"), 5);
+
+    assert!(matches!(
+        coordinator.commit_plan(proposal, at(2)),
+        Err(CoordinatorError::InvalidPlan(_))
+    ));
+    assert_eq!(
+        coordinator.status(request),
+        Some(&ClusterRequestStatus::Pending)
+    );
+}
+
+#[test]
 fn worker_leases_expire_and_new_epochs_revive_them() {
     let mut coordinator = Coordinator::new(RoundRobinRouting);
     coordinator.join(summary("a", &[MODEL], 0, 0)).unwrap();

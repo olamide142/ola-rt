@@ -1346,24 +1346,52 @@ impl Coordinator {
         }
     }
 
-    /// Plans and commits one cluster iteration, if any request is pending.
+    /// Builds a policy decision for pending requests without committing it.
+    ///
+    /// Replicated coordinators can propose this value to their consensus log,
+    /// then call [`commit_plan`](Self::commit_plan) when it is committed. This
+    /// keeps followers from independently executing potentially divergent
+    /// policy decisions.
     ///
     /// # Errors
     ///
-    /// Fails if the policy cannot plan or its plan is invalid; nothing
-    /// changes.
-    pub fn plan(
-        &mut self,
+    /// Fails if the policy cannot plan or its plan is invalid; coordinator
+    /// state is unchanged.
+    pub fn plan_decision(
+        &self,
         at: Timestamp,
-    ) -> Result<Option<(ClusterIteration, CoordinatorOutput)>, CoordinatorError> {
+    ) -> Result<Option<ClusterDecision>, CoordinatorError> {
         if self.pending.is_empty() {
             return Ok(None);
         }
         let snapshot = self.snapshot(at);
-        let ClusterDecision { plan, record } = self
+        let decision = self
             .policy
             .plan(&snapshot)
             .map_err(CoordinatorError::Policy)?;
+        decision
+            .plan
+            .validate(&snapshot)
+            .map_err(CoordinatorError::InvalidPlan)?;
+        Ok(Some(decision))
+    }
+
+    /// Applies a previously computed, committed policy decision.
+    ///
+    /// Validation is repeated against current state so stale or invalid
+    /// decisions have no effect. The returned effects are not delivered by
+    /// this method; a replicated caller should publish them only on its leader.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the decision no longer matches current state.
+    pub fn commit_plan(
+        &mut self,
+        decision: ClusterDecision,
+        at: Timestamp,
+    ) -> Result<(ClusterIteration, CoordinatorOutput), CoordinatorError> {
+        let ClusterDecision { plan, record } = decision;
+        let snapshot = self.snapshot(at);
         plan.validate(&snapshot)
             .map_err(CoordinatorError::InvalidPlan)?;
 
@@ -1463,7 +1491,23 @@ impl Coordinator {
             decision: record,
         };
         self.policy.observe(&iteration);
-        Ok(Some((iteration, output)))
+        Ok((iteration, output))
+    }
+
+    /// Plans and commits one cluster iteration, if any request is pending.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the policy cannot plan or its plan is invalid; nothing
+    /// changes.
+    pub fn plan(
+        &mut self,
+        at: Timestamp,
+    ) -> Result<Option<(ClusterIteration, CoordinatorOutput)>, CoordinatorError> {
+        let Some(decision) = self.plan_decision(at)? else {
+            return Ok(None);
+        };
+        self.commit_plan(decision, at).map(Some)
     }
 
     /// Applies one message from a worker.
