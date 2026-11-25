@@ -201,6 +201,25 @@ impl TcpCoordinator {
         self.coordinator.expire_workers(now, timeout)
     }
 
+    /// Applies a replicated state-machine input and dispatches its effects.
+    ///
+    /// A consensus adapter should invoke this only after the corresponding
+    /// [`CoordinatorInput`] has committed. Followers can instead apply the
+    /// input to their underlying [`Coordinator`] and discard its output; only
+    /// the leader should send worker commands or client events.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the state machine rejects the input or command dispatch fails.
+    pub async fn apply_committed_input(
+        &mut self,
+        input: crate::CoordinatorInput,
+    ) -> Result<crate::CoordinatorApplyResult, TcpCoordinatorError> {
+        let result = self.coordinator.apply_committed_input(input)?;
+        self.dispatch(&result.output.commands).await?;
+        Ok(result)
+    }
+
     /// Expires silent workers, requeues their requests, and dispatches a new
     /// planning pass. Recovered requests restart by recompute; see
     /// [`Coordinator::recover_lost_requests`].
@@ -635,16 +654,24 @@ impl TcpCoordinator {
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
         match event {
             CoordinatorLinkEvent::Message(message) => {
-                let output = self.coordinator.handle(worker, message, at)?;
-                self.dispatch(&output.commands).await?;
-                Ok(output)
+                let result = self
+                    .apply_committed_input(crate::CoordinatorInput::WorkerMessage {
+                        worker: worker.clone(),
+                        message,
+                        at,
+                    })
+                    .await?;
+                Ok(result.output)
             }
             CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us } => {
-                match self.coordinator.heartbeat(worker, epoch, at) {
-                    // A delayed heartbeat from a replaced process is dropped.
-                    Ok(()) | Err(CoordinatorError::StaleWorkerEpoch { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
+                self.apply_committed_input(crate::CoordinatorInput::Heartbeat {
+                    worker: worker.clone(),
+                    epoch,
+                    at,
+                })
+                .await?;
+                // Clock calibration is transport telemetry, not replicated
+                // scheduler state, so each coordinator records it locally.
                 self.record_calibration(worker, at, sent_at_us);
                 Ok(CoordinatorOutput::default())
             }

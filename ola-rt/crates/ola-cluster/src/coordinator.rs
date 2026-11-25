@@ -164,6 +164,60 @@ pub enum WorkerMessage {
     },
 }
 
+/// A deterministic coordinator state-machine input suitable for replication.
+///
+/// A consensus-backed coordinator should append one of these inputs to its
+/// replicated log and call [`Coordinator::apply_committed_input`] only after
+/// that entry commits. Timestamps and lease timeouts are carried in the input
+/// so replicas do not consult their local clocks while applying it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CoordinatorInput {
+    /// Apply a report received from a worker.
+    WorkerMessage {
+        /// Reporting worker.
+        worker: WorkerId,
+        /// Report payload.
+        message: WorkerMessage,
+        /// Coordinator-clock time of receipt.
+        at: Timestamp,
+    },
+    /// Renew a worker's lease from a heartbeat.
+    Heartbeat {
+        /// Reporting worker.
+        worker: WorkerId,
+        /// Worker process epoch.
+        epoch: u64,
+        /// Coordinator-clock time of receipt.
+        at: Timestamp,
+    },
+    /// Mark a worker lost and recover its owned requests.
+    WorkerLost {
+        /// Lost worker.
+        worker: WorkerId,
+        /// Coordinator-clock time of detection.
+        at: Timestamp,
+    },
+    /// Expire leases and recover requests using a committed time and timeout.
+    ExpireLeases {
+        /// Coordinator-clock time at which leases are evaluated.
+        now: Timestamp,
+        /// Lease timeout, in microseconds.
+        timeout_micros: u64,
+    },
+}
+
+/// Result of applying a committed coordinator input.
+#[derive(Clone, Debug, Default)]
+pub struct CoordinatorApplyResult {
+    /// Worker/client effects produced by the state transition.
+    pub output: CoordinatorOutput,
+    /// Workers newly marked lost by this input.
+    pub lost_workers: Vec<WorkerId>,
+    /// Requests requeued for recomputation.
+    pub recovered_requests: Vec<ClusterRequestId>,
+}
+
 impl WorkerMessage {
     /// The cluster request the message reports on, if any.
     pub const fn request(&self) -> Option<ClusterRequestId> {
@@ -850,6 +904,51 @@ impl Coordinator {
         self.retain_worker_observation(observation);
         self.generation += 1;
         Ok(())
+    }
+
+    /// Applies one already-committed state-machine input.
+    ///
+    /// Consensus adapters should call this on every replica in log order.
+    /// This method performs no network I/O; the returned output is for the
+    /// elected leader to dispatch after application.
+    pub fn apply_committed_input(
+        &mut self,
+        input: CoordinatorInput,
+    ) -> Result<CoordinatorApplyResult, CoordinatorError> {
+        let mut result = CoordinatorApplyResult::default();
+        match input {
+            CoordinatorInput::WorkerMessage {
+                worker,
+                message,
+                at,
+            } => {
+                result.output = self.handle(&worker, message, at)?;
+            }
+            CoordinatorInput::Heartbeat { worker, epoch, at } => {
+                match self.heartbeat(&worker, epoch, at) {
+                    Ok(()) | Err(CoordinatorError::StaleWorkerEpoch { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            CoordinatorInput::WorkerLost { worker, at } => {
+                result.recovered_requests = self.recover_worker(&worker, at)?;
+                result.lost_workers.push(worker);
+                result.output.commands = self.take_commands();
+            }
+            CoordinatorInput::ExpireLeases {
+                now,
+                timeout_micros,
+            } => {
+                let expired = self.expire_workers(now, Duration::from_micros(timeout_micros));
+                if !expired.is_empty() {
+                    result.recovered_requests =
+                        self.requeue_owned_by(&expired.iter().cloned().collect(), now);
+                    result.output.commands = self.take_commands();
+                }
+                result.lost_workers = expired;
+            }
+        }
+        Ok(result)
     }
 
     /// Records a worker heartbeat in the coordinator's clock domain.
@@ -1899,5 +1998,30 @@ mod feedback_tests {
             })
             .unwrap();
         assert_eq!(coordinator.feedback_snapshot().policy, installed);
+    }
+
+    #[test]
+    fn committed_inputs_round_trip_and_replay_deterministically() {
+        let input = CoordinatorInput::ExpireLeases {
+            now: Timestamp::from_micros(250),
+            timeout_micros: 100,
+        };
+        let encoded = serde_json::to_vec(&input).unwrap();
+        let decoded: CoordinatorInput = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, input);
+
+        let mut first = Coordinator::new(AdaptiveClusterPolicy::default());
+        let mut second = Coordinator::new(AdaptiveClusterPolicy::default());
+        let first_result = first.apply_committed_input(decoded.clone()).unwrap();
+        let second_result = second.apply_committed_input(decoded).unwrap();
+
+        assert!(first_result.lost_workers.is_empty());
+        assert!(first_result.recovered_requests.is_empty());
+        assert_eq!(first.generation, second.generation);
+        assert_eq!(first_result.lost_workers, second_result.lost_workers);
+        assert_eq!(
+            first_result.recovered_requests,
+            second_result.recovered_requests
+        );
     }
 }

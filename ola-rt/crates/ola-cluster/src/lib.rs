@@ -22,8 +22,8 @@ pub use coordinator::{
     ClientEvent, ClusterFeedbackSnapshot, ClusterIteration, ClusterMigrationObservation,
     ClusterMigrationOutcome, ClusterPolicyUpdateObservation, ClusterRequestObservation,
     ClusterRequestOutcome, ClusterRequestStatus, ClusterRouteObservation, ClusterTraceEvent,
-    ClusterTraceRecord, ClusterWorkerObservation, Coordinator, CoordinatorError, CoordinatorOutput,
-    WorkerCommand, WorkerMessage,
+    ClusterTraceRecord, ClusterWorkerObservation, Coordinator, CoordinatorApplyResult,
+    CoordinatorError, CoordinatorInput, CoordinatorOutput, WorkerCommand, WorkerMessage,
 };
 pub use local::{LocalCluster, LocalClusterError, LocalClusterStep};
 pub use network::{LinkCalibration, TcpCoordinator, TcpCoordinatorError};
