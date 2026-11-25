@@ -480,6 +480,85 @@ Scoring per window should be the default for this study. The pooled p95
 picked the wrong baseline, and that made a 0.4 s gain per hour look like a
 10.5 s gain at night.
 
+## Where is the headroom? A sweep of ServeGen workloads (2026-11-25)
+
+`servegen_headroom` screens a workload before any controller is built. It
+runs the 8 named policies and scores every trace hour. The **hindsight
+bound** takes each hour's best policy, and the **headroom** is the best
+single policy's hourly mean minus that bound. The bound ignores switching
+and carried-over backlog, and picking each hour's best of 8 noisy runs
+rewards luck, so it is an optimistic upper bound.
+
+`servegen.py --peak-output-rate` sets the rate scale so the busiest hour
+asks for a target decode rate. That puts different workloads at the same
+load. The sweep covered:
+- 4 workloads: language m-large, m-mid and m-small, and reasoning
+  deepseek-r1;
+- 4 and 16 clients;
+- peaks of 18, 24 and 30 tokens/s (about 51%, 69% and 86% of the
+  simulated decode capacity);
+- 4 slots, 10 seeds each.
+
+| workload | clients | peak 18 | peak 24 | peak 30 |
+| --- | ---: | ---: | ---: | ---: |
+| m-large | 4 | 1.6% | 2.0% | 1.4% |
+| m-large | 16 | 3.8% | 4.0% | 2.9% |
+| m-mid | 4 | 0.7% | 1.1% | 4.1% |
+| m-mid | 16 | 1.3% | 2.1% | **6.3%** |
+| m-small | 4 | 0.8% | 2.6% | 5.4% |
+| m-small | 16 | 2.1% | 3.0% | 5.8% |
+| deepseek-r1 | 4 | 0.0% | 0.0% | 1.6% |
+| deepseek-r1 | 16 | 0.1% | 0.2% | 1.8% |
+
+Headroom grows with load and with the number of clients mixed together.
+deepseek-r1's outputs are clipped at `--max-output` 1,024, which leaves few
+requests, so its row says little about reasoning workloads.
+
+**Real controllers on the best candidates** (16 clients, peak 30; 10
+held-out seeds for fitting), plus the original m-large workload. Δ in the
+hourly mean against FIFO, which is the best single policy in all three:
+
+| controller | m-large, 4 clients | m-mid, 16 clients | m-small, 16 clients |
+| --- | --- | --- | --- |
+| hindsight bound | −1.06 (2.0%) | −8.35 (6.3%) | −3.36 (5.8%) |
+| `oracle-switch` (night, day and evening bins, chosen in-sample) | −0.17 [−0.44, +0.16] | −3.36 [−4.08, −2.68] | +0.29 [−2.02, +3.14] |
+| `clock-table` (best policy per hour of day, learned held-out) | **−0.31 [−0.38, −0.24]** | +3.36 [−2.77, +10.43] | +0.41 [−1.15, +2.21] |
+| `table-sizes` (size HMM, table learned per hour) | −0.19 [−0.27, −0.10] | +0.79 [−3.32, +8.02] | +1.26 [+0.32, +2.54] |
+| `table-arrivals` | 0 (FIFO throughout) | 0 (FIFO throughout) | +0.13 [−0.30, +0.70] |
+
+**Tables must be learned on the evaluation objective.** Learning a table
+with one pooled p95 per state picked `sjf-total` everywhere on m-mid. That
+is 35.8 s worse per hour than FIFO, because shortest-job-first starves
+the hours where long requests dominate. `learn_table` now scores each
+state hour by hour. On m-large this changes the size table from (day
+`sjf-total`, night FIFO, evening `sjf-total`) to (day FIFO, night FIFO,
+evening `sjf-total`), and its gain from −0.38 s to −0.19 s per hour. The
+earlier −0.38 s came partly from a table chosen on a different score.
+
+**Conclusion.** On ServeGen at 4 slots, switching between scheduling
+policies is worth at most about 0.6% on an hourly score with a controller
+that can actually be built (`clock-table` on m-large). The 2–6% hindsight
+bounds are not captured. Per-hour preferences are noisy, and switching
+mid-backlog costs more than the per-hour differences, so held-out tables
+do not transfer on m-mid and m-small. The one sizeable gain, the oracle on
+m-mid (2.5%), picks its bins in-sample, and no held-out controller
+reproduces it.
+
+Further work on regime switching for the scheduler is unlikely to pay. A
+knob with larger per-regime effects is needed: admission and slot count
+under KV pressure, prefill chunking, or routing across replicas (the
+policy agent's area).
+
+```sh
+lab/replay/servegen.py --model m-mid --clients 16 --peak-output-rate 30 \
+    --time-scale 6 --seeds $(seq -s, 1 20) --out 'm-mid-{seed}.jsonl'
+OLA_COST=10745,30227,482,97,13047,24568 HEADER=1 LABEL="m-mid, 16 clients" \
+  cargo run --release -p ola-bench --example servegen_headroom -- m-mid-{1..10}.jsonl
+OLA_COST=10745,30227,482,97,13047,24568 ADAPTIVE=none \
+  cargo run --release -p ola-bench --example servegen_adaptive -- \
+  m-mid-{1..10}.jsonl --fit m-mid-{11..20}.jsonl
+```
+
 ## Threats to validity
 
 The live executor and the replays are the same simulator. The stall fit

@@ -24,7 +24,9 @@
 //!   regime-to-policy table whenever the HMM's most probable regime reaches
 //!   90%. The table is learned on the held-out seeds by decoding their
 //!   regimes with the same HMM (not the true labels) and scoring each
-//!   policy on each decoded regime's requests.
+//!   policy on each decoded regime's requests, hour by hour;
+//! - `clock-table` switches on the clock alone: each hour of the day runs
+//!   the policy that was best in that hour on the held-out seeds.
 //!
 //! The static policies run first. Their per-regime means pick the oracle's
 //! policy for each regime, and their hourly means pick the best single
@@ -294,21 +296,29 @@ fn decode(trace: &SchedulingTrace, trigger: &RegimeTrigger) -> Vec<usize> {
     states
 }
 
+/// Fewest requests a (trace, hour, state) group needs to be scored when
+/// learning a table; a p95 over fewer is mostly noise.
+const MIN_GROUP_REQUESTS: usize = 10;
+
 /// Each trigger state's best policy, learned offline on `fits`: requests
-/// are grouped by their decoded state (not the true regime) and every
-/// policy is scored per group.
+/// are grouped by their decoded state (not the true regime), and every
+/// policy is scored on the study's hourly objective restricted to each
+/// state: the mean, over every trace hour with enough of the state's
+/// requests, of that group's p95 completion plus p95 TTFT. Scoring a state
+/// by one pooled p95 instead favours shortest-job-first, which starves the
+/// hours where long requests dominate.
 fn learn_table(
-    fits: &[SchedulingTrace],
+    fits: &[(SchedulingTrace, Vec<Label>)],
     trigger: &RegimeTrigger,
     config: &SimulationConfig,
 ) -> Vec<&'static str> {
     let decoded = fits
         .iter()
-        .map(|trace| decode(trace, trigger))
+        .map(|(trace, _)| decode(trace, trigger))
         .collect::<Vec<_>>();
     let runs = POLICIES.map(|name| {
         fits.iter()
-            .map(|trace| {
+            .map(|(trace, _)| {
                 run_scheduling_trial(trace, indexed_policy(&theta(name)).expect("policy"), config)
                     .expect("trial")
             })
@@ -317,14 +327,26 @@ fn learn_table(
     (0..trigger.model.states())
         .map(|state| {
             let score = |policy: usize| {
-                mean(
-                    &runs[policy]
+                let mut groups = Vec::new();
+                for ((run, states), (_, labels)) in runs[policy].iter().zip(&decoded).zip(fits) {
+                    let hours = labels
                         .iter()
-                        .zip(&decoded)
-                        .filter(|(_, states)| states.contains(&state))
-                        .map(|(run, states)| objective(run, |index| states[index] == state))
-                        .collect::<Vec<_>>(),
-                )
+                        .filter_map(|label| label.hour)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for hour in hours {
+                        let member = |index: usize| {
+                            states[index] == state && labels[index].hour == Some(hour)
+                        };
+                        if (0..states.len()).filter(|&i| member(i)).count() >= MIN_GROUP_REQUESTS {
+                            groups.push(objective(run, member));
+                        }
+                    }
+                }
+                if groups.is_empty() {
+                    f64::INFINITY
+                } else {
+                    mean(&groups)
+                }
             };
             let best = (0..POLICIES.len())
                 .min_by(|a, b| score(*a).total_cmp(&score(*b)))
@@ -340,6 +362,47 @@ fn learn_table(
                     .join(", ")
             );
             POLICIES[best]
+        })
+        .collect()
+}
+
+/// Each hour of the day's best policy, learned offline on `fits` by the
+/// hourly objective: daily patterns recur, so the clock alone can drive
+/// the switch.
+fn learn_clock_table(
+    fits: &[(SchedulingTrace, Vec<Label>)],
+    config: &SimulationConfig,
+) -> BTreeMap<u64, &'static str> {
+    let runs = POLICIES.map(|name| {
+        fits.iter()
+            .map(|(trace, _)| {
+                run_scheduling_trial(trace, indexed_policy(&theta(name)).expect("policy"), config)
+                    .expect("trial")
+            })
+            .collect::<Vec<_>>()
+    });
+    let hours = fits
+        .iter()
+        .flat_map(|(_, labels)| labels.iter().filter_map(|label| label.hour))
+        .collect::<std::collections::BTreeSet<_>>();
+    hours
+        .into_iter()
+        .map(|hour| {
+            let score = |policy: usize| {
+                mean(
+                    &runs[policy]
+                        .iter()
+                        .zip(fits)
+                        .map(|(run, (_, labels))| {
+                            objective(run, |index| labels[index].hour == Some(hour))
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let best = (0..POLICIES.len())
+                .min_by(|a, b| score(*a).total_cmp(&score(*b)))
+                .expect("policies");
+            (hour, POLICIES[best])
         })
         .collect()
 }
@@ -487,7 +550,7 @@ fn main() {
     };
 
     let states = std::env::var("REGIME_STATES").map_or(3, |v| v.parse().expect("REGIME_STATES"));
-    let fits = fit.iter().map(|path| load(path).0).collect::<Vec<_>>();
+    let fits = fit.iter().map(|path| load(path)).collect::<Vec<_>>();
     let fit_model = |sequences: Vec<Vec<Vec<f64>>>, features| {
         let model = GaussianHmm::fit(&sequences, states, 50).expect("training windows");
         eprintln!("{features:?} regime model: {model:?}");
@@ -501,13 +564,13 @@ fn main() {
     };
     let arrival_trigger = fit_model(
         fits.iter()
-            .map(|trace| ArrivalWindows::features(&arrivals(trace), WINDOW_ARRIVALS))
+            .map(|(trace, _)| ArrivalWindows::features(&arrivals(trace), WINDOW_ARRIVALS))
             .collect(),
         RegimeFeatures::Arrivals,
     );
     let size_trigger = fit_model(
         fits.iter()
-            .map(|trace| {
+            .map(|(trace, _)| {
                 let sizes = trace
                     .requests
                     .iter()
@@ -568,9 +631,11 @@ fn main() {
     for (label, _, table) in &tables {
         eprintln!("{label}: {table:?}");
     }
+    let clock_table = learn_clock_table(&fits, &config);
+    eprintln!("clock-table: {clock_table:?}");
     let names = POLICIES
         .into_iter()
-        .chain(["oracle-switch"])
+        .chain(["oracle-switch", "clock-table"])
         .chain(adaptive_controllers.iter().map(|c| c.0))
         .chain(tables.iter().map(|t| t.0))
         .collect::<Vec<_>>();
@@ -633,8 +698,17 @@ fn main() {
                 Some((trace.requests[first].arrival_micros, regime_best[regime]))
             })
             .collect::<Vec<_>>();
-        let mut controllers: Vec<Controller> =
-            vec![("oracle-switch", Box::new(oracle_switch(schedule)), None)];
+        let clock = clock_table
+            .iter()
+            .filter_map(|(hour, name)| {
+                let first = labels.iter().position(|label| label.hour == Some(*hour))?;
+                Some((trace.requests[first].arrival_micros, *name))
+            })
+            .collect::<Vec<_>>();
+        let mut controllers: Vec<Controller> = vec![
+            ("oracle-switch", Box::new(oracle_switch(schedule)), None),
+            ("clock-table", Box::new(oracle_switch(clock)), None),
+        ];
         for (label, trigger, table) in &tables {
             let policy = regime_table((*trigger).clone(), table.clone(), reference);
             controllers.push((label, Box::new(policy), None));
