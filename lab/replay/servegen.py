@@ -32,7 +32,18 @@ client's rate, and `--time-scale` compresses time (a 600 s window lasts
 Output is JSON Lines in the `replay_trace export` format (`arrival_us`,
 `prompt_tokens`, `max_new_tokens`, `priority`, `deadline_us`), plus `window`
 and `client`. The first line records provenance and has no `arrival_us`.
-Each request runs to its sampled output length.
+By default each request's `max_new_tokens` is its sampled output length,
+so a scheduler or detector reading it knows the true length. In
+production `max_tokens` is a client-set cap and the true length is learned
+only at end of sequence; `--limit` models that, writing the sampled length
+as `eos_after` and a cap as `max_new_tokens`:
+
+- `exact` (default): the cap is the true length, and no `eos_after`;
+- `fixed:N`: every request is capped at N, a default `max_tokens` (raised
+  to the true length when that is longer, so nothing is truncated);
+- `pow2`: the cap is the next power of two at or above the true length
+  (at least 16, at most `--max-output`), a client that sizes its caps
+  roughly.
 
     python3 lab/replay/servegen.py --model m-large --start 36000 --hours 4 \\
         --clients 8 --rate-scale 0.05 --time-scale 10 --seeds 1,2,3 \\
@@ -148,6 +159,7 @@ def main():
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--max-input", type=int, default=4096)
     parser.add_argument("--max-output", type=int, default=1024)
+    parser.add_argument("--limit", default="exact", help="exact, fixed:N or pow2; see above")
     parser.add_argument("--seeds", default="1", help="comma-separated; one trace per seed from one fetch")
     parser.add_argument("--out", required=True, help="output path; {seed} is replaced by the seed")
     args = parser.parse_args()
@@ -179,6 +191,17 @@ def main():
         write(out, args, seed, chosen, requests)
 
 
+def cap(limit, output, max_output):
+    """The `max_new_tokens` a request with true length `output` is sent with."""
+    if limit == "exact":
+        return output
+    if limit == "pow2":
+        return min(max(16, 1 << (output - 1).bit_length()), max_output)
+    if limit.startswith("fixed:"):
+        return max(output, int(limit.split(":", 1)[1]))
+    raise ValueError(f"unknown --limit {limit}")
+
+
 def generate(args, chosen, traces, datasets, rng):
     """One sample of the workload, ServeGen's way."""
     requests = []
@@ -202,17 +225,21 @@ def generate(args, chosen, traces, datasets, rng):
             for gap in drawn:
                 at += gap * stretch
                 seconds = args.start + (at - args.start) / args.time_scale
-                requests.append(
-                    {
-                        "arrival_us": round(seconds * 1e6),
-                        "prompt_tokens": max(1, min(sample(lengths["input_tokens"], rng), args.max_input)),
-                        "max_new_tokens": max(1, min(sample(lengths["output_tokens"], rng), args.max_output)),
-                        "priority": 0,
-                        "deadline_us": None,
-                        "window": start,
-                        "client": client,
-                    }
-                )
+                # Prompt first, then output: the draw order fixes each seed's trace.
+                prompt = max(1, min(sample(lengths["input_tokens"], rng), args.max_input))
+                output = max(1, min(sample(lengths["output_tokens"], rng), args.max_output))
+                request = {
+                    "arrival_us": round(seconds * 1e6),
+                    "prompt_tokens": prompt,
+                    "max_new_tokens": cap(args.limit, output, args.max_output),
+                    "priority": 0,
+                    "deadline_us": None,
+                    "window": start,
+                    "client": client,
+                }
+                if args.limit != "exact":
+                    request["eos_after"] = output
+                requests.append(request)
     requests.sort(key=lambda r: r["arrival_us"])
     return requests
 

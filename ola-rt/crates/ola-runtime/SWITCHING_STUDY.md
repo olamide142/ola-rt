@@ -352,7 +352,7 @@ Caveats specific to this result:
 - **Output lengths are oracle knowledge.** In these traces `max_new_tokens`
   is each request's sampled output length. So `sjf-total` and the size
   features both know true output lengths. In production `max_tokens` is a
-  client-set cap, so both would be weaker.
+  client-set cap, so both would be weaker. The next section tests this.
 - **The table comes from the same deployment.** It is learned on other
   days drawn from the same distribution. A shifted workload needs a refit,
   or a replay to confirm the table entry.
@@ -370,6 +370,54 @@ OLA_COST=10745,30227,482,97,13047,24568 \
 
 All controllers take about 45 minutes on 12 cores. `ADAPTIVE=none` runs
 only the static policies, the oracle and the tables, in under a minute.
+
+### With output caps instead of true lengths (2026-11-25)
+
+`servegen.py --limit` keeps the same requests (same seeds and draws) but
+sends each with a cap as `max_new_tokens` and stops it at its true length
+(`eos_after`):
+- `fixed:1024`: every request is capped at 1,024, a server default;
+- `pow2`: the cap is the next power of two at or above the true length, a
+  client that sizes its caps roughly.
+
+`servegen_adaptive` now picks the oracle's per-regime policies and the
+reference (the best single policy, which controllers start at) from the
+static runs on the same traces. With exact lengths it reproduces the table
+above exactly. Results at 4 slots, 10 seeds, tables fitted on seeds 11–20
+of the same cap mode, Δ against the best single policy:
+
+| caps | best single | oracle night | `table-sizes` night | `table-sizes` day | `table-sizes` evening | learned table (day, night, evening states) |
+| --- | --- | --- | --- | --- | --- | --- |
+| exact | `sjf-total` | −10.46 [−11.86, −8.79] | −10.89 [−12.48, −9.08] | +0.22 [−0.15, +0.73] | +0.00 | sjf-total, fifo, sjf-total |
+| `pow2` | `sjf-total` | −8.37 [−10.44, −6.28] | −8.72 [−10.83, −6.53] | +0.25 [−0.14, +0.76] | +0.00 | sjf-total, fifo, sjf-total |
+| `fixed:1024` | `fifo` | +0.40 [+0.04, +0.98] | +0.00 | +0.00 | −0.33 [−0.77, +0.13] | fifo, fifo, sjf-total |
+
+- **Rough caps keep about 80% of the gain.** With power-of-two caps,
+  `sjf-total` still ranks jobs roughly by length. The night still prefers
+  FIFO by 8.4 s, and the size HMM still finds the regimes (each state's
+  scores are within 0.7 s of the exact case). The learned table is
+  unchanged and again matches the oracle.
+- **A uniform cap removes the headroom.** With every cap at 1,024,
+  `sjf-total` ranks by prompt alone. FIFO becomes the best single policy.
+  By day and in the evening, `sjf-total` is better by under 0.5 s, and the
+  CIs include zero. The oracle gains nothing at night, and is 0.40 s worse
+  there because the night's leftover backlog runs under `sjf-total` after
+  the switch. `table-sizes` learns FIFO for night and day, so it does no
+  harm.
+
+So the result depends on clients sending informative output limits, not on
+exact lengths. Where every request carries the same default cap, there is
+nothing to adapt for in this policy pair. A length predictor (for example,
+per-client history) would be the way to win it back.
+
+```sh
+python3 lab/replay/servegen.py --model m-large --hours 24 --clients 4 \
+    --rate-scale 0.0000824 --time-scale 6 --limit pow2 \
+    --seeds $(seq -s, 1 20) --out 'pow2-{seed}.jsonl'
+OLA_COST=10745,30227,482,97,13047,24568 ADAPTIVE=none \
+  cargo run --release -p ola-bench --example servegen_adaptive -- \
+  pow2-{1..10}.jsonl --fit pow2-{11..20}.jsonl
+```
 
 ## Threats to validity
 

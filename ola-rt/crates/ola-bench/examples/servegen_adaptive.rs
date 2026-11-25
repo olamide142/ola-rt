@@ -26,9 +26,11 @@
 //!   regimes with the same HMM (not the true labels) and scoring each
 //!   policy on each decoded regime's requests.
 //!
-//! Every controller starts at `sjf-total`, the best single policy. Scores
-//! are p95 completion plus p95 TTFT per regime and over the day; each is
-//! compared with `sjf-total` on paired per-seed differences.
+//! The static policies run first. Their per-regime means pick the oracle's
+//! policy for each regime, and their whole-day means pick the best single
+//! policy, which every controller starts at and is compared with on paired
+//! per-seed differences. Scores are p95 completion plus p95 TTFT per regime
+//! and over the day.
 //!
 //! ```sh
 //! OLA_COST=10745,30227,482,97,13047,24568 \
@@ -62,9 +64,6 @@ const REGIMES: [(&str, u64, u64); 3] = [
 
 /// The controllers' grid: `policy` indexes this list.
 const POLICIES: [&str; 2] = ["fifo", "sjf-total"];
-
-/// Each regime's best policy in `servegen_regimes` at 4 slots.
-const REGIME_BEST: [&str; 3] = ["fifo", "sjf-total", "sjf-total"];
 
 const WINDOW_ARRIVALS: usize = 8;
 
@@ -371,6 +370,60 @@ fn regime_table(
         })
 }
 
+/// A controller to run, with its meter if it has an optimizer.
+type Controller = (
+    &'static str,
+    Box<dyn ExecutionPolicy>,
+    Option<AdaptationMeter>,
+);
+
+/// One controller's run on one trace: its label, scores, replaying calls,
+/// switches (when metered) and charged stall.
+type RunRow = (&'static str, Vec<f64>, u64, Option<u64>, u64);
+
+/// Runs every trace's controllers, the traces on parallel threads, and
+/// returns each trace's rows in trace order.
+fn run_all(
+    traces: &[(SchedulingTrace, Vec<Option<usize>>)],
+    config: &SimulationConfig,
+    controllers: impl Fn(&SchedulingTrace, &[Option<usize>]) -> Vec<Controller> + Sync,
+) -> Vec<Vec<RunRow>> {
+    std::thread::scope(|scope| {
+        let handles = traces
+            .iter()
+            .map(|(trace, regime_of)| {
+                let controllers = &controllers;
+                scope.spawn(move || {
+                    controllers(trace, regime_of)
+                        .into_iter()
+                        .map(|(label, policy, meter)| {
+                            let charge_meter = meter.clone();
+                            let run = run_charged_trial(trace, policy, config, &[], &mut |_, _| {
+                                charge_meter
+                                    .as_ref()
+                                    .map_or(0, AdaptationMeter::take_micros)
+                            })
+                            .expect("trial");
+                            assert!(
+                                run.requests.iter().all(|r| r.completed_micros.is_some()),
+                                "{label} left work unfinished"
+                            );
+                            let replaying = meter.as_ref().map_or(0, |meter| meter.counts().1);
+                            let switches = meter.as_ref().map(|meter| meter.counts().2);
+                            let stall = meter.as_ref().map_or(0, AdaptationMeter::total_micros);
+                            (label, scores(&run, regime_of), replaying, switches, stall)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("seed thread"))
+            .collect()
+    })
+}
+
 /// Per-controller run accounting, summed over seeds.
 #[derive(Default)]
 struct Tally {
@@ -497,93 +550,88 @@ fn main() {
         .chain(tables.iter().map(|t| t.0))
         .collect::<Vec<_>>();
 
-    // Seeds are independent; run them on parallel threads.
-    let per_seed = std::thread::scope(|scope| {
-        let handles = traces
-            .iter()
-            .map(|(trace, regime_of)| {
-                let (grid, config, tables, adaptive_controllers) =
-                    (&grid, &config, &tables, &adaptive_controllers);
-                scope.spawn(move || {
-                    let schedule = (0..REGIMES.len())
-                        .filter_map(|regime| {
-                            let first = regime_of.iter().position(|r| *r == Some(regime))?;
-                            Some((trace.requests[first].arrival_micros, REGIME_BEST[regime]))
-                        })
-                        .collect::<Vec<_>>();
-                    let mut controllers: Vec<(
-                        &str,
-                        Box<dyn ExecutionPolicy>,
-                        Option<AdaptationMeter>,
-                    )> = POLICIES
-                        .into_iter()
-                        .map(|name| (name, indexed_policy(&theta(name)).expect("policy"), None))
-                        .collect();
-                    controllers.push(("oracle-switch", Box::new(oracle_switch(schedule)), None));
-                    for (label, trigger, table) in tables {
-                        let policy = regime_table((*trigger).clone(), table.clone(), "sjf-total");
-                        controllers.push((label, Box::new(policy), None));
-                    }
-                    for &(label, adaptation, interval, horizon, trigger) in adaptive_controllers {
-                        let (policy, meter) = charged_adaptive_policy_over(
-                            theta("sjf-total"),
-                            grid.clone(),
-                            indexed_policy,
-                            cost,
-                            slots,
-                            OnlineTuning {
-                                interval,
-                                horizon,
-                                ..OnlineTuning::default()
-                            },
-                            adaptation,
-                            SwitchingCost::default(),
-                            trigger.cloned(),
-                        )
-                        .expect("adaptive policy");
-                        controllers.push((label, Box::new(policy), Some(meter)));
-                    }
-                    controllers
-                        .into_iter()
-                        .map(|(label, policy, meter)| {
-                            let charge_meter = meter.clone();
-                            let run = run_charged_trial(trace, policy, config, &[], &mut |_, _| {
-                                charge_meter
-                                    .as_ref()
-                                    .map_or(0, AdaptationMeter::take_micros)
-                            })
-                            .expect("trial");
-                            assert!(
-                                run.requests.iter().all(|r| r.completed_micros.is_some()),
-                                "{label} left work unfinished"
-                            );
-                            let (_, replaying, _) =
-                                meter.as_ref().map_or((0, 0, 0), AdaptationMeter::counts);
-                            let switches = meter.as_ref().map(|meter| meter.counts().2);
-                            let stall = meter.as_ref().map_or(0, AdaptationMeter::total_micros);
-                            (label, scores(&run, regime_of), replaying, switches, stall)
-                        })
-                        .collect::<Vec<_>>()
-                })
+    let mut results: BTreeMap<&str, Tally> = BTreeMap::new();
+    let mut record = |per_seed: Vec<Vec<RunRow>>| {
+        for runs in per_seed {
+            for (label, row, replaying, switches, stall) in runs {
+                let tally = results.entry(label).or_default();
+                tally.rows.push(row);
+                tally.replaying_calls += replaying;
+                if let Some(switches) = switches {
+                    *tally.switches.get_or_insert(0) += switches;
+                }
+                tally.stall_micros += stall;
+            }
+        }
+    };
+
+    // The static policies first: they fix each regime's best policy, for
+    // the oracle, and the best single policy, which every controller
+    // starts at and is compared with.
+    let statics = run_all(&traces, &config, |_, _| {
+        POLICIES
+            .into_iter()
+            .map(|name| -> Controller {
+                (name, indexed_policy(&theta(name)).expect("policy"), None)
+            })
+            .collect()
+    });
+    let mean_of = |name: &str, index: usize| {
+        mean(
+            &statics
+                .iter()
+                .flatten()
+                .filter(|row| row.0 == name)
+                .map(|row| row.1[index])
+                .collect::<Vec<_>>(),
+        )
+    };
+    let best_at = |index: usize| {
+        POLICIES
+            .into_iter()
+            .min_by(|a, b| mean_of(a, index).total_cmp(&mean_of(b, index)))
+            .expect("policies")
+    };
+    let regime_best = (0..REGIMES.len()).map(best_at).collect::<Vec<_>>();
+    let reference = best_at(REGIMES.len());
+    eprintln!("per-regime best {regime_best:?}, best single policy {reference}");
+    record(statics);
+
+    let others = run_all(&traces, &config, |trace, regime_of| {
+        let schedule = (0..REGIMES.len())
+            .filter_map(|regime| {
+                let first = regime_of.iter().position(|r| *r == Some(regime))?;
+                Some((trace.requests[first].arrival_micros, regime_best[regime]))
             })
             .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("seed thread"))
-            .collect::<Vec<_>>()
-    });
-    let mut results: BTreeMap<&str, Tally> = BTreeMap::new();
-    for runs in per_seed {
-        for (label, row, replaying, switches, stall) in runs {
-            let tally = results.entry(label).or_default();
-            tally.rows.push(row);
-            tally.replaying_calls += replaying;
-            if let Some(switches) = switches {
-                *tally.switches.get_or_insert(0) += switches;
-            }
-            tally.stall_micros += stall;
+        let mut controllers: Vec<Controller> =
+            vec![("oracle-switch", Box::new(oracle_switch(schedule)), None)];
+        for (label, trigger, table) in &tables {
+            let policy = regime_table((*trigger).clone(), table.clone(), reference);
+            controllers.push((label, Box::new(policy), None));
         }
-    }
+        for &(label, adaptation, interval, horizon, trigger) in &adaptive_controllers {
+            let (policy, meter) = charged_adaptive_policy_over(
+                theta(reference),
+                grid.clone(),
+                indexed_policy,
+                cost,
+                slots,
+                OnlineTuning {
+                    interval,
+                    horizon,
+                    ..OnlineTuning::default()
+                },
+                adaptation,
+                SwitchingCost::default(),
+                trigger.cloned(),
+            )
+            .expect("adaptive policy");
+            controllers.push((label, Box::new(policy), Some(meter)));
+        }
+        controllers
+    });
+    record(others);
 
     let seeds = traces.len() as f64;
     let column = |name: &str, index: usize| -> Vec<f64> {
@@ -591,8 +639,10 @@ fn main() {
     };
     let day = REGIMES.len();
     println!(
-        "Mean objective (s), p95 completion + p95 TTFT; Δ vs sjf-total on paired seeds \
-         [95% CI]. Replays, switches and stall are per run.\n"
+        "Mean objective (s), p95 completion + p95 TTFT; Δ vs {reference}, the best single \
+         policy, on paired seeds [95% CI]. Per-regime best: {}. Replays, switches and stall \
+         are per run.\n",
+        regime_best.join(", ")
     );
     let header = REGIMES
         .iter()
@@ -606,12 +656,12 @@ fn main() {
         let cells = (0..=day)
             .map(|index| {
                 let values = column(name, index);
-                if name == "sjf-total" {
+                if name == reference {
                     return format!("{:.1}", mean(&values));
                 }
                 let diffs = values
                     .iter()
-                    .zip(column("sjf-total", index))
+                    .zip(column(reference, index))
                     .map(|(a, b)| a - b)
                     .collect::<Vec<_>>();
                 let (lo, hi) = bootstrap(&diffs);
