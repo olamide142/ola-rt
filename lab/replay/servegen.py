@@ -46,7 +46,7 @@ as `eos_after` and a cap as `max_new_tokens`:
   roughly.
 
     python3 lab/replay/servegen.py --model m-large --start 36000 --hours 4 \\
-        --clients 8 --rate-scale 0.05 --time-scale 10 --seeds 1,2,3 \\
+        --clients 8 --peak-output-rate 24 --time-scale 10 --seeds 1,2,3 \\
         --out servegen-{seed}.jsonl
 
 Standard library only.
@@ -60,6 +60,8 @@ import http.client
 import io
 import json
 import math
+import os
+import re
 import random
 import sys
 import time
@@ -73,9 +75,15 @@ WINDOW_SECONDS = 600
 
 
 def fetch(url, attempts=4):
+    request = urllib.request.Request(url)
+    # The one API call per run (the client listing) is rate limited to 60
+    # an hour without a token; GITHUB_TOKEN, when set, goes to the API only.
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        request.add_header("Authorization", f"Bearer {token}")
     for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(url, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 return response.read().decode()
         except (OSError, http.client.HTTPException) as error:
             if attempt + 1 == attempts:
@@ -89,15 +97,30 @@ def raw(ref, path):
 
 
 def client_ids(ref, category, model):
-    listing = json.loads(
-        fetch(f"https://api.github.com/repos/{REPO}/contents/data/{category}/{model}?ref={ref}")
-    )
-    ids = sorted(
-        int(entry["name"].split("-")[1])
-        for entry in listing
-        if entry["name"].endswith("-trace.csv")
-    )
-    return ids
+    """Client numbers with a trace file. The REST API is rate limited to 60
+    calls an hour per address without a token, so without GITHUB_TOKEN (or
+    when the API refuses) the listing is read from the repository's web
+    tree page, which embeds it as JSON."""
+    path = f"data/{category}/{model}"
+    names = None
+    if os.environ.get("GITHUB_TOKEN"):
+        try:
+            listing = json.loads(fetch(f"https://api.github.com/repos/{REPO}/contents/{path}?ref={ref}"))
+            names = [entry["name"] for entry in listing]
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            print(f"API listing failed ({error}); using the tree page", file=sys.stderr)
+    if names is None:
+        page = fetch(f"https://github.com/{REPO}/tree/{ref}/{path}")
+        match = re.search(
+            r'<script type="application/json" data-target="react-app.embeddedData">(.*?)</script>',
+            page,
+            re.S,
+        )
+        tree = json.loads(match.group(1))["payload"]["codeViewTreeRoute"]["tree"]
+        names = [item["name"] for item in tree["items"]]
+        if len(names) != tree.get("totalCount", len(names)):
+            raise RuntimeError(f"tree page for {path} is truncated; set GITHUB_TOKEN")
+    return sorted(int(name.split("-")[1]) for name in names if name.endswith("-trace.csv"))
 
 
 def parse_trace(text):
@@ -156,6 +179,12 @@ def main():
     parser.add_argument("--hours", type=float, default=24.0, help="span length in trace hours")
     parser.add_argument("--clients", type=int, default=8, help="busiest clients to include")
     parser.add_argument("--rate-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--peak-output-rate",
+        type=float,
+        help="set --rate-scale so the busiest trace hour asks for this many output tokens "
+        "per second of compressed time (the simulated RTX 4090 decodes about 35)",
+    )
     parser.add_argument("--time-scale", type=float, default=1.0)
     parser.add_argument("--max-input", type=int, default=4096)
     parser.add_argument("--max-output", type=int, default=1024)
@@ -184,11 +213,33 @@ def main():
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         datasets = dict(pool.map(dataset_of, chosen))
+    if args.peak_output_rate:
+        args.rate_scale = args.peak_output_rate / peak_output_rate(args, chosen, traces, datasets)
+        print(f"rate scale {args.rate_scale:.4g} for a peak of {args.peak_output_rate} tokens/s", file=sys.stderr)
     seeds = [int(seed) for seed in args.seeds.split(",")]
     for seed in seeds:
         out = args.out.replace("{seed}", str(seed))
         requests = generate(args, chosen, traces, datasets, random.Random(seed))
         write(out, args, seed, chosen, requests)
+
+
+def peak_output_rate(args, chosen, traces, datasets):
+    """Expected output tokens per second of compressed time in the busiest
+    trace hour, at rate scale 1."""
+    per_hour = {}
+    for client in chosen:
+        published = sorted(datasets[client])
+        for start, (rate, *_rest) in traces[client].items():
+            index = bisect.bisect_right(published, start) - 1
+            if index < 0:
+                continue
+            values, cumulative = datasets[client][published[index]]["output_tokens"]
+            probabilities = [b - a for a, b in zip([0.0] + cumulative[:-1], cumulative)]
+            mean_output = sum(min(v, args.max_output) * p for v, p in zip(values, probabilities))
+            hour = start // 3600
+            per_hour[hour] = per_hour.get(hour, 0.0) + rate * mean_output * args.time_scale
+    # Each hour holds 3600 / WINDOW_SECONDS windows; average them.
+    return max(per_hour.values()) * WINDOW_SECONDS / 3600
 
 
 def cap(limit, output, max_output):
