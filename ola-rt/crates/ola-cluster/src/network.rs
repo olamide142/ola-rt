@@ -120,7 +120,8 @@ impl TcpCoordinator {
             CoordinatorWorkerLink::connect(address, expected_worker, self.frames_tx.clone())
                 .await?;
         let worker = link.worker().clone();
-        self.coordinator.join(summary)?;
+        self.apply_committed_input(crate::CoordinatorInput::JoinWorker { summary })
+            .await?;
         self.calibration
             .insert(worker.clone(), LinkCalibration::default());
         self.links.insert(worker.clone(), link);
@@ -408,7 +409,8 @@ impl TcpCoordinator {
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
         self.coordinator
-            .commit_submit(request, spec, at)
+            .apply_committed_input(crate::CoordinatorInput::Submit { request, spec, at })
+            .map(|result| result.output)
             .map_err(TcpCoordinatorError::Coordinator)
     }
 
@@ -422,9 +424,10 @@ impl TcpCoordinator {
         request: ClusterRequestId,
         at: Timestamp,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        let output = self.coordinator.cancel(request, at)?;
-        self.dispatch(&output.commands).await?;
-        Ok(output)
+        Ok(self
+            .apply_committed_input(crate::CoordinatorInput::Cancel { request, at })
+            .await?
+            .output)
     }
 
     /// Waits for the next frame from any worker.

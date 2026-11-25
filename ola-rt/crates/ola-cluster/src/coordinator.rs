@@ -170,9 +170,30 @@ pub enum WorkerMessage {
 /// replicated log and call [`Coordinator::apply_committed_input`] only after
 /// that entry commits. Timestamps and lease timeouts are carried in the input
 /// so replicas do not consult their local clocks while applying it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CoordinatorInput {
+    /// Register a worker using its handshake summary.
+    JoinWorker {
+        /// Initial worker summary.
+        summary: WorkerSummary,
+    },
+    /// Commit a validated client submission in coordinator ID order.
+    Submit {
+        /// Stable ID returned by `prepare_submit`.
+        request: ClusterRequestId,
+        /// Request payload.
+        spec: RequestSpec,
+        /// Coordinator-clock arrival time.
+        at: Timestamp,
+    },
+    /// Apply a client's cancellation request.
+    Cancel {
+        /// Request to cancel.
+        request: ClusterRequestId,
+        /// Coordinator-clock time of cancellation.
+        at: Timestamp,
+    },
     /// Apply a report received from a worker.
     WorkerMessage {
         /// Reporting worker.
@@ -919,6 +940,13 @@ impl Coordinator {
     ) -> Result<CoordinatorApplyResult, CoordinatorError> {
         let mut result = CoordinatorApplyResult::default();
         match input {
+            CoordinatorInput::JoinWorker { summary } => self.join(summary)?,
+            CoordinatorInput::Submit { request, spec, at } => {
+                result.output = self.commit_submit(request, spec, at)?;
+            }
+            CoordinatorInput::Cancel { request, at } => {
+                result.output = self.cancel(request, at)?;
+            }
             CoordinatorInput::WorkerMessage {
                 worker,
                 message,
@@ -2025,5 +2053,56 @@ mod feedback_tests {
             first_result.recovered_requests,
             second_result.recovered_requests
         );
+    }
+
+    #[test]
+    fn join_submit_and_cancel_are_replayable_inputs() {
+        let worker = WorkerId::new("replica-worker");
+        let inputs = [
+            CoordinatorInput::JoinWorker {
+                summary: WorkerSummary {
+                    worker: worker.clone(),
+                    generation: 0,
+                    reported_at: Timestamp::ZERO,
+                    health: WorkerHealth::Ready,
+                    role: WorkerRole::Mixed,
+                    models: BTreeSet::new(),
+                    max_active_requests: 1,
+                    queued_requests: 0,
+                    live_requests: 0,
+                    queued_tokens: 0,
+                    admitted_requests: 0,
+                    kv: BTreeMap::new(),
+                },
+            },
+            CoordinatorInput::Submit {
+                request: ClusterRequestId::new(1),
+                spec: RequestSpec::text("model", "hello"),
+                at: Timestamp::from_micros(10),
+            },
+            CoordinatorInput::Cancel {
+                request: ClusterRequestId::new(1),
+                at: Timestamp::from_micros(20),
+            },
+        ];
+        let mut first = Coordinator::new(AdaptiveClusterPolicy::default());
+        let mut second = Coordinator::new(AdaptiveClusterPolicy::default());
+
+        for input in inputs {
+            let encoded = serde_json::to_vec(&input).unwrap();
+            let decoded: CoordinatorInput = serde_json::from_slice(&encoded).unwrap();
+            first.apply_committed_input(decoded.clone()).unwrap();
+            second.apply_committed_input(decoded).unwrap();
+        }
+
+        assert_eq!(first.generation, second.generation);
+        assert_eq!(
+            first.status(ClusterRequestId::new(1)),
+            second.status(ClusterRequestId::new(1))
+        );
+        assert!(matches!(
+            first.status(ClusterRequestId::new(1)),
+            Some(ClusterRequestStatus::Cancelled)
+        ));
     }
 }
