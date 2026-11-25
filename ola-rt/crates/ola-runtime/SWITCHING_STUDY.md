@@ -264,6 +264,11 @@ policy (`sjf-total`):
 | --- | --- | --- | --- | --- |
 | `oracle-switch` − `sjf-total` (s) | **−10.46 [−11.86, −8.79]** | +0.00 [+0.00, +0.01] | +0.00 [+0.00, +0.00] | +0.09 [−0.44, +0.65] |
 
+> **Corrected (2026-11-25):** the reference here is the best policy by
+> pooled whole-day p95, `sjf-total`. FIFO is within 0.4 s of it on that
+> score and 4.1 s better per hour, and against FIFO the night offers
+> nothing. See "Scoring per hour, and the right baseline" below.
+
 This is the first case where a switch pays after a real regime transition.
 The night's p95 falls by about 8% at no cost in the other regimes, because
 the regimes last far longer than the backlog takes to drain. **The
@@ -287,6 +292,10 @@ OLA_COST=10745,30227,482,97,13047,24568 MAX_ACTIVE=4 \
 ```
 
 ## A real controller on the ServeGen day (2026-11-23)
+
+> **Corrected (2026-11-25):** the deltas in this section are against
+> `sjf-total`. Against FIFO, the better baseline, see "Scoring per hour,
+> and the right baseline" below.
 
 `servegen_adaptive` replaces the oracle with online controllers that choose
 between FIFO and `sjf-total`. It runs at 4 slots on the same 10 traces and
@@ -418,6 +427,58 @@ OLA_COST=10745,30227,482,97,13047,24568 ADAPTIVE=none \
   cargo run --release -p ola-bench --example servegen_adaptive -- \
   pow2-{1..10}.jsonl --fit pow2-{11..20}.jsonl
 ```
+
+## Scoring per hour, and the right baseline (2026-11-25)
+
+A pooled p95 over 14,400 s is dominated by the busiest stretch. SLOs are
+usually judged per window, so `servegen_adaptive` now also scores each
+trace hour (about 53 requests) and averages the 24 hourly objectives. The
+best single policy, which controllers start at and are compared with, is
+chosen on that hourly mean.
+
+**The baseline changes.** By hourly mean FIFO beats `sjf-total` by 4.1 s
+[2.9, 5.6]. On the pooled day p95 they were within 0.4 s, not
+significantly different. The earlier sections compared against
+`sjf-total`, which made the night look like the gain. Against FIFO the
+night offers nothing (FIFO is the night's best). What remains is the day
+and the evening, where `sjf-total` is better by 0.46 s and 1.18 s.
+
+All controllers at 4 slots, exact lengths, 10 seeds, stall charged.
+Δ against FIFO (s) [95% CI]:
+
+| controller | night | day | evening | whole day | hourly mean | replays | stall (s) |
+| --- | --- | --- | --- | --- | --- | ---: | ---: |
+| `sjf-total` | +10.86 | −0.46 | −1.18 | −0.43 [−0.99, +0.12] | +4.12 [+2.89, +5.63] | – | – |
+| `oracle-switch` | +0.40 [+0.05, +1.00] | −0.46 | −1.18 | −0.34 [−0.59, −0.05] | −0.17 [−0.44, +0.16] | – | – |
+| `replay-past` | +1.43 | +0.16 | −0.90 | +0.39 [+0.03, +0.75] | +1.39 [+0.38, +2.88] | 2,432 | 50.9 |
+| `replay-state` | +1.46 | +0.16 | −0.51 | +0.65 [+0.24, +1.04] | +0.26 [+0.08, +0.46] | 2,432 | 52.1 |
+| `hmm-past` | +0.00 | −0.07 | −0.58 | −0.16 [−0.39, +0.04] | −0.12 [−0.21, −0.05] | 8.2 | 0.16 |
+| `hmm-state` | +1.08 | −0.13 | −0.07 | +0.07 [−0.03, +0.23] | +0.49 [−0.06, +1.55] | 8.2 | 0.17 |
+| `sizes-past` | +0.00 | −0.05 | −0.27 | −0.16 [−0.38, +0.00] | −0.12 [−0.24, −0.03] | 3.4 | 0.06 |
+| `sizes-state` | +1.08 | −0.08 | −0.29 | +0.06 [+0.00, +0.17] | +0.45 [−0.06, +1.43] | 3.6 | 0.07 |
+| `table-arrivals` | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| **`table-sizes`** | +0.00 | **−0.24 [−0.40, −0.09]** | **−1.18 [−1.56, −0.81]** | **−0.42 [−0.65, −0.20]** | **−0.38 [−0.46, −0.29]** | 0 | 0 |
+
+- **The honest gain is small.** Adapting the scheduler on this day is worth
+  about 0.7% on the hourly mean and 0.6% on the whole day. That is about
+  6% in the evening, at no cost.
+- **`table-sizes` beats the oracle.** The oracle switches to `sjf-total`
+  at the day's first arrival, so the night's leftover long jobs wait
+  behind short ones (+0.40 s at night). The table's detection lags the
+  boundary, and that lag lets the night backlog drain under FIFO first.
+  Instant switching is not optimal when the backlog carries over.
+- **Periodic replay is worse than not adapting** on every whole-day score.
+  It switches into `sjf-total` at night.
+- **Triggered replay is roughly neutral.** Past-window replays gain a
+  little (−0.12 s hourly). State-seeded replays sometimes pick `sjf-total`
+  at night, which widens their CIs.
+- **Rough output limits change nothing.** With power-of-two limits,
+  `table-sizes` gains −0.37 s [−0.46, −0.29] hourly against FIFO. With a
+  uniform 1,024 limit the gain is −0.09 s [−0.18, −0.00], essentially nil.
+
+Scoring per window should be the default for this study. The pooled p95
+picked the wrong baseline, and that made a 0.4 s gain per hour look like a
+10.5 s gain at night.
 
 ## Threats to validity
 

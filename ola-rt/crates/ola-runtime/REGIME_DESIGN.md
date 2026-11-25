@@ -108,7 +108,9 @@ regimes that share an arrival process but differ in length mix are
 separated by an HMM over windows of admitted requests' sizes
 (`RegimeFeatures::Sizes`), which arrivals alone cannot do. A learned
 state → θ table applied on the posterior (`servegen_adaptive`'s
-`table-sizes`) matched the oracle with no replay. See `SWITCHING_STUDY.md`.
+`table-sizes`) matched the oracle with no replay. Against the right
+baseline (FIFO, best by hourly score) the gain is small: about 0.7% per
+hour, 6% in the evening. See `SWITCHING_STUDY.md`.
 
 ## Order of work
 

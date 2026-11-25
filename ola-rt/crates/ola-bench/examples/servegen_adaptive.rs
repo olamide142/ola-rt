@@ -27,10 +27,12 @@
 //!   policy on each decoded regime's requests.
 //!
 //! The static policies run first. Their per-regime means pick the oracle's
-//! policy for each regime, and their whole-day means pick the best single
+//! policy for each regime, and their hourly means pick the best single
 //! policy, which every controller starts at and is compared with on paired
-//! per-seed differences. Scores are p95 completion plus p95 TTFT per regime
-//! and over the day.
+//! per-seed differences. Scores are p95 completion plus p95 TTFT per
+//! regime, over the whole day, and averaged over trace hours (the window an
+//! SLO is typically judged over; a pooled p95 hides a gain confined to one
+//! regime).
 //!
 //! ```sh
 //! OLA_COST=10745,30227,482,97,13047,24568 \
@@ -165,12 +167,33 @@ fn objective(run: &SchedulingRun, keep: impl Fn(usize) -> bool) -> f64 {
     (p95(completion) + p95(ttft)) as f64 / 1e6
 }
 
-/// Objectives for each regime, then the whole day.
-fn scores(run: &SchedulingRun, regime_of: &[Option<usize>]) -> Vec<f64> {
+/// Where a request falls in the ServeGen day.
+#[derive(Clone, Copy)]
+struct Label {
+    regime: Option<usize>,
+    /// Trace hour of the request's ServeGen window.
+    hour: Option<u64>,
+}
+
+/// Objectives for each regime, the whole day, and the mean over trace
+/// hours of each hour's objective: an hour is the window an SLO would
+/// typically be judged over, and a pooled p95 hides a gain confined to
+/// one regime.
+fn scores(run: &SchedulingRun, labels: &[Label]) -> Vec<f64> {
     let mut out = (0..REGIMES.len())
-        .map(|regime| objective(run, |index| regime_of[index] == Some(regime)))
+        .map(|regime| objective(run, |index| labels[index].regime == Some(regime)))
         .collect::<Vec<_>>();
     out.push(objective(run, |_| true));
+    let hours = labels
+        .iter()
+        .filter_map(|label| label.hour)
+        .collect::<std::collections::BTreeSet<_>>();
+    out.push(mean(
+        &hours
+            .into_iter()
+            .map(|hour| objective(run, |index| labels[index].hour == Some(hour)))
+            .collect::<Vec<_>>(),
+    ));
     out
 }
 
@@ -195,20 +218,22 @@ fn mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / values.len().max(1) as f64
 }
 
-/// A trace and the regime of each request.
-fn load(path: &str) -> (SchedulingTrace, Vec<Option<usize>>) {
+/// A trace and where each request falls in the day.
+fn load(path: &str) -> (SchedulingTrace, Vec<Label>) {
     let text = std::fs::read_to_string(path).expect("trace file");
     let (trace, windows) = SchedulingTrace::from_json_lines("servegen", &text).expect("trace");
-    let regime_of = windows
+    let labels = windows
         .iter()
-        .map(|window| {
-            let window = (*window)?;
-            REGIMES
-                .iter()
-                .position(|(_, start, end)| (*start..*end).contains(&window))
+        .map(|window| Label {
+            regime: window.and_then(|window| {
+                REGIMES
+                    .iter()
+                    .position(|(_, start, end)| (*start..*end).contains(&window))
+            }),
+            hour: window.map(|window| window / 3600),
         })
         .collect();
-    (trace, regime_of)
+    (trace, labels)
 }
 
 fn arrivals(trace: &SchedulingTrace) -> Vec<u64> {
@@ -384,17 +409,17 @@ type RunRow = (&'static str, Vec<f64>, u64, Option<u64>, u64);
 /// Runs every trace's controllers, the traces on parallel threads, and
 /// returns each trace's rows in trace order.
 fn run_all(
-    traces: &[(SchedulingTrace, Vec<Option<usize>>)],
+    traces: &[(SchedulingTrace, Vec<Label>)],
     config: &SimulationConfig,
-    controllers: impl Fn(&SchedulingTrace, &[Option<usize>]) -> Vec<Controller> + Sync,
+    controllers: impl Fn(&SchedulingTrace, &[Label]) -> Vec<Controller> + Sync,
 ) -> Vec<Vec<RunRow>> {
     std::thread::scope(|scope| {
         let handles = traces
             .iter()
-            .map(|(trace, regime_of)| {
+            .map(|(trace, labels)| {
                 let controllers = &controllers;
                 scope.spawn(move || {
-                    controllers(trace, regime_of)
+                    controllers(trace, labels)
                         .into_iter()
                         .map(|(label, policy, meter)| {
                             let charge_meter = meter.clone();
@@ -411,7 +436,7 @@ fn run_all(
                             let replaying = meter.as_ref().map_or(0, |meter| meter.counts().1);
                             let switches = meter.as_ref().map(|meter| meter.counts().2);
                             let stall = meter.as_ref().map_or(0, AdaptationMeter::total_micros);
-                            (label, scores(&run, regime_of), replaying, switches, stall)
+                            (label, scores(&run, labels), replaying, switches, stall)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -593,14 +618,18 @@ fn main() {
             .expect("policies")
     };
     let regime_best = (0..REGIMES.len()).map(best_at).collect::<Vec<_>>();
-    let reference = best_at(REGIMES.len());
+    // The reference is the best single policy by the hourly score, the one
+    // an SLO judged per hour would pick.
+    let reference = best_at(REGIMES.len() + 1);
     eprintln!("per-regime best {regime_best:?}, best single policy {reference}");
     record(statics);
 
-    let others = run_all(&traces, &config, |trace, regime_of| {
+    let others = run_all(&traces, &config, |trace, labels| {
         let schedule = (0..REGIMES.len())
             .filter_map(|regime| {
-                let first = regime_of.iter().position(|r| *r == Some(regime))?;
+                let first = labels
+                    .iter()
+                    .position(|label| label.regime == Some(regime))?;
                 Some((trace.requests[first].arrival_micros, regime_best[regime]))
             })
             .collect::<Vec<_>>();
@@ -640,20 +669,20 @@ fn main() {
     let day = REGIMES.len();
     println!(
         "Mean objective (s), p95 completion + p95 TTFT; Δ vs {reference}, the best single \
-         policy, on paired seeds [95% CI]. Per-regime best: {}. Replays, switches and stall \
+         policy by hourly mean, on paired seeds [95% CI]. Per-regime best: {}. Replays, switches and stall \
          are per run.\n",
         regime_best.join(", ")
     );
     let header = REGIMES
         .iter()
         .map(|(name, ..)| *name)
-        .chain(["whole day"])
+        .chain(["whole day", "hourly mean"])
         .collect::<Vec<_>>()
         .join(" | ");
     println!("| controller | {header} | replays | switches | stall (s) |");
-    println!("|---|{}---:|---:|---:|", "---|".repeat(day + 1));
+    println!("|---|{}---:|---:|---:|", "---|".repeat(day + 2));
     for name in names {
-        let cells = (0..=day)
+        let cells = (0..=day + 1)
             .map(|index| {
                 let values = column(name, index);
                 if name == reference {
