@@ -215,9 +215,73 @@ impl TcpCoordinator {
         &mut self,
         input: crate::CoordinatorInput,
     ) -> Result<crate::CoordinatorApplyResult, TcpCoordinatorError> {
+        let heartbeat = match &input {
+            crate::CoordinatorInput::Heartbeat {
+                worker,
+                at,
+                sent_at_us,
+                ..
+            } => Some((worker.clone(), *at, *sent_at_us)),
+            _ => None,
+        };
         let result = self.coordinator.apply_committed_input(input)?;
+        if let Some((worker, at, sent_at_us)) = heartbeat {
+            self.record_calibration(&worker, at, sent_at_us);
+        }
         self.dispatch(&result.output.commands).await?;
         Ok(result)
+    }
+
+    /// Waits for and decodes the next worker event without applying it.
+    ///
+    /// The returned input can be proposed to a replicated log; apply it with
+    /// [`apply_committed_input`](Self::apply_committed_input) only after
+    /// commitment. Heartbeats are acknowledged at the transport layer before
+    /// they are returned. A disconnected link yields a `WorkerLost` input and
+    /// is removed locally, but scheduler state is left untouched.
+    ///
+    /// Frames already queued for a link that has since been removed are
+    /// discarded internally.
+    pub async fn next_coordinator_input(
+        &mut self,
+        at: Timestamp,
+    ) -> (WorkerId, crate::CoordinatorInput) {
+        loop {
+            let (worker, frame) = self.next_frame().await;
+            let Some(link) = self.links.get_mut(&worker) else {
+                continue;
+            };
+            match link.accept_frame(frame).await {
+                Ok(crate::CoordinatorLinkEvent::Message(message)) => {
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::WorkerMessage {
+                            worker,
+                            message,
+                            at,
+                        },
+                    );
+                }
+                Ok(crate::CoordinatorLinkEvent::Heartbeat { epoch, sent_at_us }) => {
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::Heartbeat {
+                            worker,
+                            epoch,
+                            sent_at_us,
+                            at,
+                        },
+                    );
+                }
+                Err(_) => {
+                    self.links.remove(&worker);
+                    return (
+                        worker.clone(),
+                        crate::CoordinatorInput::WorkerLost { worker, at },
+                    );
+                }
+            }
+        }
     }
 
     /// Expires silent workers, requeues their requests, and dispatches a new
@@ -232,7 +296,12 @@ impl TcpCoordinator {
         now: Timestamp,
         timeout: Duration,
     ) -> Result<CoordinatorOutput, TcpCoordinatorError> {
-        self.coordinator.recover_lost_requests(now, timeout);
+        let timeout_micros = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
+        self.apply_committed_input(crate::CoordinatorInput::ExpireLeases {
+            now,
+            timeout_micros,
+        })
+        .await?;
         self.plan_pending(now).await
     }
 
@@ -639,7 +708,11 @@ impl TcpCoordinator {
             Ok(event) => Ok((worker, Some(event))),
             Err(_) => {
                 self.links.remove(&worker);
-                self.coordinator.recover_worker(&worker, at)?;
+                self.apply_committed_input(crate::CoordinatorInput::WorkerLost {
+                    worker: worker.clone(),
+                    at,
+                })
+                .await?;
                 output.extend(self.plan_pending(at).await?);
                 Ok((worker, None))
             }
@@ -667,12 +740,10 @@ impl TcpCoordinator {
                 self.apply_committed_input(crate::CoordinatorInput::Heartbeat {
                     worker: worker.clone(),
                     epoch,
+                    sent_at_us,
                     at,
                 })
                 .await?;
-                // Clock calibration is transport telemetry, not replicated
-                // scheduler state, so each coordinator records it locally.
-                self.record_calibration(worker, at, sent_at_us);
                 Ok(CoordinatorOutput::default())
             }
         }

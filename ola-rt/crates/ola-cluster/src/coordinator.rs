@@ -188,6 +188,8 @@ pub enum CoordinatorInput {
         worker: WorkerId,
         /// Worker process epoch.
         epoch: u64,
+        /// Worker-clock time carried by the heartbeat, in microseconds.
+        sent_at_us: u64,
         /// Coordinator-clock time of receipt.
         at: Timestamp,
     },
@@ -924,12 +926,12 @@ impl Coordinator {
             } => {
                 result.output = self.handle(&worker, message, at)?;
             }
-            CoordinatorInput::Heartbeat { worker, epoch, at } => {
-                match self.heartbeat(&worker, epoch, at) {
-                    Ok(()) | Err(CoordinatorError::StaleWorkerEpoch { .. }) => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            CoordinatorInput::Heartbeat {
+                worker, epoch, at, ..
+            } => match self.heartbeat(&worker, epoch, at) {
+                Ok(()) | Err(CoordinatorError::StaleWorkerEpoch { .. }) => {}
+                Err(error) => return Err(error),
+            },
             CoordinatorInput::WorkerLost { worker, at } => {
                 result.recovered_requests = self.recover_worker(&worker, at)?;
                 result.lost_workers.push(worker);
