@@ -210,6 +210,15 @@ pub enum CoordinatorInput {
         /// Cost in microseconds.
         cost_us: u64,
     },
+    /// Apply a policy plan that has already committed in the replicated log.
+    CommitPlan {
+        /// Validated actions to apply.
+        plan: ClusterPlan,
+        /// Candidate evidence recorded by the proposing policy.
+        routes: Vec<RouteRecord>,
+        /// Coordinator-clock planning time.
+        at: Timestamp,
+    },
     /// Apply a report received from a worker.
     WorkerMessage {
         /// Reporting worker.
@@ -977,6 +986,16 @@ impl Coordinator {
             }
             CoordinatorInput::SetWorkerNetworkCost { worker, cost_us } => {
                 self.set_network_cost(worker, cost_us);
+            }
+            CoordinatorInput::CommitPlan { plan, routes, at } => {
+                let decision = ClusterDecision {
+                    plan,
+                    record: ClusterDecisionRecord {
+                        policy: self.policy_descriptor(),
+                        routes,
+                    },
+                };
+                result.output = self.commit_plan(decision, at)?.1;
             }
             CoordinatorInput::WorkerMessage {
                 worker,

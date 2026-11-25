@@ -6,9 +6,9 @@ use ola_bench::{KvGeometry, synthetic_artifact, synthetic_prompt};
 use ola_cluster::{
     ClientEvent, ClusterAction, ClusterPlan, ClusterPlanError, ClusterPolicy, ClusterRequestStatus,
     ClusterSnapshot, ClusterTraceEvent, ClusterTraceRecord, Coordinator, CoordinatorError,
-    DeferReason, KvHeadroomRouting, LeastLoadedRouting, LocalCluster, PowerOfTwoRouting,
-    PrefixAffinityRouting, RejectReason, RoundRobinRouting, RouteReason, WorkerCommand,
-    WorkerHealth, WorkerHost, WorkerMessage, WorkerRole, WorkerSummary,
+    CoordinatorInput, DeferReason, KvHeadroomRouting, LeastLoadedRouting, LocalCluster,
+    PowerOfTwoRouting, PrefixAffinityRouting, RejectReason, RoundRobinRouting, RouteReason,
+    WorkerCommand, WorkerHealth, WorkerHost, WorkerMessage, WorkerRole, WorkerSummary,
 };
 use ola_core::{
     ClusterRequestId, Input, ModelDescriptor, ModelId, RequestId, RequestSpec, Timestamp, WorkerId,
@@ -446,8 +446,14 @@ fn policy_decision_can_be_committed_after_external_replication() {
         Some(&ClusterRequestStatus::Pending)
     );
 
-    let (iteration, output) = coordinator.commit_plan(proposal, at(2)).unwrap();
-    assert_eq!(iteration.plan.actions.len(), 1);
+    let input = CoordinatorInput::CommitPlan {
+        plan: proposal.plan,
+        routes: proposal.record.routes,
+        at: at(2),
+    };
+    let encoded = serde_json::to_vec(&input).unwrap();
+    let decoded: CoordinatorInput = serde_json::from_slice(&encoded).unwrap();
+    let output = coordinator.apply_committed_input(decoded).unwrap().output;
     assert_eq!(output.commands.len(), 1);
     assert!(matches!(
         coordinator.status(request),

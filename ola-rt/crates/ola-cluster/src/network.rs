@@ -349,6 +349,25 @@ impl TcpCoordinator {
             .map_err(TcpCoordinatorError::Coordinator)
     }
 
+    /// Builds a serializable coordinator input for external consensus.
+    ///
+    /// Append the returned input to the replicated log, then apply it with
+    /// [`apply_committed_input`](Self::apply_committed_input) after commit.
+    /// The plan contains actions and route evidence; each replica supplies its
+    /// own descriptor for the replicated policy configuration.
+    pub fn plan_input(
+        &self,
+        at: Timestamp,
+    ) -> Result<Option<crate::CoordinatorInput>, TcpCoordinatorError> {
+        Ok(self
+            .plan_decision(at)?
+            .map(|decision| crate::CoordinatorInput::CommitPlan {
+                plan: decision.plan,
+                routes: decision.record.routes,
+                at,
+            }))
+    }
+
     /// Applies a committed decision and dispatches its worker commands.
     ///
     /// Call only after the decision has been durably committed by the

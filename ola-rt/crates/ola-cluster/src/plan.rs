@@ -40,7 +40,8 @@ impl fmt::Display for RejectReason {
 }
 
 /// One decision about one pending request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum ClusterAction {
     /// Make `worker` the request's owner.
     Assign {
@@ -77,7 +78,7 @@ impl ClusterAction {
 }
 
 /// Every decision of one cluster planning pass.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ClusterPlan {
     /// Coordinator generation of the snapshot the plan was built from.
     pub generation: u64,

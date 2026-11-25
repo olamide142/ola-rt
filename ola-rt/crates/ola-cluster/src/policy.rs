@@ -122,7 +122,7 @@ impl ClusterDecisionRecord {
 }
 
 /// The workers a policy weighed for one request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RouteRecord {
     /// Request being routed.
     pub request: ClusterRequestId,
