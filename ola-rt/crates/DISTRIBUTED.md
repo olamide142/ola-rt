@@ -379,8 +379,27 @@ request ownership or provide inference failover.
 
 ## Implementation status
 
-This section describes the code as of 2026-10-31. Where it and the design
+This section describes the code as of 2026-11-26. Where it and the design
 above disagree, this is what runs.
+
+### Consensus scaffold
+
+`ola-cluster::consensus` pins the coordinator's OpenRaft type configuration:
+`CoordinatorInput` is the replicated log entry, the response is currently
+unit, node IDs are `u64`, and peer metadata uses OpenRaft's `BasicNode`.
+This makes the command vocabulary type-check against OpenRaft, but it is not
+a running consensus implementation. In particular, the repository does not
+yet provide a log store, state-machine/snapshot store, Raft peer transport,
+membership bootstrap, or leader-term fencing. Existing `TcpCoordinator`
+paths still apply commands directly and are not replicated; deployments must
+not interpret the dependency or type aliases as providing high availability.
+
+The next implementation boundary is the in-memory protocol-test adapter in
+sequence step 2 above. OpenRaft's example memory store is tied to its example
+key/value request and response types, so it cannot directly host this
+coordinator state machine; a test store must implement the storage traits for
+`CoordinatorRaftTypeConfig` (or deliberately wrap a generic test store).
+Such a store is test-only and must not be reused as production persistence.
 
 ### Crates and transports
 
