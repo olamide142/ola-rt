@@ -2150,8 +2150,18 @@ mod feedback_tests {
         for input in inputs {
             let encoded = serde_json::to_vec(&input).unwrap();
             let decoded: CoordinatorInput = serde_json::from_slice(&encoded).unwrap();
-            first.apply_committed_input(decoded.clone()).unwrap();
-            second.apply_committed_input(decoded).unwrap();
+            let first_result = first.apply_committed_input(decoded.clone()).unwrap();
+            let second_result = second.apply_committed_input(decoded).unwrap();
+
+            // A future consensus adapter dispatches effects only from the
+            // leader, but every replica must derive the same effects from the
+            // committed input stream.
+            assert_eq!(first_result.output, second_result.output);
+            assert_eq!(first_result.lost_workers, second_result.lost_workers);
+            assert_eq!(
+                first_result.recovered_requests,
+                second_result.recovered_requests
+            );
         }
 
         assert_eq!(first.generation, second.generation);
